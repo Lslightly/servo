@@ -469,6 +469,7 @@ dependencies = [
 name = "arkweb"
 version = "0.7.0"
 dependencies = [
+ "cookie 0.18.2",
  "cxx",
  "cxx-build",
  "dpi",
