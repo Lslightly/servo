@@ -1,0 +1,13 @@
+diff --git a/services/modules/seccomp/seccomp_policy.c b/services/modules/seccomp/seccomp_policy.c
+index ebee99b0..b3c2d177 100644
+--- a/services/modules/seccomp/seccomp_policy.c
++++ b/services/modules/seccomp/seccomp_policy.c
+@@ -38,7 +38,7 @@
+ #define SECCOMP_SET_MODE_FILTER  (1)
+ #endif
+ 
+-#ifdef __LP__
++#ifdef __LP64__
+ #define FILTER_LIB_PATH_FORMAT "lib64/seccomp/lib%s_filter.z.so"
+ #define FILTER_LIB_PATH_PART "lib64/seccomp/lib"
+ #else
