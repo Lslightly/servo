@@ -50,6 +50,9 @@ pub mod ffi {
         fn get_progress(id: u32) -> i32;
         fn can_go_back(id: u32) -> bool;
         fn can_go_forward(id: u32) -> bool;
+        /// Whether an editable element is focused and the soft keyboard is up, so ACE performs
+        /// keyboard-avoidance layout (`ServoNWeb::NeedSoftKeyboard`).
+        fn need_soft_keyboard(id: u32) -> bool;
 
         // Engine-global cookie access, backed by Servo's site-data manager (sync rendezvous).
         fn cookie_get(url: &CxxString, include_http_only: bool) -> String;
@@ -79,6 +82,10 @@ pub mod ffi {
             source: &CxxString,
         );
         fn on_frame_ready(self: &WebViewClient);
+        /// Tell ACE an editable is focused (`true, true`) or blurred (`false, false`) so its back
+        /// button closes the soft keyboard and it tracks the focus text field. The keyboard itself
+        /// is driven by the engine's own IME connection, not by this.
+        fn update_text_field_status(self: &WebViewClient, show_keyboard: bool, attach_ime: bool);
     }
 }
 
@@ -178,6 +185,9 @@ fn can_go_back(id: u32) -> bool {
 }
 fn can_go_forward(id: u32) -> bool {
     crate::runtime::can_go_forward(id)
+}
+fn need_soft_keyboard(id: u32) -> bool {
+    crate::runtime::need_soft_keyboard(id)
 }
 fn cookie_get(url: &CxxString, include_http_only: bool) -> String {
     crate::runtime::cookie_get(url, include_http_only)
