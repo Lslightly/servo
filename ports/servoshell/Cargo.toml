@@ -37,7 +37,10 @@ ProductName = "ServoShell"
 default = ["default_base", "media-gstreamer"]
 # Feature groups:
 # Base default features, without GStreamer media support.
-default_base = [
+default_base = ["base", "sqlite-backend"]
+# Everything in `default_base` except the storage backend, so that a build can
+# pick a different one (`--no-default-features --features "base,ohos-rdb-backend"`).
+base = [
     "bundled",
     "default_web_features",
     "default_tooling",
@@ -69,7 +72,9 @@ max_log_level = ["log/release_max_level_info"]
 media-gstreamer = ["servo/media-gstreamer"]
 multiprocess = ["servo/multiprocess"]
 native-bluetooth = ["servo/native-bluetooth"]
+ohos-rdb-backend = ["servo/ohos-rdb-backend"]
 profilemozjs = ["servo/profilemozjs"]
+sqlite-backend = ["servo/sqlite-backend"]
 subtlecrypto = ["servo/subtlecrypto"]
 tracing = ["dep:tracing", "dep:tracing-subscriber", "servo/tracing"]
 tracing-hitrace = ["tracing", "dep:hitrace"]
