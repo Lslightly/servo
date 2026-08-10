@@ -17,12 +17,11 @@ use storage_traits::indexeddb::{
 };
 
 use crate::indexeddb::IndexedDBDescription;
-use crate::indexeddb::engines::{KvsEngine, KvsTransaction};
+use crate::indexeddb::engines::{KvsEngine, KvsTransaction, encoding};
 use crate::shared::{DB_INIT_PRAGMAS, DB_PRAGMAS};
 
 mod create;
 mod database_model;
-mod encoding;
 mod object_data_model;
 mod object_store_index_model;
 mod object_store_model;

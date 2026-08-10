@@ -18,7 +18,7 @@ crate-type = ["rlib"]
 [features]
 # Note: Servoshell does not use the default features of servo, so you also
 # need to add feature-groups that should be default to ports/servoshell/Cargo.toml
-default = ["bundled", "clipboard", "default_tooling", "js_jit", "multiprocess"]
+default = ["bundled", "clipboard", "default_tooling", "js_jit", "multiprocess", "sqlite-backend"]
 ## Convenience feature groups, to select multiple related features for a sensible
 #  configuration with `--no-default-features` build
 #
@@ -72,7 +72,9 @@ multiprocess = ["servo-base/multiprocess", "servo-constellation/multiprocess"]
 
 native-bluetooth = ["servo-bluetooth/native-bluetooth"]
 no-wgl = ["dep:mozangle", "mozangle/egl", "mozangle/build_dlls", "surfman/sm-angle-default", "paint_api/no-wgl"]
+ohos-rdb-backend = ["storage/ohos-rdb-backend"]
 profilemozjs = ["script/profilemozjs"]
+sqlite-backend = ["storage/sqlite-backend"]
 testbinding = ["script/testbinding"]
 tracing = [
     "dep:tracing",
