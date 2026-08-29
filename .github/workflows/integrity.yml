@@ -1,0 +1,24 @@
+name: Integrity
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  integrity:
+    name: integrity
+    runs-on: ubuntu-24.04
+    steps:
+      # The PR head, not GitHub's merge commit: the stack must stay linear.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+      - name: Check that base + patches reproduce the PR head
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GIT_COMMITTER_NAME: integrity
+          GIT_COMMITTER_EMAIL: integrity@invalid
+        run: python3 docs/ohos-sync/check_integrity.py

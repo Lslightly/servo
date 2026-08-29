@@ -1,0 +1,396 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 18 Sep 2026 18:06:16 +0000
+Subject: [PATCH] fonts: Compute FreeType glyph advances without the autohinter
+
+`PlatformFont::glyph_h_advance` loaded every glyph with light hinting to
+read its advance. For fonts loaded by FreeType's TrueType driver, light
+hinting always runs the autohinter, whose first use on each `FT_Face`
+walks the whole character map. Servo creates one face per font size, so
+this was paid again for every size, and was 29-56% of layout
+instructions on CJK pages on OpenHarmony.
+
+In light mode the autohinter never changes the horizontal scale, so the
+advance it produces is the design-unit advance scaled by `x_scale` and
+rounded to whole pixels. Compute that directly with `FT_Get_Advance`
+whenever a light load would go through the autohinter, and otherwise
+keep loading the glyph, now with `FT_LOAD_BITMAP_METRICS_ONLY` so that
+color bitmap glyphs are no longer decoded just to be measured.
+
+This intentionally diverges in one case: for a composite glyph with a
+`USE_MY_METRICS` component whose advance differs from the composite's
+`hmtx` entry, the autohinter uses the component's advance, while the new
+code uses `hmtx`. HarfBuzz and other browsers also use the `hmtx` value.
+Glyphs whose data FreeType cannot load now also get their `hmtx` advance
+instead of none.
+
+Since upstream d15ed10a8a8 (#48455) Android and OpenHarmony load glyphs
+without hinting, which never runs the autohinter, so the fast path only
+applies where glyph loads are light-hinted (desktop Linux) and the unit test
+checks that it stays off elsewhere. On OpenHarmony this patch now only skips
+decoding colour bitmaps to measure them; the OpenHarmony measurements below
+predate #48455, which removed the autohinter cost there by itself.
+
+Testing: A new unit test checks that the new advance equals the one from
+loading the glyph, for every glyph of four TrueType test fonts at eight
+sizes, including fractional ones, with and without synthetic bold. It
+can be run with `./mach test-unit -p servo-fonts`. Beyond that, a
+standalone C program applying the same rule found no difference over
+4.7M glyph/size pairs from 159 font faces (system, WPT, test and
+HarmonyOS fonts), including variable fonts at several instances with
+and without `HVAR`, using both the bundled FreeType 2.13.2 and a system
+FreeType 2.14. `css/css-text` and `css/css-fonts` WPT results are
+unchanged. On a HarmonyOS phone, layout instructions went down by
+27-51% on four pages.
+
+Validation: `./mach test-unit -p servo-fonts`, and `./mach test-unit --ohos -p servo-fonts` on a device, where glyph loads are unhinted and the test checks that the fast path stays off (the new `autohinted_advances_match_loaded_advances` compares every glyph of four TrueType test fonts at eight sizes, with and without synthetic bold, against a glyph load; it fails if the rounding is off by 1/64 px). `./mach test-wpt --release --processes 10 css/css-text css/css-fonts` on upstream main: 2523/2526 expected, the 3 unexpected emoji tests identical with the baseline binary. `servo-freetype-advance-cost/tools/advcheck.c` (same eligibility rule, bundled FreeType 2.13.2 and system 2.14): 0 of 4.7M glyph/size pairs differ. Desktop, 19 sizes of HarmonyOS Sans SC: 1379 -> 1172 M user instructions, screenshots byte-identical. PLR-AL00 production HAP on 357b32533ca, `servoperf page --only load --iterations 5`, two rounds alternating builds, `Layout>::reflow` M instructions/load: chuxing 209.9 -> 102.4, biyadi 205.8 -> 136.6, shibashiji 178.0 -> 118.4, keai-pruned 428.4 -> 312.5; FCP within +-2%. (sync 2026-10-08) PLR-AL00, production HAPs of the stack without and with this patch, same method: chuxing 122.8 -> 89.9 (-27%), shibashiji 101.8 -> 94.3 (-7%), biyadi and keai-pruned unchanged within noise; what remains on OpenHarmony is the colour-emoji PNG decoding this patch skips (`Load_SBit_Png` under layout 40.6 -> 7.3 M/load on chuxing).
+AI-assisted: Yes (agent session; written and tested by the agent, reviewed by a second agent and the maintainer)
+AI-assisted: Yes (agent session; 2026-10-08 sync -- conflict resolution with upstream d15ed10a8a8 (#48455), which loads glyphs unhinted on Android and OpenHarmony: the fast path is limited to light-hinted loads, and the unit test asserts that and embeds its fonts so it also runs on devices; re-measured on a PLR-AL00)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/fonts/platform/freetype/font.rs    | 144 ++++++++++++++----
+ .../fonts/platform/freetype/freetype_face.rs  |  95 +++++++++++-
+ 2 files changed, 200 insertions(+), 39 deletions(-)
+
+diff --git a/components/fonts/platform/freetype/font.rs b/components/fonts/platform/freetype/font.rs
+index ad45955004c..2f2579c98a1 100644
+--- a/components/fonts/platform/freetype/font.rs
++++ b/components/fonts/platform/freetype/font.rs
+@@ -8,9 +8,9 @@ use app_units::Au;
+ use euclid::default::{Point2D, Rect, Size2D};
+ use fonts_traits::{FontIdentifier, FontTemplateDescriptor, LocalFontIdentifier};
+ use freetype_sys::{
+-    FT_F26Dot6, FT_Get_Char_Index, FT_Get_Kerning, FT_GlyphSlot, FT_KERNING_DEFAULT,
+-    FT_LOAD_DEFAULT, FT_LOAD_NO_HINTING, FT_Load_Glyph, FT_Size_Metrics, FT_SizeRec, FT_UInt,
+-    FT_ULong, FT_Vector,
++    FT_F26Dot6, FT_FaceRec, FT_Get_Char_Index, FT_Get_Kerning, FT_GlyphSlot, FT_Int32,
++    FT_KERNING_DEFAULT, FT_LOAD_DEFAULT, FT_LOAD_NO_HINTING, FT_Load_Glyph, FT_Long, FT_MulFix,
++    FT_Pos, FT_Size_Metrics, FT_SizeRec, FT_UInt, FT_ULong, FT_Vector,
+ };
+ use log::debug;
+ use memmap2::Mmap;
+@@ -32,6 +32,8 @@ use crate::platform::freetype::freetype_face::{
+ 
+ const SEMI_BOLD_U16: u16 = Weight::SEMI_BOLD.value() as u16;
+ 
++const FT_LOAD_BITMAP_METRICS_ONLY: FT_Int32 = 1 << 22;
++
+ /// Convert FreeType-style 26.6 fixed point to an [`f64`].
+ fn fixed_26_dot_6_to_float(fixed: FT_F26Dot6) -> f64 {
+     fixed as f64 / 64.0
+@@ -194,25 +196,16 @@ impl PlatformFontMethods for PlatformFont {
+ 
+     fn glyph_h_advance(&self, glyph: GlyphId) -> Option<FractionalPixel> {
+         let face = self.face.lock();
+-
+-        let load_flags = face.glyph_load_flags();
+-        let result = unsafe { FT_Load_Glyph(face.as_ptr(), glyph as FT_UInt, load_flags) };
+-        if 0 != result {
+-            debug!("Unable to load glyph {}. reason: {:?}", glyph, result);
+-            return None;
+-        }
+-
+-        let void_glyph = face.as_ref().glyph;
+-        let slot: FT_GlyphSlot = void_glyph;
+-        if void_glyph.is_null() {
+-            return None;
+-        }
+-
+-        if self.synthetic_bold {
+-            mozilla_glyphslot_embolden_less(slot);
+-        }
+-
+-        let advance = unsafe { (*slot).metrics.horiAdvance };
++        let advance = if face.has_autohinted_advances() {
++            let advance = face.autohinted_advance(glyph as FT_UInt)?;
++            if self.synthetic_bold {
++                advance + synthetic_bold_strength(face.as_ref())
++            } else {
++                advance
++            }
++        } else {
++            self.loaded_glyph_h_advance(&face, glyph)?
++        };
+         Some(fixed_26_dot_6_to_float(advance) * self.unscalable_font_metrics_scale())
+     }
+ 
+@@ -412,6 +405,31 @@ impl PlatformFontMethods for PlatformFont {
+ }
+ 
+ impl PlatformFont {
++    /// Returns the advance of `glyph` in 26.6 fixed point by loading it.
++    fn loaded_glyph_h_advance(&self, face: &FreeTypeFace, glyph: GlyphId) -> Option<FT_Pos> {
++        let mut load_flags = face.glyph_load_flags();
++        // Only the advance is needed, so don't decode bitmaps. Emboldening needs the bitmap.
++        if !self.synthetic_bold {
++            load_flags |= FT_LOAD_BITMAP_METRICS_ONLY;
++        }
++        let result = unsafe { FT_Load_Glyph(face.as_ptr(), glyph as FT_UInt, load_flags) };
++        if 0 != result {
++            debug!("Unable to load glyph {}. reason: {:?}", glyph, result);
++            return None;
++        }
++
++        let slot: FT_GlyphSlot = face.as_ref().glyph;
++        if slot.is_null() {
++            return None;
++        }
++
++        if self.synthetic_bold {
++            mozilla_glyphslot_embolden_less(slot);
++        }
++
++        Some(unsafe { (*slot).metrics.horiAdvance })
++    }
++
+     /// Find the scale to use for metrics of unscalable fonts. Unscalable fonts, those using bitmap
+     /// glyphs, are scaled after glyph rasterization. In order for metrics to match the final scaled
+     /// font, we need to scale them based on the final size and the actual font size.
+@@ -455,15 +473,21 @@ impl std::fmt::Debug for FreeTypeFaceTableProviderData {
+     }
+ }
+ 
++/// How much [mozilla_glyphslot_embolden_less] widens outline glyphs, in 26.6 fixed point.
++fn synthetic_bold_strength(face: &FT_FaceRec) -> FT_Pos {
++    // FT_GlyphSlot_Embolden uses a divisor of 24 here; we'll be only half as
++    // bold.
++    let size = unsafe { &*face.size };
++    unsafe { FT_MulFix(face.units_per_EM as FT_Long, size.metrics.y_scale) / 48 }
++}
++
+ // This is copied from the webrender glyph rasterizer
+ // https://github.com/servo/webrender/blob/c4bd5b47d8f5cd684334b445e67a1f945d106848/wr_glyph_rasterizer/src/platform/unix/font.rs#L115
+ //
+ // Custom version of FT_GlyphSlot_Embolden to be less aggressive with outline
+ // fonts than the default implementation in FreeType.
+ fn mozilla_glyphslot_embolden_less(slot: FT_GlyphSlot) {
+-    use freetype_sys::{
+-        FT_GLYPH_FORMAT_OUTLINE, FT_GlyphSlot_Embolden, FT_Long, FT_MulFix, FT_Outline_Embolden,
+-    };
++    use freetype_sys::{FT_GLYPH_FORMAT_OUTLINE, FT_GlyphSlot_Embolden, FT_Outline_Embolden};
+ 
+     if slot.is_null() {
+         return;
+@@ -477,12 +501,7 @@ fn mozilla_glyphslot_embolden_less(slot: FT_GlyphSlot) {
+         return;
+     }
+ 
+-    let face_ = unsafe { &*slot_.face };
+-
+-    // FT_GlyphSlot_Embolden uses a divisor of 24 here; we'll be only half as
+-    // bold.
+-    let size_ = unsafe { &*face_.size };
+-    let strength = unsafe { FT_MulFix(face_.units_per_EM as FT_Long, size_.metrics.y_scale) / 48 };
++    let strength = synthetic_bold_strength(unsafe { &*slot_.face });
+     unsafe { FT_Outline_Embolden(&raw mut slot_.outline, strength) };
+ 
+     // Adjust metrics to suit the fattened glyph.
+@@ -498,3 +517,66 @@ fn mozilla_glyphslot_embolden_less(slot: FT_GlyphSlot) {
+     slot_.metrics.vertAdvance += strength;
+     slot_.metrics.horiBearingY += strength;
+ }
++
++#[cfg(test)]
++mod tests {
++    use servo_url::ServoUrl;
++    use webrender_api::FontHinting;
++
++    use super::*;
++
++    #[test]
++    fn autohinted_advances_match_loaded_advances() {
++        // Embedded rather than read from the source tree, so that the test also runs on
++        // devices, whose glyph loads are not light-hinted.
++        let fonts: [(&str, &[u8]); 4] = [
++            (
++                "DejaVuSans.ttf",
++                include_bytes!("../../tests/support/dejavu-fonts-ttf-2.37/ttf/DejaVuSans.ttf"),
++            ),
++            (
++                "DejaVuSansMono.ttf",
++                include_bytes!("../../tests/support/dejavu-fonts-ttf-2.37/ttf/DejaVuSansMono.ttf"),
++            ),
++            (
++                "DejaVuSerif.ttf",
++                include_bytes!("../../tests/support/dejavu-fonts-ttf-2.37/ttf/DejaVuSerif.ttf"),
++            ),
++            (
++                "csstest-basic-regular.ttf",
++                include_bytes!("../../tests/support/CSSTest/csstest-basic-regular.ttf"),
++            ),
++        ];
++        let sizes = [8.0, 11.0, 12.5, 13.33, 16.0, 17.5, 21.33, 48.0];
++        for (path, bytes) in fonts {
++            let data = FontData::from_bytes(bytes);
++            let url = ServoUrl::parse(&format!("https://fonts.invalid/{path}")).unwrap();
++            let identifier = FontIdentifier::Web(url);
++            for size in sizes {
++                for synthetic_bold in [false, true] {
++                    let font = PlatformFont::new_from_data(
++                        identifier.clone(),
++                        &data,
++                        Some(Au::from_f64_px(size)),
++                        synthetic_bold,
++                    )
++                    .unwrap();
++                    let face = font.face.lock();
++                    assert_eq!(
++                        face.has_autohinted_advances(),
++                        FALLBACK_HINTING_STYLE == FontHinting::Light,
++                        "{path:?}"
++                    );
++                    for glyph in 0..face.as_ref().num_glyphs as GlyphId {
++                        assert_eq!(
++                            font.glyph_h_advance(glyph),
++                            font.loaded_glyph_h_advance(&face, glyph)
++                                .map(fixed_26_dot_6_to_float),
++                            "{path:?} at {size}px, synthetic bold {synthetic_bold}, glyph {glyph}",
++                        );
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/components/fonts/platform/freetype/freetype_face.rs b/components/fonts/platform/freetype/freetype_face.rs
+index 4368e990b47..3ea486a7c6d 100644
+--- a/components/fonts/platform/freetype/freetype_face.rs
++++ b/components/fonts/platform/freetype/freetype_face.rs
+@@ -2,18 +2,20 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-use std::ffi::c_long;
++use std::ffi::{CStr, c_char, c_long};
+ use std::fmt::Debug;
+ use std::ptr;
+ 
+ use app_units::Au;
+ use fonts_traits::FontData;
+ use freetype_sys::{
+-    FT_Done_Face, FT_Done_MM_Var, FT_F26Dot6, FT_FACE_FLAG_COLOR, FT_FACE_FLAG_FIXED_SIZES,
+-    FT_FACE_FLAG_SCALABLE, FT_Face, FT_FaceRec, FT_Fixed, FT_Get_MM_Var, FT_HAS_MULTIPLE_MASTERS,
+-    FT_Int32, FT_LOAD_COLOR, FT_LOAD_DEFAULT, FT_LOAD_NO_HINTING, FT_LOAD_TARGET_LIGHT,
+-    FT_LOAD_TARGET_MONO, FT_LOAD_TARGET_NORMAL, FT_Long, FT_MM_Var, FT_New_Memory_Face, FT_Pos,
+-    FT_Select_Size, FT_Set_Char_Size, FT_Set_Var_Design_Coordinates, FTErrorMethods,
++    FT_Done_Face, FT_Done_MM_Var, FT_Error, FT_F26Dot6, FT_FACE_FLAG_COLOR,
++    FT_FACE_FLAG_FIXED_SIZES, FT_FACE_FLAG_SCALABLE, FT_FACE_FLAG_TRICKY, FT_Face, FT_FaceRec,
++    FT_Fixed, FT_Get_MM_Var, FT_HAS_MULTIPLE_MASTERS, FT_Int32, FT_LOAD_COLOR, FT_LOAD_DEFAULT,
++    FT_LOAD_NO_HINTING, FT_LOAD_NO_SCALE, FT_LOAD_TARGET_LIGHT, FT_LOAD_TARGET_MONO,
++    FT_LOAD_TARGET_NORMAL, FT_Library, FT_Long, FT_MM_Var, FT_Module, FT_MulFix,
++    FT_New_Memory_Face, FT_Pos, FT_Select_Size, FT_Set_Char_Size, FT_Set_Var_Design_Coordinates,
++    FT_UInt, FTErrorMethods,
+ };
+ use memmap2::Mmap;
+ use servo_arc::Arc;
+@@ -49,6 +51,24 @@ fn fallback_free_type_hinting_load_flags() -> FT_Int32 {
+     }
+ }
+ 
++const FT_FACE_FLAG_SVG: FT_Long = 1 << 16;
++
++unsafe extern "C" {
++    fn FT_Get_Advance(
++        face: FT_Face,
++        glyph_index: FT_UInt,
++        load_flags: FT_Int32,
++        advance: *mut FT_Fixed,
++    ) -> FT_Error;
++    fn FT_Get_Font_Format(face: FT_Face) -> *const c_char;
++    fn FT_Get_Module(library: FT_Library, module_name: *const c_char) -> FT_Module;
++}
++
++/// Rounds a 26.6 fixed point value to a whole pixel, like `FT_PIX_ROUND`.
++fn pix_round(value: FT_Pos) -> FT_Pos {
++    (value + 32) & !63
++}
++
+ /// A safe wrapper around [FT_Face].
+ #[derive(Debug)]
+ pub(crate) struct FreeTypeFace {
+@@ -57,6 +77,9 @@ pub(crate) struct FreeTypeFace {
+     /// backed by `_data`.
+     face: ptr::NonNull<FT_FaceRec>,
+     _data: FontBackingStore,
++    /// Whether loading a glyph with [Self::glyph_load_flags] always runs FreeType's autohinter,
++    /// which allows [Self::autohinted_advance] to compute its advance without loading the glyph.
++    autohinted: bool,
+ }
+ 
+ pub(crate) enum FontBackingStore {
+@@ -110,10 +133,35 @@ impl FreeTypeFace {
+             return Err("Could not create FreeType face");
+         };
+ 
+-        Ok(Self {
++        let mut face = Self {
+             face,
+             _data: font_backing_store,
+-        })
++            autohinted: false,
++        };
++        face.autohinted = face.light_loads_are_autohinted(library);
++        Ok(face)
++    }
++
++    /// Mirrors the conditions under which `FT_Load_Glyph` uses the autohinter for a
++    /// light-hinted load. Only the TrueType driver doesn't hint lightly itself, and fonts
++    /// with bitmap strikes or SVG glyphs may be loaded without the autohinter. Servo never
++    /// sets a transform, which would also disable it. Platforms whose glyph loads are not
++    /// light-hinted (see [FALLBACK_HINTING_STYLE]) never use the autohinter.
++    fn light_loads_are_autohinted(&self, library: &FreeTypeLibraryHandle) -> bool {
++        if fallback_free_type_hinting_load_flags() != FT_LOAD_TARGET_LIGHT {
++            return false;
++        }
++        let required_flags = FT_FACE_FLAG_SCALABLE;
++        let disqualifying_flags = FT_FACE_FLAG_TRICKY | FT_FACE_FLAG_FIXED_SIZES | FT_FACE_FLAG_SVG;
++        if self.as_ref().face_flags & (required_flags | disqualifying_flags) != required_flags {
++            return false;
++        }
++        let format = unsafe { FT_Get_Font_Format(self.as_ptr()) };
++        if format.is_null() || unsafe { CStr::from_ptr(format) } != c"TrueType" {
++            return false;
++        }
++        let autohinter = unsafe { FT_Get_Module(library.freetype_library, c"autofitter".as_ptr()) };
++        !autohinter.is_null()
+     }
+ 
+     pub(crate) fn as_ref(&self) -> &FT_FaceRec {
+@@ -204,6 +252,37 @@ impl FreeTypeFace {
+         load_flags as FT_Int32
+     }
+ 
++    /// Whether [Self::autohinted_advance] returns the same advance as loading the glyph with
++    /// [Self::glyph_load_flags].
++    pub(crate) fn has_autohinted_advances(&self) -> bool {
++        // SAFETY: A face always has an active size.
++        let metrics = unsafe { &(*self.as_ref().size).metrics };
++        // Without a size, FreeType loads glyphs unscaled and unhinted.
++        self.autohinted && metrics.x_ppem != 0 && metrics.y_ppem != 0
++    }
++
++    /// Returns the advance of `glyph` in 26.6 fixed point without loading the glyph, or
++    /// `None` if the glyph doesn't exist. Only valid if [Self::has_autohinted_advances].
++    ///
++    /// In light mode the autohinter never changes the horizontal scale, so the advance it
++    /// produces is the design-unit advance scaled and rounded to whole pixels. Avoiding the
++    /// autohinter also avoids its expensive per-face initialization.
++    ///
++    /// This deliberately diverges for composite glyphs whose `USE_MY_METRICS` component has a
++    /// different advance than the composite's `hmtx` entry: the autohinter uses the component's
++    /// advance, while this uses `hmtx`, like HarfBuzz and other browsers do.
++    pub(crate) fn autohinted_advance(&self, glyph: FT_UInt) -> Option<FT_Pos> {
++        let mut advance = 0;
++        let result =
++            unsafe { FT_Get_Advance(self.as_ptr(), glyph, FT_LOAD_NO_SCALE, &mut advance) };
++        if !result.succeeded() {
++            return None;
++        }
++        // SAFETY: A face always has an active size.
++        let x_scale = unsafe { (*self.as_ref().size).metrics.x_scale };
++        Some(pix_round(unsafe { FT_MulFix(advance, x_scale) }))
++    }
++
+     /// Applies to provided variations to the font face.
+     ///
+     /// Returns the normalized font variations, which are clamped

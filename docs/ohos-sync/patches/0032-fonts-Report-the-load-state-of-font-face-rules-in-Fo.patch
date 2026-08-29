@@ -1,0 +1,417 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 18 Sep 2026 08:34:49 +0000
+Subject: [PATCH] fonts: Report the load state of @font-face rules in
+ FontFace.status
+
+A FontFace for an @font-face rule was created with the status "loading"
+and kept it forever, and its `loaded` promise never settled, so awaiting
+`FontFace.load()` on such a face hung. Keep the load state on the rule,
+which the FontContext and the FontFace share, and settle the promise when
+the state changes. A rejection is marked handled, because the object exists
+whether or not the page asked for the font.
+
+Fork note: first of four patches that stop Servo from downloading every
+@font-face rule; this one also stands on its own. Meant for upstream; the code is the same
+as in the upstream-based version.
+
+Relies on: `FontFaceRuleInfo` being shared between the FontContext and the
+css-connected FontFace (upstream #45975/#46271), and on
+`ScriptThread::handle_web_font_loaded` / `Document::maybe_fulfill_font_ready_promise`
+as the places where a finished load reaches script.
+
+Drop when upstream reports the load state of css-connected faces: on plain
+upstream, `css/css-fonts/font-palette-add.html` then finishes instead of
+timing out (it awaits `[...document.fonts][0].load()`), and a css-connected
+face reports "loaded" once its font is in use.
+
+Validation: `./mach test-wpt --release --processes 1 css/css-font-loading css/css-fonts html/canvas/element/text html/canvas/offscreen/text` (947 tests): font-palette-{add,modify,remove}-2 now pass and font-palette-{add,modify,remove} fail on the unimplemented `font-palette` instead of timing out (expectations updated); the only other unexpected result, font-variant-emoji-1 FAIL, also happens on plain ohos-main. font-variant-emoji-2 and matching/font-unicode-presented-as-emoji-outline keep upstream's FAIL expectations: they fail whenever a colour emoji font is installed, as on CI, and pass only without one.
+AI-assisted: Yes (agent session; written and tested by the agent, ported from upstream main to ohos-main's Rc<Promise> API)
+AI-assisted: Yes (agent session; 2026-10-08 sync -- conflict resolution for upstream's RootedPromise conversion (#47935, #48333), resolved to the code of the upstream-bound lazy-webfonts branch; folded the squash commit that keeps the two colour-emoji FAIL expectations)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/fonts/font_context.rs              | 19 ++++--
+ components/script/dom/css/fontface.rs         | 60 ++++++++++++++++++-
+ components/script/dom/css/fontfaceset.rs      | 14 +++++
+ components/script/dom/document/document.rs    |  1 +
+ components/script/event_loop/script_thread.rs |  8 ++-
+ components/shared/fonts/lib.rs                | 52 +++++++++++++++-
+ .../css/css-fonts/font-palette-add-2.html.ini |  2 -
+ .../css/css-fonts/font-palette-add.html.ini   |  2 +-
+ .../css-fonts/font-palette-modify-2.html.ini  |  2 -
+ .../css-fonts/font-palette-modify.html.ini    |  2 +-
+ .../css-fonts/font-palette-remove-2.html.ini  |  2 -
+ .../css-fonts/font-palette-remove.html.ini    |  2 +-
+ .../matching/font-unicode-PUA.html.ini        |  7 +--
+ 13 files changed, 147 insertions(+), 26 deletions(-)
+ delete mode 100644 tests/wpt/meta/css/css-fonts/font-palette-add-2.html.ini
+ delete mode 100644 tests/wpt/meta/css/css-fonts/font-palette-modify-2.html.ini
+ delete mode 100644 tests/wpt/meta/css/css-fonts/font-palette-remove-2.html.ini
+
+diff --git a/components/fonts/font_context.rs b/components/fonts/font_context.rs
+index f1d7b583d59..4d87a441320 100644
+--- a/components/fonts/font_context.rs
++++ b/components/fonts/font_context.rs
+@@ -15,7 +15,7 @@ use content_security_policy::Violation;
+ use fonts_traits::{
+     CSSFontFaceDescriptors, FontDescriptor, FontFaceRuleInfo, FontIdentifier, FontTemplate,
+     FontTemplateRef, FontTemplateRefMethods, StylesheetWebFontLoadFinishedCallback,
+-    WebFontLoadEvent, WebFontSetDifference,
++    WebFontLoadEvent, WebFontLoadState, WebFontSetDifference,
+ };
+ use log::{debug, trace};
+ use malloc_size_of::MallocSizeOf;
+@@ -669,6 +669,9 @@ impl WebFontDownloadState {
+                     .web_fonts
+                     .write()
+                     .add_new_template(family_name, new_template);
++                initiator
++                    .font_face_rule
++                    .set_load_state(WebFontLoadState::Loaded);
+                 self.font_context
+                     .invalidate_font_groups_after_web_font_load();
+ 
+@@ -689,6 +692,9 @@ impl WebFontDownloadState {
+         let family_name = self.css_font_face_descriptors.family_name.clone();
+         match self.initiator {
+             WebFontLoadInitiator::Stylesheet(initiator) => {
++                initiator
++                    .font_face_rule
++                    .set_load_state(WebFontLoadState::Failed);
+                 if self
+                     .font_context
+                     .number_of_loading_web_fonts
+@@ -748,6 +754,7 @@ impl FontContextWebFontMethods for Arc<FontContext> {
+         };
+ 
+         let css_font_face_descriptors = CSSFontFaceDescriptors::from(&font_face_rule.descriptors);
++        font_face_rule.set_load_state(WebFontLoadState::Loading);
+ 
+         let initiator = FontFaceRuleInitiator {
+             font_face_rule: font_face_rule.clone(),
+@@ -1602,11 +1609,11 @@ impl KnownFontFaceRules {
+                 continue;
+             } else {
+                 // This is a new rule that does not conflict with anything that previously existed, so insert it.
+-                let font_face_rule_entry = ServoArc::new(FontFaceRuleInfo {
+-                    cascade_index: AtomicUsize::new(cascade_index),
+-                    descriptors: borrowed_rule.descriptors.clone(),
+-                    rule: rule_with_origin.rule,
+-                });
++                let font_face_rule_entry = ServoArc::new(FontFaceRuleInfo::new(
++                    cascade_index,
++                    borrowed_rule.descriptors.clone(),
++                    rule_with_origin.rule,
++                ));
+                 difference
+                     .added_font_faces
+                     .push(font_face_rule_entry.clone());
+diff --git a/components/script/dom/css/fontface.rs b/components/script/dom/css/fontface.rs
+index 93e2bacbf0b..4939c9a47ad 100644
+--- a/components/script/dom/css/fontface.rs
++++ b/components/script/dom/css/fontface.rs
+@@ -7,7 +7,8 @@ use std::cell::{Cell, Ref, RefCell};
+ use cssparser::Parser;
+ use dom_struct::dom_struct;
+ use fonts::{
+-    FontContext, FontContextWebFontMethods, FontFaceRuleInfo, FontTemplate, LowercaseFontFamilyName,
++    FontContext, FontContextWebFontMethods, FontFaceRuleInfo, FontTemplate,
++    LowercaseFontFamilyName, WebFontLoadState,
+ };
+ use js::context::JSContext;
+ use js::rust::HandleObject;
+@@ -333,7 +334,9 @@ impl FontFace {
+     ) -> Self {
+         Self {
+             reflector: Reflector::new(),
+-            status: Cell::new(FontFaceLoadStatus::Loading),
++            // The status of a css-connected face comes from its `@font-face` rule, see
++            // `Status()`.
++            status: Cell::new(FontFaceLoadStatus::Unloaded),
+             descriptors: DomRefCell::new(descriptors),
+             font_face_set: MutNullableDom::default(),
+             family_name: DomRefCell::new(family_name),
+@@ -466,6 +469,39 @@ impl FontFace {
+         }
+     }
+ 
++    /// Settle the `[[FontStatusPromise]]` of a [css-connected] face whose `@font-face` rule
++    /// has finished loading in the `FontContext`, which is what loads it.
++    ///
++    /// [css-connected]: https://drafts.csswg.org/css-font-loading/#css-connected
++    pub(crate) fn update_status_from_css_font_face_rule(&self, cx: &mut JSContext) {
++        if !self.is_css_connected() {
++            return;
++        }
++
++        // `status` is not the status of a css-connected face, so it is used here to hold the
++        // status this object last reported, to settle the promise exactly once.
++        let status = self.Status();
++        if status == self.status.get() {
++            return;
++        }
++        self.status.set(status);
++
++        match status {
++            FontFaceLoadStatus::Loaded => self.font_status_promise.resolve_native(cx, &self),
++            FontFaceLoadStatus::Error => {
++                // Nothing necessarily awaits the promise of a css-connected face, because
++                // the object exists whether or not the page asked for the font, so a
++                // rejection here must not be reported as unhandled.
++                let promise = self.font_status_promise.root(cx);
++                promise.set_promise_is_handled(cx);
++                promise.reject_error(cx, Error::Network(Some("Failed to load font data".into())));
++            },
++            // Note: unlike a face that script created, the template of a css-connected face
++            // belongs to the `FontContext` already, so the `FontFaceSet` has nothing to add.
++            FontFaceLoadStatus::Unloaded | FontFaceLoadStatus::Loading => {},
++        }
++    }
++
+     pub(super) fn set_associated_font_face_set(&self, font_face_set: &FontFaceSet) {
+         self.font_face_set.set(Some(font_face_set));
+     }
+@@ -643,7 +679,19 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
+ 
+     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-status>
+     fn Status(&self) -> FontFaceLoadStatus {
+-        self.status.get()
++        // A css-connected face is loaded by the `FontContext` rather than by this object, so
++        // the `@font-face` rule it shares with the `FontContext` is what knows its status.
++        match self
++            .css_font_face_rule()
++            .as_ref()
++            .map(|rule| rule.load_state())
++        {
++            Some(WebFontLoadState::Unloaded) => FontFaceLoadStatus::Unloaded,
++            Some(WebFontLoadState::Loading) => FontFaceLoadStatus::Loading,
++            Some(WebFontLoadState::Loaded) => FontFaceLoadStatus::Loaded,
++            Some(WebFontLoadState::Failed) => FontFaceLoadStatus::Error,
++            None => self.status.get(),
++        }
+     }
+ 
+     /// The load() method of FontFace forces a url-based font face to request its font data and
+@@ -651,6 +699,12 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
+     /// loaded, it does nothing.
+     /// <https://drafts.csswg.org/css-font-loading/#font-face-load>
+     fn Load(&self, cx: &mut JSContext) -> RootedPromise {
++        // A css-connected face is loaded by the `FontContext` together with its
++        // `@font-face` rule.
++        if self.is_css_connected() {
++            return self.font_status_promise.root(cx);
++        }
++
+         // Step 2. If font face’s [[Urls]] slot is null, or its status attribute is anything
+         // other than "unloaded", return font face’s [[FontStatusPromise]] and abort these
+         // steps.
+diff --git a/components/script/dom/css/fontfaceset.rs b/components/script/dom/css/fontfaceset.rs
+index 36a0574ce55..b14b1a7477d 100644
+--- a/components/script/dom/css/fontfaceset.rs
++++ b/components/script/dom/css/fontfaceset.rs
+@@ -99,6 +99,20 @@ impl FontFaceSet {
+         }
+     }
+ 
++    /// Settle the promises of css-connected faces whose `@font-face` rules have finished
++    /// loading. Those faces are loaded by the `FontContext`, so nothing else tells them.
++    pub(crate) fn update_css_connected_face_statuses(&self, cx: &mut JSContext) {
++        let entries: Vec<DomRoot<FontFace>> = self
++            .set_entries
++            .borrow()
++            .iter()
++            .map(|face| face.as_rooted())
++            .collect();
++        for face in entries {
++            face.update_status_from_css_font_face_rule(cx);
++        }
++    }
++
+     /// Fulfill the font ready promise, returning true if it was not already fulfilled beforehand.
+     pub(crate) fn fulfill_ready_promise_if_needed(&self, cx: &mut JSContext) -> bool {
+         let promise = self.promise.borrow();
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index f2629ebb658..e878bb472c7 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -3401,6 +3401,7 @@ impl Document {
+         }
+ 
+         let fonts = self.Fonts(cx);
++        fonts.update_css_connected_face_statuses(cx);
+         if !fonts.waiting_to_fullfill_promise() {
+             return false;
+         }
+diff --git a/components/script/event_loop/script_thread.rs b/components/script/event_loop/script_thread.rs
+index 54b9f83422e..2d38c747419 100644
+--- a/components/script/event_loop/script_thread.rs
++++ b/components/script/event_loop/script_thread.rs
+@@ -1846,7 +1846,7 @@ impl ScriptThread {
+                 // so it attempts to resolve the document.fonts.ready promise. This happens as a result
+                 // of processing this message, so there's nothing more to do.
+                 if event == WebFontLoadEvent::LoadedSuccessfully {
+-                    self.handle_web_font_loaded(cx.no_gc(), pipeline_id)
++                    self.handle_web_font_loaded(cx, pipeline_id)
+                 }
+             },
+             ScriptThreadMessage::DispatchIFrameLoadEvent {
+@@ -3328,14 +3328,16 @@ impl ScriptThread {
+     }
+ 
+     /// Handles a Web font being loaded. Does nothing if the page no longer exists.
+-    fn handle_web_font_loaded(&self, no_gc: &NoGC, pipeline_id: PipelineId) {
++    fn handle_web_font_loaded(&self, cx: &mut JSContext, pipeline_id: PipelineId) {
+         let Some(document) = self.documents.borrow().find_document(pipeline_id) else {
+             warn!("Web font loaded in closed pipeline {}.", pipeline_id);
+             return;
+         };
+ 
+         // TODO: This should only dirty nodes that are waiting for a web font to finish loading!
+-        document.dirty_all_nodes(no_gc);
++        document.dirty_all_nodes(cx.no_gc());
++
++        document.Fonts(cx).update_css_connected_face_statuses(cx);
+ 
+         document
+             .window()
+diff --git a/components/shared/fonts/lib.rs b/components/shared/fonts/lib.rs
+index bce69cef6a3..b37348df2f0 100644
+--- a/components/shared/fonts/lib.rs
++++ b/components/shared/fonts/lib.rs
+@@ -10,7 +10,7 @@ mod font_template;
+ mod system_font_service_proxy;
+ 
+ use std::sync::Arc;
+-use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::{AtomicUsize, Ordering};
+ 
+ pub use font_descriptor::*;
+ pub use font_identifier::*;
+@@ -133,6 +133,30 @@ impl WebFontSetDifference {
+     }
+ }
+ 
++/// How far the font described by an `@font-face` rule has got towards being usable.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum WebFontLoadState {
++    /// The face has not started loading.
++    Unloaded,
++    /// The face is being fetched, or is waiting to be.
++    Loading,
++    /// The face has a usable [`FontTemplate`].
++    Loaded,
++    /// None of the sources of the face could be used.
++    Failed,
++}
++
++impl From<usize> for WebFontLoadState {
++    fn from(value: usize) -> Self {
++        match value {
++            0 => Self::Unloaded,
++            1 => Self::Loading,
++            2 => Self::Loaded,
++            _ => Self::Failed,
++        }
++    }
++}
++
+ #[derive(MallocSizeOf)]
+ pub struct FontFaceRuleInfo {
+     /// The index of this `@font-face` in the cascade, relative to all
+@@ -146,4 +170,30 @@ pub struct FontFaceRuleInfo {
+     /// to the set of live `@font-face` rules.
+     #[conditional_malloc_size_of]
+     pub rule: ServoArc<LockedFontFaceRule>,
++    /// The [`WebFontLoadState`] of this rule, shared with the `FontFace` object that
++    /// exposes it to script.
++    load_state: AtomicUsize,
++}
++
++impl FontFaceRuleInfo {
++    pub fn new(
++        cascade_index: usize,
++        descriptors: Descriptors,
++        rule: ServoArc<LockedFontFaceRule>,
++    ) -> Self {
++        Self {
++            cascade_index: AtomicUsize::new(cascade_index),
++            descriptors,
++            rule,
++            load_state: AtomicUsize::new(WebFontLoadState::Unloaded as usize),
++        }
++    }
++
++    pub fn load_state(&self) -> WebFontLoadState {
++        self.load_state.load(Ordering::SeqCst).into()
++    }
++
++    pub fn set_load_state(&self, state: WebFontLoadState) {
++        self.load_state.store(state as usize, Ordering::SeqCst);
++    }
+ }
+diff --git a/tests/wpt/meta/css/css-fonts/font-palette-add-2.html.ini b/tests/wpt/meta/css/css-fonts/font-palette-add-2.html.ini
+deleted file mode 100644
+index 2c1f6729797..00000000000
+--- a/tests/wpt/meta/css/css-fonts/font-palette-add-2.html.ini
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[font-palette-add-2.html]
+-  expected: TIMEOUT
+diff --git a/tests/wpt/meta/css/css-fonts/font-palette-add.html.ini b/tests/wpt/meta/css/css-fonts/font-palette-add.html.ini
+index b233f2d5a10..765859d4996 100644
+--- a/tests/wpt/meta/css/css-fonts/font-palette-add.html.ini
++++ b/tests/wpt/meta/css/css-fonts/font-palette-add.html.ini
+@@ -1,2 +1,2 @@
+ [font-palette-add.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/css/css-fonts/font-palette-modify-2.html.ini b/tests/wpt/meta/css/css-fonts/font-palette-modify-2.html.ini
+deleted file mode 100644
+index 7139fc2f566..00000000000
+--- a/tests/wpt/meta/css/css-fonts/font-palette-modify-2.html.ini
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[font-palette-modify-2.html]
+-  expected: TIMEOUT
+diff --git a/tests/wpt/meta/css/css-fonts/font-palette-modify.html.ini b/tests/wpt/meta/css/css-fonts/font-palette-modify.html.ini
+index 213a4d900b0..bae0422832b 100644
+--- a/tests/wpt/meta/css/css-fonts/font-palette-modify.html.ini
++++ b/tests/wpt/meta/css/css-fonts/font-palette-modify.html.ini
+@@ -1,2 +1,2 @@
+ [font-palette-modify.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/css/css-fonts/font-palette-remove-2.html.ini b/tests/wpt/meta/css/css-fonts/font-palette-remove-2.html.ini
+deleted file mode 100644
+index 326719fff31..00000000000
+--- a/tests/wpt/meta/css/css-fonts/font-palette-remove-2.html.ini
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[font-palette-remove-2.html]
+-  expected: TIMEOUT
+diff --git a/tests/wpt/meta/css/css-fonts/font-palette-remove.html.ini b/tests/wpt/meta/css/css-fonts/font-palette-remove.html.ini
+index cd98290602f..b2f3dffb082 100644
+--- a/tests/wpt/meta/css/css-fonts/font-palette-remove.html.ini
++++ b/tests/wpt/meta/css/css-fonts/font-palette-remove.html.ini
+@@ -1,2 +1,2 @@
+ [font-palette-remove.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/css/css-fonts/matching/font-unicode-PUA.html.ini b/tests/wpt/meta/css/css-fonts/matching/font-unicode-PUA.html.ini
+index d7f2f88d781..e187b9e3e56 100644
+--- a/tests/wpt/meta/css/css-fonts/matching/font-unicode-PUA.html.ini
++++ b/tests/wpt/meta/css/css-fonts/matching/font-unicode-PUA.html.ini
+@@ -1,10 +1,9 @@
+ [font-unicode-PUA.html]
+-  expected: TIMEOUT
+   [PUA character U+F000 is rendered with a non-generic font.]
+-    expected: NOTRUN
++    expected: FAIL
+ 
+   [PUA character U+F001 is rendered with a non-generic font.]
+-    expected: NOTRUN
++    expected: FAIL
+ 
+   [PUA character U+F002 is rendered with a non-generic font.]
+-    expected: NOTRUN
++    expected: FAIL

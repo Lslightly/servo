@@ -1,0 +1,2850 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 9 Jul 2026 19:47:19 +0000
+Subject: [PATCH] ports/arkweb: vendor the arkweb-test app + a HAP build script
+
+The pytest smoke tests drive a specific OpenHarmony app (bundle
+org.openharmonyrs.arkwebtest) whose pages -- DialogPage, SplitPage,
+TabsPage, the `--ps page` routing, the browser chrome -- are exactly what
+the tests target. That app lived in a separate repo with the
+port-specific changes uncommitted, splitting each feature (e.g. JS
+dialogs: shim + test here, DialogPage there) across two repos. Vendor its
+source under ports/arkweb/test-app so the shim, its test pages and the
+tests version together and a checkout is self-sufficient to build, deploy
+and test.
+
+Vendored: the ArkTS/resources/config source (~240 KB) plus the public
+OpenHarmony debug signing certs so the HAP signs out of the box. Build
+outputs, oh_modules, .hvigor, local.properties and the 12 MB
+hap-sign-tool.jar (located in the SDK toolchain) stay ignored.
+
+Add ports/arkweb/tools/build_test_app.py to automate the HAP recipe
+(local.properties, temporary SDK 26->21, clear signingConfigs -> unsigned
+build, sign with the vendored certs, install), restoring
+build-profile.json5 afterwards.
+
+Verified on rk3568: build_test_app.py builds+signs+installs, and the six
+dialog tests pass against the vendored-built app.
+
+Validation: Test by running uv run ports/arkweb/tools/build_test_app.py (builds, signs and installs the HAP).
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/test-app/.gitignore              |  13 +
+ ports/arkweb/test-app/AppScope/app.json5      |  10 +
+ .../resources/base/element/string.json        |   8 +
+ .../resources/base/media/background.png       | Bin 0 -> 451 bytes
+ .../resources/base/media/foreground.png       | Bin 0 -> 16925 bytes
+ .../resources/base/media/layered_image.json   |   7 +
+ ports/arkweb/test-app/build-profile.json5     |  57 +++++
+ ports/arkweb/test-app/code-linter.json5       |  32 +++
+ ports/arkweb/test-app/entry/.gitignore        |   6 +
+ .../arkweb/test-app/entry/build-profile.json5 |  33 +++
+ ports/arkweb/test-app/entry/hvigorfile.ts     |   6 +
+ .../test-app/entry/obfuscation-rules.txt      |  23 ++
+ ports/arkweb/test-app/entry/oh-package.json5  |  10 +
+ .../main/ets/entryability/EntryAbility.ets    | 117 +++++++++
+ .../entrybackupability/EntryBackupAbility.ets |  16 ++
+ .../entry/src/main/ets/pages/DialogPage.ets   |  99 ++++++++
+ .../entry/src/main/ets/pages/Index.ets        | 233 ++++++++++++++++++
+ .../entry/src/main/ets/pages/SplitPage.ets    |  57 +++++
+ .../entry/src/main/ets/pages/TabsPage.ets     |  75 ++++++
+ .../test-app/entry/src/main/module.json5      |  55 +++++
+ .../main/resources/base/element/color.json    |   8 +
+ .../main/resources/base/element/float.json    |   8 +
+ .../main/resources/base/element/string.json   |  16 ++
+ .../main/resources/base/media/background.png  | Bin 0 -> 451 bytes
+ .../main/resources/base/media/foreground.png  | Bin 0 -> 16925 bytes
+ .../resources/base/media/layered_image.json   |   7 +
+ .../main/resources/base/media/startIcon.png   | Bin 0 -> 16035 bytes
+ .../resources/base/profile/backup_config.json |   3 +
+ .../resources/base/profile/main_pages.json    |   8 +
+ .../main/resources/dark/element/color.json    |   8 +
+ .../test-app/entry/src/mock/mock-config.json5 |   2 +
+ .../src/ohosTest/ets/test/Ability.test.ets    |  35 +++
+ .../entry/src/ohosTest/ets/test/List.test.ets |   5 +
+ .../test-app/entry/src/ohosTest/module.json5  |  11 +
+ .../test-app/entry/src/test/List.test.ets     |   5 +
+ .../entry/src/test/LocalUnit.test.ets         |  33 +++
+ .../test-app/hvigor/hvigor-config.json5       |  23 ++
+ ports/arkweb/test-app/hvigorfile.ts           |   6 +
+ ports/arkweb/test-app/oh-package-lock.json5   |  28 +++
+ ports/arkweb/test-app/oh-package.json5        |  10 +
+ ports/arkweb/test-app/signing/OpenHarmony.p12 | Bin 0 -> 8252 bytes
+ .../signing/OpenHarmonyApplication.pem        |  44 ++++
+ .../signing/OpenHarmonyProfileDebug.pem       |  44 ++++
+ .../test-app/signing/profile-debug.json       |  34 +++
+ .../arkweb/test-app/signing/profile-debug.p7b | Bin 0 -> 3544 bytes
+ ports/arkweb/tools/build_test_app.py          | 130 ++++++++++
+ 46 files changed, 1325 insertions(+)
+ create mode 100644 ports/arkweb/test-app/.gitignore
+ create mode 100644 ports/arkweb/test-app/AppScope/app.json5
+ create mode 100644 ports/arkweb/test-app/AppScope/resources/base/element/string.json
+ create mode 100644 ports/arkweb/test-app/AppScope/resources/base/media/background.png
+ create mode 100644 ports/arkweb/test-app/AppScope/resources/base/media/foreground.png
+ create mode 100644 ports/arkweb/test-app/AppScope/resources/base/media/layered_image.json
+ create mode 100644 ports/arkweb/test-app/build-profile.json5
+ create mode 100644 ports/arkweb/test-app/code-linter.json5
+ create mode 100644 ports/arkweb/test-app/entry/.gitignore
+ create mode 100644 ports/arkweb/test-app/entry/build-profile.json5
+ create mode 100644 ports/arkweb/test-app/entry/hvigorfile.ts
+ create mode 100644 ports/arkweb/test-app/entry/obfuscation-rules.txt
+ create mode 100644 ports/arkweb/test-app/entry/oh-package.json5
+ create mode 100644 ports/arkweb/test-app/entry/src/main/ets/entryability/EntryAbility.ets
+ create mode 100644 ports/arkweb/test-app/entry/src/main/ets/entrybackupability/EntryBackupAbility.ets
+ create mode 100644 ports/arkweb/test-app/entry/src/main/ets/pages/DialogPage.ets
+ create mode 100644 ports/arkweb/test-app/entry/src/main/ets/pages/Index.ets
+ create mode 100644 ports/arkweb/test-app/entry/src/main/ets/pages/SplitPage.ets
+ create mode 100644 ports/arkweb/test-app/entry/src/main/ets/pages/TabsPage.ets
+ create mode 100644 ports/arkweb/test-app/entry/src/main/module.json5
+ create mode 100644 ports/arkweb/test-app/entry/src/main/resources/base/element/color.json
+ create mode 100644 ports/arkweb/test-app/entry/src/main/resources/base/element/float.json
+ create mode 100644 ports/arkweb/test-app/entry/src/main/resources/base/element/string.json
+ create mode 100644 ports/arkweb/test-app/entry/src/main/resources/base/media/background.png
+ create mode 100644 ports/arkweb/test-app/entry/src/main/resources/base/media/foreground.png
+ create mode 100644 ports/arkweb/test-app/entry/src/main/resources/base/media/layered_image.json
+ create mode 100644 ports/arkweb/test-app/entry/src/main/resources/base/media/startIcon.png
+ create mode 100644 ports/arkweb/test-app/entry/src/main/resources/base/profile/backup_config.json
+ create mode 100644 ports/arkweb/test-app/entry/src/main/resources/base/profile/main_pages.json
+ create mode 100644 ports/arkweb/test-app/entry/src/main/resources/dark/element/color.json
+ create mode 100644 ports/arkweb/test-app/entry/src/mock/mock-config.json5
+ create mode 100644 ports/arkweb/test-app/entry/src/ohosTest/ets/test/Ability.test.ets
+ create mode 100644 ports/arkweb/test-app/entry/src/ohosTest/ets/test/List.test.ets
+ create mode 100644 ports/arkweb/test-app/entry/src/ohosTest/module.json5
+ create mode 100644 ports/arkweb/test-app/entry/src/test/List.test.ets
+ create mode 100644 ports/arkweb/test-app/entry/src/test/LocalUnit.test.ets
+ create mode 100644 ports/arkweb/test-app/hvigor/hvigor-config.json5
+ create mode 100644 ports/arkweb/test-app/hvigorfile.ts
+ create mode 100644 ports/arkweb/test-app/oh-package-lock.json5
+ create mode 100644 ports/arkweb/test-app/oh-package.json5
+ create mode 100644 ports/arkweb/test-app/signing/OpenHarmony.p12
+ create mode 100644 ports/arkweb/test-app/signing/OpenHarmonyApplication.pem
+ create mode 100644 ports/arkweb/test-app/signing/OpenHarmonyProfileDebug.pem
+ create mode 100644 ports/arkweb/test-app/signing/profile-debug.json
+ create mode 100644 ports/arkweb/test-app/signing/profile-debug.p7b
+ create mode 100644 ports/arkweb/tools/build_test_app.py
+
+diff --git a/ports/arkweb/test-app/.gitignore b/ports/arkweb/test-app/.gitignore
+new file mode 100644
+index 00000000000..30f04767e52
+--- /dev/null
++++ b/ports/arkweb/test-app/.gitignore
+@@ -0,0 +1,13 @@
++/node_modules
++/oh_modules
++/local.properties
++/.idea
++**/build
++/.hvigor
++.cxx
++/.clangd
++/.clang-format
++/.clang-tidy
++**/.test
++/.appanalyzer
++signing/hap-sign-tool.jar
+diff --git a/ports/arkweb/test-app/AppScope/app.json5 b/ports/arkweb/test-app/AppScope/app.json5
+new file mode 100644
+index 00000000000..e5325c80b16
+--- /dev/null
++++ b/ports/arkweb/test-app/AppScope/app.json5
+@@ -0,0 +1,10 @@
++{
++  "app": {
++    "bundleName": "org.openharmonyrs.arkwebtest",
++    "vendor": "example",
++    "versionCode": 1000000,
++    "versionName": "1.0.0",
++    "icon": "$media:layered_image",
++    "label": "$string:app_name"
++  }
++}
+diff --git a/ports/arkweb/test-app/AppScope/resources/base/element/string.json b/ports/arkweb/test-app/AppScope/resources/base/element/string.json
+new file mode 100644
+index 00000000000..6bb9a1270c9
+--- /dev/null
++++ b/ports/arkweb/test-app/AppScope/resources/base/element/string.json
+@@ -0,0 +1,8 @@
++{
++  "string": [
++    {
++      "name": "app_name",
++      "value": "arkweb-test"
++    }
++  ]
++}
+diff --git a/ports/arkweb/test-app/AppScope/resources/base/media/background.png b/ports/arkweb/test-app/AppScope/resources/base/media/background.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..e654ada64b5f4d1f2e3bd607f49ef74cf0a360b5
+GIT binary patch
+literal 451
+zcmeAS@N?(olHy`uVBq!ia0y~yU;#2&7#Nv>l<Vc42Y{49vPY0F14ES>14Ba#1H&(%
+zP{RubhEf9thF1v;3|2E37{m+a><Y92O0Wg^gt+q6wEh48Kl`v0P&ET%lDE4H<9{aI
+zdq56*iKnkC`zuyner|y+^SrBpLaHUM5hW>!C8<`)MX5lF!N|bKOxM6v*U&h`(A3J%
+z(8|zM+rYrez~Ejv`)w2rx%nxXX_dG&tk>F~4%DClx1l66H?_DVF}DD>o*(w}b^!HE
+x^K@|xskrs_AR{A?*QD@&eV&H{h&hnpJsXQ010(M}ixiM6JYD@<);T3K0RSexRnY(d
+
+literal 0
+HcmV?d00001
+
+diff --git a/ports/arkweb/test-app/AppScope/resources/base/media/foreground.png b/ports/arkweb/test-app/AppScope/resources/base/media/foreground.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca5b43208073b3bb8b1fb084a52ab786efd3de4a
+GIT binary patch
+literal 16925
+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
+Y+<GpF4~2$yCks8e`$V<yj>TX94XKY^+5i9m
+
+literal 0
+HcmV?d00001
+
+diff --git a/ports/arkweb/test-app/AppScope/resources/base/media/layered_image.json b/ports/arkweb/test-app/AppScope/resources/base/media/layered_image.json
+new file mode 100644
+index 00000000000..fb49920440f
+--- /dev/null
++++ b/ports/arkweb/test-app/AppScope/resources/base/media/layered_image.json
+@@ -0,0 +1,7 @@
++{
++  "layered-image":
++  {
++    "background" : "$media:background",
++    "foreground" : "$media:foreground"
++  }
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/build-profile.json5 b/ports/arkweb/test-app/build-profile.json5
+new file mode 100644
+index 00000000000..8344a1505cc
+--- /dev/null
++++ b/ports/arkweb/test-app/build-profile.json5
+@@ -0,0 +1,57 @@
++{
++  "app": {
++    "signingConfigs": [
++      {
++        "name": "default",
++        "type": "OpenHarmony",
++        "material": {
++          "certpath": "./signing/OpenHarmonyApplication.pem",
++          "keyAlias": "openharmony application release",
++          "keyPassword": "123456",
++          "profile": "./signing/profile-debug.p7b",
++          "signAlg": "SHA256withECDSA",
++          "storeFile": "./signing/OpenHarmony.p12",
++          "storePassword": "123456"
++        }
++      }
++    ],
++    "products": [
++      {
++        "name": "default",
++        "signingConfig": "default",
++        "compileSdkVersion": 26,
++        "targetSdkVersion": 26,
++        "compatibleSdkVersion": 20,
++        "runtimeOS": "OpenHarmony",
++        "buildOption": {
++          "strictMode": {
++            "caseSensitiveCheck": true,
++            "useNormalizedOHMUrl": true
++          }
++        }
++      }
++    ],
++    "buildModeSet": [
++      {
++        "name": "debug",
++      },
++      {
++        "name": "release"
++      }
++    ]
++  },
++  "modules": [
++    {
++      "name": "entry",
++      "srcPath": "./entry",
++      "targets": [
++        {
++          "name": "default",
++          "applyToProducts": [
++            "default"
++          ]
++        }
++      ]
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/code-linter.json5 b/ports/arkweb/test-app/code-linter.json5
+new file mode 100644
+index 00000000000..073990fa453
+--- /dev/null
++++ b/ports/arkweb/test-app/code-linter.json5
+@@ -0,0 +1,32 @@
++{
++  "files": [
++    "**/*.ets"
++  ],
++  "ignore": [
++    "**/src/ohosTest/**/*",
++    "**/src/test/**/*",
++    "**/src/mock/**/*",
++    "**/node_modules/**/*",
++    "**/oh_modules/**/*",
++    "**/build/**/*",
++    "**/.preview/**/*"
++  ],
++  "ruleSet": [
++    "plugin:@performance/recommended",
++    "plugin:@typescript-eslint/recommended"
++  ],
++  "rules": {
++    "@security/no-unsafe-aes": "error",
++    "@security/no-unsafe-hash": "error",
++    "@security/no-unsafe-mac": "warn",
++    "@security/no-unsafe-dh": "error",
++    "@security/no-unsafe-dsa": "error",
++    "@security/no-unsafe-ecdsa": "error",
++    "@security/no-unsafe-rsa-encrypt": "error",
++    "@security/no-unsafe-rsa-sign": "error",
++    "@security/no-unsafe-rsa-key": "error",
++    "@security/no-unsafe-dsa-key": "error",
++    "@security/no-unsafe-dh-key": "error",
++    "@security/no-unsafe-3des": "error"
++  }
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/.gitignore b/ports/arkweb/test-app/entry/.gitignore
+new file mode 100644
+index 00000000000..e2713a2779c
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/.gitignore
+@@ -0,0 +1,6 @@
++/node_modules
++/oh_modules
++/.preview
++/build
++/.cxx
++/.test
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/build-profile.json5 b/ports/arkweb/test-app/entry/build-profile.json5
+new file mode 100644
+index 00000000000..6bd6457a2fe
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/build-profile.json5
+@@ -0,0 +1,33 @@
++{
++  "apiType": "stageMode",
++  "buildOption": {
++    "resOptions": {
++      "copyCodeResource": {
++        "enable": false
++      }
++    }
++  },
++  "buildOptionSet": [
++    {
++      "name": "release",
++      "arkOptions": {
++        "obfuscation": {
++          "ruleOptions": {
++            "enable": false,
++            "files": [
++              "./obfuscation-rules.txt"
++            ]
++          }
++        }
++      }
++    },
++  ],
++  "targets": [
++    {
++      "name": "default"
++    },
++    {
++      "name": "ohosTest",
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/hvigorfile.ts b/ports/arkweb/test-app/entry/hvigorfile.ts
+new file mode 100644
+index 00000000000..b0e3a1ab98a
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/hvigorfile.ts
+@@ -0,0 +1,6 @@
++import { hapTasks } from '@ohos/hvigor-ohos-plugin';
++
++export default {
++  system: hapTasks, /* Built-in plugin of Hvigor. It cannot be modified. */
++  plugins: []       /* Custom plugin to extend the functionality of Hvigor. */
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/obfuscation-rules.txt b/ports/arkweb/test-app/entry/obfuscation-rules.txt
+new file mode 100644
+index 00000000000..b78c7692ce7
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/obfuscation-rules.txt
+@@ -0,0 +1,23 @@
++# Define project specific obfuscation rules here.
++# You can include the obfuscation configuration files in the current module's build-profile.json5.
++#
++# For more details, see
++#   https://developer.huawei.com/consumer/en/doc/harmonyos-guides/source-obfuscation
++
++# Obfuscation options:
++# -disable-obfuscation: disable all obfuscations
++# -enable-property-obfuscation: obfuscate the property names
++# -enable-toplevel-obfuscation: obfuscate the names in the global scope
++# -compact: remove unnecessary blank spaces and all line feeds
++# -remove-log: remove all console.* statements
++# -print-namecache: print the name cache that contains the mapping from the old names to new names
++# -apply-namecache: reuse the given cache file
++
++# Keep options:
++# -keep-property-name: specifies property names that you want to keep
++# -keep-global-name: specifies names that you want to keep in the global scope
++
++-enable-property-obfuscation
++-enable-toplevel-obfuscation
++-enable-filename-obfuscation
++-enable-export-obfuscation
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/oh-package.json5 b/ports/arkweb/test-app/entry/oh-package.json5
+new file mode 100644
+index 00000000000..248c3b7541a
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/oh-package.json5
+@@ -0,0 +1,10 @@
++{
++  "name": "entry",
++  "version": "1.0.0",
++  "description": "Please describe the basic information.",
++  "main": "",
++  "author": "",
++  "license": "",
++  "dependencies": {}
++}
++
+diff --git a/ports/arkweb/test-app/entry/src/main/ets/entryability/EntryAbility.ets b/ports/arkweb/test-app/entry/src/main/ets/entryability/EntryAbility.ets
+new file mode 100644
+index 00000000000..43a0d16c8e6
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/ets/entryability/EntryAbility.ets
+@@ -0,0 +1,117 @@
++import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
++import { hilog } from '@kit.PerformanceAnalysisKit';
++import { window } from '@kit.ArkUI';
++
++const DOMAIN = 0x0000;
++const DEFAULT_URL = 'about:blank';
++
++export default class EntryAbility extends UIAbility {
++  // Which page to load at startup, chosen by the `page` launch parameter (see `resolvePage`).
++  // Defaults to the single-webview browser so existing (servoperf) launches are unaffected.
++  private targetPage: string = 'pages/Index';
++
++  onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
++    try {
++      this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
++    } catch (err) {
++      hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
++    }
++    this.targetPage = this.resolvePage(want);
++    this.applyStartUrl(want);
++    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
++  }
++
++  // `--ps page tabs|split` selects a multi-webview test page; anything else is the browser.
++  // Page switching after launch is done in-app (nav buttons) or by force-stop + relaunch.
++  private resolvePage(want: Want): string {
++    if (want.parameters !== undefined) {
++      const params = want.parameters as Record<string, Object>;
++      const page = params['page'];
++      if (typeof page === 'string') {
++        if (page === 'tabs') {
++          return 'pages/TabsPage';
++        }
++        if (page === 'split') {
++          return 'pages/SplitPage';
++        }
++        if (page === 'dialog') {
++          return 'pages/DialogPage';
++        }
++      }
++    }
++    return 'pages/Index';
++  }
++
++  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
++    this.applyStartUrl(want);
++    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onNewWant');
++  }
++
++  private applyStartUrl(want: Want): void {
++    let url: string = '';
++    let proxyUri: string = '';
++    let ignoreCertErrors: boolean = false;
++    if (typeof want.uri === 'string' && want.uri.length > 0) {
++      url = want.uri;
++    }
++    if (want.parameters !== undefined) {
++      const params = want.parameters as Record<string, Object>;
++      if (url.length === 0) {
++        const candidate = params['--url'];
++        if (typeof candidate === 'string' && candidate.length > 0) {
++          url = candidate;
++        }
++      }
++      // `--proxy-uri=http://host:port` — Index.ets calls
++      // webview.ProxyController.applyProxyOverride before loadUrl. Used by
++      // servoperf's wpr-replay path for the arkweb engine.
++      const proxy = params['--proxy-uri'];
++      if (typeof proxy === 'string' && proxy.length > 0) {
++        proxyUri = proxy;
++      }
++      // `--ignore-certificate-errors` (presence-detected). When set,
++      // `onSslErrorEventReceive` auto-confirms self-signed cert errors,
++      // needed for WPR replay's per-host leaf certs.
++      if (params['--ignore-certificate-errors'] !== undefined) {
++        ignoreCertErrors = true;
++      }
++    }
++    if (url.length === 0) {
++      url = DEFAULT_URL;
++    }
++    AppStorage.setOrCreate<string>('startUrl', url);
++    AppStorage.setOrCreate<string>('proxyUri', proxyUri);
++    AppStorage.setOrCreate<boolean>('ignoreCertErrors', ignoreCertErrors);
++    hilog.info(DOMAIN, 'testTag',
++      'startUrl=%{public}s proxy=%{public}s ignoreCertErrors=%{public}s',
++      url, proxyUri.length > 0 ? proxyUri : '<none>', `${ignoreCertErrors}`);
++  }
++
++  onDestroy(): void {
++    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onDestroy');
++  }
++
++  onWindowStageCreate(windowStage: window.WindowStage): void {
++    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageCreate');
++
++    windowStage.loadContent(this.targetPage, (err) => {
++      if (err.code) {
++        hilog.error(DOMAIN, 'testTag', 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
++        return;
++      }
++      hilog.info(DOMAIN, 'testTag', 'Succeeded in loading %{public}s', this.targetPage);
++    });
++  }
++
++  onWindowStageDestroy(): void {
++    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageDestroy');
++  }
++
++  onForeground(): void {
++    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
++  }
++
++  onBackground(): void {
++    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
++  }
++}
+diff --git a/ports/arkweb/test-app/entry/src/main/ets/entrybackupability/EntryBackupAbility.ets b/ports/arkweb/test-app/entry/src/main/ets/entrybackupability/EntryBackupAbility.ets
+new file mode 100644
+index 00000000000..8e4de992820
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/ets/entrybackupability/EntryBackupAbility.ets
+@@ -0,0 +1,16 @@
++import { hilog } from '@kit.PerformanceAnalysisKit';
++import { BackupExtensionAbility, BundleVersion } from '@kit.CoreFileKit';
++
++const DOMAIN = 0x0000;
++
++export default class EntryBackupAbility extends BackupExtensionAbility {
++  async onBackup() {
++    hilog.info(DOMAIN, 'testTag', 'onBackup ok');
++    await Promise.resolve();
++  }
++
++  async onRestore(bundleVersion: BundleVersion) {
++    hilog.info(DOMAIN, 'testTag', 'onRestore ok %{public}s', JSON.stringify(bundleVersion));
++    await Promise.resolve();
++  }
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/src/main/ets/pages/DialogPage.ets b/ports/arkweb/test-app/entry/src/main/ets/pages/DialogPage.ets
+new file mode 100644
+index 00000000000..f9c8b4f4699
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/ets/pages/DialogPage.ets
+@@ -0,0 +1,99 @@
++import { webview } from '@kit.ArkWeb';
++import { router } from '@kit.ArkUI';
++
++// A page for exercising JS dialogs end-to-end. The Web component's onAlert/onConfirm/onPrompt
++// handlers show real ArkUI dialogs and return the user's choice back to the page, so the engine's
++// dialog round-trip (Servo -> shim -> ACE -> NWebJSDialogResult -> shim -> Servo) can be tested
++// with a real response, not just the unhandled auto-dismiss.
++//
++// The built-in page has three buttons (Alert/Confirm/Prompt) and encodes the outcome as the body
++// background colour so it can be checked from a screenshot:
++//   alert   -> purple (acknowledged)
++//   confirm -> green if OK, red if Cancel
++//   prompt  -> green if OK (returns the default "hi"), red if Cancel
++function dialogPage(): string {
++  const html = `<body id=b style="margin:0;background:#dddddd;font-family:sans-serif">
++<div style="display:flex">
++<button style="flex:1;height:90px;font-size:22px" onclick="a()">Alert</button>
++<button style="flex:1;height:90px;font-size:22px" onclick="c()">Confirm</button>
++<button style="flex:1;height:90px;font-size:22px" onclick="p()">Prompt</button>
++</div>
++<script>
++function bg(x){document.getElementById('b').style.background=x}
++function a(){alert('Alert message');bg('#9b59b6')}
++function c(){bg(confirm('Confirm message')?'#00cc00':'#cc0000')}
++function p(){var r=prompt('Prompt message','hi');bg(r==='hi'?'#00cc00':(r===null?'#cc0000':'#2471a3'))}
++</script>
++</body>`;
++  return 'data:text/html,' + encodeURIComponent(html);
++}
++
++@Entry
++@Component
++struct DialogPage {
++  @StorageProp('startUrl') startUrl: string = '';
++  private controller: webview.WebviewController = new webview.WebviewController();
++
++  private pageUrl(): string {
++    return this.startUrl.length > 0 && this.startUrl !== 'about:blank' ? this.startUrl : dialogPage();
++  }
++
++  @Builder
++  navBar() {
++    Row({ space: 6 }) {
++      Button('Browser').height(32).onClick(() => router.replaceUrl({ url: 'pages/Index' }))
++      Button('Tabs').height(32).onClick(() => router.replaceUrl({ url: 'pages/TabsPage' }))
++      Button('Split').height(32).onClick(() => router.replaceUrl({ url: 'pages/SplitPage' }))
++      Button('Dialog').height(32).enabled(false)
++    }
++    .width('100%')
++    .padding(6)
++  }
++
++  build() {
++    Column() {
++      this.navBar()
++      Web({ src: this.pageUrl(), controller: this.controller })
++        .javaScriptAccess(true)
++        .layoutWeight(1)
++        .width('100%')
++        .onAlert((event) => {
++          if (event) {
++            AlertDialog.show({
++              title: 'Alert',
++              message: event.message,
++              confirm: { value: 'OK', action: () => { event.result.handleConfirm(); } },
++              autoCancel: false,
++            });
++          }
++          return true;
++        })
++        .onConfirm((event) => {
++          if (event) {
++            AlertDialog.show({
++              title: 'Confirm',
++              message: event.message,
++              primaryButton: { value: 'OK', action: () => { event.result.handleConfirm(); } },
++              secondaryButton: { value: 'Cancel', action: () => { event.result.handleCancel(); } },
++              autoCancel: false,
++            });
++          }
++          return true;
++        })
++        .onPrompt((event) => {
++          if (event) {
++            AlertDialog.show({
++              title: 'Prompt',
++              message: `${event.message}  (default: ${event.value})`,
++              primaryButton: { value: 'OK', action: () => { event.result.handlePromptConfirm(event.value); } },
++              secondaryButton: { value: 'Cancel', action: () => { event.result.handleCancel(); } },
++              autoCancel: false,
++            });
++          }
++          return true;
++        })
++    }
++    .width('100%')
++    .height('100%')
++  }
++}
+diff --git a/ports/arkweb/test-app/entry/src/main/ets/pages/Index.ets b/ports/arkweb/test-app/entry/src/main/ets/pages/Index.ets
+new file mode 100644
+index 00000000000..cdd1ebaf835
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/ets/pages/Index.ets
+@@ -0,0 +1,233 @@
++import { webview } from '@kit.ArkWeb';
++import { BusinessError } from '@kit.BasicServicesKit';
++import { hilog, hiTraceMeter } from '@kit.PerformanceAnalysisKit';
++
++const DOMAIN = 0x0000;
++
++// Emit an instant marker into hitrace so servoperf's critical-path
++// analyser can pick it up the same way as Servo's tracing-hitrace spans.
++function markInstant(name: string, taskId: number): void {
++  hiTraceMeter.startTrace(name, taskId);
++  hiTraceMeter.finishTrace(name, taskId);
++}
++
++@Entry
++@Component
++struct Index {
++  @StorageLink('startUrl') @Watch('onStartUrlChanged') startUrl: string = 'about:blank';
++  @StorageProp('proxyUri') proxyUri: string = '';
++  @StorageProp('ignoreCertErrors') ignoreCertErrors: boolean = false;
++  @State urlBar: string = 'about:blank';
++  @State currentUrl: string = 'about:blank';
++  @State progress: number = 100;
++  private controllerReady: boolean = false;
++  private proxyApplied: boolean = false;
++  private controller: webview.WebviewController = new webview.WebviewController();
++
++  aboutToAppear(): void {
++    if (this.startUrl.length > 0) {
++      this.urlBar = this.startUrl;
++      this.currentUrl = this.startUrl;
++    }
++  }
++
++  /// Apply the launch-supplied proxy URI via webview.ProxyController. Async:
++  /// the per-app proxy isn't active until the callback fires, so the caller
++  /// (controller-attached handler / navigate) must defer loadUrl until then.
++  private applyProxyThen(after: () => void): void {
++    if (this.proxyUri.length === 0 || this.proxyApplied) {
++      after();
++      return;
++    }
++    try {
++      const config = new webview.ProxyConfig();
++      config.insertProxyRule(this.proxyUri, webview.ProxySchemeFilter.MATCH_ALL_SCHEMES);
++      webview.ProxyController.applyProxyOverride(config, () => {
++        this.proxyApplied = true;
++        hilog.info(DOMAIN, 'arkwebtest', 'proxy applied: %{public}s', this.proxyUri);
++        after();
++      });
++    } catch (err) {
++      const e = err as BusinessError;
++      hilog.error(DOMAIN, 'arkwebtest',
++        'applyProxyOverride failed: %{public}d %{public}s', e.code, e.message);
++      after();
++    }
++  }
++
++  onStartUrlChanged(): void {
++    if (this.startUrl.length === 0 || this.startUrl === this.currentUrl) {
++      return;
++    }
++    this.urlBar = this.startUrl;
++    this.currentUrl = this.startUrl;
++    if (this.controllerReady) {
++      try {
++        this.controller.loadUrl(this.startUrl);
++      } catch (err) {
++        const e = err as BusinessError;
++        hilog.error(DOMAIN, 'arkwebtest', 'loadUrl failed: %{public}d %{public}s', e.code, e.message);
++      }
++    }
++  }
++
++  private navigate(url: string): void {
++    if (url.length === 0) {
++      return;
++    }
++    this.currentUrl = url;
++    if (!this.controllerReady) {
++      return;
++    }
++    try {
++      this.controller.loadUrl(url);
++    } catch (err) {
++      const e = err as BusinessError;
++      hilog.error(DOMAIN, 'arkwebtest', 'loadUrl failed: %{public}d %{public}s', e.code, e.message);
++    }
++  }
++
++  build() {
++    Column() {
++      Row({ space: 4 }) {
++        Button('<')
++          .onClick(() => {
++            if (!this.controllerReady) return;
++            try {
++              if (this.controller.accessBackward()) {
++                this.controller.backward();
++              }
++            } catch (_) { /* ignore */ }
++          })
++          .width(40)
++        Button('>')
++          .onClick(() => {
++            if (!this.controllerReady) return;
++            try {
++              if (this.controller.accessForward()) {
++                this.controller.forward();
++              }
++            } catch (_) { /* ignore */ }
++          })
++          .width(40)
++        TextInput({ text: this.urlBar })
++          .layoutWeight(1)
++          .onChange((value: string) => {
++            this.urlBar = value;
++          })
++          .onSubmit(() => {
++            this.navigate(this.urlBar);
++          })
++        Button('Go')
++          .onClick(() => {
++            this.navigate(this.urlBar);
++          })
++          .width(50)
++        Button('R')
++          .onClick(() => {
++            if (!this.controllerReady) return;
++            try {
++              this.controller.refresh();
++            } catch (_) { /* ignore */ }
++          })
++          .width(40)
++      }
++      .width('100%')
++      .padding(8)
++
++      if (this.progress < 100) {
++        Progress({ value: this.progress, total: 100 })
++          .width('100%')
++          .height(2)
++      }
++
++      Web({ src: this.currentUrl, controller: this.controller })
++        .javaScriptAccess(true)
++        .domStorageAccess(true)
++        .mixedMode(MixedMode.All)
++        .onControllerAttached(() => {
++          this.controllerReady = true;
++          hilog.info(DOMAIN, 'arkwebtest', 'controllerAttached, navigating to %{public}s', this.currentUrl);
++          if (this.currentUrl.length === 0) {
++            return;
++          }
++          this.applyProxyThen(() => {
++            try {
++              this.controller.loadUrl(this.currentUrl);
++            } catch (err) {
++              const e = err as BusinessError;
++              hilog.error(DOMAIN, 'arkwebtest', 'initial loadUrl failed: %{public}d %{public}s', e.code, e.message);
++            }
++          });
++        })
++        // WPR replay uses per-host self-signed leaf certs; auto-confirm
++        // when servoperf passed --ignore-certificate-errors.
++        .onSslErrorEventReceive((event) => {
++          if (this.ignoreCertErrors) {
++            event?.handler?.handleConfirm();
++          } else {
++            event?.handler?.handleCancel();
++          }
++        })
++        .onProgressChange((event) => {
++          if (event !== undefined) {
++            this.progress = event.newProgress;
++          }
++        })
++        .onPageBegin((event) => {
++          if (event !== undefined) {
++            this.urlBar = event.url;
++            markInstant('PageBegin', 1);
++          }
++        })
++        .onPageEnd((event) => {
++          if (event !== undefined) {
++            this.urlBar = event.url;
++            this.progress = 100;
++            // Matches the milestone name servoperf already uses for Servo on OHOS.
++            markInstant('PageLoadEndedPrompt', 2);
++            markInstant('PageEnd', 3);
++          }
++        })
++        .onFirstContentfulPaint(event => {
++          markInstant('FirstContentfulPaint', 4);
++          if (event !== undefined) {
++            hiTraceMeter.traceByValue('FirstContentfulPaintMs', event.firstContentfulPaintMs);
++            hilog.info(DOMAIN, 'arkwebtest',
++              'FCP: navigationStartTick=%{public}d firstContentfulPaintMs=%{public}d',
++              event.navigationStartTick, event.firstContentfulPaintMs);
++          }
++        })
++        .onFirstMeaningfulPaint((details) => {
++          markInstant('FirstMeaningfulPaint', 5);
++          // firstMeaningfulPaintTime is already a millisecond delta from
++          // navigationStartTime (the doc says "time taken … in milliseconds").
++          const fmp = details?.firstMeaningfulPaintTime;
++          if (fmp !== undefined) {
++            hiTraceMeter.traceByValue('FirstMeaningfulPaintMs', fmp);
++            hilog.info(DOMAIN, 'arkwebtest',
++              'FMP: firstMeaningfulPaintMs=%{public}d navigationStartTimeUs=%{public}d',
++              fmp, details?.navigationStartTime ?? -1);
++          }
++        })
++        .onLargestContentfulPaint((details) => {
++          markInstant('LargestContentfulPaint', 6);
++          // largestImagePaintTime / largestTextPaintTime are millisecond
++          // deltas from navigation start — same units as the FCP delta.
++          const imgPaint = details?.largestImagePaintTime;
++          const txtPaint = details?.largestTextPaintTime;
++          const lcpEnd = Math.max(imgPaint ?? 0, txtPaint ?? 0);
++          if (lcpEnd > 0) {
++            hiTraceMeter.traceByValue('LargestContentfulPaintMs', lcpEnd);
++            hilog.info(DOMAIN, 'arkwebtest',
++              'LCP: largestImagePaintMs=%{public}d largestTextPaintMs=%{public}d navigationStartTimeUs=%{public}d',
++              imgPaint ?? -1, txtPaint ?? -1, details?.navigationStartTime ?? -1);
++          }
++        })
++        .layoutWeight(1)
++        .width('100%')
++    }
++    .width('100%')
++    .height('100%')
++  }
++}
+diff --git a/ports/arkweb/test-app/entry/src/main/ets/pages/SplitPage.ets b/ports/arkweb/test-app/entry/src/main/ets/pages/SplitPage.ets
+new file mode 100644
+index 00000000000..bf64bf9e482
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/ets/pages/SplitPage.ets
+@@ -0,0 +1,57 @@
++import { webview } from '@kit.ArkWeb';
++import { router } from '@kit.ArkUI';
++
++// See TabsPage: self-contained, visually distinct pages so each surface is identifiable offline.
++function dataPage(bg: string, label: string): string {
++  const html = `<body style="margin:0;height:100vh;background:${bg};color:#fff;`
++    + `display:flex;align-items:center;justify-content:center;font-family:sans-serif">`
++    + `<h1 style="font-size:7vw">${label}</h1></body>`;
++  return 'data:text/html,' + encodeURIComponent(html);
++}
++
++// Parallel multi-webview test: two `Web` components stacked top/bottom, both live and painting at
++// the same time. This is the real multi-surface case — two NWeb/rendering contexts concurrently.
++@Entry
++@Component
++struct SplitPage {
++  @StorageProp('startUrl') startUrl: string = '';
++  private topController: webview.WebviewController = new webview.WebviewController();
++  private bottomController: webview.WebviewController = new webview.WebviewController();
++
++  // Top surface honours a launch-supplied URL (`-U`); the bottom is always a built-in data: page.
++  private topUrl(): string {
++    return this.startUrl.length > 0 && this.startUrl !== 'about:blank'
++      ? this.startUrl
++      : dataPage('#c0392b', 'Surface A (top)');
++  }
++
++  @Builder
++  navBar() {
++    Row({ space: 6 }) {
++      Button('Browser').height(32).onClick(() => router.replaceUrl({ url: 'pages/Index' }))
++      Button('Tabs').height(32).onClick(() => router.replaceUrl({ url: 'pages/TabsPage' }))
++      Button('Split').height(32).enabled(false)
++    }
++    .width('100%')
++    .padding(6)
++  }
++
++  build() {
++    Column() {
++      this.navBar()
++      Web({ src: this.topUrl(), controller: this.topController })
++        .javaScriptAccess(true)
++        .layoutWeight(1)
++        .width('100%')
++      Divider()
++        .strokeWidth(2)
++        .color(Color.White)
++      Web({ src: dataPage('#2471a3', 'Surface B (bottom)'), controller: this.bottomController })
++        .javaScriptAccess(true)
++        .layoutWeight(1)
++        .width('100%')
++    }
++    .width('100%')
++    .height('100%')
++  }
++}
+diff --git a/ports/arkweb/test-app/entry/src/main/ets/pages/TabsPage.ets b/ports/arkweb/test-app/entry/src/main/ets/pages/TabsPage.ets
+new file mode 100644
+index 00000000000..dab762ad93f
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/ets/pages/TabsPage.ets
+@@ -0,0 +1,75 @@
++import { webview } from '@kit.ArkWeb';
++import { router } from '@kit.ArkUI';
++
++// Distinct self-contained pages so each Web surface is visually identifiable without a network
++// (the test device has none). Colour + label make it obvious which webview rendered which tab.
++function dataPage(bg: string, label: string): string {
++  const html = `<body style="margin:0;height:100vh;background:${bg};color:#fff;`
++    + `display:flex;align-items:center;justify-content:center;font-family:sans-serif">`
++    + `<h1 style="font-size:7vw">${label}</h1></body>`;
++  return 'data:text/html,' + encodeURIComponent(html);
++}
++
++// Tab-based multi-webview test: three `Web` components (one per tab), each its own
++// WebviewController, exercising create + show/hide of several NWeb surfaces in one window.
++@Entry
++@Component
++struct TabsPage {
++  @StorageProp('startUrl') startUrl: string = '';
++  @State activeIndex: number = 0;
++  private controllers: webview.WebviewController[] = [
++    new webview.WebviewController(),
++    new webview.WebviewController(),
++    new webview.WebviewController(),
++  ];
++
++  // Tab 1 honours a launch-supplied URL (`-U`); the rest use built-in data: pages.
++  private firstUrl(): string {
++    return this.startUrl.length > 0 && this.startUrl !== 'about:blank'
++      ? this.startUrl
++      : dataPage('#c0392b', 'Tab 1');
++  }
++
++  @Builder
++  navBar() {
++    Row({ space: 6 }) {
++      Button('Browser').height(32).onClick(() => router.replaceUrl({ url: 'pages/Index' }))
++      Button('Tabs').height(32).enabled(false)
++      Button('Split').height(32).onClick(() => router.replaceUrl({ url: 'pages/SplitPage' }))
++    }
++    .width('100%')
++    .padding(6)
++  }
++
++  build() {
++    Column() {
++      this.navBar()
++      Tabs({ index: this.activeIndex }) {
++        TabContent() {
++          Web({ src: this.firstUrl(), controller: this.controllers[0] })
++            .javaScriptAccess(true)
++            .width('100%')
++            .height('100%')
++        }.tabBar('Tab 1')
++        TabContent() {
++          Web({ src: dataPage('#27ae60', 'Tab 2'), controller: this.controllers[1] })
++            .javaScriptAccess(true)
++            .width('100%')
++            .height('100%')
++        }.tabBar('Tab 2')
++        TabContent() {
++          Web({ src: dataPage('#2471a3', 'Tab 3'), controller: this.controllers[2] })
++            .javaScriptAccess(true)
++            .width('100%')
++            .height('100%')
++        }.tabBar('Tab 3')
++      }
++      .onChange((index: number) => {
++        this.activeIndex = index;
++      })
++      .layoutWeight(1)
++    }
++    .width('100%')
++    .height('100%')
++  }
++}
+diff --git a/ports/arkweb/test-app/entry/src/main/module.json5 b/ports/arkweb/test-app/entry/src/main/module.json5
+new file mode 100644
+index 00000000000..a6365c4c7b8
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/module.json5
+@@ -0,0 +1,55 @@
++{
++  "module": {
++    "name": "entry",
++    "type": "entry",
++    "description": "$string:module_desc",
++    "mainElement": "EntryAbility",
++    "deviceTypes": [
++      "default"
++    ],
++    "deliveryWithInstall": true,
++    "installationFree": false,
++    "pages": "$profile:main_pages",
++    "requestPermissions": [
++      {
++        "name": "ohos.permission.INTERNET"
++      }
++    ],
++    "abilities": [
++      {
++        "name": "EntryAbility",
++        "srcEntry": "./ets/entryability/EntryAbility.ets",
++        "description": "$string:EntryAbility_desc",
++        "icon": "$media:layered_image",
++        "label": "$string:EntryAbility_label",
++        "startWindowIcon": "$media:startIcon",
++        "startWindowBackground": "$color:start_window_background",
++        "exported": true,
++        "skills": [
++          {
++            "entities": [
++              "entity.system.home"
++            ],
++            "actions": [
++              "ohos.want.action.home"
++            ]
++          }
++        ]
++      }
++    ],
++    "extensionAbilities": [
++      {
++        "name": "EntryBackupAbility",
++        "srcEntry": "./ets/entrybackupability/EntryBackupAbility.ets",
++        "type": "backup",
++        "exported": false,
++        "metadata": [
++          {
++            "name": "ohos.extension.backup",
++            "resource": "$profile:backup_config"
++          }
++        ],
++      }
++    ]
++  }
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/src/main/resources/base/element/color.json b/ports/arkweb/test-app/entry/src/main/resources/base/element/color.json
+new file mode 100644
+index 00000000000..3c712962da3
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/resources/base/element/color.json
+@@ -0,0 +1,8 @@
++{
++  "color": [
++    {
++      "name": "start_window_background",
++      "value": "#FFFFFF"
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/src/main/resources/base/element/float.json b/ports/arkweb/test-app/entry/src/main/resources/base/element/float.json
+new file mode 100644
+index 00000000000..33ea22304f9
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/resources/base/element/float.json
+@@ -0,0 +1,8 @@
++{
++  "float": [
++    {
++      "name": "page_text_font_size",
++      "value": "50fp"
++    }
++  ]
++}
+diff --git a/ports/arkweb/test-app/entry/src/main/resources/base/element/string.json b/ports/arkweb/test-app/entry/src/main/resources/base/element/string.json
+new file mode 100644
+index 00000000000..c702cb80ecf
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/resources/base/element/string.json
+@@ -0,0 +1,16 @@
++{
++  "string": [
++    {
++      "name": "module_desc",
++      "value": "module description"
++    },
++    {
++      "name": "EntryAbility_desc",
++      "value": "description"
++    },
++    {
++      "name": "EntryAbility_label",
++      "value": "arkweb-test"
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/src/main/resources/base/media/background.png b/ports/arkweb/test-app/entry/src/main/resources/base/media/background.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..e654ada64b5f4d1f2e3bd607f49ef74cf0a360b5
+GIT binary patch
+literal 451
+zcmeAS@N?(olHy`uVBq!ia0y~yU;#2&7#Nv>l<Vc42Y{49vPY0F14ES>14Ba#1H&(%
+zP{RubhEf9thF1v;3|2E37{m+a><Y92O0Wg^gt+q6wEh48Kl`v0P&ET%lDE4H<9{aI
+zdq56*iKnkC`zuyner|y+^SrBpLaHUM5hW>!C8<`)MX5lF!N|bKOxM6v*U&h`(A3J%
+z(8|zM+rYrez~Ejv`)w2rx%nxXX_dG&tk>F~4%DClx1l66H?_DVF}DD>o*(w}b^!HE
+x^K@|xskrs_AR{A?*QD@&eV&H{h&hnpJsXQ010(M}ixiM6JYD@<);T3K0RSexRnY(d
+
+literal 0
+HcmV?d00001
+
+diff --git a/ports/arkweb/test-app/entry/src/main/resources/base/media/foreground.png b/ports/arkweb/test-app/entry/src/main/resources/base/media/foreground.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca5b43208073b3bb8b1fb084a52ab786efd3de4a
+GIT binary patch
+literal 16925
+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
+Y+<GpF4~2$yCks8e`$V<yj>TX94XKY^+5i9m
+
+literal 0
+HcmV?d00001
+
+diff --git a/ports/arkweb/test-app/entry/src/main/resources/base/media/layered_image.json b/ports/arkweb/test-app/entry/src/main/resources/base/media/layered_image.json
+new file mode 100644
+index 00000000000..fb49920440f
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/resources/base/media/layered_image.json
+@@ -0,0 +1,7 @@
++{
++  "layered-image":
++  {
++    "background" : "$media:background",
++    "foreground" : "$media:foreground"
++  }
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/src/main/resources/base/media/startIcon.png b/ports/arkweb/test-app/entry/src/main/resources/base/media/startIcon.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc152ee792894f64113fdd516360b5f267c95d8c
+GIT binary patch
+literal 16035
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/ports/arkweb/test-app/entry/src/main/resources/base/profile/backup_config.json b/ports/arkweb/test-app/entry/src/main/resources/base/profile/backup_config.json
+new file mode 100644
+index 00000000000..78f40ae7c49
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/resources/base/profile/backup_config.json
+@@ -0,0 +1,3 @@
++{
++  "allowToBackupRestore": true
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/src/main/resources/base/profile/main_pages.json b/ports/arkweb/test-app/entry/src/main/resources/base/profile/main_pages.json
+new file mode 100644
+index 00000000000..8f1b0ec1acb
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/resources/base/profile/main_pages.json
+@@ -0,0 +1,8 @@
++{
++  "src": [
++    "pages/Index",
++    "pages/TabsPage",
++    "pages/SplitPage",
++    "pages/DialogPage"
++  ]
++}
+diff --git a/ports/arkweb/test-app/entry/src/main/resources/dark/element/color.json b/ports/arkweb/test-app/entry/src/main/resources/dark/element/color.json
+new file mode 100644
+index 00000000000..79b11c2747a
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/resources/dark/element/color.json
+@@ -0,0 +1,8 @@
++{
++  "color": [
++    {
++      "name": "start_window_background",
++      "value": "#000000"
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/src/mock/mock-config.json5 b/ports/arkweb/test-app/entry/src/mock/mock-config.json5
+new file mode 100644
+index 00000000000..7a73a41bfdf
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/mock/mock-config.json5
+@@ -0,0 +1,2 @@
++{
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/src/ohosTest/ets/test/Ability.test.ets b/ports/arkweb/test-app/entry/src/ohosTest/ets/test/Ability.test.ets
+new file mode 100644
+index 00000000000..85c78f67579
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/ohosTest/ets/test/Ability.test.ets
+@@ -0,0 +1,35 @@
++import { hilog } from '@kit.PerformanceAnalysisKit';
++import { describe, beforeAll, beforeEach, afterEach, afterAll, it, expect } from '@ohos/hypium';
++
++export default function abilityTest() {
++  describe('ActsAbilityTest', () => {
++    // Defines a test suite. Two parameters are supported: test suite name and test suite function.
++    beforeAll(() => {
++      // Presets an action, which is performed only once before all test cases of the test suite start.
++      // This API supports only one parameter: preset action function.
++    })
++    beforeEach(() => {
++      // Presets an action, which is performed before each unit test case starts.
++      // The number of execution times is the same as the number of test cases defined by **it**.
++      // This API supports only one parameter: preset action function.
++    })
++    afterEach(() => {
++      // Presets a clear action, which is performed after each unit test case ends.
++      // The number of execution times is the same as the number of test cases defined by **it**.
++      // This API supports only one parameter: clear action function.
++    })
++    afterAll(() => {
++      // Presets a clear action, which is performed after all test cases of the test suite end.
++      // This API supports only one parameter: clear action function.
++    })
++    it('assertContain', 0, () => {
++      // Defines a test case. This API supports three parameters: test case name, filter parameter, and test case function.
++      hilog.info(0x0000, 'testTag', '%{public}s', 'it begin');
++      let a = 'abc';
++      let b = 'b';
++      // Defines a variety of assertion methods, which are used to declare expected boolean conditions.
++      expect(a).assertContain(b);
++      expect(a).assertEqual(a);
++    })
++  })
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/src/ohosTest/ets/test/List.test.ets b/ports/arkweb/test-app/entry/src/ohosTest/ets/test/List.test.ets
+new file mode 100644
+index 00000000000..794c7dc4ed6
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/ohosTest/ets/test/List.test.ets
+@@ -0,0 +1,5 @@
++import abilityTest from './Ability.test';
++
++export default function testsuite() {
++  abilityTest();
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/src/ohosTest/module.json5 b/ports/arkweb/test-app/entry/src/ohosTest/module.json5
+new file mode 100644
+index 00000000000..509a3a28a3e
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/ohosTest/module.json5
+@@ -0,0 +1,11 @@
++{
++  "module": {
++    "name": "entry_test",
++    "type": "feature",
++    "deviceTypes": [
++      "phone"
++    ],
++    "deliveryWithInstall": true,
++    "installationFree": false
++  }
++}
+diff --git a/ports/arkweb/test-app/entry/src/test/List.test.ets b/ports/arkweb/test-app/entry/src/test/List.test.ets
+new file mode 100644
+index 00000000000..bb5b5c3731e
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/test/List.test.ets
+@@ -0,0 +1,5 @@
++import localUnitTest from './LocalUnit.test';
++
++export default function testsuite() {
++  localUnitTest();
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/entry/src/test/LocalUnit.test.ets b/ports/arkweb/test-app/entry/src/test/LocalUnit.test.ets
+new file mode 100644
+index 00000000000..165fc1615ee
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/test/LocalUnit.test.ets
+@@ -0,0 +1,33 @@
++import { describe, beforeAll, beforeEach, afterEach, afterAll, it, expect } from '@ohos/hypium';
++
++export default function localUnitTest() {
++  describe('localUnitTest', () => {
++    // Defines a test suite. Two parameters are supported: test suite name and test suite function.
++    beforeAll(() => {
++      // Presets an action, which is performed only once before all test cases of the test suite start.
++      // This API supports only one parameter: preset action function.
++    });
++    beforeEach(() => {
++      // Presets an action, which is performed before each unit test case starts.
++      // The number of execution times is the same as the number of test cases defined by **it**.
++      // This API supports only one parameter: preset action function.
++    });
++    afterEach(() => {
++      // Presets a clear action, which is performed after each unit test case ends.
++      // The number of execution times is the same as the number of test cases defined by **it**.
++      // This API supports only one parameter: clear action function.
++    });
++    afterAll(() => {
++      // Presets a clear action, which is performed after all test cases of the test suite end.
++      // This API supports only one parameter: clear action function.
++    });
++    it('assertContain', 0, () => {
++      // Defines a test case. This API supports three parameters: test case name, filter parameter, and test case function.
++      let a = 'abc';
++      let b = 'b';
++      // Defines a variety of assertion methods, which are used to declare expected boolean conditions.
++      expect(a).assertContain(b);
++      expect(a).assertEqual(a);
++    });
++  });
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/hvigor/hvigor-config.json5 b/ports/arkweb/test-app/hvigor/hvigor-config.json5
+new file mode 100644
+index 00000000000..37293711fe0
+--- /dev/null
++++ b/ports/arkweb/test-app/hvigor/hvigor-config.json5
+@@ -0,0 +1,23 @@
++{
++  "modelVersion": "6.0.1",
++  "dependencies": {
++  },
++  "execution": {
++    // "analyze": "normal",                     /* Define the build analyze mode. Value: [ "normal" | "advanced" | "ultrafine" | false ]. Default: "normal" */
++    // "daemon": true,                          /* Enable daemon compilation. Value: [ true | false ]. Default: true */
++    // "incremental": true,                     /* Enable incremental compilation. Value: [ true | false ]. Default: true */
++    // "parallel": true,                        /* Enable parallel compilation. Value: [ true | false ]. Default: true */
++    // "typeCheck": false,                      /* Enable typeCheck. Value: [ true | false ]. Default: false */
++    // "optimizationStrategy": "memory"         /* Define the optimization strategy. Value: [ "memory" | "performance" ]. Default: "memory" */
++  },
++  "logging": {
++    // "level": "info"                          /* Define the log level. Value: [ "debug" | "info" | "warn" | "error" ]. Default: "info" */
++  },
++  "debugging": {
++    // "stacktrace": false                      /* Disable stacktrace compilation. Value: [ true | false ]. Default: false */
++  },
++  "nodeOptions": {
++    // "maxOldSpaceSize": 8192                  /* Enable nodeOptions maxOldSpaceSize compilation. Unit M. Used for the daemon process. Default: 8192*/
++    // "exposeGC": true                         /* Enable to trigger garbage collection explicitly. Default: true*/
++  }
++}
+diff --git a/ports/arkweb/test-app/hvigorfile.ts b/ports/arkweb/test-app/hvigorfile.ts
+new file mode 100644
+index 00000000000..47113e2e36e
+--- /dev/null
++++ b/ports/arkweb/test-app/hvigorfile.ts
+@@ -0,0 +1,6 @@
++import { appTasks } from '@ohos/hvigor-ohos-plugin';
++
++export default {
++  system: appTasks, /* Built-in plugin of Hvigor. It cannot be modified. */
++  plugins: []       /* Custom plugin to extend the functionality of Hvigor. */
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/oh-package-lock.json5 b/ports/arkweb/test-app/oh-package-lock.json5
+new file mode 100644
+index 00000000000..72cbd52ad9e
+--- /dev/null
++++ b/ports/arkweb/test-app/oh-package-lock.json5
+@@ -0,0 +1,28 @@
++{
++  "meta": {
++    "stableOrder": true,
++    "enableUnifiedLockfile": false
++  },
++  "lockfileVersion": 3,
++  "ATTENTION": "THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.",
++  "specifiers": {
++    "@ohos/hamock@1.0.0": "@ohos/hamock@1.0.0",
++    "@ohos/hypium@1.0.25": "@ohos/hypium@1.0.25"
++  },
++  "packages": {
++    "@ohos/hamock@1.0.0": {
++      "name": "@ohos/hamock",
++      "version": "1.0.0",
++      "integrity": "sha512-K6lDPYc6VkKe6ZBNQa9aoG+ZZMiwqfcR/7yAVFSUGIuOAhPvCJAo9+t1fZnpe0dBRBPxj2bxPPbKh69VuyAtDg==",
++      "resolved": "https://repo.harmonyos.com/ohpm/@ohos/hamock/-/hamock-1.0.0.har",
++      "registryType": "ohpm"
++    },
++    "@ohos/hypium@1.0.25": {
++      "name": "@ohos/hypium",
++      "version": "1.0.25",
++      "integrity": "sha512-l6uO2pjl8HyEKdekLqQt7tUpWbDqX/42zoAzkagtUVZAW9jT6lMvbe54MVjoLxq/RwQGygRvi6j4GpypSMFSHw==",
++      "resolved": "https://repo.harmonyos.com/ohpm/@ohos/hypium/-/hypium-1.0.25.har",
++      "registryType": "ohpm"
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/ports/arkweb/test-app/oh-package.json5 b/ports/arkweb/test-app/oh-package.json5
+new file mode 100644
+index 00000000000..15e9983550d
+--- /dev/null
++++ b/ports/arkweb/test-app/oh-package.json5
+@@ -0,0 +1,10 @@
++{
++  "modelVersion": "6.0.1",
++  "description": "Please describe the basic information.",
++  "dependencies": {
++  },
++  "devDependencies": {
++    "@ohos/hypium": "1.0.25",
++    "@ohos/hamock": "1.0.0"
++  }
++}
+diff --git a/ports/arkweb/test-app/signing/OpenHarmony.p12 b/ports/arkweb/test-app/signing/OpenHarmony.p12
+new file mode 100644
+index 0000000000000000000000000000000000000000..60f9bb48e677960e9dd7257e9f55c80915417ecf
+GIT binary patch
+literal 8252
+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
+FKLF87;N1WK
+
+literal 0
+HcmV?d00001
+
+diff --git a/ports/arkweb/test-app/signing/OpenHarmonyApplication.pem b/ports/arkweb/test-app/signing/OpenHarmonyApplication.pem
+new file mode 100644
+index 00000000000..825abdc7bcc
+--- /dev/null
++++ b/ports/arkweb/test-app/signing/OpenHarmonyApplication.pem
+@@ -0,0 +1,44 @@
++-----BEGIN CERTIFICATE-----
++MIICRDCCAcmgAwIBAgIED+E4izAMBggqhkjOPQQDAwUAMGgxCzAJBgNVBAYTAkNO
++MRQwEgYDVQQKEwtPcGVuSGFybW9ueTEZMBcGA1UECxMQT3Blbkhhcm1vbnkgVGVh
++bTEoMCYGA1UEAxMfT3Blbkhhcm1vbnkgQXBwbGljYXRpb24gUm9vdCBDQTAeFw0y
++MTAyMDIxMjE0MThaFw00OTEyMzExMjE0MThaMGgxCzAJBgNVBAYTAkNOMRQwEgYD
++VQQKEwtPcGVuSGFybW9ueTEZMBcGA1UECxMQT3Blbkhhcm1vbnkgVGVhbTEoMCYG
++A1UEAxMfT3Blbkhhcm1vbnkgQXBwbGljYXRpb24gUm9vdCBDQTB2MBAGByqGSM49
++AgEGBSuBBAAiA2IABE023XmRaw2DnO8NSsb+KG/uY0FtS3u5LQucdr3qWVnRW5ui
++QIL6ttNZBEeLTUeYcJZCpayg9Llf+1SmDA7dY4iP2EcRo4UN3rilovtfFfsmH4ty
++3SApHVFzWUl+NwdH8KNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC
++AQYwHQYDVR0OBBYEFBc6EKGrGXzlAE+s0Zgnsphadw7NMAwGCCqGSM49BAMDBQAD
++ZwAwZAIwd1p3JzHN93eoPped1li0j64npgqNzwy4OrkehYAqNXpcpaEcLZ7UxW8E
++I2lZJ3SbAjAkqySHb12sIwdSFKSN9KCMMEo/eUT5dUXlcKR2nZz0MJdxT5F51qcX
++1CumzkcYhgU=
++-----END CERTIFICATE-----
++-----BEGIN CERTIFICATE-----
++MIICYTCCAeWgAwIBAgIEHmXAPTAMBggqhkjOPQQDAwUAMGgxCzAJBgNVBAYTAkNO
++MRQwEgYDVQQKEwtPcGVuSGFybW9ueTEZMBcGA1UECxMQT3Blbkhhcm1vbnkgVGVh
++bTEoMCYGA1UEAxMfT3Blbkhhcm1vbnkgQXBwbGljYXRpb24gUm9vdCBDQTAeFw0y
++MTAyMDIxMjE1MzJaFw00OTEyMzExMjE1MzJaMGMxCzAJBgNVBAYTAkNOMRQwEgYD
++VQQKEwtPcGVuSGFybW9ueTEZMBcGA1UECxMQT3Blbkhhcm1vbnkgVGVhbTEjMCEG
++A1UEAxMaT3Blbkhhcm1vbnkgQXBwbGljYXRpb24gQ0EwdjAQBgcqhkjOPQIBBgUr
++gQQAIgNiAAQhnu7Hna8XNa2KyqRf5+lBJScE4xqf89N0g0OuqAb2re8nGsvWkw26
++uDekfnBYicd+G3Cydqa2zFIwV7Talyg2ULW3r8KbGpyl84mJEPPRmCGJ+H9gtCsf
+++OrJ4Y76LVWjYzBhMB8GA1UdIwQYMBaAFBc6EKGrGXzlAE+s0Zgnsphadw7NMA8G
++A1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBTbhrciFtUL
++oUu33SV7ufEFfaItRzAMBggqhkjOPQQDAwUAA2gAMGUCMG3cXjiDmXTvf7D4Omhf
++qcc2nuO+EMfWE+N9ZhBP5UhV34mAGWi3SfLU6rcV0urWEQIxAMYIb3epOnKhUrcm
++Lfu1WKzFlpYQwmw73RaCHP2I3k6NcuWOYeNwWXSNZ8o0nzvaLg==
++-----END CERTIFICATE-----
++-----BEGIN CERTIFICATE-----
++MIICMzCCAbegAwIBAgIEaOC/zDAMBggqhkjOPQQDAwUAMGMxCzAJBgNVBAYTAkNO
++MRQwEgYDVQQKEwtPcGVuSGFybW9ueTEZMBcGA1UECxMQT3Blbkhhcm1vbnkgVGVh
++bTEjMCEGA1UEAxMaT3Blbkhhcm1vbnkgQXBwbGljYXRpb24gQ0EwHhcNMjEwMjAy
++MTIxOTMxWhcNNDkxMjMxMTIxOTMxWjBoMQswCQYDVQQGEwJDTjEUMBIGA1UEChML
++T3Blbkhhcm1vbnkxGTAXBgNVBAsTEE9wZW5IYXJtb255IFRlYW0xKDAmBgNVBAMT
++H09wZW5IYXJtb255IEFwcGxpY2F0aW9uIFJlbGVhc2UwWTATBgcqhkjOPQIBBggq
++hkjOPQMBBwNCAATbYOCQQpW5fdkYHN45v0X3AHax12jPBdEDosFRIZ1eXmxOYzSG
++JwMfsHhUU90E8lI0TXYZnNmgM1sovubeQqATo1IwUDAfBgNVHSMEGDAWgBTbhrci
++FtULoUu33SV7ufEFfaItRzAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0OBBYEFPtxruhl
++cRBQsJdwcZqLu9oNUVgaMAwGCCqGSM49BAMDBQADaAAwZQIxAJta0PQ2p4DIu/ps
++LMdLCDgQ5UH1l0B4PGhBlMgdi2zf8nk9spazEQI/0XNwpft8QAIwHSuA2WelVi/o
++zAlF08DnbJrOOtOnQq5wHOPlDYB4OtUzOYJk9scotrEnJxJzGsh/
++-----END CERTIFICATE-----
+diff --git a/ports/arkweb/test-app/signing/OpenHarmonyProfileDebug.pem b/ports/arkweb/test-app/signing/OpenHarmonyProfileDebug.pem
+new file mode 100644
+index 00000000000..3bccf719131
+--- /dev/null
++++ b/ports/arkweb/test-app/signing/OpenHarmonyProfileDebug.pem
+@@ -0,0 +1,44 @@
++-----BEGIN CERTIFICATE-----
++MIICRDCCAcmgAwIBAgIED+E4izAMBggqhkjOPQQDAwUAMGgxCzAJBgNVBAYTAkNO
++MRQwEgYDVQQKEwtPcGVuSGFybW9ueTEZMBcGA1UECxMQT3Blbkhhcm1vbnkgVGVh
++bTEoMCYGA1UEAxMfT3Blbkhhcm1vbnkgQXBwbGljYXRpb24gUm9vdCBDQTAeFw0y
++MTAyMDIxMjE0MThaFw00OTEyMzExMjE0MThaMGgxCzAJBgNVBAYTAkNOMRQwEgYD
++VQQKEwtPcGVuSGFybW9ueTEZMBcGA1UECxMQT3Blbkhhcm1vbnkgVGVhbTEoMCYG
++A1UEAxMfT3Blbkhhcm1vbnkgQXBwbGljYXRpb24gUm9vdCBDQTB2MBAGByqGSM49
++AgEGBSuBBAAiA2IABE023XmRaw2DnO8NSsb+KG/uY0FtS3u5LQucdr3qWVnRW5ui
++QIL6ttNZBEeLTUeYcJZCpayg9Llf+1SmDA7dY4iP2EcRo4UN3rilovtfFfsmH4ty
++3SApHVFzWUl+NwdH8KNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC
++AQYwHQYDVR0OBBYEFBc6EKGrGXzlAE+s0Zgnsphadw7NMAwGCCqGSM49BAMDBQAD
++ZwAwZAIwd1p3JzHN93eoPped1li0j64npgqNzwy4OrkehYAqNXpcpaEcLZ7UxW8E
++I2lZJ3SbAjAkqySHb12sIwdSFKSN9KCMMEo/eUT5dUXlcKR2nZz0MJdxT5F51qcX
++1CumzkcYhgU=
++-----END CERTIFICATE-----
++-----BEGIN CERTIFICATE-----
++MIICYTCCAeWgAwIBAgIEHmXAPTAMBggqhkjOPQQDAwUAMGgxCzAJBgNVBAYTAkNO
++MRQwEgYDVQQKEwtPcGVuSGFybW9ueTEZMBcGA1UECxMQT3Blbkhhcm1vbnkgVGVh
++bTEoMCYGA1UEAxMfT3Blbkhhcm1vbnkgQXBwbGljYXRpb24gUm9vdCBDQTAeFw0y
++MTAyMDIxMjE1MzJaFw00OTEyMzExMjE1MzJaMGMxCzAJBgNVBAYTAkNOMRQwEgYD
++VQQKEwtPcGVuSGFybW9ueTEZMBcGA1UECxMQT3Blbkhhcm1vbnkgVGVhbTEjMCEG
++A1UEAxMaT3Blbkhhcm1vbnkgQXBwbGljYXRpb24gQ0EwdjAQBgcqhkjOPQIBBgUr
++gQQAIgNiAAQhnu7Hna8XNa2KyqRf5+lBJScE4xqf89N0g0OuqAb2re8nGsvWkw26
++uDekfnBYicd+G3Cydqa2zFIwV7Talyg2ULW3r8KbGpyl84mJEPPRmCGJ+H9gtCsf
+++OrJ4Y76LVWjYzBhMB8GA1UdIwQYMBaAFBc6EKGrGXzlAE+s0Zgnsphadw7NMA8G
++A1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBTbhrciFtUL
++oUu33SV7ufEFfaItRzAMBggqhkjOPQQDAwUAA2gAMGUCMG3cXjiDmXTvf7D4Omhf
++qcc2nuO+EMfWE+N9ZhBP5UhV34mAGWi3SfLU6rcV0urWEQIxAMYIb3epOnKhUrcm
++Lfu1WKzFlpYQwmw73RaCHP2I3k6NcuWOYeNwWXSNZ8o0nzvaLg==
++-----END CERTIFICATE-----
++-----BEGIN CERTIFICATE-----
++MIICODCCAb2gAwIBAgIEFKYJUDAMBggqhkjOPQQDAwUAMGMxCzAJBgNVBAYTAkNO
++MRQwEgYDVQQKEwtPcGVuSGFybW9ueTEZMBcGA1UECxMQT3Blbkhhcm1vbnkgVGVh
++bTEjMCEGA1UEAxMaT3Blbkhhcm1vbnkgQXBwbGljYXRpb24gQ0EwHhcNMjEwMjAy
++MTIyMTI1WhcNNDkxMjMxMTIyMTI1WjBuMQswCQYDVQQGEwJDTjEUMBIGA1UEChML
++T3Blbkhhcm1vbnkxGTAXBgNVBAsTEE9wZW5IYXJtb255IFRlYW0xLjAsBgNVBAMT
++JU9wZW5IYXJtb255IEFwcGxpY2F0aW9uIFByb2ZpbGUgRGVidWcwWTATBgcqhkjO
++PQIBBggqhkjOPQMBBwNCAATZNH/LPiyU8ar4uBIFyi40yCUTX1nqsXExvaDVHkC+
++ZZT+6D+gVK+Dxz1fH0lCt1IgTAxQBd0OVTM9i+PJIE3ao1IwUDAfBgNVHSMEGDAW
++gBTbhrciFtULoUu33SV7ufEFfaItRzAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0OBBYE
++FFQ8O5FRWjHrsdwhrA15sSEVovdyMAwGCCqGSM49BAMDBQADZwAwZAIweioYr8UT
++KDiyo2PQPHqgsyVsNPVk9kZaC9yrpIawN+55fevOXzFiuGP0IjCLhCFSAjA+69aB
++La2cynFQtEOk59rSD5v0ZHIgzJX4L+ROAumr/qt1O14yWTJA7jzZuHPIT3c=
++-----END CERTIFICATE-----
+diff --git a/ports/arkweb/test-app/signing/profile-debug.json b/ports/arkweb/test-app/signing/profile-debug.json
+new file mode 100644
+index 00000000000..08d07777237
+--- /dev/null
++++ b/ports/arkweb/test-app/signing/profile-debug.json
+@@ -0,0 +1,34 @@
++{
++    "version-name": "2.0.0",
++    "version-code": 2,
++    "uuid": "fe686e1b-3770-4824-a938-961b140a7c98",
++    "validity": {
++        "not-before": 1783535141,
++        "not-after": 2098895141
++    },
++    "type": "debug",
++    "bundle-info": {
++        "developer-id": "OpenHarmony",
++        "development-certificate": "-----BEGIN CERTIFICATE-----\nMIICMzCCAbegAwIBAgIEaOC/zDAMBggqhkjOPQQDAwUAMGMxCzAJBgNVBAYTAkNO\nMRQwEgYDVQQKEwtPcGVuSGFybW9ueTEZMBcGA1UECxMQT3Blbkhhcm1vbnkgVGVh\nbTEjMCEGA1UEAxMaT3Blbkhhcm1vbnkgQXBwbGljYXRpb24gQ0EwHhcNMjEwMjAy\nMTIxOTMxWhcNNDkxMjMxMTIxOTMxWjBoMQswCQYDVQQGEwJDTjEUMBIGA1UEChML\nT3Blbkhhcm1vbnkxGTAXBgNVBAsTEE9wZW5IYXJtb255IFRlYW0xKDAmBgNVBAMT\nH09wZW5IYXJtb255IEFwcGxpY2F0aW9uIFJlbGVhc2UwWTATBgcqhkjOPQIBBggq\nhkjOPQMBBwNCAATbYOCQQpW5fdkYHN45v0X3AHax12jPBdEDosFRIZ1eXmxOYzSG\nJwMfsHhUU90E8lI0TXYZnNmgM1sovubeQqATo1IwUDAfBgNVHSMEGDAWgBTbhrci\nFtULoUu33SV7ufEFfaItRzAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0OBBYEFPtxruhl\ncRBQsJdwcZqLu9oNUVgaMAwGCCqGSM49BAMDBQADaAAwZQIxAJta0PQ2p4DIu/ps\nLMdLCDgQ5UH1l0B4PGhBlMgdi2zf8nk9spazEQI/0XNwpft8QAIwHSuA2WelVi/o\nzAlF08DnbJrOOtOnQq5wHOPlDYB4OtUzOYJk9scotrEnJxJzGsh/\n-----END CERTIFICATE-----\n",
++        "bundle-name": "org.openharmonyrs.arkwebtest",
++        "apl": "normal",
++        "app-feature": "hos_normal_app"
++    },
++    "acls": {
++        "allowed-acls": [
++            ""
++        ]
++    },
++    "permissions": {
++        "restricted-permissions": [
++            ""
++        ]
++    },
++    "debug-info": {
++        "device-ids": [
++            "9106F4BB0C195B60BDC5020F326F8F78C37751F3AF5CB235D19957DE8E5F1E3B"
++        ],
++        "device-id-type": "udid"
++    },
++    "issuer": "pki_internal"
++}
+diff --git a/ports/arkweb/test-app/signing/profile-debug.p7b b/ports/arkweb/test-app/signing/profile-debug.p7b
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd5c5a5a8a339cc01cd1f82a72cdd067000108d7
+GIT binary patch
+literal 3544
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/ports/arkweb/tools/build_test_app.py b/ports/arkweb/tools/build_test_app.py
+new file mode 100644
+index 00000000000..f699e1d8503
+--- /dev/null
++++ b/ports/arkweb/tools/build_test_app.py
+@@ -0,0 +1,130 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = []
++# ///
++"""Build, sign and install the vendored arkweb-test HAP (the on-device test app).
++
++The app lives at ``ports/arkweb/test-app``; the pytest smoke tests in this directory drive it
++on device. This automates the otherwise-manual HAP recipe.
++
++Prerequisites: a *writable* OpenHarmony command-line-tools SDK (hvigor writes into the SDK
++dir). In this container:
++  * SDK: ``/home/ubuntu/ohos-sdk-w`` (a writable copy) with an ``<apiVersion>`` symlink,
++    e.g. ``ln -sfn default/openharmony /home/ubuntu/ohos-sdk-w/21``
++  * hvigorw: ``/opt/command-line-tools/bin/hvigorw``; node: ``/opt/command-line-tools/tool/node``
++
++The container SDK is API 21 while the app targets compileSdkVersion 26, and hvigor's signing
++rejects the plaintext test password, so this script temporarily lowers the SDK version and
++clears ``signingConfigs`` to build an UNSIGNED HAP, then signs it with the vendored public
++OpenHarmony debug certs (``test-app/signing``) and installs it. ``build-profile.json5`` is
++restored afterwards.
++
++Run:  ``uv run ports/arkweb/tools/build_test_app.py``  (add ``--no-install`` to only build)
++"""
++
++from __future__ import annotations
++
++import argparse
++import os
++import re
++import subprocess
++import sys
++from pathlib import Path
++
++APP = Path(__file__).resolve().parent.parent / "test-app"
++BUNDLE = "org.openharmonyrs.arkwebtest"
++
++
++def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
++    print("+", " ".join(str(c) for c in cmd))
++    subprocess.run(cmd, cwd=cwd, env=env, check=True)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description="Build/sign/install the arkweb-test HAP.")
++    parser.add_argument("--sdk-dir", default="/home/ubuntu/ohos-sdk-w")
++    parser.add_argument("--hvigorw", default="/opt/command-line-tools/bin/hvigorw")
++    parser.add_argument("--node-dir", default="/opt/command-line-tools/tool/node")
++    parser.add_argument("--compile-sdk", default="21", help="API version the SDK provides")
++    parser.add_argument("--target", default=None, help="hdc device serial (auto if one device)")
++    parser.add_argument("--hdc", default="hdc")
++    parser.add_argument("--no-install", action="store_true", help="build + sign only")
++    args = parser.parse_args()
++
++    sdk = Path(args.sdk_dir)
++    sign_tool = sdk / "default/openharmony/toolchains/lib/hap-sign-tool.jar"
++    if not sign_tool.exists():
++        candidates = list(sdk.rglob("hap-sign-tool.jar"))
++        if candidates:
++            sign_tool = candidates[0]
++    if not sign_tool.exists():
++        sys.exit(f"hap-sign-tool.jar not found under {sdk}")
++
++    profile = APP / "build-profile.json5"
++    original = profile.read_text()
++    (APP / "local.properties").write_text(f"sdk.dir={sdk}\nnodejs.dir={args.node_dir}\n")
++
++    try:
++        # Lower the SDK version and clear signingConfigs so hvigor builds an unsigned HAP.
++        munged = original
++        munged = re.sub(r'"compileSdkVersion":\s*\d+', f'"compileSdkVersion": {args.compile_sdk}', munged)
++        munged = re.sub(r'"targetSdkVersion":\s*\d+', f'"targetSdkVersion": {args.compile_sdk}', munged)
++        munged = re.sub(r'"signingConfigs":\s*\[.*?\],', '"signingConfigs": [],', munged, count=1, flags=re.S)
++        munged = re.sub(r'\s*"signingConfig":\s*"[^"]*",\n', "\n", munged, count=1)
++        profile.write_text(munged)
++
++        env = {**os.environ, "DEVECO_SDK_HOME": str(sdk), "OHOS_BASE_SDK_HOME": str(sdk)}
++        run(
++            [args.hvigorw, "assembleHap", "--mode", "module", "-p", "product=default", "--no-daemon"],
++            cwd=APP,
++            env=env,
++        )
++    finally:
++        profile.write_text(original)  # restore compileSdkVersion 26 + signingConfigs
++
++    unsigned = APP / "entry/build/default/outputs/default/entry-default-unsigned.hap"
++    if not unsigned.exists():
++        sys.exit(f"unsigned HAP not produced at {unsigned}")
++    signed = APP / "entry/build/default/outputs/default/entry-signed.hap"
++    signing = APP / "signing"
++    run(
++        [
++            "java",
++            "-jar",
++            str(sign_tool),
++            "sign-app",
++            "-keyAlias",
++            "openharmony application release",
++            "-signAlg",
++            "SHA256withECDSA",
++            "-mode",
++            "localSign",
++            "-appCertFile",
++            str(signing / "OpenHarmonyApplication.pem"),
++            "-profileFile",
++            str(signing / "profile-debug.p7b"),
++            "-keystoreFile",
++            str(signing / "OpenHarmony.p12"),
++            "-inFile",
++            str(unsigned),
++            "-outFile",
++            str(signed),
++            "-keyPwd",
++            "123456",
++            "-keystorePwd",
++            "123456",
++        ]
++    )
++    print(f"signed HAP: {signed}")
++
++    if not args.no_install:
++        hdc = [args.hdc]
++        if args.target:
++            hdc += ["-t", args.target]
++        run([*hdc, "shell", "aa", "force-stop", BUNDLE])
++        run([*hdc, "install", "-r", str(signed)])
++        print("installed.")
++
++
++if __name__ == "__main__":
++    main()

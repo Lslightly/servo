@@ -1,0 +1,765 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 10 Jul 2026 20:52:19 +0000
+Subject: [PATCH] ports/arkweb: wire HTTP-auth and permission request delegates
+
+request_authentication -> OnHttpAuthRequestByJS and request_permission ->
+onGeolocationShow/onPermissionRequest, via parked requests resolved through
+new resolve_http_auth/resolve_permission bridge fns. Enable dom_geolocation.
+
+HTTP auth works end-to-end; the permission path is wired but not yet reachable
+from web content (Servo geolocation/getUserMedia don't send PromptPermission).
+
+Add ControllerPage handlers, an http_server conftest fixture (loopback = secure
+context, + Basic-auth endpoint) and test_permissions.py. The HTTP-auth
+round-trip is verified; the geolocation prompt is tracked as xfail pending
+Servo-side plumbing.
+
+Validation: Test by running uv run ports/arkweb/tools/test_permissions.py on a device.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+
+Require an explicit target when several devices are attached.
+
+The pytest fixtures took `Hdc().list_targets()[0]`, so on a bench with more than
+one device connected the suite silently drove whichever one hdc happened to
+enumerate first. `http_server` made it worse by resolving the target a second
+time, independently of the `device` fixture, so its `hdc rport` could land on a
+different device than the tests were driving.
+
+Resolve the serial once, in a session-scoped `hdc_target` fixture, with the
+semantics deploy.py already uses for `--target`: a lone attached device is used
+implicitly, an ambiguous fleet is an error naming the attached serials, and an
+explicitly requested serial that is not attached is an error rather than a
+silent fallback. The choice comes from `--target` or `HDC_TARGET`; the env var
+is what makes the single-file `uv run ports/arkweb/tools/test_x.py` form
+selectable, since its `__main__` does not forward arguments to pytest.
+
+Validation: Test with two devices attached: the suite must fail naming both serials, `--target=<serial>` and `HDC_TARGET=<serial>` must each run against the named device, and an unattached serial must be rejected. `uv run ports/arkweb/tools/test_render.py` covers the single-file path and test_permissions.py the `hdc rport` path.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/README.md                        |   4 +
+ ports/arkweb/cpp/servo_client.h               |  13 ++
+ ports/arkweb/cpp/servo_handler_proxy.cpp      |  81 +++++++++
+ ports/arkweb/cpp/servo_handler_proxy.h        |   6 +
+ ports/arkweb/src/bridge.rs                    |  42 +++++
+ ports/arkweb/src/runtime.rs                   | 159 +++++++++++++++++-
+ .../src/main/ets/pages/ControllerPage.ets     |  38 +++++
+ ports/arkweb/tools/conftest.py                | 120 ++++++++++++-
+ ports/arkweb/tools/test_permissions.py        |  60 +++++++
+ 9 files changed, 512 insertions(+), 11 deletions(-)
+ create mode 100644 ports/arkweb/tools/test_permissions.py
+
+diff --git a/ports/arkweb/README.md b/ports/arkweb/README.md
+index 1edcbfa870a..8507387fff0 100644
+--- a/ports/arkweb/README.md
++++ b/ports/arkweb/README.md
+@@ -55,6 +55,10 @@ uv run --with pytest --with hdc-py --with pillow python -m pytest ports/arkweb/t
+ uv run ports/arkweb/tools/test_scroll.py
+ ```
+ 
++With more than one device attached the suite refuses to guess: pass `--target=<serial>`, or
++set `HDC_TARGET=<serial>` (which also works for the single-file form above, whose `__main__`
++does not forward arguments to pytest). A lone attached device needs neither.
++
+ The session fixture skips everything when no device is connected or the shim is not
+ deployed, sets `web.engine.enforce=100` if unset (not persistent across reboots), and wakes
+ and unlocks the screen. The IME tests additionally need a default input method on the
+diff --git a/ports/arkweb/cpp/servo_client.h b/ports/arkweb/cpp/servo_client.h
+index 4763a44ba3a..80438d74ffb 100644
+--- a/ports/arkweb/cpp/servo_client.h
++++ b/ports/arkweb/cpp/servo_client.h
+@@ -46,6 +46,19 @@ public:
+     // via servo::arkweb::file_picker_continue / file_picker_cancel.
+     virtual bool show_file_picker(std::uint64_t picker_id, const std::string& accept_types,
+                                   bool multiple) const = 0;
++    // Asks ACE to show a geolocation permission prompt for `origin` (ArkTS onGeolocationShow).
++    // Returns whether a handler took it; the decision arrives via servo::arkweb::resolve_permission.
++    virtual bool show_geolocation_permission(std::uint64_t request_id,
++                                             const std::string& origin) const = 0;
++    // Asks ACE to show a permission prompt (ArkTS onPermissionRequest). `resources` is the
++    // NWebAccessRequest resource bitmask (1<<1 video capture, 1<<2 audio capture). Returns whether
++    // a handler took it; the decision arrives via servo::arkweb::resolve_permission.
++    virtual bool show_permission_request(std::uint64_t request_id, const std::string& origin,
++                                         std::int32_t resources) const = 0;
++    // Asks ACE to show an HTTP-auth login prompt (ArkTS onHttpAuthRequest). Returns whether a
++    // handler took it; credentials arrive via servo::arkweb::resolve_http_auth.
++    virtual bool show_http_auth_request(std::uint64_t request_id, const std::string& host,
++                                        const std::string& realm) const = 0;
+ };
+ 
+ }  // namespace servo::embedder
+diff --git a/ports/arkweb/cpp/servo_handler_proxy.cpp b/ports/arkweb/cpp/servo_handler_proxy.cpp
+index 03d727b4958..7c2bdb57391 100644
+--- a/ports/arkweb/cpp/servo_handler_proxy.cpp
++++ b/ports/arkweb/cpp/servo_handler_proxy.cpp
+@@ -5,9 +5,12 @@
+ #include <utility>
+ 
+ #include "arkweb/src/bridge.rs.h"
++#include "ohos_nweb/nweb_access_request.h"
+ #include "ohos_nweb/nweb_console_log.h"
+ #include "ohos_nweb/nweb_file_selector_params.h"
++#include "ohos_nweb/nweb_geolocation_callback_interface.h"
+ #include "ohos_nweb/nweb_js_dialog_result.h"
++#include "ohos_nweb/nweb_js_http_auth_result.h"
+ #include "ohos_nweb/nweb_select_popup_menu.h"
+ #include "ohos_nweb/nweb_value_callback.h"
+ 
+@@ -301,4 +304,82 @@ bool NWebHandlerProxy::show_js_dialog(std::uint64_t dialog_id, std::int32_t kind
+     }
+ }
+ 
++namespace {
++// The callback ACE / the app invokes with the geolocation decision, routed back to the parked
++// Servo PermissionRequest by id. `retain`/`incognito` have no Servo equivalent and are dropped.
++class ServoGeolocationCallback : public NWebGeolocationCallbackInterface {
++public:
++    explicit ServoGeolocationCallback(std::uint64_t request_id) : request_id_(request_id) {}
++    void GeolocationCallbackInvoke(const std::string& /*origin*/, bool allow, bool /*retain*/,
++                                   bool /*incognito*/) override {
++        servo::arkweb::resolve_permission(request_id_, allow);
++    }
++
++private:
++    std::uint64_t request_id_;
++};
++
++// The access request handed to ACE / the app for non-geolocation permission prompts
++// (camera / microphone). Agree/Refuse route back to the parked Servo PermissionRequest.
++class ServoAccessRequest : public NWebAccessRequest {
++public:
++    ServoAccessRequest(std::uint64_t request_id, std::string origin, int resources)
++        : request_id_(request_id), origin_(std::move(origin)), resources_(resources) {}
++    std::string Origin() override { return origin_; }
++    int ResourceAcessId() override { return resources_; }
++    void Agree(int /*resourceId*/) override { servo::arkweb::resolve_permission(request_id_, true); }
++    void Refuse() override { servo::arkweb::resolve_permission(request_id_, false); }
++
++private:
++    std::uint64_t request_id_;
++    std::string origin_;
++    int resources_;
++};
++
++// The result object ACE / the app invokes with HTTP-auth credentials (or cancellation), routed
++// back to the parked Servo AuthenticationRequest by id.
++class ServoHttpAuthResult : public NWebJSHttpAuthResult {
++public:
++    explicit ServoHttpAuthResult(std::uint64_t request_id) : request_id_(request_id) {}
++    bool Confirm(const std::string& userName, const std::string& pwd) override {
++        servo::arkweb::resolve_http_auth(request_id_, true, userName, pwd);
++        return true;
++    }
++    void Cancel() override { servo::arkweb::resolve_http_auth(request_id_, false, "", ""); }
++    bool IsHttpAuthInfoSaved() override { return false; }
++
++private:
++    std::uint64_t request_id_;
++};
++}  // namespace
++
++bool NWebHandlerProxy::show_geolocation_permission(std::uint64_t request_id,
++                                                   const std::string& origin) const {
++    auto h = handler();
++    if (!h) {
++        return false;
++    }
++    h->OnGeolocationShow(origin, std::make_shared<ServoGeolocationCallback>(request_id));
++    return true;
++}
++
++bool NWebHandlerProxy::show_permission_request(std::uint64_t request_id, const std::string& origin,
++                                               std::int32_t resources) const {
++    auto h = handler();
++    if (!h) {
++        return false;
++    }
++    h->OnPermissionRequest(std::make_shared<ServoAccessRequest>(request_id, origin, resources));
++    return true;
++}
++
++bool NWebHandlerProxy::show_http_auth_request(std::uint64_t request_id, const std::string& host,
++                                              const std::string& realm) const {
++    auto h = handler();
++    if (!h) {
++        return false;
++    }
++    return h->OnHttpAuthRequestByJS(std::make_shared<ServoHttpAuthResult>(request_id), host, realm);
++}
++
+ }  // namespace servo::arkweb
+diff --git a/ports/arkweb/cpp/servo_handler_proxy.h b/ports/arkweb/cpp/servo_handler_proxy.h
+index 355f946a38e..a8a4c983d25 100644
+--- a/ports/arkweb/cpp/servo_handler_proxy.h
++++ b/ports/arkweb/cpp/servo_handler_proxy.h
+@@ -36,6 +36,12 @@ public:
+                            std::int32_t height) const override;
+     bool show_file_picker(std::uint64_t picker_id, const std::string& accept_types,
+                           bool multiple) const override;
++    bool show_geolocation_permission(std::uint64_t request_id,
++                                     const std::string& origin) const override;
++    bool show_permission_request(std::uint64_t request_id, const std::string& origin,
++                                 std::int32_t resources) const override;
++    bool show_http_auth_request(std::uint64_t request_id, const std::string& host,
++                                const std::string& realm) const override;
+ 
+ private:
+     std::shared_ptr<OHOS::NWeb::NWebHandler> handler() const;
+diff --git a/ports/arkweb/src/bridge.rs b/ports/arkweb/src/bridge.rs
+index 6eeb343ac40..45b46a96595 100644
+--- a/ports/arkweb/src/bridge.rs
++++ b/ports/arkweb/src/bridge.rs
+@@ -130,6 +130,30 @@ pub mod ffi {
+             accept_types: &CxxString,
+             multiple: bool,
+         ) -> bool;
++        /// Ask ACE to show a geolocation permission prompt for `origin`. Returns whether a
++        /// handler took it; the decision comes back via `resolve_permission`.
++        fn show_geolocation_permission(
++            self: &WebViewClient,
++            request_id: u64,
++            origin: &CxxString,
++        ) -> bool;
++        /// Ask ACE to show a permission prompt for the `NWebAccessRequest` resource bitmask
++        /// (1<<1 video capture, 1<<2 audio capture). The decision comes back via
++        /// `resolve_permission`.
++        fn show_permission_request(
++            self: &WebViewClient,
++            request_id: u64,
++            origin: &CxxString,
++            resources: i32,
++        ) -> bool;
++        /// Ask ACE to show an HTTP-auth login prompt. Credentials come back via
++        /// `resolve_http_auth`.
++        fn show_http_auth_request(
++            self: &WebViewClient,
++            request_id: u64,
++            host: &CxxString,
++            realm: &CxxString,
++        ) -> bool;
+     }
+ }
+ 
+@@ -154,6 +178,18 @@ pub mod ffi_arkweb {
+         fn file_picker_continue(picker_id: u64, paths: &CxxVector<CxxString>);
+         /// The file picker was dismissed without a selection.
+         fn file_picker_cancel(picker_id: u64);
++        /// Deliver a permission decision from ACE back to the parked `PermissionRequest`
++        /// (geolocation and access-request prompts alike, see `show_geolocation_permission` /
++        /// `show_permission_request`).
++        fn resolve_permission(request_id: u64, allow: bool);
++        /// Deliver HTTP-auth credentials (or cancellation) from ACE back to the parked
++        /// `AuthenticationRequest` (see `show_http_auth_request`).
++        fn resolve_http_auth(
++            request_id: u64,
++            confirmed: bool,
++            username: &CxxString,
++            password: &CxxString,
++        );
+     }
+ 
+     unsafe extern "C++" {
+@@ -291,3 +327,9 @@ fn file_picker_continue(picker_id: u64, paths: &CxxVector<CxxString>) {
+ fn file_picker_cancel(picker_id: u64) {
+     crate::runtime::file_picker_cancel(picker_id)
+ }
++fn resolve_permission(request_id: u64, allow: bool) {
++    crate::runtime::resolve_permission(request_id, allow)
++}
++fn resolve_http_auth(request_id: u64, confirmed: bool, username: &CxxString, password: &CxxString) {
++    crate::runtime::resolve_http_auth(request_id, confirmed, username, password)
++}
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index 3b861e36b16..106665a6676 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -33,13 +33,14 @@ use raw_window_handle::{
+     WindowHandle,
+ };
+ use servo::{
+-    CompositionEvent, CompositionState, ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D,
+-    EmbedderControl, EmbedderControlId, EventLoopWaker, FilePicker, ImeEvent, InputEvent,
+-    InputMethodControl, InputMethodType, JSValue, Key, KeyState, KeyboardEvent, LoadStatus,
+-    MediaSessionActionType, MediaSessionEvent, NamedKey, Opts, Preferences, RefreshDriver,
+-    RenderingContext, Scroll, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder,
+-    SimpleDialog, TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
+-    WebViewDelegate, WindowRenderingContext,
++    AuthenticationRequest, CompositionEvent, CompositionState, ConsoleLogLevel, CookieSource,
++    DevicePoint, DeviceVector2D, EmbedderControl, EmbedderControlId, EventLoopWaker, FilePicker,
++    ImeEvent, InputEvent, InputMethodControl, InputMethodType, JSValue, Key, KeyState,
++    KeyboardEvent, LoadStatus, MediaSessionActionType, MediaSessionEvent, NamedKey, Opts,
++    PermissionFeature, PermissionRequest, Preferences, RefreshDriver, RenderingContext, Scroll,
++    SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog, TouchEvent,
++    TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate,
++    WindowRenderingContext,
+ };
+ use url::Url;
+ 
+@@ -187,6 +188,18 @@ enum Action {
+         paths: Vec<String>,
+         cancelled: bool,
+     },
++    /// A permission decision from ACE (geolocation callback or access-request object).
++    ResolvePermission {
++        request_id: u64,
++        allow: bool,
++    },
++    /// HTTP-auth credentials (or cancellation) from ACE.
++    ResolveHttpAuth {
++        request_id: u64,
++        confirmed: bool,
++        username: String,
++        password: String,
++    },
+     GetCookie {
+         url: String,
+         include_http_only: bool,
+@@ -316,6 +329,48 @@ fn resolve_file_picker(picker_id: u64, paths: Vec<String>, cancelled: bool) {
+     });
+ }
+ 
++static NEXT_PERMISSION_ID: AtomicU64 = AtomicU64::new(1);
++
++thread_local! {
++    /// Permission prompts (geolocation, camera/microphone) awaiting a decision. Like the other
++    /// `!Send` embedder requests, the `PermissionRequest` is parked on the servo thread; ACE (or
++    /// the app's permission handler) reports the decision through the geolocation callback /
++    /// access-request object, routed back as an `Action`.
++    static PERMISSION_REQUESTS: RefCell<HashMap<u64, PermissionRequest>> =
++        RefCell::new(HashMap::new());
++}
++
++fn resolve_parked_permission(request_id: u64, allow: bool) {
++    PERMISSION_REQUESTS.with(|requests| {
++        if let Some(request) = requests.borrow_mut().remove(&request_id) {
++            if allow {
++                request.allow();
++            } else {
++                request.deny();
++            }
++        }
++    });
++}
++
++static NEXT_AUTH_ID: AtomicU64 = AtomicU64::new(1);
++
++thread_local! {
++    /// HTTP-auth requests awaiting credentials. Dropping a parked request responds "no
++    /// credentials" (the load proceeds to the error/401 page), which is also the cancel path.
++    static AUTH_REQUESTS: RefCell<HashMap<u64, AuthenticationRequest>> =
++        RefCell::new(HashMap::new());
++}
++
++fn resolve_parked_http_auth(request_id: u64, confirmed: bool, username: String, password: String) {
++    AUTH_REQUESTS.with(|requests| {
++        if let Some(request) = requests.borrow_mut().remove(&request_id) {
++            if confirmed {
++                request.authenticate(username, password);
++            }
++        }
++    });
++}
++
+ /// Resolve a parked JS dialog with the user's response and unblock the page's script. A prompt
+ /// carries the entered text on confirm; everything else confirms or cancels.
+ fn resolve_parked_dialog(dialog_id: u64, confirmed: bool, value: String) {
+@@ -515,6 +570,9 @@ impl ServoThread {
+             // off by default in Servo. Backed by the OHOS system pasteboard via the clipboard
+             // delegate. (`ClipboardEvent`/`execCommand` copy-paste is already enabled by default.)
+             dom_async_clipboard_enabled: true,
++            // Expose `navigator.geolocation` so the ArkWeb geolocation permission flow
++            // (onGeolocationShow) is reachable; off by default in Servo.
++            dom_geolocation_enabled: true,
+             ..Default::default()
+         };
+         // Route networking through an HTTP(S) proxy when one is configured (dev/testing aid; the
+@@ -803,6 +861,15 @@ impl ServoThread {
+                 paths,
+                 cancelled,
+             } => resolve_file_picker(picker_id, paths, cancelled),
++            Action::ResolvePermission { request_id, allow } => {
++                resolve_parked_permission(request_id, allow)
++            },
++            Action::ResolveHttpAuth {
++                request_id,
++                confirmed,
++                username,
++                password,
++            } => resolve_parked_http_auth(request_id, confirmed, username, password),
+             Action::GetCookie {
+                 url,
+                 include_http_only,
+@@ -1190,6 +1257,62 @@ impl WebViewDelegate for ArkWebViewDelegate {
+         }
+     }
+ 
++    fn request_permission(&self, webview: WebView, request: PermissionRequest) {
++        // ArkWeb splits permission prompts: geolocation goes through the dedicated
++        // onGeolocationShow event, camera/microphone through onPermissionRequest (an
++        // NWebAccessRequest resource bitmask). Other features have no ArkWeb prompt; dropping
++        // the request sends Servo's default response.
++        let Some(client) = self.client.as_ref() else {
++            return;
++        };
++        let feature = request.feature();
++        let origin = webview
++            .url()
++            .map(|url| url.origin().ascii_serialization())
++            .unwrap_or_default();
++        let request_id = NEXT_PERMISSION_ID.fetch_add(1, Ordering::Relaxed);
++        cxx::let_cxx_string!(origin_cxx = &origin);
++        let shown = match feature {
++            PermissionFeature::Geolocation => {
++                PERMISSION_REQUESTS.with(|r| r.borrow_mut().insert(request_id, request));
++                client.show_geolocation_permission(request_id, &origin_cxx)
++            },
++            PermissionFeature::Camera | PermissionFeature::Microphone => {
++                let resources = if matches!(feature, PermissionFeature::Camera) {
++                    1 << 1
++                } else {
++                    1 << 2
++                };
++                PERMISSION_REQUESTS.with(|r| r.borrow_mut().insert(request_id, request));
++                client.show_permission_request(request_id, &origin_cxx, resources)
++            },
++            feature => {
++                info!("[arkweb] no ArkWeb prompt for permission {feature:?}; default response");
++                return;
++            },
++        };
++        if !shown {
++            resolve_parked_permission(request_id, false);
++        }
++    }
++
++    fn request_authentication(&self, _webview: WebView, request: AuthenticationRequest) {
++        // Dropping the request responds "no credentials", so bailing out (no client / no ArkTS
++        // handler) lets the load continue to the 401 page rather than hanging.
++        let Some(client) = self.client.as_ref() else {
++            return;
++        };
++        let host = request.url().host_str().unwrap_or_default().to_owned();
++        let request_id = NEXT_AUTH_ID.fetch_add(1, Ordering::Relaxed);
++        AUTH_REQUESTS.with(|r| r.borrow_mut().insert(request_id, request));
++        cxx::let_cxx_string!(host_cxx = &host);
++        // Servo does not surface the authentication realm (or proxy-ness) to the embedder.
++        cxx::let_cxx_string!(realm_cxx = "");
++        if !client.show_http_auth_request(request_id, &host_cxx, &realm_cxx) {
++            resolve_parked_http_auth(request_id, false, String::new(), String::new());
++        }
++    }
++
+     fn notify_media_session_event(&self, _webview: WebView, event: MediaSessionEvent) {
+         if let MediaSessionEvent::PlaybackStateChange(state) = event {
+             // Servo's MediaSessionPlaybackState is 1-based (None_=1); OHOS MediaPlaybackState is
+@@ -1692,6 +1815,28 @@ pub fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString) {
+     })
+ }
+ 
++pub fn resolve_permission(request_id: u64, allow: bool) {
++    guard("resolve_permission", || {
++        send(Action::ResolvePermission { request_id, allow })
++    })
++}
++
++pub fn resolve_http_auth(
++    request_id: u64,
++    confirmed: bool,
++    username: &CxxString,
++    password: &CxxString,
++) {
++    guard("resolve_http_auth", || {
++        send(Action::ResolveHttpAuth {
++            request_id,
++            confirmed,
++            username: username.to_string(),
++            password: password.to_string(),
++        })
++    })
++}
++
+ pub fn select_popup_continue(select_id: u64, indices: &CxxVector<i32>) {
+     guard("select_popup_continue", || {
+         send(Action::ResolveSelectPopup {
+diff --git a/ports/arkweb/test-app/entry/src/main/ets/pages/ControllerPage.ets b/ports/arkweb/test-app/entry/src/main/ets/pages/ControllerPage.ets
+index a0853d9c63c..321f50af402 100644
+--- a/ports/arkweb/test-app/entry/src/main/ets/pages/ControllerPage.ets
++++ b/ports/arkweb/test-app/entry/src/main/ets/pages/ControllerPage.ets
+@@ -28,6 +28,19 @@ function colorPage(name: string, color: string): string {
+   return 'data:text/html,' + encodeURIComponent(html);
+ }
+ 
++// Requests the current position on load and paints the outcome: green = got a position,
++// red = permission denied (code 1), blue = granted but unavailable/timeout. Grey = still waiting.
++function geoPage(): string {
++  const html = `<html><head><title>geo-page</title></head>
++<body style="margin:0;background:#dddddd">
++<script>
++navigator.geolocation.getCurrentPosition(
++  function(p){document.body.style.background='#00cc00';},
++  function(e){document.body.style.background=(e.code===1)?'#cc0000':'#2244cc';});
++</script></body></html>`;
++  return 'data:text/html,' + encodeURIComponent(html);
++}
++
+ @Entry
+ @Component
+ struct ControllerPage {
+@@ -146,6 +159,10 @@ struct ControllerPage {
+           this.controller.resumeAllMedia();
+           return 'ok';
+         }))
++        this.apiButton('loadGeo', () => this.invoke('loadGeo', () => {
++          this.controller.loadUrl(geoPage());
++          return 'ok';
++        }))
+       }
+       // Cookie manager (WebCookieManager), for the page passed as the start URL.
+       Row({ space: 2 }) {
+@@ -178,6 +195,27 @@ struct ControllerPage {
+             report('pageEnd', event.url.substring(0, 80));
+           }
+         })
++        .onGeolocationShow((event) => {
++          if (event) {
++            report('geoShow', event.origin);
++            event.geolocation.invoke(event.origin, true, false);
++          }
++        })
++        .onPermissionRequest((event) => {
++          if (event) {
++            report('permission', event.request.getOrigin());
++            // Deny camera/microphone: Servo's OHOS getUserMedia backend is unimplemented, so
++            // granting would let the page proceed into an unsupported capture path.
++            event.request.deny();
++          }
++        })
++        .onHttpAuthRequest((event) => {
++          if (event) {
++            report('httpAuth', `${event.host}|${event.realm}`);
++            event.handler.confirm('user', 'passwd');
++          }
++          return true;
++        })
+     }
+     .width('100%')
+     .height('100%')
+diff --git a/ports/arkweb/tools/conftest.py b/ports/arkweb/tools/conftest.py
+index 28611cc915f..e570c04302b 100644
+--- a/ports/arkweb/tools/conftest.py
++++ b/ports/arkweb/tools/conftest.py
+@@ -22,10 +22,13 @@ xDevice, or the on-device @ohos/hypium module, once that tooling is validated he
+ from __future__ import annotations
+ 
+ import base64
++import http.server
+ import json
+ import os
+ import re
+ import shlex
++import subprocess
++import threading
+ import time
+ from collections.abc import Callable
+ from pathlib import Path
+@@ -300,13 +303,42 @@ def region_changed(
+ # --- fixtures --------------------------------------------------------------------------
+ 
+ 
++def pytest_addoption(parser: pytest.Parser) -> None:
++    parser.addoption(
++        "--target",
++        default=None,
++        help="hdc target serial to run against. Required when more than one device is attached; "
++        "may also be given as HDC_TARGET.",
++    )
++
++
+ @pytest.fixture(scope="session")
+-def device() -> HarmonyDevice:
+-    hdc = Hdc()
+-    targets = hdc.list_targets()
++def hdc_target(pytestconfig: pytest.Config) -> str:
++    """The hdc serial every fixture drives, mirroring deploy.py's --target semantics.
++
++    A lone attached device is used implicitly, but an ambiguous fleet has to be
++    disambiguated: picking the first listed target silently drives whichever device hdc
++    happened to enumerate first, which on a multi-device bench is somebody else's phone.
++    """
++    explicit = pytestconfig.getoption("--target") or os.environ.get("HDC_TARGET")
++    targets = Hdc().list_targets()
+     if not targets:
+         pytest.skip("no hdc device connected")
+-    dev = hdc.connect(targets[0])
++    if explicit:
++        if explicit not in targets:
++            pytest.fail(f"requested target {explicit!r} is not connected; attached: {', '.join(targets)}")
++        return explicit
++    if len(targets) > 1:
++        pytest.fail(
++            "multiple hdc targets connected; select one with --target=<serial> or HDC_TARGET=<serial>: "
++            + ", ".join(targets)
++        )
++    return targets[0]
++
++
++@pytest.fixture(scope="session")
++def device(hdc_target: str) -> HarmonyDevice:
++    dev = Hdc().connect(hdc_target)
+     probe = sh(dev, f"if [ -f {SHIM_PATH} ]; then echo __OK__; else echo __MISSING__; fi", check=False)
+     if "__MISSING__" in probe:
+         pytest.skip(f"Servo shim not deployed at {SHIM_PATH} -- run deploy.py first")
+@@ -332,6 +364,86 @@ def dump(device: HarmonyDevice, tmp_path: Path):
+     return lambda: dump_layout(device, tmp_path)
+ 
+ 
++# --- local HTTP fixture server (device-reachable via hdc reverse-forward) ----------------
++
++GEO_PAGE = """<html><head><title>geo-page</title></head>
++<body style="margin:0;background:#dddddd">
++<script>
++navigator.geolocation.getCurrentPosition(
++  function(p){document.body.style.background='#00cc00';},
++  function(e){document.body.style.background=(e.code===1)?'#cc0000':'#2244cc';});
++</script></body></html>"""
++
++AUTH_OK_PAGE = "<html><body style='margin:0;background:#00cc00'>authed</body></html>"
++
++# user:passwd -- matches the credentials ControllerPage's onHttpAuthRequest confirms with.
++AUTH_CREDENTIALS = "Basic " + base64.b64encode(b"user:passwd").decode()
++
++
++class _FixtureHandler(http.server.BaseHTTPRequestHandler):
++    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
++        if self.path == "/geo.html":
++            self._page(GEO_PAGE)
++        elif self.path == "/auth":
++            if self.headers.get("Authorization") == AUTH_CREDENTIALS:
++                self._page(AUTH_OK_PAGE)
++            else:
++                body = b"unauthorized"
++                self.send_response(401)
++                self.send_header("WWW-Authenticate", 'Basic realm="servo-test"')
++                self.send_header("Content-Type", "text/html")
++                self.send_header("Content-Length", str(len(body)))
++                self.end_headers()
++                self.wfile.write(body)
++        else:
++            self.send_error(404)
++
++    def _page(self, html: str) -> None:
++        body = html.encode()
++        self.send_response(200)
++        self.send_header("Content-Type", "text/html")
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    def log_message(self, format: str, *args) -> None:  # quiet
++        pass
++
++
++@pytest.fixture(scope="session")
++def http_server(device: HarmonyDevice, hdc_target: str):
++    """Base URL of a host-side fixture server, reachable from the device at 127.0.0.1.
++
++    An `hdc rport` reverse-forward makes the host server reachable on device loopback.
++    Loopback is a *potentially trustworthy* origin (a secure context), which data: URLs are
++    not -- required for anything gated on secure contexts, e.g. permission prompts
++    (non-secure contexts are silently denied without a prompt). Also serves the Basic-auth
++    endpoint (`/auth`, credentials user/passwd) for the HTTP-auth tests.
++    """
++    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _FixtureHandler)
++    port = server.server_address[1]
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    target = hdc_target
++    forward = f"tcp:{port}"
++    result = subprocess.run(
++        ["hdc", "-t", target, "rport", forward, forward],
++        capture_output=True,
++        text=True,
++        timeout=CMD_TIMEOUT,
++    )
++    assert "OK" in result.stdout or result.returncode == 0, f"hdc rport failed: {result.stdout!r}"
++    yield f"http://127.0.0.1:{port}"
++    subprocess.run(
++        ["hdc", "-t", target, "fport", "rm", forward, forward],
++        capture_output=True,
++        text=True,
++        timeout=CMD_TIMEOUT,
++        check=False,
++    )
++    server.shutdown()
++
++
+ @pytest.fixture
+ def launch(device: HarmonyDevice):
+     """Return a function that (re)launches the app on a page and waits for first render.
+diff --git a/ports/arkweb/tools/test_permissions.py b/ports/arkweb/tools/test_permissions.py
+new file mode 100644
+index 00000000000..c8785913ed0
+--- /dev/null
++++ b/ports/arkweb/tools/test_permissions.py
+@@ -0,0 +1,60 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""HTTP-auth and permission prompts wired from the Servo delegate to ArkWeb.
++
++HTTP auth (`request_authentication` -> `onHttpAuthRequest`) works end-to-end: a 401 endpoint
++on the `http_server` fixture triggers the prompt; ControllerPage's handler confirms with
++user/passwd; the credentials are retried and the server serves the authed page. Verified from
++pixels.
++
++Permission prompts (`request_permission` -> `onGeolocationShow` / `onPermissionRequest`) are
++wired on both the shim and app sides, but not reachable from web content on this Servo build:
++Servo's `Geolocation::request_position` never sends `PromptPermission` (steps 5/6 are TODO),
++getUserMedia is unimplemented, and even `navigator.storage.persist()` does not reach the
++delegate here. So the geolocation round-trip is a tracked xfail -- it will XPASS (alerting us)
++once Servo routes geolocation permission to the embedder. See conftest `http_server` for why
++fixtures are served over loopback (a secure context; permission prompts require one).
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from conftest import is_green, sample, wait_for_pixel, wait_log, web_box
++
++
++def _web_center(tree: dict) -> tuple[int, int]:
++    left, top, right, bottom = web_box(tree)
++    return ((left + right) // 2, (top + bottom) // 2)
++
++
++def test_http_auth_credentials_roundtrip(launch, device, dump, cap, http_server):
++    launch(page="controller", url=f"{http_server}/auth")
++
++    # Servo's 401 handling asked the embedder; the shim cannot surface the realm (empty).
++    assert wait_log(device, "ArkWebTest: httpAuth=127.0.0.1|"), "onHttpAuthRequest never fired"
++
++    # The confirmed credentials must be retried against the server: only then does it serve
++    # the green page.
++    point = _web_center(dump())
++    img = wait_for_pixel(cap, point, is_green, timeout=15.0)
++    assert is_green(sample(img, point)), "credentials round-trip did not reach the authed page"
++
++
++@pytest.mark.xfail(
++    reason="Servo Geolocation::request_position steps 5/6 are TODO: it never sends "
++    "PromptPermission, so request_permission -> onGeolocationShow is unreachable. "
++    "XPASS here means Servo now routes geolocation permission to the embedder.",
++    strict=False,
++)
++def test_geolocation_permission_prompt(launch, device, http_server):
++    launch(page="controller", url=f"{http_server}/geo.html")
++    assert wait_log(device, "ArkWebTest: geoShow=http://127.0.0.1"), "onGeolocationShow never fired"
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))

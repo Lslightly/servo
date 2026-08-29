@@ -1,0 +1,1373 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 29 Aug 2026 03:52:36 +0000
+Subject: [PATCH] docs: add the ohos-main sync runbook and stack manifest
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+docs/ohos-sync.md is the runbook for rebasing ohos-main onto upstream,
+including the fixed decisions (base = upstream tip, lockfile regenerated,
+superseded patches kept as annotated empty commits, signoff, AI-assisted
+trailer on agent-resolved conflicts, validation gate). docs/ohos-sync/STACK.md
+is the ordered patch manifest with a per-sync log; check_stack.py verifies
+it against the git log.
+
+The runbook also sets the stack conventions: the fold step may reorder under
+the same tree-identity rule, towards docs/CI first, additive as early as
+dependencies allow and invasive last; cfg guards shared by several fork
+features grow with the stack, each any() arm added by the patch that starts
+relying on the code, so every prefix builds with its own features. Its
+"After a sync: updating your branches" section covers the routine
+pull --rebase path, the cases where it trips, and the deterministic
+`git rebase --onto sync/<date> pre-sync/<date> <branch>` form the tags
+guarantee.
+
+Vendored third-party code in third_party/<name>, which
+third_party/patches/<name>/update.sh generates from upstream plus the
+patches next to it, is left out of the patch files, which would otherwise
+carry megabytes of generated sources. check_stack.py runs each
+update.sh --check instead, which needs network access, as the scripts fetch
+upstream.
+
+check_stack.py only ran by hand at sync time, so the `integrity` CI job runs
+check_integrity.py on every PR. CI has no `base/<date>` tags, so the script
+derives the base as `HEAD~<number of STACK.md entries>`, deepens the depth-1
+checkout to it, and runs the manifest and `git am` checks; a PR that adds a
+commit without a manifest line shifts the derived base and fails the
+subject comparison. The base must also be an ancestor of servo/servo main,
+checked via the GitHub compare API. The job checks out the PR head rather
+than GitHub's merge commit, which would not be a linear stack.
+
+Validation: uv run docs/ohos-sync/check_stack.py base/<date> passes on ohos-main and reports the manifest, the patch set and each vendored directory as ok. `uv run docs/ohos-sync/check_integrity.py` passes, also in a `git clone --depth 1` with no git identity configured, and fails with a subject diff for an extra commit without a manifest line and with "patch set does not reproduce the head tree" for an edited added line in a patch file. `uv run ruff check docs/ohos-sync` and `uv run ruff format --check docs/ohos-sync` pass.
+AI-assisted: drafted by an agent session from the maintainer's decisions; reviewed by the maintainer.
+AI-assisted: Yes (agent session; drafted from the maintainer's ordering and guard-widening proposal)
+AI-assisted: Yes (agent session; drafted from the maintainer's review question)
+AI-assisted: Yes (agent session; script and workflow written by the agent)
+AI-assisted: Yes (agent session; written and tested by the agent)
+AI-assisted: Yes (agent session; 2026-10-08 sync -- folded the seven `docs: record patches …` commits into this one, rewrote STACK.md and the patch set for the rebased stack, added the runbook notes on rerere, `--empty=ask`, re-vendoring, `mach -p` features and the per-commit Cargo.lock check, and made gen_patches.py and check_stack.py keep empty placeholder commits)
+AI-assisted: Yes (agent session; 2026-10-09 restack -- folded in "docs: stack ordering and feature-guard conventions", "ci: add an integrity job checking that base + patches reproduce the PR head", "docs/ohos-sync: keep vendored third-party code out of the patch files", "docs/ohos-sync: find vendoring scripts under third_party/patches too", the runbook part of "docs: document how to update local branches after a sync" and the tooling part of "third_party: move freetype-sys to the third_party/patches layout"; rewrote STACK.md for the restacked stack and added the restack note to the runbook)
+AI-assisted: Yes (agent session; 2026-10-13 sync -- folded the fourteen `docs: record patches …` commits into this one and rewrote STACK.md, its sync log and the patch set for the rebased stack, restarted the hdc server after deploy.py's reboot in step 3.4 and added a device-test gotcha on the `BuildNotFound` of `mach build -p arkweb`)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/integrity.yml   |  24 ++
+ docs/ohos-sync.md                 | 342 +++++++++++++++++++
+ docs/ohos-sync/STACK.md           | 542 ++++++++++++++++++++++++++++++
+ docs/ohos-sync/check_integrity.py |  66 ++++
+ docs/ohos-sync/check_stack.py     | 100 ++++++
+ docs/ohos-sync/drift.py           |  72 ++++
+ docs/ohos-sync/gen_patches.py     |  52 +++
+ docs/ohos-sync/stacklib.py        |  57 ++++
+ 8 files changed, 1255 insertions(+)
+ create mode 100644 .github/workflows/integrity.yml
+ create mode 100644 docs/ohos-sync.md
+ create mode 100644 docs/ohos-sync/STACK.md
+ create mode 100644 docs/ohos-sync/check_integrity.py
+ create mode 100644 docs/ohos-sync/check_stack.py
+ create mode 100644 docs/ohos-sync/drift.py
+ create mode 100644 docs/ohos-sync/gen_patches.py
+ create mode 100644 docs/ohos-sync/stacklib.py
+
+diff --git a/.github/workflows/integrity.yml b/.github/workflows/integrity.yml
+new file mode 100644
+index 00000000000..f9c1efd83ef
+--- /dev/null
++++ b/.github/workflows/integrity.yml
+@@ -0,0 +1,24 @@
++name: Integrity
++
++on:
++  pull_request:
++
++permissions:
++  contents: read
++
++jobs:
++  integrity:
++    name: integrity
++    runs-on: ubuntu-24.04
++    steps:
++      # The PR head, not GitHub's merge commit: the stack must stay linear.
++      - uses: actions/checkout@v6
++        with:
++          ref: ${{ github.event.pull_request.head.sha }}
++          fetch-depth: 1
++      - name: Check that base + patches reproduce the PR head
++        env:
++          GITHUB_TOKEN: ${{ github.token }}
++          GIT_COMMITTER_NAME: integrity
++          GIT_COMMITTER_EMAIL: integrity@invalid
++        run: python3 docs/ohos-sync/check_integrity.py
+diff --git a/docs/ohos-sync.md b/docs/ohos-sync.md
+new file mode 100644
+index 00000000000..ea1489dce8c
+--- /dev/null
++++ b/docs/ohos-sync.md
+@@ -0,0 +1,342 @@
++# Syncing `ohos-main` with upstream
++
++`ohos-main` is `main` (a mirror of `upstream/main`) plus an ordered patch
++stack. It is rebased regularly and force-pushed. This is the runbook; it is
++written so an agent session can run a sync end to end with only
++"run the sync runbook in docs/ohos-sync.md" as instruction.
++
++Rules the runbook implements come from `CONTRIBUTING.md`. Where the two
++disagree, `CONTRIBUTING.md` wins and this file must be fixed.
++
++## Terms
++
++- `base/<date>`: the upstream commit the stack sits on after the sync.
++- `pre-sync/<date>`: the `ohos-main` tip before the sync (recovery point and
++  left side of the range-diff review). Prunable after a few good syncs.
++- `sync/<date>`: the `ohos-main` tip after the sync. Permanent.
++- Stack manifest: `docs/ohos-sync/STACK.md`, the ordered list of patches on
++  the stack (tier, test coverage, upstream watch paths), plus a per-sync log
++  of conflicts, drift verdicts and drops. Checked against
++  `git log base/<date>..ohos-main` by `docs/ohos-sync/check_stack.py`.
++- Patch set: `docs/ohos-sync/patches/`, generated by `gen_patches.py`,
++  verified by `check_stack.py` (`git am` onto the base must reproduce the
++  tree). Its diff between syncs shows exactly which patches changed and
++  how — the reviewable form of the range-diff.
++- `integrity` CI job: runs `docs/ohos-sync/check_integrity.py` on every PR,
++  i.e. `check_stack.py` against the PR head with the base derived from the
++  manifest length (CI has no `base/<date>` tags), and checks that this base
++  is an upstream commit.
++
++## What a sync review consists of
++
++A rebase can go wrong in three ways, and each needs its own evidence:
++
++1. We changed a patch (conflict resolution, shrink, drop): visible in the
++   `patches/` diff and the range-diff. Reviewed hunk by hunk.
++2. Upstream changed something a patch relies on without a textual
++   conflict (semantic drift, duplicated functionality, stale rationale):
++   invisible in any diff. Surfaced by the drift report (`drift.py`) — every
++   hit gets a written verdict in the sync log, and a hit against a patch
++   with `manual` coverage means that patch's `Validation:` steps are run,
++   not merely classified.
++3. Everything else: the test gate (below). Coverage is uneven — `STACK.md`
++   says which patches rest on 2 alone.
++
++## Decisions (fixed, do not re-ask)
++
++1. Base = the tip of `upstream/main` at the time of the sync, unless the
++   sync request names a commit.
++2. `Cargo.lock` is never merged by hand. Resolve to upstream's version, then
++   regenerate the fork's additions with `cargo update -p <crate>` /
++   `cargo metadata --locked` until it is consistent.
++3. When upstream has landed something equivalent to a patch, the patch is
++   NOT silently dropped. Verify equivalence by running the patch's
++   `Validation:` steps against plain upstream. Then keep an empty commit
++   whose message states it was dropped in favor of upstream (`Superseded-by:
++   <upstream commit>`), who verified equivalence and how. Upstream doing
++   strictly more is fine; any regression stops the sync and is escalated to
++   a human. Empty placeholders are removed in the next sync's fold step
++   (step 2), and the drop is recorded in the manifest log.
++4. Every rebased commit gets `Signed-off-by` of the person running the sync
++   (`git rebase --signoff`).
++5. If an agent resolved a conflict, the commit gets an `AI-assisted:` trailer
++   (or an extra line on the existing one) that says what was changed, or
++   "mechanical conflict resolution, no semantic change". Never-conflicting
++   commits are not touched.
++6. Validation is a hard gate: all steps below must pass or be explicitly
++   answered by a human before `ohos-main` is force-pushed.
++7. Never push from an agent session. The human pushes the branch and tags.
++
++## Procedure
++
++### 0. Prepare
++
++```sh
++git fetch upstream main
++git tag pre-sync/<date> ohos-main
++git tag base/<date> upstream/main
++git worktree add -b ohos-sync-<date> <worktree-dir> ohos-main
++```
++
++Use a private cargo target dir for the worktree (see the workspace
++`AGENTS.md` if working in the servo-workspace container).
++
++Predict the conflicts before starting, and list the upstream commits that
++touch files the stack touches — this is the briefing for conflict
++resolution:
++
++```sh
++git merge-tree --write-tree upstream/main ohos-main | grep ^CONFLICT
++git diff --name-only base/<prev>..pre-sync/<date> | grep -v '^ports/arkweb/' \
++  | xargs git log --oneline base/<prev>..base/<date> --
++```
++
++Run the drift report and keep its output; the verdict column is filled in
++during step 3 and goes into the sync log:
++
++```sh
++uv run docs/ohos-sync/drift.py base/<prev> base/<date> ohos-main > drift.md
++```
++
++It lists, per patch, upstream commits touching the patch's own files and
++its `watch:` paths from `STACK.md`, plus a keyword scan of upstream
++subjects. This is how upstream equivalents (decision 3) and stale
++rationale are found when nothing conflicts. If a patch gained a new
++dependency surface, extend its `watch:` list in the same sync.
++
++### 1. Rebase
++
++```sh
++git -c rerere.enabled=false rebase --signoff --empty=ask \
++  --onto base/<date> base/<prev> ohos-sync-<date>
++```
++
++`--empty=ask` (`stop` from git 2.45) stops at a patch that applies empty,
++so it becomes a decision-3 placeholder instead of silently disappearing.
++Keep rerere off unless `.git/rr-cache` holds only resolutions recorded by
++earlier syncs of this stack (then use `--rerere-autoupdate`): a recorded
++resolution of unknown origin replays without a stop.
++
++For each stop:
++
++- Read the commit's message: intent and `Validation:` trailer.
++- Read the upstream commits that touched the conflicting hunks
++  (`git log -p base/<prev>..base/<date> -- <file>`).
++- Resolve, keeping the patch minimal against upstream-owned files (prefer
++  taking upstream's version and re-adding the fork's hook).
++- `Cargo.lock`: `git checkout --theirs`-equivalent is wrong here since in a
++  rebase "ours" is upstream; take the upstream side, then
++  `cargo metadata --locked` and fix by `cargo update -p` on the fork's own
++  dependencies only.
++- Vendored third-party code (`third_party/<name>`): when upstream moves the
++  pin its `third_party/patches/<name>/update.sh` reads (Stylo's `rev` in
++  `Cargo.toml`), rebase those patches onto the new pin in a checkout of the
++  project, re-export them with `update.sh --export-patches <checkout> <rev>`,
++  re-run `update.sh` and regenerate `Cargo.lock`; `update.sh --check` must
++  pass. A stale copy still builds, because `[patch]` resolves to whatever is
++  vendored, so check this whenever the pin moved, conflict or not.
++- Compile-check the crate(s) affected before continuing:
++  `./mach check --ohos -p <crate>` (arkweb and other OHOS-only crates are
++  not checkable on the host target). `mach` drops its `--features` when `-p`
++  is given; pass cargo arguments after `--` instead
++  (`./mach check --ohos -- -p servo-storage --features ohos-rdb-backend`).
++- Write the final message (original text, the `AI-assisted:` line from
++  decision 5) to a file, stage the resolution and commit it with
++
++  ```sh
++  git commit -s -F <file> --author="$(git log -1 --format='%an <%ae>' REBASE_HEAD)" \
++    --date="$(git log -1 --format=%ad REBASE_HEAD)"
++  ```
++
++  then `git rebase --continue`. Without `--author`/`--date` the sync runner
++  becomes the author of someone else's patch. Do not rely on amending after
++  `--continue`: the rebase runs on through every cleanly-applying pick, so
++  the commit is out of reach by then.
++
++If a patch applies empty, or applies but a `git log --grep` / file search
++shows upstream landed an equivalent: apply decision 3.
++
++### 2. Fold (when the stack has something to fold)
++
++A sync has two history-rewriting steps: the rebase (step 1) moves the stack,
++folding reshapes it. Do all folding here — after the rebase, before
++validation — so the stack is validated exactly once, in its final shape.
++
++Fold, via `git rebase -i base/<date>`:
++
++- fixup/follow-up commits into the commit they fix, tests into the commit
++  they test (a standalone fix commit survives only when its message carries
++  root-cause information worth keeping);
++- empty placeholder commits from a *previous* sync's supersede (decision 3)
++  are dropped now, one sync after they were created;
++- patches that upstreaming has whittled down can be merged with their
++  remaining sibling if that leaves one coherent patch;
++- the `docs: record patches …` commits added between syncs: `STACK.md` and
++  the patch set belong to the first commit, so their entries move there and
++  the commits disappear (no later commit touches `STACK.md` or `patches/`).
++
++Rules:
++
++- Tree identity: folding must not change content. `git diff <pre-fold-tip>
++  HEAD` must be empty; record the pre-fold tip in the sync report.
++- Ordering: a commit may only move earlier if nothing it needs (files,
++  features, README content its tests read) lands later — check with a quick
++  `git rebase -i` dry run; a failed pick means the move is illegal.
++- Messages: the surviving commit keeps its primary author; merge the
++  `Validation:` trailers (union of steps, deduplicated) and keep every
++  `AI-assisted:` line; note the fold in an added `AI-assisted:` line if an
++  agent performed it.
++- Bookkeeping: update `STACK.md` (entries removed/renamed) and list every
++  fold in the sync-log entry — what was folded into what, and why. The
++  manifest history is the record of when patches disappeared.
++- Reordering is also a fold-step operation, under the same tree-identity
++  rule. Target order: docs/policy/CI first, then as additive-early as
++  dependencies allow, invasive (tier C) last — conflicts then arrive with
++  the rest of the stack already applied, and every prefix stays buildable.
++  Batch reorders: patch-file renumbering makes each one a noisy review.
++
++If there is nothing to fold, say so in the sync report ("fold: nothing to
++do") rather than skipping silently.
++
++### 3. Validate
++
++Everything here runs in the sync worktree on the rebased stack.
++
++Mandatory:
++
++1. `./mach fmt --check` (or `./mach fmt` and confirm no diff), `./mach test-tidy`.
++2. `./mach check --ohos` for the whole workspace; then per-crate host tests
++   for stack crates that have them: `./mach test-unit -p servo-storage`,
++   `./mach test-unit -p arkweb` (host-tested module).
++3. Full OHOS release build:
++   `./mach build --ohos --release --no-package -p arkweb` and the servoshell
++   HAP build as used by the stack's Validation trailers.
++4. Deploy and run the on-device arkweb suite on an OpenHarmony device
++   (`ports/arkweb/README.md`, "On-device tests"); with several devices
++   attached set `HDC_TARGET`. `deploy.py` reboots the board, and the hdc
++   server does not re-enumerate a rebooted device: restart it with
++   `hdc kill -r` before running the suite. If every test fails with
++   `HdcDisconnectedError`, the device dropped off the hdc server: restart
++   it the same way, then rerun.
++5. Walk every `Validation:` trailer of the stack
++   (`git log --format='%h %(trailers:key=Validation,valueonly,unfold)' base/<date>..HEAD`)
++   and classify each: ran and passed / ran and failed / needs a human
++   (hardware or judgment). Commits that conflicted or were touched by
++   upstream churn in the same files must have their steps run, not just
++   classified.
++6. Drift verdicts: one line per hit in `drift.md` — no effect / mirrored
++   in commit X / rationale updated / superseded (decision 3) / needs a
++   human. Hits against `manual`-coverage patches escalate to running that
++   patch's `Validation:` steps.
++7. Stack integrity:
++   `git range-diff base/<prev>..pre-sync/<date> base/<date>..HEAD`
++   read in full; every commit has a non-empty `Validation:` trailer; every
++   commit that touches a `Cargo.toml` or `Cargo.lock` passes
++   `cargo metadata --locked --offline` (checked out in a scratch worktree),
++   so the stack stays bisectable; regenerate the patch set and check
++   everything:
++
++   ```sh
++   uv run docs/ohos-sync/gen_patches.py base/<date>
++   git add docs/ohos-sync/patches   # amend into the docs/manifest commit
++   uv run docs/ohos-sync/check_stack.py base/<date>
++   ```
++
++Any failure is a regression until proven a pre-existing upstream issue
++(check the same test on plain `base/<date>`). Regressions are fixed on the
++stack (in the commit that owns the code) before hand-off.
++
++### 4. Hand off
++
++Update `docs/ohos-sync/STACK.md` (manifest + sync log entry with the drift
++verdicts) and the patch set in the first commit of the stack and write the
++sync report:
++
++- upstream range (`base/<prev>..base/<date>`, commit count),
++- conflicts and how each was resolved,
++- drift hits and verdicts, and which manual validations they triggered,
++- patches superseded/dropped (decision 3) with the equivalence evidence,
++- validation results, verbatim for anything that failed or was skipped,
++- open items that need a human decision.
++
++The human reviews the sync with:
++
++```sh
++git diff pre-sync/<date> ohos-sync-<date> -- docs/ohos-sync
++```
++
++Reading it: most rebased patches should show exactly one added
++`Signed-off-by` line (message-only). A few more lines of `index`/hunk-header
++context churn appear in patches touching files upstream also modified
++(`Cargo.lock` above all) — noise, but it marks where context drifted.
++Everything else is a real change and is read hunk by hunk against the
++conflict/drift notes in the sync log; STACK.md's diff carries the sync-log
++entry itself. On the forge the same view is the `pre-sync/<date>` →
++`sync/<date>` compare filtered to the `docs/ohos-sync` path. Then:
++
++```sh
++git push --force-with-lease=ohos-main:pre-sync/<date> ohos ohos-sync-<date>:ohos-main
++git push ohos pre-sync/<date> base/<date>
++git tag sync/<date> ohos-sync-<date> && git push ohos sync/<date>
++```
++
++## After a sync: updating your branches
++
++`ohos-main` is force-pushed by the sync, so local branches need a rebase —
++the same routine one as after any upstream move:
++
++- Set `git config pull.rebase true` once. After a sync, `git pull --rebase`
++  on `ohos-main` and `git rebase ohos-main` on feature branches replay only
++  your own commits: fork-point detection (your reflog of the remote branch
++  knows the old published tip) excludes the old stack copies, and patch-id
++  matching drops anything content-identical to the new stack.
++- That covers the common case, not every case. It can trip when your clone
++  has no reflog of the old tip (fresh clone, long-unfetched machine), or
++  when you built directly on a patch the sync reshaped (conflict-resolved,
++  shrunk, folded, superseded).
++- The deterministic form needs neither reflog nor patch-id and is always
++  correct about which commits are yours:
++
++  ```sh
++  git rebase --onto sync/<date> pre-sync/<date> my-branch
++  ```
++
++  Only genuine content conflicts between your work and the new base remain
++  — those exist under any sync model.
++
++## Device-test gotchas
++
++- `ohos-test-runner` selects the device via `OHOS_TEST_RUNNER_HDC_TARGET`,
++  not `HDC_TARGET`, and is not safe under nextest's concurrent list/run
++  invocations (fixed device paths); wrap it in `flock` or run with a
++  serialising wrapper.
++- The repo's `.config/nextest.toml` slow-timeout (5 s × 4) kills device
++  tests; pass `--config-file` with a profile whose period is minutes.
++- `./mach package --ohos` cannot sign in a container whose signing config
++  has short passwords (hvigor `00303116`); sign the unsigned HAP with
++  `hap-sign-tool.jar` as `ports/arkweb/tools/build_test_app.py` does.
++- `./mach build --ohos --release --no-package -p arkweb` builds the library,
++  then fails in mach's post-build step with `BuildNotFound` when the profile
++  directory has no `libservoshell.so` (a fresh target directory); the
++  arkweb library is complete at that point.
++
++## Stack hygiene
++
++- Folding conventions live in step 2 of the procedure; between syncs, land
++  fixups as ordinary commits on `ohos-main` and let the next sync's fold
++  step fold them.
++- A fold-only restack between syncs, on the same base, follows step 2's
++  rules. Tag the old tip `pre-restack/<date>` and the new one
++  `restack/<date>`, record it in the sync log, and update branches with
++  `git rebase --onto restack/<date> pre-restack/<date> <branch>`.
++- Keep the docs/policy/CI commits first on the stack so they rebase first.
++- A patch that conflicts on consecutive syncs is a refactor-to-additive
++  work item; note it in the manifest log.
++- Feature guards grow with the stack: code shared by several fork features
++  starts under the first feature's `cfg` in the patch that adds it, and a
++  later patch widens the guard to `cfg(any(...))` when it starts relying on
++  the code — never a pre-emptive grab-bag "common" patch. At every stack
++  position the guard then equals exactly the features introduced so far, so
++  dropping a patch leaves no stale `any()` arms, and every prefix of the
++  stack builds with its own features (spot-check with
++  `cargo hack check --each-feature`).
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+new file mode 100644
+index 00000000000..fba08cdd162
+--- /dev/null
++++ b/docs/ohos-sync/STACK.md
+@@ -0,0 +1,542 @@
++# ohos-main patch stack
++
++Ordered list of the patches on `ohos-main`, first patch first. Kept in sync
++with `git log base/<date>..ohos-main` by `check_stack.py` (subjects must
++match exactly). Per entry:
++
++- tier per the fork policy: A = additive, B = seam in shared code,
++  C = invasive;
++- coverage: what proves the patch after a rebase — `CI` (host build/tests),
++  `device` (the arkweb on-device suite), `manual` (only its `Validation:`
++  recipe), `tooling` (self-checking scripts), `none` (docs);
++- watch: upstream paths the patch depends on but does not modify. `drift.py`
++  reports upstream commits touching them, so semantic drift is reviewed
++  even when the patch applies cleanly. Keep the list file-level and short.
++
++The checked-in `patches/` directory is generated from the stack by
++`gen_patches.py` and verified by `check_stack.py`; never edit it by hand.
++Its diff between syncs is the GitHub-viewable form of the range-diff.
++
++Vendored third-party code under `third_party/<name>` is left out of the patch
++files, which would otherwise carry megabytes of generated sources. Each
++`third_party/patches/<name>/update.sh` regenerates its directory from upstream
++plus the patches next to it, so after applying the stack to a fresh base, run
++those scripts (they need network access). `check_stack.py` runs each with
++`--check` to verify the committed copy.
++
++1. `docs: add the ohos-main sync runbook and stack manifest` — A · tooling · watch: -
++2. `docs: Mark this repo as an experimental OHOS downstream fork` — B · none · watch: -
++3. `Allow clearly marked AI assisted contributions` — B · none · watch: -
++4. `ports/arkweb: Servo as an alternative ArkWeb webview backend` — B · device · watch: components/servo/servo.rs components/servo/webview.rs components/servo/webview_delegate.rs components/shared/embedder ports/servoshell/egl/ohos
++5. `ports/arkweb: vendor the arkweb-test app + a HAP build script` — A · device · watch: -
++6. `ports/arkweb: Wire touch, scroll and key input; fix open/close leaks` — A · device · watch: components/shared/embedder/input_events.rs components/servo/webview.rs
++7. `ports/arkweb: Drive console, progress and crash handler callbacks` — A · device · watch: components/servo/webview_delegate.rs
++8. `ports/arkweb: Back the cookie manager with Servo's site-data manager` — B · device · watch: components/net/cookie_storage.rs components/servo/site_data_manager.rs
++9. `ports/arkweb: Return ExecuteJavaScript results to ACE` — A · device · watch: components/servo/webview.rs components/servo/javascript_evaluator.rs
++10. `ports/arkweb: Optional network proxy for on-device testing` — A · device · watch: components/config/prefs.rs
++11. `ports/arkweb: restrict libservo_arkweb.so exported symbols and load it with RTLD_LOCAL` — A · device · watch: -
++12. `ports/arkweb: drive presentation from the OHOS display vsync` — A · device · watch: components/servo/servo.rs components/servo/webview.rs
++13. `ports/arkweb: honor LibraryLoaded lazy flag, defer Servo::new` — A · device · watch: components/servo/servo.rs
++14. `ports/arkweb: split pure conversion helpers into a host-tested module` — B · CI · watch: components/shared/embedder
++15. `ports/arkweb: IME / soft-keyboard integration` — B · device · watch: components/shared/embedder/input_events.rs components/servo/webview_delegate.rs ports/servoshell/egl/ohos components/script/dom/html/form_controls/htmlinputelement.rs components/script/dom/html/form_controls/htmltextareaelement.rs components/script/dom/document/editing.rs
++16. `ports/arkweb: add on-device regression tests (scroll, nav, render, multi-webview, vsync)` — B · device · watch: -
++17. `ports/arkweb: JS dialogs (alert/confirm/prompt)` — A · device · watch: components/servo/webview_delegate.rs
++18. `ports/arkweb: <select> dropdowns` — A · device · watch: components/servo/webview_delegate.rs
++19. `ports/arkweb: <input type=file> pickers` — A · device · watch: components/servo/webview_delegate.rs
++20. `ports/arkweb: resolve <input type=color> (no ACE hook)` — A · device · watch: components/servo/webview_delegate.rs
++21. `ports/arkweb: wire the OHOS system clipboard via ohos-pasteboard` — B · device · watch: components/servo/clipboard_delegate.rs components/servo/Cargo.toml components/script/dom/clipboard
++22. `ports/arkweb: sync URL bar on history navigation` — A · device · watch: components/servo/webview_delegate.rs
++23. `ports/arkweb: add port README with build/deploy/test docs` — A · none · watch: -
++24. `ports/arkweb: wire Tier-1 NWeb methods` — A · device · watch: components/servo/webview.rs components/servo/webview_delegate.rs
++25. `ports/arkweb: wire HTTP-auth and permission request delegates` — A · device · watch: components/servo/webview_delegate.rs components/script/dom/geolocation components/script/dom/permission
++26. `ohos: add a chrome-less mode to the servoshell app` — B · manual · watch: ports/servoshell/prefs.rs
++27. `ohos: Insert committed IME text through a composition update` — B · manual · watch: components/script/dom/document/editing.rs components/shared/embedder/input_events.rs
++28. `layout: emit a trace marker when a reflow actually laid out` — B · manual · watch: components/shared/layout/lib.rs
++29. `fonts: Compute FreeType glyph advances without the autohinter` — B · CI+device · watch: -
++30. `third_party: vendor freetype-sys with the openharmony-rs patches` — B · CI · watch: components/fonts/platform/freetype
++31. `third_party: vendor Stylo with the eager pseudo-element cascade skip` — B · CI · watch: Cargo.toml deny.toml components/layout/query.rs components/script/layout_dom/servo_layout_element.rs
++32. `fonts: Report the load state of @font-face rules in FontFace.status` — B · CI · watch: -
++33. `fonts: Only load @font-face fonts that the page uses` — C · CI · watch: components/shared/fonts/font_template.rs components/script/dom/document/document.rs
++34. `fonts: Only relayout for web font changes that can affect laid-out text` — B · CI · watch: -
++35. `script: Lay out once for web fonts that finish loading together` — B · CI · watch: components/script/dom/globalscope/globalscope.rs components/net/image_cache.rs
++36. `script: Delay the load event while web fonts are loading` — B · CI · watch: -
++37. `storage: add an OHOS RDB backend for webstorage, client_storage and indexeddb` — C · CI+device · watch: components/storage components/config/prefs.rs components/net/Cargo.toml
++38. `ci: Choose the pull request jobs from the changed files` — B · CI · watch: python/servo/try_parser.py .github/workflows/linux-wpt.yml
++39. `ci: Smoke test the x86_64 HAP on the OpenHarmony emulator` — B · CI · watch: .github/workflows/ohos.yml support/openharmony/entry/src/main/module.json5
++40. `constellation: Abort superseded iframe navigations` — B · CI · watch: components/script/dom/html/embedded_content/htmliframeelement.rs
++41. `script: Fix TimerListener leak (#48752)` — B · manual · watch: -
++42. `script: ClearKeptObjects in microtask checkpoint (#48739)` — B · manual · watch: -
++43. `script: Drop tasks for closed pipelines` — B · manual · watch: components/script/messaging.rs
++44. `script: Add a js-quickjs feature for running on the QuickJS mozjs shim` — B · CI · watch: Cargo.toml components/script_bindings/trace.rs components/script/runtime/job_queue.rs components/script/scripting/script_module.rs
++45. `script: Keep MediaQueryLists with change listeners alive` — B · CI · watch: -
++46. `script: Treat any defined detail as present in performance.measure` — B · CI · watch: -
++47. `ci: Build servoshell on QuickJS, and run WPT with it nightly` — A · CI · watch: .github/workflows/linux-wpt.yml .github/workflows/linux-common.yml .github/workflows/dispatch-workflow.yml python/servo/try_parser.py
++48. `ci: Run the Linux build, lint and QuickJS jobs on the self-hosted runners` — B · CI · watch: .github/workflows/linux.yml .github/workflows/linux-arm64.yml
++49. `mach: Add a --js-engine option to build on QuickJS` — B · CI · watch: python/servo/build_commands.py python/servo/testing_commands.py
++50. `ci: Pass the check-run data to curl through stdin` — B · CI · watch: -
++51. `wpt: Condition expectations on the JavaScript engine` — B · CI · watch: tests/wpt/tests/tools/wptrunner/wptrunner/metadata.py tests/wpt/tests/tools/wptrunner/wptrunner/manifestupdate.py tests/wpt/tests/tools/wptrunner/wptrunner/manifestexpected.py tests/wpt/tests/tools/wptrunner/wptrunner/wpttest.py tests/wpt/tests/tools/wptrunner/wptrunner/products.py tests/wpt/tests/tools/wptrunner/wptrunner/browsers/servo.py
++52. `wpt: Add the QuickJS expectations` — B · CI · watch: -
++53. `ci: Run QuickJS WPT on pull requests and fail on unexpected results` — B · CI · watch: .github/workflows/linux.yml .github/workflows/main.yml
++54. `quickjs: Bump servo-quickjs for Intl over the system ICU` — B · CI · watch: -
++55. `wpt: Accept repository names with hyphens in update-wpt run URLs` — B · CI · watch: -
++56. `wpt: Keep both engines' expectations in update-wpt` — B · CI · watch: -
++57. `ci: Keep the QuickJS WPT run when a pull request needs a full run` — A · CI · watch: -
++58. `ci: Let the QuickJS WPT report create its check run and comment` — A · CI · watch: -
++59. `quickjs: Bump servo-quickjs for Intl web compatibility` — B · CI · watch: -
++60. `wpt: Run the ecmascript tests` — B · CI · watch: -
++61. `script: Release each microtask's autorelease pool entries when it ends` — B · CI · watch: -
++62. `quickjs: Bump servo-quickjs for shared runtime-state access` — B · CI · watch: -
++63. `servoshell: Move the headless window and event loop out of the desktop module` — B · CI · watch: -
++64. `servoshell: Run the servoshell executable headless on OpenHarmony` — B · manual · watch: ports/servoshell/desktop/cli.rs ports/servoshell/running_app_state.rs ports/servoshell/build.rs
++65. `wptrunner: Add a servo_ohos product for Servo on OpenHarmony devices` — B · manual · watch: tests/wpt/tests/tools/wptrunner/wptrunner/browsers/base.py tests/wpt/tests/tools/wptrunner/wptrunner/executors/executorservo.py tests/wpt/tests/tools/wptrunner/wptrunner/testrunner.py
++66. `mach: Run WPT on OpenHarmony devices with mach test-wpt --ohos` — B · manual · watch: python/servo/command_base.py
++67. `servoshell: Print a backtrace when the headless executable crashes on OpenHarmony` — B · manual · watch: ports/servoshell/panic_hook.rs
++
++## Sync log
++
++One entry per sync, newest first. Records the upstream range and every
++patch that was dropped, superseded, squashed or split, with the reason.
++
++### 2026-10-13
++
++- base: `base/2026-10-08` (ab7e8fb1358) → `base/2026-10-13` (5979b83191a);
++  pre-sync tip `pre-sync/2026-10-13` = 870190b0397.
++- upstream: 79 commits; stack 85 → 67: the fourteen `docs: record patches …`
++  commits and the four `squash!` commits folded, three patches emptied
++  (decision 3). Numbers below are the old ones unless marked "new".
++- rebase: `git -c rerere.enabled=false rebase --signoff --empty=ask`; 1–30
++  applied cleanly.
++- conflicts:
++  - 31 (Stylo): upstream moved the pin 7b2f078 → c81cd9c (#48784, #48806;
++    four Stylo commits); the patch applied unchanged, was re-exported and
++    `third_party/stylo` re-vendored, `update.sh --check` ok. `deny.toml`
++    resolved to upstream's: #46281 allows unused allowed organizations, so
++    the patch no longer empties `[sources.allow-org]` and its message drops
++    that paragraph. `Cargo.lock` regenerated from upstream's.
++  - 36 (load event): `layout_api` imports next to upstream's
++    `ContainerTimingRecord`; `LoadBlocker::terminate` takes the JSContext
++    first since #48795 (compile fix).
++  - 37 (RDB storage): `default_tooling` (#47255, devtools feature guard)
++    kept in servo's `default` and servoshell's `base` group, whose contract
++    is "the default set minus the storage backend".
++  - 47 (TimerListener backport), 48 (ClearKeptObjects backport) → placeholders,
++    see dropped.
++  - 51 (js-quickjs): `components/servo/Cargo.toml` next to `default_tooling`.
++  - 54 (QuickJS CI): `try_parser.py` workflow enum and names next to
++    upstream's perf-analysis try job (#47820).
++  - 62 (QuickJS expectations): `media-loading-pseudo-classes-in-has.sub.html.ini`
++    resolved to upstream's (#48802 dropped its subtests); the QuickJS
++    conditions are regenerated from this sync's QuickJS WPT run.
++  - 74 (ecmascript tests) → placeholder, see dropped.
++- fold: `squash!` 38 → 4 (OpenHarmony-v7.0-Release headers and
++  ohos-patches/0002), 39 → 8 (partitioned-cookie overloads), 40 → 11
++  (ohos-patches/0001 rebase), 65 → 56 (fork check for pull requests from
++  branches of this repository); each squash commit's description follows
++  the target's, its Validation steps are appended to the target's, and its
++  AI-assisted line is kept. The fourteen `docs: record patches …` commits
++  folded into this manifest. No reordering. Placeholders from earlier
++  syncs: none left (the 2026-10-09 restack dropped them).
++- runbook: step 3.4 restarts the hdc server after deploy.py's reboot, and
++  a device-test gotcha covers the `BuildNotFound` of `mach build -p arkweb`
++  (both in 1); step 3.8 gains the rerun rule this sync used for the QuickJS
++  expectations (in 62, which owns step 3.8).
++- old → new: 1..37→1..37, 42..43→38..39, 45→40, 47..49→41..43,
++  51..54→44..47, 56→48, 58→49, 60..63→50..53, 67→54, 69..74→55..60,
++  76→61, 78→62, 80..84→63..67.
++- dropped (decision 3, empty placeholders, removed next sync):
++  - 47 → 5f65837a45d (#48752) and 48 → 10c8149c3c8 (#48739): identical
++    patch-ids (`git log --cherry-mark`); 47 stopped only because #48795
++    rewrote the same lines. Their leak checks were not re-run on plain
++    upstream.
++  - 74 → 28d2258a4e1 (#48810): identical patch-id, applied empty.
++- watch: 51's `components/script/modules/script_module.rs` →
++  `components/script/scripting/script_module.rs` (#48801 moved it).
++- drift verdicts (`drift.py base/2026-10-08 base/2026-10-13`):
++  - a0d7a24dc0c devtools feature guard (#47255) → 4, 12, 13, 21, 26,
++    32–37, 45, 49, 51, 52: arkweb depends on `servo` without default features,
++    so it is now built without devtools, which it never used (a size win;
++    add the `devtools` feature if `setWebDebuggingAccess` is wired up). The
++    devtools-off build has upstream's dead-code warnings (68 locations, none
++    on a line of this stack). servoshell keeps devtools through
++    `default_tooling` (37 above). No effect otherwise.
++  - f2fe72df95d a11y focused node (#48708) → 4, 6, 9, 12, 24, 28, 33–36,
++    52: adds a private accessibility-focus step to `WebView`; no API the
++    stack uses changed. Device suite (focus, controller tests) below.
++  - 3e72b8874ab no pointer events for touch compatibility mouse events
++    (#48701) → 4, 6, 14, 15, 27: `MouseButtonEvent` gained an internal
++    flag; arkweb sends touch events, whose compatibility events script
++    synthesizes. Device suite (taps, scroll, select, IME) and the PLR IME
++    check below.
++  - 54add76e6ec, 72437e50887 radio/checkbox state, 8d46a644803 cmd-delete
++    (macOS) → 15, 27, 33: no effect on text input or composition.
++  - e1fe321d8af ContainerTiming, 4b388ed8eaa Stylo prefs → 10, 28, 32–37,
++    51, 52: pref and paint-metric additions; no effect on the proxy pref,
++    the RanLayout marker (`restyle_and_build_trees` call unchanged) or the
++    RDB pref.
++  - d9e89624158 `modules` → `scripting`, 803fd928319 `FetchController`,
++    667d03341f6 JSContext-first in `event_loop`, b237fc44f97 image
++    `loadTime`, a34c92555aa computed role, bcc2d31b215 Element/Window spec
++    steps, 8e64783f230 permanent roots, 34af31d71a6 `Serializable` → 28,
++    32–36, 45, 49, 51, 52: compile-level only (36 fixed above); crown and
++    WPT below.
++  - 150b19a4e2b, 84088c7a435 Stylo pin and `display: contents` → 31
++    (re-vendored), 51.
++  - 82eb041cbeb Crypto to script_webcrypto, 979278bf00c vello, cb49d78d051
++    deny → 31, 51: Cargo/deny context only.
++  - 5f65837a45d, 10c8149c3c8 → 47, 48 (superseded); 5f65837a45d → 35 and
++    10c8149c3c8 → 51, 76: next to the fixes, no effect; 76's per-microtask
++    pool release sits beside ClearKeptObjects in the same checkpoint.
++  - 3a942129b19 constellation `debug_assert_eq` restored (#48771) → 45:
++    the assertion precedes 45's hunk and compares viewport sizes; no effect.
++  - 3dcc4e02bc1 perf-analysis try job (#47820) → 14, 42, 54, 56, 58, 61,
++    63, 65, 83: resolved in 54; `./mach test-scripts` below.
++  - 5dd40514d14 taiki-e in lint.yml (#48776) → 56, 65: only in steps the
++    self-hosted runners skip; no effect.
++  - 28d2258a4e1, ee8fc660a33 ecmascript/acid WPT → 74 (superseded).
++  - a7c2999d04e WPT sync and the other `tests/wpt` hits on 33, 45, 53, 62,
++    82: shared `MANIFEST.json`/meta churn; test-tidy's manifest check passes.
++  - keyword hits: c6a82e9db3f ohos-abilitykit-sys 0.1.7, 1d62cfd3615
++    ohos-ime-sys 0.2.5 (arkweb IME uses ohos-ime; device suite below),
++    330d3f91a15 Android keyboard: no effect.
++- QuickJS expectations (62): a full QuickJS run of the rebased stack
++  (release, servo-quickjs cbf02ee, `--processes 16`) ran 58,340 tests, 76
++  with unexpected results. Those were rerun 3 times with each engine; 7
++  tests had results that recurred in every QuickJS run and never occurred
++  with SpiderMonkey, and only those were updated (all as
++  `if js_engine == "quickjs"` conditions): six media tests of the known
++  media-element lifetime gap (autoplay, allowed-to-play,
++  resource-selection-candidate-moved; failing on ohos-main since the
++  servo-quickjs pool scopes) and `sandbox-window-open-srcdoc.html`. Both
++  engines time out on the latter; #48802 dropped its subtest expectations
++  because SpiderMonkey reports no subtests (it hits wptrunner's outer
++  timeout), while QuickJS still reports them as TIMEOUT and NOTRUN, as
++  before the sync.
++  The other 69 were flaky or failed with SpiderMonkey too (host effects).
++  Afterwards the 7 ran as expected with QuickJS.
++- validation (final stack unless noted):
++  - fmt, test-tidy (cargo-deny, WPT manifest), `./mach test-scripts`,
++    check_stack.py and check_integrity.py; `cargo metadata --locked` at all
++    nine commits that touch a Cargo manifest or the lock file.
++  - `./mach check`, `./mach check --ohos`, `./mach check --ohos -p arkweb`,
++    `./mach check --js-engine quickjs`, `RUSTFLAGS="-D warnings" ./mach check
++    --use-crown` and `./mach clippy --locked -- -- --deny warnings`; the only
++    new warnings are upstream's devtools-off dead code in the arkweb build
++    and upstream's unfulfilled `expect(unused_variables)` in servoshell's
++    `egl/app.rs` (c73bea970da, before the previous base). Compile checks
++    at the resolved commits 31, 36, 37 (also `--ohos` with the RDB
++    backend) and 51.
++  - host unit: servo-storage 53/53 (incl. schema_parity), arkweb 6/6,
++    servo-fonts 7/7. Device unit (DAYU200): servo-storage 53/53 (sqlite),
++    64/64 (twin) and 43/43 (RDB only), one documented skip each, all
++    warning-free; servo-fonts 2/3 (upstream's
++    `ohos::font_list::test_get_system_font_families`, as before).
++  - DAYU200 arkweb suite: 35 passed, 1 xfailed (known) with this sync's
++    release shim and test app; the shim exports the same 41 dynamic symbols
++    as at the previous sync.
++  - PLR (production HarmonyOS HAP with `tracing-hitrace`): committed IME
++    text appears in a text input (27); `--chrome=none` hides toolbar and
++    tab bar (26); with the tracing filter next to it, hitrace records
++    RanLayout markers (7 against 10 `restyle_and_build_trees`, 28).
++  - OHOS WPT runner (80–84), headless release executable on the PLR:
++    `/infrastructure/` and `/dom/nodes/` (610 tests) run. Unexpected
++    besides the testdriver BiDi/Bluetooth set: TouchEvent subtests of the
++    two `Document-createEvent` tests and `assumptions/ahem.html` pass (the
++    phone exposes touch events and has Ahem), `testdriver/file_upload.sub.html`
++    fails, `moveBefore-range-iframe-crash.html` times out (load-flaky, as in
++    82's validation), and `allowed-to-play.html` is reported CRASH ("Browser
++    not responding", 3 of 3), as with the runner's pre-sync build; `moveBefore-disconnected-id-map.html` crashes as expected (its
++    backtrace symbolizes to the `TreeOrderedIndexMap::remove` panic).
++  - host WPT, release, against plain `base/2026-10-13`: the Stylo set (31),
++    the web-font set with flexbox, grid and cssom-view (32–36), timers,
++    navigation, history, iframes, form submission, workers, user-timing
++    (45, 49), webstorage and IndexedDB (37's sqlite side): 9,811 tests,
++    13 unexpected; 3 repeats on the stack and the base show the same flaky
++    or host results on both, except 005.html, which passes with 45.
++    `form-submit-cross-frame.html` failed 2 of 3 under load on the stack
++    and 10/10 passes alone on both.
++  - 49: 100 replace navigations (`nav2.html?how=timeout`), RSS 236 and 238
++    MiB against 938 and 940 MiB on plain `base/2026-10-13`.
++  - not run: 37's RDB-vs-sqlite WPT A/B on a device (step 4; needs the
++    HAP-mode runner of branch `wpt-ohos`, which the stack's headless runner
++    does not replace) — no upstream change touched components/storage in
++    this range; 43's emulator smoke test and actionlint on the workflows
++    (CI).
++
++### 2026-10-09 (restack, base unchanged)
++
++- base: unchanged, `base/2026-10-08` (ab7e8fb1358); pre-restack tip
++  `pre-restack/2026-10-09` = c1ea354ab8c (= `sync/2026-10-08`), new tip
++  `restack/2026-10-09`. Update branches with
++  `git rebase --onto restack/2026-10-09 pre-restack/2026-10-09 <branch>`.
++- why: the fold step run between syncs at the maintainer's request: drop the
++  placeholders, fold follow-ups into the commits they complete, and reorder
++  to the target order (docs/policy/CI first, additive early, invasive
++  last). Stack 53 → 37; the final tree is c1ea354ab8c's apart from this
++  manifest, the patch files and one runbook bullet on restacks.
++- dropped (decision 3 placeholders, one sync early; `sync/2026-10-08` keeps
++  them): 4 (API-21 SDK → fef77e189b8), 35 (FontFaceSet.load backport →
++  a8d5fdaa915), 40 (rustls → 866d0957e4f), 48 (responsive-iframe
++  expectations → f9b43a6f0b9).
++- fold:
++  - 1 ← 32 (stack conventions), 41 (integrity CI job), 43 and 50 (vendored
++    code tooling), and the docs/ohos-sync parts of 31 and 52: all sync
++    infrastructure now lives in patch 1, and no later patch touches
++    docs/ohos-sync.
++  - 2 ← the CONTRIBUTING.md part of 31 (it sits in text 2 adds).
++  - 4 (old 5, ArkWeb backend) ← 6 (on-device render fixes, deploy.py, OHOS
++    patches): the backend did not render on a device without them; their
++    root-cause notes moved into the message.
++  - 11 (old 12, exported symbols) ← 13 (dlopen with RTLD_LOCAL), renamed
++    to say both.
++  - 15 (old 17, IME) ← 18 (UpdateTextFieldStatus).
++  - 30 (old 44, vendor freetype-sys) ← the freetype-sys part of 52, so the
++    crate is vendored in the third_party/patches layout from the start.
++  - 33 (old 37, lazy @font-face loading) ← 45 (no fonts for unloaded
++    faces) and 47 (first available font of elements without text), both
++    fixes of its regressions.
++  - 35 (old 39, batched web font loads) ← 49 (SVG text re-rendered when a
++    batch is applied); the SVG text gap remains at 33–34.
++- moved: the test app (old 21) to right after the backend, so later
++  features and their tests find it in the tree; servoshell (old 33, 53),
++  the RanLayout marker (34), FreeType advances (42) and the two vendoring
++  patches (44, 51) before the web-font series (36–39); the load-event delay
++  (46, upstream-bound on its own) right after the series; the RDB backend
++  (30, tier C) last.
++- old → new: 1→1, 2→2, 3→3, 5→4, 21→5, 7..11→6..10, 12→11, 14..16→12..14,
++  17→15, 19→16, 20→17, 22..29→18..25, 33→26, 53→27, 34→28, 42→29, 44→30,
++  51→31, 36→32, 37→33, 38→34, 39→35, 46→36, 30→37.
++- validation: the rebase applied with no conflicts; the final tree equals
++  c1ea354ab8c outside docs/ohos-sync; `cargo metadata --locked` passes at
++  every commit; `./mach check --ohos -p arkweb` at 4, 11, 15 and 25,
++  `./mach check --ohos` at 26–27 and `./mach check` at 26–36 pass with no
++  new warnings; `./mach test-unit -p servo-fonts` 7/7 at 29 and 33;
++  check_stack.py, check_integrity.py and test-tidy at the tip. WPT at the
++  web-font fold targets: see the restack's hand-off.
++
++### 2026-10-08
++
++- base: `base/2026-08-29` (bc6153bb1bb) → `base/2026-10-08` (ab7e8fb1358);
++  pre-sync tip `pre-sync/2026-10-08` = 57bef201228.
++- upstream: 701 commits; stack 61 → 53: the seven `docs: record patches …`
++  commits and the two `squash!` commits folded, one new patch (53).
++- rebase: `git -c rerere.enabled=false rebase --signoff --empty=ask` (the
++  rr-cache held 85 recorded resolutions of unknown origin).
++- conflicts:
++  - 2 (fork notice): `main.yml` push preset vs #48530 (intel macOS jobs
++    removed); kept the fork's reduced presets.
++  - 4 (API-21 SDK): upstream fef77e189b8 (#48505) moved both products to
++    API 23 → placeholder, see dropped.
++  - 30 (RDB storage): workspace versions 0.7.0 (#48535) with the fork's
++    `default-features = false` re-added; `multiprocess` (new upstream default,
++    22c646903a0) kept in servo's `default` and servoshell's `base` group,
++    whose stated contract is "the default set minus the storage backend";
++    arkweb stays without it (single-process). The fork's `[lints.rust]` table
++    dropped: upstream added `[lints] workspace = true` (a40515c3b0f), cargo
++    rejects both, and `build.rs` already emits the check-cfg. `Cargo.lock`
++    regenerated from upstream's (`ohos-rdb-sys` kept at 0.1.0).
++  - 33 (chrome-less): upstream #48684 replaced `Tabs` with a `List` tab bar,
++    a `Stack` of XComponents and `@Entry({ useSharedStorage: true })`;
++    re-applied as `if (this.showChrome)` around the toolbar and the tab list.
++  - 34 (RanLayout marker): upstream's accessibility work reshaped the
++    `restyle_and_build_trees` call; marker re-added unchanged.
++  - 35 (FontFaceSet.load backport) → placeholder, see dropped.
++  - 36, 37 (web fonts): upstream converted `Rc<Promise>` to
++    `RootedPromise`/`TracedPromise` (#47935, #48333) and `icu_locid` to
++    `icu_locale_core`; resolved to the upstream-bound `lazy-webfonts` code
++    (460f417f242, 3a1db33e3cc), which the code files of 36–39 now match
++    line for line; 37's MANIFEST.json entry re-inserted.
++  - 42 (FreeType advances): upstream d15ed10a8a8 (#48455) loads glyphs
++    unhinted on Android and OpenHarmony. The fast path assumed light hinting
++    and would have rounded advances that upstream now leaves fractional, so it
++    is gated on light-hinted loads (desktop); the unit test asserts that and
++    embeds its fonts so it also runs on devices. On OpenHarmony the patch now
++    only skips decoding colour bitmaps; its OHOS measurements predate #48455.
++  - 46 (load event): imports only. 51 (Stylo): upstream moved the pin
++    b3e6425 → 7b2f078 (+368 Stylo commits); the patch rebased with identical
++    `+`/`-` lines (context only: `clone_display()` → `*get_display()`),
++    re-exported, `third_party/stylo` re-vendored, `update.sh --check` ok.
++- applied cleanly, did not compile or did not work (fixed in the owning
++  patch):
++  - 5 (arkweb): `WebView::set_throttled` removed (c974e3c7c79) → `OnPause` /
++    `OnOccluded` hide the WebView, which also stops painting; `WebView::focus`
++    removed (15aa067b33e) → `set_focused`, focusing one WebView unfocuses the
++    others as servoshell does with windows; blur stays a logged no-op.
++    Applied to every arkweb commit, so each prefix builds.
++  - 17 (arkweb IME): d2abb3339dd (#48690, landed the day of the base) made
++    a composition end stop inserting text; the device suite caught it (typing,
++    backspace and blur failed). Commits are now sent as update + end. The same
++    bug hit servoshell's OpenHarmony port → new patch 53 (meant for upstream).
++  - 30: index names unique per object store (#47936) mirrored into the RDB
++    schema copy; `GenericCallback::new` lost its `ProfilerChan` (#48037).
++  - 49 (SVG text): `traverse_preorder_non_rooting` →
++    `traverse_preorder_unrooted` (#48555).
++- fold: `squash!` commits into 30 (clippy `duplicate_mod` fix) and 36 (emoji
++  expectations restored), this sync's fixups into their patches, the
++  `docs: record patches …` commits into this manifest. Patches 49 (old 56),
++  45–47 and 52 kept separate. Every commit now passes
++  `cargo metadata --locked` (5–29 had auto-merged lockfiles cargo rejected).
++  Each commit this sync resolved, adapted or regenerated carries an
++  `AI-assisted:` line saying what (decision 5).
++- dropped (decision 3, empty placeholders, removed next sync):
++  - 4 → fef77e189b8 (#48505): the OpenHarmony product packages against an
++    API-23 SDK and runs on a DAYU200; compatibleSdkVersion 20 → 23 is within
++    the fork's minimum-API policy.
++  - 35 → a8d5fdaa915 (#47564): identical patch-id (`--cherry-mark`).
++  - 40 → 866d0957e4f (#48079): applied empty, base pins rustls 0.23.45.
++  - 48 → f9b43a6f0b9 (WPT sync #47639): the edited `allowed=` variants no
++    longer exist; base carries the `allow=` expectations.
++- new tests: `components/storage/tests/schema_parity.rs` (30; fails on the
++  pre-sync RDB schema), `test_focus.py`, repaint/tap after foregrounding in
++  `test_throttle.py`, `test_cookies.py` with ControllerPage cookie buttons
++  (28; first automated coverage of the cookie manager, 9),
++  `test_clipboard.py` (25; replaces its manual round-trip recipe: a token
++  written with `writeText` is read back after a force-stop, so only the
++  system pasteboard can hold it, and without READ_PASTEBOARD the read falls
++  back to the empty in-process clipboard).
++- expectations: 37 drops its six `generic-family-keywords-003` canvas FAILs
++  (they pass on the new base, as on upstream) and the two
++  `layer-font-face-override` FAILs (passed with the lazy web-font patches
++  already before this sync; upstream still fails them).
++- drift (`drift.py`; hits not listed are churn in the large shared files
++  covered by the compile and test gates):
++  - 15aa067b33e system focus, c974e3c7c79 hidden WebViews, 07777aaa24a
++    WebView borrows → 5 (above). fd4d5d0e377 key events, d2abb3339dd
++    composition, 53f2a80314b touch compat mouse events → 7, 17: arkweb suite
++    (IME fixed, touch/scroll/select/dialog pass).
++  - 47def473014 `WebView::clear_session_history` → opportunity for 28's
++    `DeleteNavigateHistory`, no drift. 12beb73b689 embedder JS in CSP
++    documents → 10 gains it, no change needed.
++  - c0e5583323a, 7256c05b108, 7130363bbf4 cookie host/domain/date → 9
++    (manual): `test_cookies.py` added and passing.
++  - 3eca066448f, d0162990069 clipboard promises/events → 25:
++    `test_clipboard.py` added and passing.
++  - e6aacc15323, b8fd8dbf768, 1462d866b8c, 2a8c5fab976, 84b5b2563a7 storage →
++    30: only #47936 needed mirroring (done, schema test added); cache storage
++    is in-memory and backend independent.
++  - d15ed10a8a8, b724f6f80e1, b9ed512231f, 694133bbcf5 FreeType/metrics →
++    42 (above); 31e3c3501e1, 29b00233c2c FontData → 45, 47: font WPT clean.
++  - 31f660d20c5 layout image loads block `load` → 46: its WPT list
++    (css-flexbox, css-grid, cssom-view) plus css-images and css-text clean.
++  - cc0c73e197c, Rc<Promise> conversions → 36, 37, 49 (above).
++  - Stylo upgrades fdb829e98c2, baa77ece393, cb086ca56ec, 5190fc46c70,
++    614cd411f84 → 51 re-vendored; pseudo-element changes upstream do not
++    touch the skip (`style_resolver.rs` hunk unchanged).
++  - 64c4855e7dd, df3525edc0d ArkUI → 33 (above). a4fe23d8085 CMake step,
++    da4d69a8af3 cargo-ohos → packaging works.
++- validation (all on the final stack unless noted): fmt, test-tidy (incl.
++  cargo-deny, WPT manifest), `./mach check` and `./mach check --ohos`,
++  arkweb and servo-storage in the plain, twin and RDB-only configurations
++  (warning-free); host unit tests servo-storage 53/53, servo-fonts 7/7,
++  arkweb 6/6; device unit tests on the DAYU200 servo-storage 53/53 (sqlite),
++  64/64 (twin) and 43/43 (RDB only), one documented skip each, servo-fonts
++  2/3 (upstream's `ohos::font_list::test_get_system_font_families` fails on
++  this board, as before the sync). WPT, host release build, against plain
++  `base/2026-10-08`: css-font-loading, css-fonts, html canvas text,
++  css-cascade 1115/1115; css-flexbox, css-grid, cssom-view, css-images,
++  css-text 6564 with one unexpected (`cssom-view/resizeTo-negative.html`
++  TIMEOUT, same on the base); the Stylo set (css-pseudo, css-content, cssom,
++  transitions, animations, nesting, lists, selectors, css-cascade,
++  css-variables) 2571, only the two layer-override passes above; SVG
++  reftests, responsive-iframe and webstorage as expected; IndexedDB has a
++  varying set of 1–5 worker/sharedworker timeouts per full-directory run on
++  both builds (19 on the stack, 13 on the base over five runs each, the same
++  tests, each passing in isolation). DAYU200
++  arkweb suite 33 passed / 1 xfailed (geolocation, known) on the final
++  shim; before the IME fix typing, backspace and blur failed while the
++  2026-09-13 shim passed them. PLR-AL00, production
++  HAP with `tracing-hitrace ohos-rdb-backend`: soft-keyboard text reaches a
++  page input (empty without patch 53), `--chrome=none` drops toolbar and tab
++  bar, localStorage persists across a force-stop, IndexedDB accepts the same
++  index name in two stores with either backend, the `RanLayout` marker
++  appears in hitrace. OpenHarmony-flavor HAP packaged against an API-23 SDK
++  runs on the DAYU200. `test_clipboard.py` 2/2 on the DAYU200. Patch 30's
++  RDB-vs-sqlite WPT A/B on the PLR-AL00 (release HAP with
++  `ohos-rdb-backend`, the `wpt-ohos` runner branch cherry-picked): 78 tests,
++  1577 subtests, no subtest differs; the one test-level difference,
++  `storage_local_setitem_quotaexceedederr.window.html` TIMEOUT on sqlite,
++  passes on both in isolation (sqlite 8.3–9.0 s against the 10 s timeout,
++  RDB 1.2–1.4 s); store proof holds on both legs. The sqlite leg leaves
++  60–70 IndexedDB databases registered whose `deleteDatabase` from test
++  cleanup never completes, the RDB leg 3; plain upstream on the host leaves
++  66 after the same tests, so this is upstream sqlite behaviour, not a
++  stack regression. Patch 42, PLR-AL00, production HAPs of the stack
++  without and with it, `servoperf page --only load`, two rounds of 5 loads
++  in alternating order, `Layout>::reflow` M instructions/load: chuxing
++  122.8 -> 89.9 (-27%), shibashiji 101.8 -> 94.3 (-7%), biyadi and
++  keai-pruned unchanged within noise; the difference is colour-emoji PNG
++  decoding (`Load_SBit_Png` 40.6 -> 7.3 M/load on chuxing).
++- not run: the GenUI FCP A/B for 46 after 31f660d20c5.
++- open: keep 42 (its colour-bitmap skip is still worth up to 27% of layout
++  on emoji-heavy pages, see validation); patch 53 and the arkweb IME fix
++  should go upstream with the next IME work; `lazy-webfonts` should drop the
++  `layer-font-face-override` FAILs too.
++
++### 2026-08-29
++
++- base: `base/2026-08-07` (79e2c7a8827) → `base/2026-08-29` (bc6153bb1bb)
++- upstream: 297 commits; stack 29 → 30 (new first patch: this runbook + manifest)
++- conflicts: `ports/arkweb: wire the OHOS system clipboard via ohos-pasteboard`
++  (servo-crate half now upstream 5c2a3839525 / #47177, patch shrunk to the
++  arkweb glue, `clipboard` feature, READ_PASTEBOARD test-app permission;
++  not a full supersede since upstream declined clipboard read);
++  `storage: add an OHOS RDB backend …` (Cargo.toml vs #47198/#43819,
++  `ascii_serialization` → `Cow` from #47264 mirrored in the twins).
++- fold: nothing to do (no fixups pending; the clipboard shrink's empty-
++  placeholder rule did not trigger — the patch shrank, it did not empty)
++- dropped: none
++- known stale: the RDB commit's 1.91 MiB RDB-only size saving no longer
++  holds (#43819 makes rusqlite unconditional in components/net); remeasure.
++- hygiene items: pre-sync `Cargo.lock` had a dangling `cookie 0.18.1` in the
++  arkweb entry (`--locked` broken mid-stack); duplicated proxy comment in
++  `ports/arkweb/src/runtime.rs`; three squashed commits keep an old
++  `Validation:`/`AI-assisted:` pair mid-body.
++- drift (from `drift.py`; hits not listed had no verdict-worthy content):
++  - `b780274a164` clang-19, `058c55ed4a1` cargo-ohos build env → patch 4
++    (API-21) unaffected textually; the rewritten packaging path is proven
++    by the servoshell OHOS release builds. `./mach package --ohos` signing
++    fails in the container (hvigor 00303116) — container config, not drift.
++  - `c1517a950cc` ohos keyboard support → servoshell + xcomponent-sys only,
++    no code shared with the arkweb IME patches (17, 18); device IME tests
++    pass.
++  - `27775d1d904` queued session-history traversals → potential behaviour
++    change for patches 26 (URL bar follows history) and 28 (back/forward
++    Tier-1 methods); `test_urlbar.py`, `test_controller.py` pass.
++  - `6ee336ce836` MouseButton(s), `1728d63f488` a11y bounds,
++    `522fa371e41` webgl guard, `a40c8f29010` threadboost, `e2bcea2a0f6`
++    DPR override → embedder-API surface of patches 5, 7, 14–16 changed
++    shape; `./mach check --ohos -p arkweb` warning-free and the device suite
++    (render, scroll, vsync) passes. No behaviour drift observed.
++  - `7a27057feec` cookie/auth memory reporting → patch 9 (cookie manager)
++    compiles against unchanged `cookie_storage.rs` API; its manual
++    Validation was NOT run this sync (no automated coverage) — open.
++  - `cb680edc199` removed prefs, `8067519db8c`/`76f48dc9e3a`/`fb04f8f1613`
++    pref additions → patches 11 and 30 set prefs by field name; compile
++    proves none of the removed prefs were used.
++  - `723dd93c61e`/`22b7b75ba42`/`522fa371e41` feature-flag reshuffle in
++    `components/servo/Cargo.toml` → resolved in patches 25 and 30.
++  - `5c2a3839525` clipboard backend → patch 25 partially superseded (see
++    conflicts). `7bea9ed91f2` `Cow` origins → mirrored in patch 30.
++    `fb04f8f1613` disk cache → patch 30 size rationale stale (see above).
++  - `b8819327242` quick_cache, `e0b630fe3e0` aws-lc-rs SRI, `27a317dd69c`
++    disk-cache temporary storage → `components/net/Cargo.toml` churn with
++    no storage interaction.
++  - keyword scan: `cb9b0804bda`/`748bf81026f` keyCode changes and
++    `f9b4d1e6094` insertLineBreak are script-side (page-visible, not port);
++    `c65518f8960`/`2a5f73586c3` CookieStoreManager is the DOM layer, not
++    the NWeb cookie manager; `b3ee31d291c` media ohos dummy backend,
++    `eff9ff0bfa4` OHOS font fallback, `e8ffe8e88ce` image decoder trait,
++    `ba14b47a9a6` arboard wayland → not on the stack's surface.
++- validation: check --ohos, tidy, fmt, test-unit servo-storage 53/53,
++  arkweb release build + deploy, DAYU200 arkweb suite 30 passed / 1 xfailed,
++  device nextest servo-storage sqlite 53/53 and RDB 43/43 (+1 documented
++  skip), clipboard round-trip with/without READ_PASTEBOARD, servoshell
++  release with and without `ohos-rdb-backend`, RDB-vs-sqlite same-HAP pref
++  A/B on localhost origin, and the full WPT subset A/B via
++  `./mach test-wpt --ohos` (runner from `wip-wpt-ohos` + device fixes on
++  scratch branch `ohos-sync-2026-08-29-wpt`): 78 tests, 0 differing
++  subtests, store proof both legs. `--flavor=harmonyos` does not install on
++  the DAYU200 (profile UDID); default flavor, hap-sign-tool signing.
++- found during validation: servoshell race `webdriver.rs:171 Expected at
++  least one window to be open` when WebDriver answers before
++  `on_surface_created`; `hdc file send -b` fails on the DAYU200 (hdc
++  3.2.0b) — worked around in the runner, servoshell fix pending.
+diff --git a/docs/ohos-sync/check_integrity.py b/docs/ohos-sync/check_integrity.py
+new file mode 100644
+index 00000000000..f82ee4d0574
+--- /dev/null
++++ b/docs/ohos-sync/check_integrity.py
+@@ -0,0 +1,66 @@
++# /// script
++# requires-python = ">=3.11"
++# ///
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at https://mozilla.org/MPL/2.0/.
++"""Check that base + patches reproduce <head-ref>, without a `base/<date>` tag.
++
++Usage: uv run docs/ohos-sync/check_integrity.py [head-ref]
++
++The base is derived as `<head-ref>~<number of STACK.md entries>`; a shallow
++clone is deepened to reach it. Then `check_stack.py` runs against it, including
++the `--check` runs of the vendoring scripts under third_party/, and the base
++must be an ancestor of servo/servo `main` (checked via the GitHub API,
++authenticated with $GITHUB_TOKEN if set). This is the `integrity` CI job.
++"""
++
++import json
++import os
++import sys
++import urllib.error
++import urllib.request
++
++from check_stack import check_manifest, check_patches, check_vendored
++from stacklib import git, read_manifest
++
++
++def upstream_status(base: str) -> str:
++    request = urllib.request.Request(
++        f"https://api.github.com/repos/servo/servo/compare/{base}...main",
++        headers={"Accept": "application/vnd.github+json"},
++    )
++    if token := os.environ.get("GITHUB_TOKEN"):
++        request.add_header("Authorization", f"Bearer {token}")
++    try:
++        with urllib.request.urlopen(request) as response:
++            return json.load(response)["status"]
++    except urllib.error.HTTPError as e:
++        return f"HTTP {e.code}"
++
++
++def main() -> int:
++    head = git("rev-parse", sys.argv[1] if len(sys.argv) > 1 else "HEAD").strip()
++    n = len(read_manifest())
++    if git("rev-parse", "--is-shallow-repository").strip() == "true":
++        git("fetch", "-q", "--no-tags", f"--depth={n + 1}", "origin", head)
++    base = git("rev-parse", "--verify", "-q", f"{head}~{n}", check=False).strip()
++    if not base:
++        print(f"{head} has fewer than {n} ancestors, but STACK.md lists {n} patches")
++        return 1
++    print(f"base: {base} ({head}~{n})")
++
++    ok = check_manifest(base, head)
++    ok = check_patches(base, head) and ok
++    ok = check_vendored() and ok
++    status = upstream_status(base)
++    if status in ("ahead", "identical"):
++        print("base ok: ancestor of servo/servo main")
++    else:
++        print(f"base is not an ancestor of servo/servo main (compare status: {status})")
++        ok = False
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/docs/ohos-sync/check_stack.py b/docs/ohos-sync/check_stack.py
+new file mode 100644
+index 00000000000..dbe0e284365
+--- /dev/null
++++ b/docs/ohos-sync/check_stack.py
+@@ -0,0 +1,100 @@
++# /// script
++# requires-python = ">=3.11"
++# ///
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at https://mozilla.org/MPL/2.0/.
++"""Check STACK.md and the checked-in patch set against `git log <base>..HEAD`.
++
++Usage: uv run docs/ohos-sync/check_stack.py <base-ref> [head-ref]
++
++1. The ordered subjects in STACK.md must equal the git log.
++2. `git am` of docs/ohos-sync/patches/*.patch onto <base-ref> must reproduce
++   the head tree (ignoring the patches directory and the vendored third-party
++   code the patches leave out).
++3. Each `third_party/patches/<name>/update.sh --check` must agree that the
++   vendored code in the working tree is what the script produces. This needs
++   network access.
++"""
++
++import subprocess
++import sys
++import tempfile
++
++from stacklib import (
++    PATCH_DIR,
++    REPO,
++    excluded_pathspecs,
++    git,
++    read_manifest,
++    stack_commits,
++    vendor_scripts,
++)
++
++
++def check_manifest(base: str, head: str) -> bool:
++    expected = [p.subject for p in read_manifest()]
++    log = [s for _, s in stack_commits(base, head)]
++    if expected == log:
++        print(f"manifest ok: {len(log)} patches")
++        return True
++    print("STACK.md and git log differ:")
++    for i in range(max(len(expected), len(log))):
++        e = expected[i] if i < len(expected) else None
++        g = log[i] if i < len(log) else None
++        mark = " " if e == g else "!"
++        print(f"{mark} {i + 1:2}. manifest: {e!r}\n       git:      {g!r}")
++    return False
++
++
++def check_patches(base: str, head: str) -> bool:
++    patches = sorted(PATCH_DIR.glob("*.patch"))
++    n = len(stack_commits(base, head))
++    if len(patches) != n:
++        print(f"patch set has {len(patches)} files, stack has {n} commits")
++        return False
++    with tempfile.TemporaryDirectory() as tmp:
++        git("worktree", "add", "--detach", "-q", tmp, base)
++        try:
++            r = subprocess.run(
++                ["git", "-C", tmp, "am", "--committer-date-is-author-date", "--empty=keep", "-q", *map(str, patches)],
++                capture_output=True,
++                text=True,
++            )
++            if r.returncode != 0:
++                print("git am failed:\n" + r.stderr + r.stdout)
++                return False
++            applied = git("-C", tmp, "rev-parse", "HEAD").strip()
++        finally:
++            git("worktree", "remove", "--force", tmp)
++    diff = git("diff", "--stat", applied, head, "--", ".", *excluded_pathspecs())
++    if diff:
++        print("patch set does not reproduce the head tree:\n" + diff)
++        return False
++    print(f"patch set ok: {n} patches reproduce {head}")
++    return True
++
++
++def check_vendored() -> bool:
++    """Run the third-party vendoring scripts against the working tree."""
++    ok = True
++    for script in vendor_scripts():
++        r = subprocess.run([script, "--check"], capture_output=True, text=True)
++        print(f"{script.relative_to(REPO)}: {r.stdout.strip() or r.stderr.strip()}")
++        ok = r.returncode == 0 and ok
++    return ok
++
++
++def main() -> int:
++    if len(sys.argv) < 2:
++        print(__doc__)
++        return 2
++    base, head = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "HEAD"
++    ok = check_manifest(base, head)
++    ok = check_patches(base, head) and ok
++    ok = check_vendored() and ok
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/docs/ohos-sync/drift.py b/docs/ohos-sync/drift.py
+new file mode 100644
+index 00000000000..1d0706b2fae
+--- /dev/null
++++ b/docs/ohos-sync/drift.py
+@@ -0,0 +1,72 @@
++# /// script
++# requires-python = ">=3.11"
++# ///
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at https://mozilla.org/MPL/2.0/.
++"""Per-patch upstream drift report for a sync.
++
++Usage: uv run docs/ohos-sync/drift.py <old-base> <new-base> [head-ref]
++
++For every patch on <new-base>..<head> lists the upstream commits in
++<old-base>..<new-base> that touched (a) files the patch modifies or (b) the
++patch's `watch:` paths from STACK.md, plus upstream commits whose subject
++matches KEYWORDS. Prints a markdown table; the verdict column is filled in by
++the person or agent running the sync.
++"""
++
++import re
++import sys
++from collections import OrderedDict
++
++from stacklib import git, read_manifest, stack_commits
++
++KEYWORDS = r"ohos|openharmony|harmony|arkweb|clipboard|pasteboard|\bime\b|keyboard|indexeddb|webstorage|cookie"
++
++
++def upstream_hits(old: str, new: str, paths: list[str]) -> OrderedDict:
++    hits: OrderedDict[str, str] = OrderedDict()
++    if not paths:
++        return hits
++    for line in git("log", "--format=%h %s", f"{old}..{new}", "--", *paths).splitlines():
++        h, s = line.split(" ", 1)
++        hits[h] = s
++    return hits
++
++
++def fmt(hits: OrderedDict) -> str:
++    return "<br>".join(f"`{k}` {v[:60]}" for k, v in hits.items()) or "—"
++
++
++def main() -> int:
++    if len(sys.argv) < 3:
++        print(__doc__)
++        return 2
++    old, new = sys.argv[1], sys.argv[2]
++    head = sys.argv[3] if len(sys.argv) > 3 else "HEAD"
++    manifest = {p.subject: p for p in read_manifest()}
++    noise = re.compile(r"^(Cargo\.lock|Cargo\.toml)$")
++
++    print("| # | patch | own files hit | watch hit | verdict |")
++    print("|---|---|---|---|---|")
++    for i, (h, subject) in enumerate(stack_commits(new, head), 1):
++        p = manifest.get(subject)
++        files = git("show", "--format=", "--name-only", h).split()
++        own = upstream_hits(old, new, [f for f in files if not noise.match(f)])
++        lock = upstream_hits(old, new, [f for f in files if noise.match(f)])
++        watch = upstream_hits(old, new, p.watch if p else [])
++        for k in own:
++            watch.pop(k, None)
++        own_cell = fmt(own)
++        if lock:
++            own_cell += f"<br>(+{len(lock)} lockfile/workspace-manifest commits)"
++        print(f"| {i} | `{h}` {subject[:50]} | {own_cell} | {fmt(watch)} | |")
++
++    print("\nUpstream subjects matching keywords (judge against the whole stack):\n")
++    for line in git("log", "--format=%h %s", "-i", "-E", f"--grep={KEYWORDS}", f"{old}..{new}").splitlines():
++        print(f"- `{line.split(' ', 1)[0]}` {line.split(' ', 1)[1]}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/docs/ohos-sync/gen_patches.py b/docs/ohos-sync/gen_patches.py
+new file mode 100644
+index 00000000000..254e4308555
+--- /dev/null
++++ b/docs/ohos-sync/gen_patches.py
+@@ -0,0 +1,52 @@
++# /// script
++# requires-python = ">=3.11"
++# ///
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at https://mozilla.org/MPL/2.0/.
++"""Regenerate docs/ohos-sync/patches from `git log <base>..HEAD`.
++
++Usage: uv run docs/ohos-sync/gen_patches.py <base-ref> [head-ref]
++
++Commit hashes are zeroed so a patch file only changes when the patch itself
++(diff, message, trailers) or the upstream blobs it touches change. The
++patches directory is excluded from the diff of the commit that carries it, and
++so is the vendored code that `third_party/*/update.sh` regenerates.
++"""
++
++import shutil
++import sys
++
++from stacklib import PATCH_DIR, excluded_pathspecs, git
++
++
++def main() -> int:
++    if len(sys.argv) < 2:
++        print(__doc__)
++        return 2
++    base, head = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "HEAD"
++    shutil.rmtree(PATCH_DIR, ignore_errors=True)
++    PATCH_DIR.mkdir()
++    out = git(
++        "format-patch",
++        "--zero-commit",
++        "--no-signature",
++        # Keep empty commits, e.g. superseded patches kept as placeholders for a sync; the
++        # pathspec below would otherwise drop them from the walk.
++        "--always",
++        "--full-history",
++        "--sparse",
++        "-N",
++        "-o",
++        str(PATCH_DIR),
++        f"{base}..{head}",
++        "--",
++        ".",
++        *excluded_pathspecs(),
++    )
++    print(f"wrote {len(out.splitlines())} patches to {PATCH_DIR}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/docs/ohos-sync/stacklib.py b/docs/ohos-sync/stacklib.py
+new file mode 100644
+index 00000000000..d0f48ffe9fa
+--- /dev/null
++++ b/docs/ohos-sync/stacklib.py
+@@ -0,0 +1,57 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at https://mozilla.org/MPL/2.0/.
++"""Shared helpers for the ohos-main stack tooling (STACK.md parsing, git)."""
++
++import re
++import subprocess
++from dataclasses import dataclass, field
++from pathlib import Path
++
++STACK_MD = Path(__file__).with_name("STACK.md")
++PATCH_DIR = Path(__file__).with_name("patches")
++REPO = Path(__file__).resolve().parents[2]
++# Vendored third-party code that third_party/patches/<name>/update.sh writes. It is kept out of the
++# patch files, which would otherwise carry megabytes of generated sources; the scripts check it
++# instead.
++GENERATED_DIRS = ["third_party/freetype-sys", "third_party/stylo"]
++ENTRY = re.compile(r"^(\d+)\. `([^`]+)` — (\S+) · (\S+)(?: · watch: (.*))?$")
++
++
++@dataclass
++class Patch:
++    number: int
++    subject: str
++    tier: str
++    coverage: str
++    watch: list[str] = field(default_factory=list)
++
++
++def git(*args: str, check: bool = True) -> str:
++    return subprocess.run(["git", *args], check=check, capture_output=True, text=True).stdout
++
++
++def excluded_pathspecs() -> list[str]:
++    """Pathspecs for what the patch files leave out."""
++    return [f":!{PATCH_DIR.relative_to(REPO)}", *(f":!{d}" for d in GENERATED_DIRS)]
++
++
++def vendor_scripts() -> list[Path]:
++    return sorted(REPO.glob("third_party/patches/*/update.sh"))
++
++
++def read_manifest() -> list[Patch]:
++    section = STACK_MD.read_text().split("## Sync log")[0]
++    patches = []
++    for line in section.splitlines():
++        m = ENTRY.match(line)
++        if m:
++            watch = [] if m.group(5) in (None, "-") else m.group(5).split()
++            patches.append(Patch(int(m.group(1)), m.group(2), m.group(3), m.group(4), watch))
++    return patches
++
++
++def stack_commits(base: str, head: str = "HEAD") -> list[tuple[str, str]]:
++    """(hash, subject) for base..head, oldest first."""
++    out = git("log", "--reverse", "--format=%h %s", f"{base}..{head}")
++    return [tuple(line.split(" ", 1)) for line in out.splitlines()]

@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 8 Oct 2026 15:56:16 +0000
+Subject: [PATCH] ohos: Insert committed IME text through a composition update
+
+Since d2abb3339dd (#48690) moved composition handling into
+`EditingAction`, a composition end only finishes the composition and the
+text is inserted by a composition update. The OpenHarmony port still sent a
+commit as an end event alone, so text typed with the soft keyboard no
+longer reached the page. Send an update followed by the end, as the
+desktop port does since that change.
+
+Meant for upstream; the ArkWeb port had the same problem in its own copy of
+this code.
+
+Validation: on a PLR-AL00, servoshell production HAP: tap a text input of a page and type with `uitest uiInput inputText`; the text must appear in the field (it stays empty without this change).
+AI-assisted: Yes (agent session; root-caused from the on-device IME failures of the 2026-10-08 sync, written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/servoshell/egl/app.rs | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/ports/servoshell/egl/app.rs b/ports/servoshell/egl/app.rs
+index 09051398d38..61b036e934f 100644
+--- a/ports/servoshell/egl/app.rs
++++ b/ports/servoshell/egl/app.rs
+@@ -642,6 +642,11 @@ impl App {
+             KeyState::Down,
+             Key::Named(NamedKey::Process),
+         )));
++        // Servo inserts the text of a composition update; the end event only finishes it.
++        webview.notify_input_event(InputEvent::Ime(ImeEvent::Composition(CompositionEvent {
++            state: CompositionState::Update,
++            data: text.clone(),
++        })));
+         webview.notify_input_event(InputEvent::Ime(ImeEvent::Composition(CompositionEvent {
+             state: CompositionState::End,
+             data: text,

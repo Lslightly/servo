@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 25 Sep 2026 04:23:00 +0000
+Subject: [PATCH] servoshell: Move the headless window and event loop out of
+ the desktop module
+
+So that other ports can run headless too.
+
+Validation: `./mach build --release` and `./mach build --ohos --release --no-package` succeed with this patch alone. At the top of the series, desktop `./mach test-wpt --release --processes 4 /infrastructure/` runs headless (185 tests); its unexpected results are the testdriver BiDi and Bluetooth ones that this series does not touch, the same as in a run of the series on plain upstream. `./mach test-tidy` passes.
+AI-assisted: Yes (agent session; written by the agent, which also ran the checks above)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/servoshell/desktop/app.rs               |  2 +-
+ ports/servoshell/desktop/event_loop.rs        | 65 ++-----------------
+ ports/servoshell/desktop/mod.rs               |  1 -
+ ports/servoshell/headless_event_loop.rs       | 65 +++++++++++++++++++
+ .../{desktop => }/headless_window.rs          |  2 +-
+ ports/servoshell/lib.rs                       |  4 ++
+ 6 files changed, 77 insertions(+), 62 deletions(-)
+ create mode 100644 ports/servoshell/headless_event_loop.rs
+ rename ports/servoshell/{desktop => }/headless_window.rs (99%)
+
+diff --git a/ports/servoshell/desktop/app.rs b/ports/servoshell/desktop/app.rs
+index 44e145357fc..08e0c8e0b21 100644
+--- a/ports/servoshell/desktop/app.rs
++++ b/ports/servoshell/desktop/app.rs
+@@ -22,9 +22,9 @@ use winit::window::WindowId;
+ use super::event_loop::AppEvent;
+ use crate::desktop::event_loop::ServoShellEventLoop;
+ use crate::desktop::headed_window::HeadedWindow;
+-use crate::desktop::headless_window::HeadlessWindow;
+ use crate::desktop::protocols;
+ use crate::desktop::tracing::trace_winit_event;
++use crate::headless_window::HeadlessWindow;
+ use crate::parser::get_default_url;
+ use crate::prefs::ServoShellPreferences;
+ use crate::running_app_state::RunningAppState;
+diff --git a/ports/servoshell/desktop/event_loop.rs b/ports/servoshell/desktop/event_loop.rs
+index 59d158b40bf..2d696f5f082 100644
+--- a/ports/servoshell/desktop/event_loop.rs
++++ b/ports/servoshell/desktop/event_loop.rs
+@@ -4,8 +4,7 @@
+ 
+ //! An event loop implementation that works in headless mode.
+ 
+-use std::sync::{Arc, Condvar, Mutex};
+-use std::time;
++use std::sync::{Arc, Mutex};
+ 
+ use gilrs::Event;
+ use log::warn;
+@@ -15,6 +14,7 @@ use servo::GamepadIndex;
+ use winit::event_loop::{EventLoop, EventLoop as WinitEventLoop, EventLoopProxy};
+ 
+ use super::app::App;
++use crate::headless_event_loop::{HeadlessEventLoop, HeadlessEventLoopWaker};
+ 
+ #[derive(Debug)]
+ pub enum AppEvent {
+@@ -82,7 +82,10 @@ impl ServoShellEventLoop {
+                     .run_app(app)
+                     .expect("Failed while running events loop");
+             },
+-            ServoShellEventLoop::Headless(event_loop) => event_loop.run_app(app),
++            ServoShellEventLoop::Headless(event_loop) => {
++                app.init(None);
++                event_loop.run(|| app.pump_servo_event_loop(None));
++            },
+         }
+     }
+ }
+@@ -111,59 +114,3 @@ impl EventLoopWaker for HeadedEventLoopWaker {
+         Box::new(self.clone())
+     }
+ }
+-
+-/// The [`HeadlessEventLoop`] is used when running in headless mode. The event
+-/// loop just loops over a condvar to simulate a real windowing system event loop.
+-#[derive(Default)]
+-pub(crate) struct HeadlessEventLoop {
+-    guard: Arc<Mutex<bool>>,
+-    condvar: Condvar,
+-}
+-
+-impl HeadlessEventLoop {
+-    fn run_app(&self, app: &mut App) {
+-        app.init(None);
+-
+-        loop {
+-            self.sleep();
+-            if !app.pump_servo_event_loop(None) {
+-                break;
+-            }
+-            *self.guard.lock().unwrap() = false;
+-        }
+-    }
+-
+-    fn sleep(&self) {
+-        // To avoid sleeping when we should be processing events, do two things:
+-        // * before sleeping, check whether our signalling flag has been set
+-        // * wait on a condition variable with a maximum timeout, to allow
+-        //   being woken up by any signals that occur while sleeping.
+-        let guard = self.guard.lock().unwrap();
+-        if *guard {
+-            return;
+-        }
+-        let _ = self
+-            .condvar
+-            .wait_timeout(guard, time::Duration::from_millis(5))
+-            .unwrap();
+-    }
+-}
+-
+-#[derive(Clone)]
+-struct HeadlessEventLoopWaker(Arc<HeadlessEventLoop>);
+-
+-impl EventLoopWaker for HeadlessEventLoopWaker {
+-    fn wake(&self) {
+-        // Set the signalling flag and notify the condition variable.
+-        // This ensures that any sleep operation is interrupted,
+-        // and any non-sleeping operation will have a change to check
+-        // the flag before going to sleep.
+-        let mut flag = self.0.guard.lock().unwrap();
+-        *flag = true;
+-        self.0.condvar.notify_all();
+-    }
+-
+-    fn clone_box(&self) -> Box<dyn EventLoopWaker> {
+-        Box::new(self.clone())
+-    }
+-}
+diff --git a/ports/servoshell/desktop/mod.rs b/ports/servoshell/desktop/mod.rs
+index 8ade3831c57..5a60ee7c26d 100644
+--- a/ports/servoshell/desktop/mod.rs
++++ b/ports/servoshell/desktop/mod.rs
+@@ -14,7 +14,6 @@ pub(crate) mod gamepad;
+ pub mod geometry;
+ mod gui;
+ pub(crate) mod headed_window;
+-mod headless_window;
+ mod keyutils;
+ mod protocols;
+ mod tracing;
+diff --git a/ports/servoshell/headless_event_loop.rs b/ports/servoshell/headless_event_loop.rs
+new file mode 100644
+index 00000000000..d3937017b8b
+--- /dev/null
++++ b/ports/servoshell/headless_event_loop.rs
+@@ -0,0 +1,65 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! An event loop for running without a windowing system.
++
++use std::sync::{Arc, Condvar, Mutex};
++use std::time;
++
++use servo::EventLoopWaker;
++
++/// The [`HeadlessEventLoop`] is used when running in headless mode. The event
++/// loop just loops over a condvar to simulate a real windowing system event loop.
++#[derive(Default)]
++pub(crate) struct HeadlessEventLoop {
++    guard: Arc<Mutex<bool>>,
++    condvar: Condvar,
++}
++
++impl HeadlessEventLoop {
++    /// Call `spin` whenever the event loop is woken up, until it returns `false`.
++    pub(crate) fn run(&self, mut spin: impl FnMut() -> bool) {
++        loop {
++            self.sleep();
++            if !spin() {
++                break;
++            }
++            *self.guard.lock().unwrap() = false;
++        }
++    }
++
++    fn sleep(&self) {
++        // To avoid sleeping when we should be processing events, do two things:
++        // * before sleeping, check whether our signalling flag has been set
++        // * wait on a condition variable with a maximum timeout, to allow
++        //   being woken up by any signals that occur while sleeping.
++        let guard = self.guard.lock().unwrap();
++        if *guard {
++            return;
++        }
++        let _ = self
++            .condvar
++            .wait_timeout(guard, time::Duration::from_millis(5))
++            .unwrap();
++    }
++}
++
++#[derive(Clone)]
++pub(crate) struct HeadlessEventLoopWaker(pub(crate) Arc<HeadlessEventLoop>);
++
++impl EventLoopWaker for HeadlessEventLoopWaker {
++    fn wake(&self) {
++        // Set the signalling flag and notify the condition variable.
++        // This ensures that any sleep operation is interrupted,
++        // and any non-sleeping operation will have a change to check
++        // the flag before going to sleep.
++        let mut flag = self.0.guard.lock().unwrap();
++        *flag = true;
++        self.0.condvar.notify_all();
++    }
++
++    fn clone_box(&self) -> Box<dyn EventLoopWaker> {
++        Box::new(self.clone())
++    }
++}
+diff --git a/ports/servoshell/desktop/headless_window.rs b/ports/servoshell/headless_window.rs
+similarity index 99%
+rename from ports/servoshell/desktop/headless_window.rs
+rename to ports/servoshell/headless_window.rs
+index d12d68ca991..6fcacb93a42 100644
+--- a/ports/servoshell/desktop/headless_window.rs
++++ b/ports/servoshell/headless_window.rs
+@@ -11,6 +11,7 @@ use std::cell::Cell;
+ use std::rc::Rc;
+ use std::sync::atomic::AtomicU64;
+ 
++use dpi::PhysicalSize;
+ use euclid::{Point2D, Scale, Size2D};
+ use log::error;
+ use servo::{
+@@ -18,7 +19,6 @@ use servo::{
+     DevicePixel, RenderingContext, ScreenGeometry, SoftwareRenderingContext, WebView,
+     convert_rect_to_css_pixel,
+ };
+-use winit::dpi::PhysicalSize;
+ 
+ use crate::prefs::ServoShellPreferences;
+ use crate::window::{MIN_WINDOW_INNER_SIZE, PlatformWindow, ServoShellWindow, ServoShellWindowId};
+diff --git a/ports/servoshell/lib.rs b/ports/servoshell/lib.rs
+index 399e0c4fcc6..da33cfdab48 100644
+--- a/ports/servoshell/lib.rs
++++ b/ports/servoshell/lib.rs
+@@ -16,6 +16,10 @@ pub(crate) mod desktop;
+ #[cfg(any(target_os = "android", target_env = "ohos"))]
+ mod egl;
+ #[cfg(not(any(target_os = "android", target_env = "ohos")))]
++mod headless_event_loop;
++#[cfg(not(any(target_os = "android", target_env = "ohos")))]
++mod headless_window;
++#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+ mod panic_hook;
+ mod parser;
+ mod prefs;

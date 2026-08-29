@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 11 Oct 2026 15:22:07 +0000
+Subject: [PATCH] ci: Let the QuickJS WPT report create its check run and
+ comment
+
+quickjs.yml gave all its jobs a read-only token, so the report of the
+QuickJS WPT run could neither create its check run nor comment on the
+pull request; both fail silently. The WPT job now takes the caller's
+token, like the Linux WPT job; the build job keeps the read-only one.
+
+Validation: actionlint reports nothing new for quickjs.yml.
+AI-assisted: Yes (agent session; from an independent agent review, written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/quickjs.yml | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/.github/workflows/quickjs.yml b/.github/workflows/quickjs.yml
+index eebc0db8bf6..286c5f7bfe8 100644
+--- a/.github/workflows/quickjs.yml
++++ b/.github/workflows/quickjs.yml
+@@ -41,9 +41,6 @@ on:
+         required: false
+         type: string
+ 
+-permissions:
+-  contents: read
+-
+ env:
+   RUST_BACKTRACE: 1
+   SHELL: /bin/bash
+@@ -61,6 +58,8 @@ jobs:
+     # a recent ohos-main. Pull requests from forks and runs while the repository variable
+     # NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners.
+     runs-on: ${{ (vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-22.04' || 'servo-ohos-linux' }}
++    permissions:
++      contents: read
+     steps:
+       - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
+       - name: Free Disk Space (Ubuntu)
+@@ -136,6 +135,8 @@ jobs:
+           path: target/${{ env.PROFILE }}/servo-tech-demo.tar.gz
+           if-no-files-found: error
+ 
++  # Takes the token of the caller, like the Linux WPT job: its report creates a check run and
++  # comments on the pull request.
+   wpt:
+     needs: build
+     if: ${{ github.event_name == 'schedule' || inputs.wpt }}

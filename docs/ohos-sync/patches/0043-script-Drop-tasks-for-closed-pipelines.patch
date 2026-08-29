@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 8 Oct 2026 13:43:00 +0200
+Subject: [PATCH] script: Drop tasks for closed pipelines
+
+Dropping tasks of exited pipelines avoids memory leaks, in cases where task keeps the something alive.
+
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+(cherry picked from commit 55f57aeaf9cb525026f3be7a7c2c6c26b2ffaf3d)
+
+----
+
+Fork note: backport of upstream pull request 48747 (head 55f57aeaf9c),
+which is still under review. Since upstream 47908 (visibilityState starts
+as visible, in base/2026-10-08), unloading a document queues a
+performance-entry task holding a Trusted<Performance>. When it arrives
+after the pipeline has exited, the task queue stored it as a task for an
+inactive document, which nothing ever removed, so it kept the whole
+window alive. Every replace navigation leaked the previous window this
+way: reloads, location.replace(), navigations before the document has
+completely loaded and meta refreshes, as long as the next page stays on
+the same site (leaving the site ends the script thread, which frees
+everything).
+Drop it (decision 3) once upstream has landed it; if review changes the
+patch, replace this commit with the landed version.
+
+Validation: Release builds of ohos-main plus patches 47 and 48 and plus patches 47 to 49, headless servoshell with `--pref=dom_testutils_enabled=true`, two runs each. A page that navigates itself with `location.href` from a timer before it has loaded (a replace navigation), 100 times, each page allocating a few MiB of JS objects, then `TestUtils.gc()`: RSS 940 and 941 MiB without this patch, 236 and 240 MiB with it (about 7 MiB per navigation). Plain ohos-main against all three patches: 940 and 937 MiB against 242 and 245 MiB. WPT with patches 47 to 49: `./mach test-wpt --release --processes 6 html/webappapis/timers html/browsers/browsing-the-web html/browsers/history page-visibility performance-timeline js workers html/webappapis/scripting/event-loops user-timing` (1029 tests): 1023 as expected. The other 6 are flaky or broken on plain ohos-main too (A/B repeats, plain ohos-main vs with the patches): navigation-unload-same-origin-fragment.html FAIL 6/10 vs 7/10; cross-origin-top-navigation-with-user-activation-in-parent.window.html TIMEOUT 23/30 vs 29/30 (18/20 vs 20/20 in the interleaved rounds); location_replace_session_history.html (expected TIMEOUT) ends in ERROR, TIMEOUT or CRASH on both, 28/2/0 vs 22/5/3 of 30; same-document-refresh.html PASS 9/10 vs 10/10 (stale FAIL expectation); form-submit-cross-frame.html FAIL 2/10 vs 0/10; iframe-src-204.html FAIL once in the full run, 0/10 vs 0/10 in repeats. `./mach fmt` and `./mach test-tidy` are clean.
+AI-assisted: Yes (agent session; the agent cherry-picked upstream pull request 48747 at 55f57aeaf9c without code changes and added the fork-style part of this message below the dashed line: fork note, Validation and these trailers)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/event_loop/script_thread.rs |  8 +-----
+ components/script/tasks/task_queue.rs         | 25 +++++++++++++------
+ 2 files changed, 19 insertions(+), 14 deletions(-)
+
+diff --git a/components/script/event_loop/script_thread.rs b/components/script/event_loop/script_thread.rs
+index 3bad36294c2..330284f776b 100644
+--- a/components/script/event_loop/script_thread.rs
++++ b/components/script/event_loop/script_thread.rs
+@@ -337,10 +337,6 @@ pub struct ScriptThread {
+     /// The JavaScript runtime.
+     js_runtime: Rc<Runtime>,
+ 
+-    /// List of pipelines that have been owned and closed by this script thread.
+-    #[no_trace]
+-    closed_pipelines: DomRefCell<FxHashSet<PipelineId>>,
+-
+     mutation_observers: Rc<ScriptMutationObservers>,
+ 
+     /// A handle to the WebGL thread
+@@ -975,7 +971,6 @@ impl ScriptThread {
+                     closing,
+                     timer_scheduler: Default::default(),
+                     js_runtime: Rc::new(runtime),
+-                    closed_pipelines: DomRefCell::new(FxHashSet::default()),
+                     mutation_observers: Default::default(),
+                     system_font_service: Arc::new(state.system_font_service.to_proxy()),
+                     #[cfg(feature = "webgl")]
+@@ -3143,7 +3138,7 @@ impl ScriptThread {
+         metadata: Option<&Metadata>,
+         origin: MutableOrigin,
+     ) -> Option<DomRoot<Document>> {
+-        if self.closed_pipelines.borrow().contains(&pipeline_id) {
++        if self.task_queue.is_pipeline_closed(&pipeline_id) {
+             // If the pipeline closed, do not process the headers.
+             return None;
+         }
+@@ -3260,7 +3255,6 @@ impl ScriptThread {
+         }
+ 
+         // Prevent any further work for this Pipeline.
+-        self.closed_pipelines.borrow_mut().insert(pipeline_id);
+         self.task_queue
+             .remove_tasks_for_exiting_pipeline(&pipeline_id);
+ 
+diff --git a/components/script/tasks/task_queue.rs b/components/script/tasks/task_queue.rs
+index 3d462225298..0b3fa1601a6 100644
+--- a/components/script/tasks/task_queue.rs
++++ b/components/script/tasks/task_queue.rs
+@@ -54,6 +54,8 @@ pub(crate) struct TaskQueue<T> {
+     throttled: DomRefCell<FxHashMap<TaskSourceName, VecDeque<QueuedTask>>>,
+     /// Tasks for not fully-active documents.
+     inactive: DomRefCell<FxHashMap<PipelineId, VecDeque<QueuedTask>>>,
++    /// List of pipelines that have been owned and closed by the parent script thread.
++    closed_pipelines: DomRefCell<FxHashSet<PipelineId>>,
+ }
+ 
+ impl<T: QueuedTaskConversion> TaskQueue<T> {
+@@ -65,6 +67,7 @@ impl<T: QueuedTaskConversion> TaskQueue<T> {
+             taken_task_counter: Default::default(),
+             throttled: Default::default(),
+             inactive: Default::default(),
++            closed_pipelines: Default::default(),
+         }
+     }
+ 
+@@ -73,6 +76,11 @@ impl<T: QueuedTaskConversion> TaskQueue<T> {
+     /// the next time the queue is processed.
+     pub(crate) fn remove_tasks_for_exiting_pipeline(&self, pipeline_id: &PipelineId) {
+         self.inactive.borrow_mut().remove(pipeline_id);
++        self.closed_pipelines.borrow_mut().insert(*pipeline_id);
++    }
++
++    pub(crate) fn is_pipeline_closed(&self, pipeline_id: &PipelineId) -> bool {
++        self.closed_pipelines.borrow().contains(pipeline_id)
+     }
+ 
+     /// Release previously held-back tasks for documents that are now fully-active.
+@@ -96,16 +104,19 @@ impl<T: QueuedTaskConversion> TaskQueue<T> {
+     /// Hold back tasks for currently not fully-active documents.
+     /// <https://html.spec.whatwg.org/multipage/#event-loop-processing-model:fully-active>
+     fn store_task_for_inactive_pipeline(&self, msg: T, pipeline_id: &PipelineId) {
+-        let mut inactive = self.inactive.borrow_mut();
+-        let inactive_queue = inactive.entry(*pipeline_id).or_default();
+-        inactive_queue.push_back(
+-            msg.into_queued_task()
+-                .expect("Incoming messages should always be convertible into queued tasks"),
+-        );
++        if !self.is_pipeline_closed(pipeline_id) {
++            let mut inactive = self.inactive.borrow_mut();
++            let inactive_queue = inactive.entry(*pipeline_id).or_default();
++            inactive_queue.push_back(
++                msg.into_queued_task()
++                    .expect("Incoming messages should always be convertible into queued tasks"),
++            );
++        }
++
+         let mut msg_queue = self.msg_queue.borrow_mut();
+         if msg_queue.is_empty() {
+             // Ensure there is at least one message.
+-            // Otherwise if the just stored inactive message
++            // Otherwise if the just stored inactive message (or dropped message)
+             // was the first and last of this iteration,
+             // it will result in a spurious wake-up of the event-loop.
+             msg_queue.push_back(T::inactive_msg());

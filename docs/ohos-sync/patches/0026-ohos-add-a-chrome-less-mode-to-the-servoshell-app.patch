@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 11 Sep 2026 02:37:32 +0000
+Subject: [PATCH] ohos: add a chrome-less mode to the servoshell app
+
+`--chrome=none` drops the toolbar and the tab bar so the XComponent fills
+the window. Measurement runs want the web content alone: the chrome costs
+ArkUI layout on every frame and, more importantly, shrinks the viewport,
+which changes how much the page has to lay out.
+
+EntryAbility consumes the flag and does not forward it to servoshell,
+whose argument parser exits the process on an option it does not
+recognise. The ArkWeb test app spells it the same way, so one launch
+argument now serves both.
+
+`aa start --psn=<key>` creates a want parameter whose *name* is the whole
+string after the `=` and whose value is null, so `--psn=--chrome=none`
+arrives as the key `--chrome=none`. Keys are therefore split on their
+first `=` before the flag is matched; what is pushed into servoshell's
+argument list is still the untouched key and value, so no other launch
+argument changes shape.
+
+Validation: on a PLR-AL00, `aa start -b org.servo.servo -a EntryAbility -U <url> --psn=--chrome=none` renders m.huaweimossel.com with no toolbar and no tab bar (screenshot compared against the same launch without the flag), and a launch carrying `--psn=--tracing-filter=info,[{servo_profiling=true}]=trace` alongside it still reaches servoshell intact (630 `handle_reflow` spans in an 18 s hitrace).
+AI-assisted: Yes (agent session; 2026-10-08 sync -- conflict resolution: re-applied on upstream #48684's rewritten Index.ets as `if (this.showChrome)` around the toolbar and the new tab list)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../main/ets/entryability/EntryAbility.ets    |  46 ++++++-
+ .../entry/src/main/ets/pages/Index.ets        | 114 +++++++++---------
+ 2 files changed, 101 insertions(+), 59 deletions(-)
+
+diff --git a/support/openharmony/entry/src/main/ets/entryability/EntryAbility.ets b/support/openharmony/entry/src/main/ets/entryability/EntryAbility.ets
+index 1933a517aeb..0a5f59394d8 100644
+--- a/support/openharmony/entry/src/main/ets/entryability/EntryAbility.ets
++++ b/support/openharmony/entry/src/main/ets/entryability/EntryAbility.ets
+@@ -7,6 +7,28 @@ import servoshell, { InitOpts } from 'libservoshell.so';
+ 
+ const WRONG_COMMAND_ARRAY = ["tracing", "devtools", "force_ipc", "multiprocess", "webdriver"];
+ 
++// `--chrome=none` hides the app's own toolbar and tab bar so the XComponent
++// fills the window. Measurement runs want the web content alone: the chrome
++// costs ArkUI layout on every frame and, more importantly, shrinks the
++// viewport, which changes how much the page has to lay out.
++//
++// It is handled here and *not* forwarded to servoshell, whose argument parser
++// exits the process on an option it does not recognise. The same spelling
++// works for the ArkWeb test app, so a measurement harness can pass one flag to
++// both.
++//
++// `--psn=<key>` — the form `aa start` needs for a single argv token — creates a
++// want parameter whose *name* is everything after the `=` and whose value is
++// null, so `--psn=--chrome=none` arrives as the key `--chrome=none`. `--ps
++// chrome none` instead produces a real key/value pair. Accept both.
++function isChromeKey(key: string): boolean {
++  return key === "--chrome" || key === "chrome";
++}
++
++function disablesChrome(value: string): boolean {
++  return value === "none" || value === "false" || value === "0";
++}
++
+ export default class EntryAbility extends UIAbility {
+   init_params: LocalStorage = new LocalStorage();
+   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam) {
+@@ -16,6 +38,7 @@ export default class EntryAbility extends UIAbility {
+     }
+     let uri: string = want.uri || "https://servo.org"
+     let params: string[] = []
++    let showChrome: boolean = true
+     if (typeof want.parameters !== "undefined") {
+       Object.entries(want.parameters).forEach((entry) => {
+         let key = entry[0]
+@@ -33,13 +56,24 @@ export default class EntryAbility extends UIAbility {
+         // Use `--psn=--arg_name` for flags that do not have a value.
+         // See the aa tool documentation for more details:
+         // https://docs.openharmony.cn/pages/v5.0/en/application-dev/tools/aa-tool.md
+-        if (key.startsWith("--")) {
+-          let value = entry[1].toString()
++        let raw_value: string = entry[1] !== null && entry[1] !== undefined ? entry[1].toString() : ""
++        // Split `--key=value` keys produced by `--psn=`, so both spellings
++        // reach the checks below as a key and a value.
++        let split_key = key
++        let split_value = raw_value
++        let eq = key.indexOf("=")
++        if (raw_value.length === 0 && eq > 0) {
++          split_key = key.substring(0, eq)
++          split_value = key.substring(eq + 1)
++        }
++        if (isChromeKey(split_key)) {
++          showChrome = !disablesChrome(split_value)
++        } else if (key.startsWith("--")) {
+           params.push(key)
+-          if (value) {
+-            params.push(value)
++          if (raw_value.length > 0) {
++            params.push(raw_value)
+           }
+-        } else if (WRONG_COMMAND_ARRAY.some(value => key.startsWith(value))) {
++        } else if (WRONG_COMMAND_ARRAY.some((prefix: string) => key.startsWith(prefix))) {
+           hilog.error(0xE0C3, "Servo EntryAbility", "-------------------------------------------------------------------------------------------------");
+           hilog.error(0xE0C3, "Servo EntryAbility", "\n\nYou probably meant to add -- infront of your argument, i.e., --psn=--tracing vs --psn=tracing. You used " + entry);
+           hilog.error(0xE0C3, "Servo EntryAbility", "-------------------------------------------------------------------------------------------------");
+@@ -49,6 +83,8 @@ export default class EntryAbility extends UIAbility {
+     }
+     let servoshell_params = params.join("\u{001f}")
+     hilog.debug(0x0000, 'Servo EntryAbility', 'Servoshell parameters: %{public}s', servoshell_params);
++    this.init_params.setOrCreate<boolean>('showChrome', showChrome)
++    hilog.info(0x0000, 'Servo EntryAbility', 'showChrome: %{public}s', `${showChrome}`);
+ 
+     let resource_dir: string = this.context.resourceDir;
+     console.debug("resourceDir: ", resource_dir);
+diff --git a/support/openharmony/entry/src/main/ets/pages/Index.ets b/support/openharmony/entry/src/main/ets/pages/Index.ets
+index 5086a5c7e36..42f7689e1c2 100644
+--- a/support/openharmony/entry/src/main/ets/pages/Index.ets
++++ b/support/openharmony/entry/src/main/ets/pages/Index.ets
+@@ -5,6 +5,10 @@ import servoshell from 'libservoshell.so';
+ @Component
+ struct Index {
+   // The state seem to be required to be on the top.
++  // Set by EntryAbility from `--chrome=none`: when false the toolbar and the
++  // tab bar are dropped and the XComponent fills the window. See the comment
++  // in EntryAbility.ets for why measurement runs want that.
++  @LocalStorageProp('showChrome') showChrome: boolean = true
+   @State urlToLoad: string = ""
+   @State tablist: Array<number> = [0];
+   @State currentId: number = 0;
+@@ -78,62 +82,64 @@ struct Index {
+     // extends beyond the edge of the screen. This does not happen with
+     // Flex.
+     Flex({ direction: FlexDirection.Column }) {
+-      Row() {
+-        Button('+')
+-          .backgroundColor(Color.White)
+-          .fontColor(Color.Black)
+-          .fontWeight(FontWeight.Bolder)
+-          .fontSize(22)
+-          .width('12%')
+-          .onClick((event) => {
+-            const new_id = this.nextTabId++;
+-            // the order is important as adding a new tab will automatically create a new surface.
+-            servoshell.nextWindowId(new_id);
+-            this.tablist.push(new_id)
+-            this.currentId = new_id;
+-          })
+-        Button('⇦')
+-          .backgroundColor(Color.White)
+-          .fontColor(Color.Black)
+-          .fontWeight(FontWeight.Bolder)
+-          .width('12%')
+-          .fontSize(12)
+-          .onClick(() => {
+-            this.onBackPress()
+-          })
+-        Button('⇨')
+-          .backgroundColor(Color.White)
+-          .fontColor(Color.Black)
+-          .fontWeight(FontWeight.Bolder)
+-          .fontSize(12)
+-          .width('12%')
+-          .onClick(() => {
+-            servoshell.goForward()
+-          })
+-        TextInput({ placeholder: 'URL', text: $$this.urlToLoad })
+-          .type(InputType.URL)
+-          .width('76%')
+-          .onChange((value) => {
+-            this.urlToLoad = value
+-          })
+-          .onSubmit((EnterKeyType) => {
+-            servoshell.loadURL(this.urlToLoad)
+-            console.info('Load URL: ', this.urlToLoad)
+-          })
+-      }
++      if (this.showChrome) {
++        Row() {
++          Button('+')
++            .backgroundColor(Color.White)
++            .fontColor(Color.Black)
++            .fontWeight(FontWeight.Bolder)
++            .fontSize(22)
++            .width('12%')
++            .onClick((event) => {
++              const new_id = this.nextTabId++;
++              // the order is important as adding a new tab will automatically create a new surface.
++              servoshell.nextWindowId(new_id);
++              this.tablist.push(new_id)
++              this.currentId = new_id;
++            })
++          Button('⇦')
++            .backgroundColor(Color.White)
++            .fontColor(Color.Black)
++            .fontWeight(FontWeight.Bolder)
++            .width('12%')
++            .fontSize(12)
++            .onClick(() => {
++              this.onBackPress()
++            })
++          Button('⇨')
++            .backgroundColor(Color.White)
++            .fontColor(Color.Black)
++            .fontWeight(FontWeight.Bolder)
++            .fontSize(12)
++            .width('12%')
++            .onClick(() => {
++              servoshell.goForward()
++            })
++          TextInput({ placeholder: 'URL', text: $$this.urlToLoad })
++            .type(InputType.URL)
++            .width('76%')
++            .onChange((value) => {
++              this.urlToLoad = value
++            })
++            .onSubmit((EnterKeyType) => {
++              servoshell.loadURL(this.urlToLoad)
++              console.info('Load URL: ', this.urlToLoad)
++            })
++        }
+ 
+-      List({ space: 10 }) {
+-        ForEach(this.tablist, (item: number, index: number) => {
+-          ListItem() {
+-            this.tabBuilder(item, index)
+-          }
+-        })
++        List({ space: 10 }) {
++          ForEach(this.tablist, (item: number, index: number) => {
++            ListItem() {
++              this.tabBuilder(item, index)
++            }
++          })
++        }
++        .listDirection(Axis.Horizontal)
++        .height(40)
++        .width('100%')
++        .padding({ left: 10, right: 10 })
++        .backgroundColor('#e1e1e1')
+       }
+-      .listDirection(Axis.Horizontal)
+-      .height(40)
+-      .width('100%')
+-      .padding({ left: 10, right: 10 })
+-      .backgroundColor('#e1e1e1')
+ 
+       Stack() {
+         ForEach(this.tablist, (item: number) => {

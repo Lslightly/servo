@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 18 Sep 2026 09:33:41 +0000
+Subject: [PATCH] fonts: Only relayout for web font changes that can affect
+ laid-out text
+
+Every web font that finished loading, and every change to the set of
+@font-face rules, dirtied the whole document. That is only necessary if
+text that has been laid out may use the font.
+
+The FontContext now records which families font matching has looked up,
+and only changes to faces of those families invalidate the document. This
+removes the invalidation when @font-face rules are added before anything
+was laid out, and when script loads a face that nothing uses.
+
+Testing: Covered by existing tests.
+
+Fork note: third of four patches; meant for upstream, applies unchanged. The
+per-load `dirty_all_nodes` it narrows is upstream behaviour (with a TODO);
+the invalidation on added rules comes from the previous patch.
+
+Relies on: the previous patch (the `affects_laid_out_text` flag rides on
+`WebFontSetDifference` and on the new `WebFontLoadEvent::LoadedSuccessfully`
+field); every web font lookup going through
+`FontContext::matching_web_font_templates`.
+
+Drop together with the previous patch, or when upstream invalidates only text
+that uses the changed family (then this family filter is redundant).
+
+Validation: `./mach test-wpt --release --processes 1 css/css-font-loading css/css-fonts html/canvas/element/text html/canvas/offscreen/text` (948 tests) unchanged from the previous patch (font-variant-emoji-1 FAIL, as on plain ohos-main). `-Z relayout-event` with the page served at 2 MB/s and 30 ms latency: the 6-rule reproducer, whose rules exist before the first layout, drops from 4 to 3 reflows (the invalidation for the added rules is gone); the keai page is unchanged at 39-40 reflows, because it lays out its text before its Google Fonts stylesheet arrives.
+AI-assisted: Yes (agent session; designed with the maintainer, written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/fonts/font_context.rs              | 41 +++++++++++++++++--
+ components/script/dom/window/window.rs        |  7 ++--
+ components/script/event_loop/script_thread.rs | 18 ++++++--
+ components/shared/fonts/lib.rs                |  9 +++-
+ 4 files changed, 64 insertions(+), 11 deletions(-)
+
+diff --git a/components/fonts/font_context.rs b/components/fonts/font_context.rs
+index acff5d65d08..d117c987ff0 100644
+--- a/components/fonts/font_context.rs
++++ b/components/fonts/font_context.rs
+@@ -138,6 +138,11 @@ pub struct FontContext {
+     /// [`FontContextWebFontMethods::process_pending_web_font_loads`] afterwards.
+     #[ignore_malloc_size_of = "The rules are measured as part of `known_font_face_rules`."]
+     pending_web_font_loads: Mutex<Vec<ServoArc<FontFaceRuleInfo>>>,
++
++    /// The font families that font matching has looked up among the web fonts, whether or
++    /// not any web font of that family existed at the time. Changes to web fonts of other
++    /// families cannot affect text that has been laid out.
++    used_font_families: RwLock<FxHashSet<LowercaseFontFamilyName>>,
+ }
+ 
+ /// A callback that will be invoked on the Fetch thread if a web font download
+@@ -200,6 +205,7 @@ impl FontContext {
+             font_feature_value_map: Default::default(),
+             number_of_loading_web_fonts: Default::default(),
+             pending_web_font_loads: Default::default(),
++            used_font_families: Default::default(),
+         }
+     }
+ 
+@@ -354,10 +360,15 @@ impl FontContext {
+             return None;
+         };
+ 
++        let family_name: LowercaseFontFamilyName = family_name.name.clone().into();
++        if !self.used_font_families.read().contains(&family_name) {
++            self.used_font_families.write().insert(family_name.clone());
++        }
++
+         self.web_fonts
+             .read()
+             .families
+-            .get(&family_name.name.clone().into())
++            .get(&family_name)
+             .map(|templates| {
+                 let mut matching_templates =
+                     templates.find_for_descriptor(Some(descriptor_to_match));
+@@ -700,6 +711,8 @@ impl WebFontDownloadState {
+                     return;
+                 }
+ 
++                let affects_laid_out_text = self.font_context.is_font_family_used(&family_name);
++
+                 // The face was registered as unloaded when its rule was added, so replace
+                 // that entry rather than adding a second one for the same rule.
+                 self.font_context
+@@ -719,7 +732,9 @@ impl WebFontDownloadState {
+                 // Note: We intentionally do not call decrement_count_of_loading_fonts_by_one here.
+                 // That is handled in the callback, which avoids document.fonts.ready being resolved
+                 // prematurely.
+-                (initiator.callback)(WebFontLoadEvent::LoadedSuccessfully);
++                (initiator.callback)(WebFontLoadEvent::LoadedSuccessfully {
++                    affects_laid_out_text,
++                });
+             },
+             WebFontLoadInitiator::Script(callback) => {
+                 self.font_context.decrement_count_of_loading_fonts_by_one();
+@@ -828,7 +843,7 @@ impl FontContextWebFontMethods for Arc<FontContext> {
+         callback: StylesheetWebFontLoadFinishedCallback,
+         document_context: &WebFontDocumentContext,
+     ) -> WebFontSetDifference {
+-        let difference = self
++        let mut difference = self
+             .known_font_face_rules
+             .lock()
+             .diff_old_and_new_font_face_rules(stylist, guards);
+@@ -860,6 +875,13 @@ impl FontContextWebFontMethods for Arc<FontContext> {
+             self.resolved_font_groups.write().clear();
+         }
+ 
++        difference.affects_laid_out_text = difference.cascade_index_of_any_rule_changed ||
++            difference
++                .added_font_faces
++                .iter()
++                .chain(difference.removed_font_faces.iter())
++                .any(|rule| self.is_font_face_rule_family_used(rule));
++
+         if !difference.removed_font_faces.is_empty() {
+             // Ensure that we clean up any WebRender resources on the next display list update.
+             self.have_removed_web_fonts.store(true, Ordering::Relaxed);
+@@ -1089,6 +1111,19 @@ impl FontContext {
+         }
+     }
+ 
++    /// Whether font matching has looked up the given family among the web fonts.
++    pub(crate) fn is_font_family_used(&self, family_name: &LowercaseFontFamilyName) -> bool {
++        self.used_font_families.read().contains(family_name)
++    }
++
++    fn is_font_face_rule_family_used(&self, font_face_rule: &FontFaceRuleInfo) -> bool {
++        font_face_rule
++            .descriptors
++            .font_family
++            .as_ref()
++            .is_some_and(|family| self.is_font_family_used(&family.name.clone().into()))
++    }
++
+     /// Whether any web font loads have been asked for but not started yet.
+     pub fn has_pending_web_font_loads(&self) -> bool {
+         !self.pending_web_font_loads.lock().is_empty()
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index cba84887daf..59d8b5f15b5 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -3757,11 +3757,12 @@ impl Window {
+ 
+         // A face that was added is unloaded, and only font matching can tell whether the
+         // page needs it. Adding an `@font-face` rule does not change any computed style, so
+-        // without dirtying nothing would be laid out again and the face would never be
+-        // asked for.
++        // without dirtying, text laid out before the rule existed would never be matched
++        // again and the face would never be asked for. Text of other families is matched
++        // against the new rules when it is laid out for the first time anyway.
+         //
+         // TODO: This should only dirty nodes that could use any of the changed web fonts!
+-        if !changed_web_fonts.is_empty() || changed_web_fonts.cascade_index_of_any_rule_changed {
++        if changed_web_fonts.affects_laid_out_text {
+             document.dirty_all_nodes(cx.no_gc());
+         }
+ 
+diff --git a/components/script/event_loop/script_thread.rs b/components/script/event_loop/script_thread.rs
+index 2d38c747419..66963bf6a4c 100644
+--- a/components/script/event_loop/script_thread.rs
++++ b/components/script/event_loop/script_thread.rs
+@@ -1845,8 +1845,11 @@ impl ScriptThread {
+                 // If the font load did not succeed then this message only serves to bump the script thread
+                 // so it attempts to resolve the document.fonts.ready promise. This happens as a result
+                 // of processing this message, so there's nothing more to do.
+-                if event == WebFontLoadEvent::LoadedSuccessfully {
+-                    self.handle_web_font_loaded(cx, pipeline_id)
++                if let WebFontLoadEvent::LoadedSuccessfully {
++                    affects_laid_out_text,
++                } = event
++                {
++                    self.handle_web_font_loaded(cx, pipeline_id, affects_laid_out_text)
+                 }
+             },
+             ScriptThreadMessage::DispatchIFrameLoadEvent {
+@@ -3328,14 +3331,21 @@ impl ScriptThread {
+     }
+ 
+     /// Handles a Web font being loaded. Does nothing if the page no longer exists.
+-    fn handle_web_font_loaded(&self, cx: &mut JSContext, pipeline_id: PipelineId) {
++    fn handle_web_font_loaded(
++        &self,
++        cx: &mut JSContext,
++        pipeline_id: PipelineId,
++        affects_laid_out_text: bool,
++    ) {
+         let Some(document) = self.documents.borrow().find_document(pipeline_id) else {
+             warn!("Web font loaded in closed pipeline {}.", pipeline_id);
+             return;
+         };
+ 
+         // TODO: This should only dirty nodes that are waiting for a web font to finish loading!
+-        document.dirty_all_nodes(cx.no_gc());
++        if affects_laid_out_text {
++            document.dirty_all_nodes(cx.no_gc());
++        }
+ 
+         document.Fonts(cx).update_css_connected_face_statuses(cx);
+ 
+diff --git a/components/shared/fonts/lib.rs b/components/shared/fonts/lib.rs
+index 2ba88411422..929fa5a3d0a 100644
+--- a/components/shared/fonts/lib.rs
++++ b/components/shared/fonts/lib.rs
+@@ -26,7 +26,11 @@ pub use system_font_service_proxy::*;
+ 
+ #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+ pub enum WebFontLoadEvent {
+-    LoadedSuccessfully,
++    LoadedSuccessfully {
++        /// Whether laid-out text may use the font, because font matching has looked up
++        /// its family before. If not, nothing needs to be laid out again.
++        affects_laid_out_text: bool,
++    },
+     UnblockedFontReadyPromise,
+ }
+ 
+@@ -124,6 +128,9 @@ pub struct WebFontSetDifference {
+     ///
+     /// This can cause different fonts to be selected during font matching.
+     pub cascade_index_of_any_rule_changed: bool,
++    /// Whether this update can change the fonts of text that has already been laid out,
++    /// because font matching has looked up the family of a rule that changed.
++    pub affects_laid_out_text: bool,
+ }
+ 
+ impl WebFontSetDifference {

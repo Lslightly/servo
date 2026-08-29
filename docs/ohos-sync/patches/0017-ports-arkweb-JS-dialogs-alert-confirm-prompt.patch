@@ -1,0 +1,513 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 9 Jul 2026 18:58:05 +0000
+Subject: [PATCH] ports/arkweb: JS dialogs (alert/confirm/prompt)
+
+Bridge Servo's show_embedder_control(EmbedderControl::SimpleDialog) to
+ACE's OnAlertDialogByJS/OnConfirmDialogByJS/OnPromptDialogByJS. The
+(!Send) SimpleDialog is parked on the servo thread keyed by an id; ACE
+returns the user's choice through an NWebJSDialogResult that routes back
+as an Action (resolve_js_dialog) to confirm/dismiss the parked dialog.
+When no ACE handler takes the dialog, the shim resolves it locally so the
+page's script is never blocked (alert acknowledges, confirm/prompt cancel).
+
+ACE marshals the dialog callbacks to its JS thread (PostSyncTask), so
+calling them from the servo thread is safe.
+
+Also drop the now-unused BuiltWebView.rendering_context field (its only
+reader was removed by the resize fix; the delegate and painter hold their
+own clones).
+
+For the handled path, add conftest helpers dump_layout()/find_center()
+(and a `dump` fixture) that read the ArkUI component tree via
+`uitest dumpLayout`, so tests can tap ArkUI components (e.g. an
+AlertDialog's buttons) by looked-up bounds instead of hard-coded
+coordinates. test_dialogs.py covers both paths: unhandled (alert()
+resolves and the script continues, confirm() -> false, prompt() -> null)
+and handled (the arkweb-test DialogPage shows a real AlertDialog whose
+OK/Cancel button is found via the layout dump and tapped, asserting the
+returned value). The handled tests skip if the DialogPage is not
+installed.
+
+Verified on rk3568: 6 dialog tests pass (3 unhandled + 3 handled).
+
+Validation: Test by running uv run ports/arkweb/tools/test_dialogs.py on a device.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/cpp/servo_client.h          |   5 +
+ ports/arkweb/cpp/servo_handler_proxy.cpp |  42 ++++++++
+ ports/arkweb/cpp/servo_handler_proxy.h   |   2 +
+ ports/arkweb/src/bridge.rs               |  15 +++
+ ports/arkweb/src/runtime.rs              |  82 +++++++++++++-
+ ports/arkweb/tools/conftest.py           |  41 +++++++
+ ports/arkweb/tools/test_dialogs.py       | 129 +++++++++++++++++++++++
+ 7 files changed, 312 insertions(+), 4 deletions(-)
+ create mode 100644 ports/arkweb/tools/test_dialogs.py
+
+diff --git a/ports/arkweb/cpp/servo_client.h b/ports/arkweb/cpp/servo_client.h
+index 958de38317a..3e76f68e615 100644
+--- a/ports/arkweb/cpp/servo_client.h
++++ b/ports/arkweb/cpp/servo_client.h
+@@ -30,6 +30,11 @@ public:
+     // Notifies ACE that an editable is focused / blurred so it tracks the focus text field and its
+     // back button closes the soft keyboard (the keyboard itself is driven by the engine's own IME).
+     virtual void update_text_field_status(bool show_keyboard, bool attach_ime) const = 0;
++    // Asks ACE to show a JS dialog (kind: 0=alert, 1=confirm, 2=prompt). Returns whether a handler
++    // took it; the user's response is delivered later via servo::arkweb::resolve_js_dialog.
++    virtual bool show_js_dialog(std::uint64_t dialog_id, std::int32_t kind,
++                                const std::string& message,
++                                const std::string& default_value) const = 0;
+ };
+ 
+ }  // namespace servo::embedder
+diff --git a/ports/arkweb/cpp/servo_handler_proxy.cpp b/ports/arkweb/cpp/servo_handler_proxy.cpp
+index 6f3338fcb04..36347c812a3 100644
+--- a/ports/arkweb/cpp/servo_handler_proxy.cpp
++++ b/ports/arkweb/cpp/servo_handler_proxy.cpp
+@@ -1,12 +1,32 @@
+ #include "servo_handler_proxy.h"
+ 
++#include <cstdint>
++#include <string>
+ #include <utility>
+ 
++#include "arkweb/src/bridge.rs.h"
+ #include "ohos_nweb/nweb_console_log.h"
++#include "ohos_nweb/nweb_js_dialog_result.h"
+ 
+ namespace servo::arkweb {
+ 
+ namespace {
++
++// The NWebJSDialogResult handed to ACE for a JS dialog; ACE calls back on it when the user
++// responds, which we route to the parked Servo SimpleDialog by id.
++class ServoJsDialogResult : public OHOS::NWeb::NWebJSDialogResult {
++public:
++    explicit ServoJsDialogResult(std::uint64_t dialog_id) : dialog_id_(dialog_id) {}
++
++    void Confirm() override { servo::arkweb::resolve_js_dialog(dialog_id_, true, std::string()); }
++    void Confirm(const std::string& message) override {
++        servo::arkweb::resolve_js_dialog(dialog_id_, true, message);
++    }
++    void Cancel() override { servo::arkweb::resolve_js_dialog(dialog_id_, false, std::string()); }
++
++private:
++    std::uint64_t dialog_id_;
++};
+ // Concrete NWebConsoleLog carrying a servo console message across to OnConsoleLog. Servo provides
+ // only the level and text; the line number and source id are unknown (0 / empty).
+ class ServoConsoleLog : public OHOS::NWeb::NWebConsoleLog {
+@@ -89,4 +109,26 @@ void NWebHandlerProxy::update_text_field_status(bool show_keyboard, bool attach_
+     }
+ }
+ 
++bool NWebHandlerProxy::show_js_dialog(std::uint64_t dialog_id, std::int32_t kind,
++                                      const std::string& message,
++                                      const std::string& default_value) const {
++    auto h = handler();
++    if (!h) {
++        return false;
++    }
++    auto result = std::make_shared<ServoJsDialogResult>(dialog_id);
++    // Servo does not surface the triggering page URL here; ACE tolerates an empty url.
++    const std::string url;
++    switch (kind) {
++        case 0:
++            return h->OnAlertDialogByJS(url, message, result);
++        case 1:
++            return h->OnConfirmDialogByJS(url, message, result);
++        case 2:
++            return h->OnPromptDialogByJS(url, message, default_value, result);
++        default:
++            return false;
++    }
++}
++
+ }  // namespace servo::arkweb
+diff --git a/ports/arkweb/cpp/servo_handler_proxy.h b/ports/arkweb/cpp/servo_handler_proxy.h
+index 4e93a113e31..e67a81853e7 100644
+--- a/ports/arkweb/cpp/servo_handler_proxy.h
++++ b/ports/arkweb/cpp/servo_handler_proxy.h
+@@ -29,6 +29,8 @@ public:
+                             const std::string& source) const override;
+     void on_frame_ready() const override;
+     void update_text_field_status(bool show_keyboard, bool attach_ime) const override;
++    bool show_js_dialog(std::uint64_t dialog_id, std::int32_t kind, const std::string& message,
++                        const std::string& default_value) const override;
+ 
+ private:
+     std::shared_ptr<OHOS::NWeb::NWebHandler> handler() const;
+diff --git a/ports/arkweb/src/bridge.rs b/ports/arkweb/src/bridge.rs
+index 4750904f1e8..3498130ee10 100644
+--- a/ports/arkweb/src/bridge.rs
++++ b/ports/arkweb/src/bridge.rs
+@@ -86,6 +86,15 @@ pub mod ffi {
+         /// button closes the soft keyboard and it tracks the focus text field. The keyboard itself
+         /// is driven by the engine's own IME connection, not by this.
+         fn update_text_field_status(self: &WebViewClient, show_keyboard: bool, attach_ime: bool);
++        /// Ask ACE to show a JS dialog (`kind`: 0=alert, 1=confirm, 2=prompt) for the page. Returns
++        /// whether a handler took it; the user's response comes back via `resolve_js_dialog`.
++        fn show_js_dialog(
++            self: &WebViewClient,
++            dialog_id: u64,
++            kind: i32,
++            message: &CxxString,
++            default_value: &CxxString,
++        ) -> bool;
+     }
+ }
+ 
+@@ -97,6 +106,9 @@ pub mod ffi_arkweb {
+         /// `eval_id` (see `servo_js.h`) once it completes.
+         fn evaluate_javascript_with_callback(id: u32, eval_id: u64, code: &CxxString);
+         fn init_logging(min_level: i32);
++        /// Deliver a JS dialog result from ACE back to the parked `SimpleDialog` (see
++        /// `show_js_dialog`). `value` carries the entered text for a confirmed prompt.
++        fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString);
+     }
+ 
+     unsafe extern "C++" {
+@@ -207,3 +219,6 @@ fn evaluate_javascript_with_callback(id: u32, eval_id: u64, code: &CxxString) {
+ fn init_logging(min_level: i32) {
+     crate::runtime::init_logging(min_level)
+ }
++fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString) {
++    crate::runtime::resolve_js_dialog(dialog_id, confirmed, value)
++}
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index 2d2521e3e54..c05ce8975cc 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -16,7 +16,7 @@ use std::panic::{self, AssertUnwindSafe};
+ use std::path::PathBuf;
+ use std::ptr::NonNull;
+ use std::rc::Rc;
+-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+ use std::sync::mpsc::{self, Receiver, Sender};
+ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+ use std::thread;
+@@ -36,9 +36,9 @@ use servo::{
+     CompositionEvent, CompositionState, ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D,
+     EmbedderControl, EmbedderControlId, EventLoopWaker, ImeEvent, InputEvent, InputMethodControl,
+     InputMethodType, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts,
+-    Preferences, RefreshDriver, RenderingContext, Scroll, Servo, ServoBuilder, TouchEvent,
+-    TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate,
+-    WindowRenderingContext,
++    Preferences, RefreshDriver, RenderingContext, Scroll, Servo, ServoBuilder, SimpleDialog,
++    TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
++    WebViewDelegate, WindowRenderingContext,
+ };
+ use url::Url;
+ 
+@@ -150,6 +150,12 @@ enum Action {
+     ImeSendEnter {
+         id: u32,
+     },
++    /// The user answered a JS dialog (from the ACE dialog result callback thread).
++    ResolveJsDialog {
++        dialog_id: u64,
++        confirmed: bool,
++        value: String,
++    },
+     GetCookie {
+         url: String,
+         include_http_only: bool,
+@@ -221,6 +227,34 @@ static SERVO_CHANNEL: OnceLock<Sender<Action>> = OnceLock::new();
+ static SYNC_STATES: LazyLock<Mutex<HashMap<u32, Arc<SyncState>>>> =
+     LazyLock::new(|| Mutex::new(HashMap::new()));
+ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
++static NEXT_DIALOG_ID: AtomicU64 = AtomicU64::new(1);
++
++thread_local! {
++    /// JS dialogs (`alert`/`confirm`/`prompt`) awaiting a user response. The `SimpleDialog` is
++    /// `!Send` and must be resolved on the servo thread, so it is parked here (both parking, from
++    /// the delegate, and resolving, from [`Action::ResolveJsDialog`], run on that thread). ACE
++    /// reports the user's choice through the [`WebViewClient`] result callback, which routes back
++    /// as an `Action`.
++    static JS_DIALOGS: RefCell<HashMap<u64, SimpleDialog>> = RefCell::new(HashMap::new());
++}
++
++/// Resolve a parked JS dialog with the user's response and unblock the page's script. A prompt
++/// carries the entered text on confirm; everything else confirms or cancels.
++fn resolve_parked_dialog(dialog_id: u64, confirmed: bool, value: String) {
++    JS_DIALOGS.with(|dialogs| {
++        let Some(dialog) = dialogs.borrow_mut().remove(&dialog_id) else {
++            return;
++        };
++        match dialog {
++            SimpleDialog::Prompt(mut prompt) if confirmed => {
++                prompt.set_current_value(&value);
++                prompt.confirm();
++            },
++            dialog if confirmed => dialog.confirm(),
++            dialog => dialog.dismiss(),
++        }
++    });
++}
+ 
+ /// Wrap a bridge-call body so a Rust panic is logged and swallowed rather than unwinding across
+ /// the C++ boundary (which cxx turns into an abort).
+@@ -627,6 +661,11 @@ impl ServoThread {
+             Action::ImeSendEnter { id } => {
+                 self.with_webview(id, |wv| ime_press_named(wv, NamedKey::Enter, 1));
+             },
++            Action::ResolveJsDialog {
++                dialog_id,
++                confirmed,
++                value,
++            } => resolve_parked_dialog(dialog_id, confirmed, value),
+             Action::GetCookie {
+                 url,
+                 include_http_only,
+@@ -1043,6 +1082,31 @@ impl WebViewDelegate for ArkWebViewDelegate {
+                 self.visible_input_methods.borrow_mut().push(control_id);
+                 self.on_ime_show(&input_method_control);
+             },
++            // JS `alert()`/`confirm()`/`prompt()`. Park the (`!Send`) dialog on this thread keyed by
++            // an id, ask ACE to show it, and let the result callback resolve it via an `Action`.
++            EmbedderControl::SimpleDialog(dialog) => {
++                let dialog_id = NEXT_DIALOG_ID.fetch_add(1, Ordering::Relaxed);
++                let (kind, default_value) = match &dialog {
++                    SimpleDialog::Alert(_) => (0, String::new()),
++                    SimpleDialog::Confirm(_) => (1, String::new()),
++                    SimpleDialog::Prompt(prompt) => (2, prompt.current_value().to_owned()),
++                };
++                let message = dialog.message().to_owned();
++                JS_DIALOGS.with(|dialogs| dialogs.borrow_mut().insert(dialog_id, dialog));
++                let handled = match self.client.as_ref() {
++                    Some(client) => {
++                        cxx::let_cxx_string!(message = &message);
++                        cxx::let_cxx_string!(default_value = &default_value);
++                        client.show_js_dialog(dialog_id, kind, &message, &default_value)
++                    },
++                    None => false,
++                };
++                // No ACE handler: resolve so the page's script is not blocked. `alert()`
++                // acknowledges and continues; `confirm()`/`prompt()` are cancelled.
++                if !handled {
++                    resolve_parked_dialog(dialog_id, kind == 0, String::new());
++                }
++            },
+             _ => {},
+         }
+     }
+@@ -1368,6 +1432,16 @@ pub fn need_soft_keyboard(id: u32) -> bool {
+     })
+ }
+ 
++pub fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString) {
++    guard("resolve_js_dialog", || {
++        send(Action::ResolveJsDialog {
++            dialog_id,
++            confirmed,
++            value: value.to_string(),
++        })
++    })
++}
++
+ /// Translate an OHOS key event into a servo `KeyboardEvent`. `action`: 0 = down, 1 = up (ArkUI
+ /// `KeyAction`). `unicode` is the character value if any (0 otherwise). Returns whether the key was
+ /// mapped and dispatched, so ACE can fall back to its own handling for keys we do not consume.
+diff --git a/ports/arkweb/tools/conftest.py b/ports/arkweb/tools/conftest.py
+index c498f29e401..77c32dad0d7 100644
+--- a/ports/arkweb/tools/conftest.py
++++ b/ports/arkweb/tools/conftest.py
+@@ -22,6 +22,7 @@ xDevice, or the on-device @ohos/hypium module, once that tooling is validated he
+ from __future__ import annotations
+ 
+ import base64
++import json
+ import os
+ import re
+ import shlex
+@@ -102,6 +103,40 @@ def launch_page(device: HarmonyDevice, url: str | None = None, page: str | None
+     sh(device, command, check=False)
+ 
+ 
++def dump_layout(device: HarmonyDevice, dest_dir: Path) -> dict:
++    """Dump the ArkUI component tree via `uitest dumpLayout` and return it parsed.
++
++    Lets tests find the on-screen bounds of ArkUI components (e.g. an AlertDialog's buttons)
++    instead of hard-coding coordinates. Note: Servo's web content is a GPU surface and is NOT
++    in this tree -- only the `Web` container node is -- so web elements still need page-layout
++    coordinates.
++    """
++    out = sh(device, "uitest dumpLayout", check=False)
++    match = re.search(r"(/data/local/tmp/layout_\d+\.json)", out)
++    assert match, f"could not find layout path in: {out!r}"
++    local = Path(dest_dir) / os.path.basename(match.group(1))
++    device.recv_file(match.group(1), str(local))
++    return json.loads(local.read_text())
++
++
++def find_center(tree: dict, text: str) -> tuple[int, int] | None:
++    """Return the screen centre of the first component whose `text` attribute equals `text`."""
++    found: list[tuple[int, int]] = []
++
++    def walk(node: dict) -> None:
++        attributes = node.get("attributes", node)
++        if attributes.get("text") == text:
++            bounds = re.match(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]", attributes.get("bounds", ""))
++            if bounds:
++                left, top, right, bottom = (int(v) for v in bounds.groups())
++                found.append(((left + right) // 2, (top + bottom) // 2))
++        for child in node.get("children", []):
++            walk(child)
++
++    walk(tree)
++    return found[0] if found else None
++
++
+ def screencap(device: HarmonyDevice, dest_dir: Path) -> Image.Image:
+     out = sh(device, "snapshot_display", check=False)
+     match = re.search(r"(/data/local/tmp/snapshot_[^\s]+\.jpeg)", out)
+@@ -191,6 +226,12 @@ def cap(device: HarmonyDevice, tmp_path: Path):
+     return lambda: screencap(device, tmp_path)
+ 
+ 
++@pytest.fixture
++def dump(device: HarmonyDevice, tmp_path: Path):
++    """Return a zero-arg function that dumps and returns the parsed ArkUI component tree."""
++    return lambda: dump_layout(device, tmp_path)
++
++
+ @pytest.fixture
+ def launch(device: HarmonyDevice):
+     """Return a function that (re)launches the app on a page and waits for first render.
+diff --git a/ports/arkweb/tools/test_dialogs.py b/ports/arkweb/tools/test_dialogs.py
+new file mode 100644
+index 00000000000..74258ab51ea
+--- /dev/null
++++ b/ports/arkweb/tools/test_dialogs.py
+@@ -0,0 +1,129 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""JS dialogs (`alert`/`confirm`/`prompt`) for the Servo ArkWeb backend.
++
++Servo surfaces these via `show_embedder_control(EmbedderControl::SimpleDialog)`; the shim
++bridges them to ACE's `OnAlertDialogByJS`/`OnConfirmDialogByJS`/`OnPromptDialogByJS` and
++routes the user's response back through an `NWebJSDialogResult`.
++
++These tests exercise the round-trip with **no app dialog handler installed** (arkweb-test
++sets none), which is the case where ACE reports the dialog unhandled and the shim resolves
++it so the page's script is never blocked: `alert()` acknowledges and continues, `confirm()`
++returns false, `prompt()` returns null. The page runs the dialog at load and encodes the
++outcome as its background colour (OCR-free pixel check). This verifies the full
++Servo -> shim -> ACE -> shim -> Servo path is wired and non-blocking.
++
++The *handled* tests at the bottom exercise the ACE->result->Servo callback returning a real
++user choice. They require the arkweb-test app's `DialogPage` (launched with `--ps page
++dialog`), whose Web component's onConfirm/onAlert/onPrompt show a real ArkUI `AlertDialog`
++and return the choice. The dialog's OK/Cancel buttons are ArkUI, so their coordinates come
++from `uitest dumpLayout` (not hard-coded); the dialog is triggered on page load via `-U` so
++no web-button coordinate is needed. These tests skip if the dialog never appears (DialogPage
++not installed). See conftest.py for the harness/provisioning notes.
++"""
++
++import time
++
++import pytest
++
++from conftest import data_url, find_center, is_green, is_red, sample, tap
++
++
++def _page(script: str) -> str:
++    return (
++        '<html><head><meta name=viewport content="width=device-width,initial-scale=1"></head>'
++        '<body id=b style="margin:0;background:#bbbbdd">'
++        f"<script>{script}</script></body></html>"
++    )
++
++
++# alert() has no return value: if it resolves, the script continues and paints green.
++ALERT = _page("alert('a'); document.getElementById('b').style.background='#00cc00';")
++# confirm() with no handler resolves to false -> red.
++CONFIRM = _page("document.getElementById('b').style.background = confirm('c') ? '#00cc00' : '#cc0000';")
++# prompt() with no handler resolves to null -> green (null === null).
++PROMPT = _page("document.getElementById('b').style.background = (prompt('p','d') === null) ? '#00cc00' : '#cc0000';")
++
++PROBE = (360, 600)
++
++
++def test_alert_resolves_and_continues(launch, cap):
++    launch(url=data_url(ALERT))
++    time.sleep(3.0)
++    assert is_green(sample(cap(), PROBE)), "alert() did not resolve -- the page's script stayed blocked"
++
++
++def test_confirm_returns_result(launch, cap):
++    launch(url=data_url(CONFIRM))
++    time.sleep(3.0)
++    assert is_red(sample(cap(), PROBE)), "confirm() (no handler) did not return false"
++
++
++def test_prompt_returns_result(launch, cap):
++    launch(url=data_url(PROMPT))
++    time.sleep(3.0)
++    assert is_green(sample(cap(), PROBE)), "prompt() (no handler) did not return null"
++
++
++# --- handled path: DialogPage shows a real dialog and returns the user's choice -----------
++
++# Triggered on load so no web-button coordinate is needed; the outcome is encoded as the
++# body colour. DialogPage's onPrompt returns the default value on OK.
++CONFIRM_LOAD = _page("document.getElementById('b').style.background = confirm('C') ? '#00cc00' : '#cc0000';")
++PROMPT_LOAD = _page(
++    "document.getElementById('b').style.background = (prompt('P','hi') === 'hi') ? '#00cc00' : '#cc0000';"
++)
++DIALOG_PROBE = (360, 900)
++
++
++def _wait_for_button(dump, text: str, timeout: float = 12.0):
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        center = find_center(dump(), text)
++        if center is not None:
++            return center
++        time.sleep(0.5)
++    return None
++
++
++def _skip_if_no_dialog(button):
++    if button is None:
++        pytest.skip(
++            "dialog button never appeared -- run the arkweb-test app's DialogPage "
++            "(the HAP with onConfirm/onAlert/onPrompt handlers)"
++        )
++
++
++def test_confirm_ok_returns_true(launch, cap, dump):
++    device = launch(url=data_url(CONFIRM_LOAD), page="dialog")
++    ok = _wait_for_button(dump, "OK")
++    _skip_if_no_dialog(ok)
++    tap(device, ok)
++    time.sleep(2.5)
++    assert is_green(sample(cap(), DIALOG_PROBE)), "confirm() did not return true after OK"
++
++
++def test_confirm_cancel_returns_false(launch, cap, dump):
++    device = launch(url=data_url(CONFIRM_LOAD), page="dialog")
++    cancel = _wait_for_button(dump, "Cancel")
++    _skip_if_no_dialog(cancel)
++    tap(device, cancel)
++    time.sleep(2.5)
++    assert is_red(sample(cap(), DIALOG_PROBE)), "confirm() did not return false after Cancel"
++
++
++def test_prompt_ok_returns_value(launch, cap, dump):
++    device = launch(url=data_url(PROMPT_LOAD), page="dialog")
++    ok = _wait_for_button(dump, "OK")
++    _skip_if_no_dialog(ok)
++    tap(device, ok)
++    time.sleep(2.5)
++    assert is_green(sample(cap(), DIALOG_PROBE)), "prompt() did not return the default value after OK"
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))

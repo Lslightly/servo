@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 9 Jul 2026 14:06:53 +0000
+Subject: [PATCH] docs: Mark this repo as an experimental OHOS downstream fork
+
+Add an initial contributing guideline and mention in the readme that
+this is a fork.
+There is no immediate plans to publish anything, hence no need to
+come up with a different name or rename crates.
+
+CONTRIBUTING.md also points at the runbook's section on updating local
+branches after a sync.
+
+Validation: not required (documentation-only change).
+AI-assisted: Yes (agent session; drafted from the maintainer's review question)
+AI-assisted: Yes (agent session; 2026-10-08 sync -- mechanical conflict resolution in .github/workflows/main.yml, where upstream #48530 dropped `macos` from the push preset; the fork's reduced presets are kept, no semantic change)
+AI-assisted: Yes (agent session; 2026-10-09 restack -- folded in the CONTRIBUTING.md part of "docs: document how to update local branches after a sync")
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/main.yml |  2 +-
+ CONTRIBUTING.md            | 31 ++++++++++++++++++++++++++++---
+ README.md                  | 15 +++++++++++++++
+ 3 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index f246bded361..88bc7453ca2 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -36,7 +36,7 @@ jobs:
+         run: |
+           {
+             echo 'result<<EOF'
+-            python ./python/servo/try_parser.py ${{ github.event_name == 'pull_request' && 'linux-unit-tests lint' || github.event_name == 'push' && 'full macos-arm-capi bencher production-bencher coverage' || 'fail-fast full' }}
++            python ./python/servo/try_parser.py ${{ github.event_name == 'pull_request' && 'linux-unit-tests lint' || github.event_name == 'push' && 'full' || 'fail-fast linux-wpt ohos' }}
+             echo EOF
+            } >> $GITHUB_OUTPUT
+ 
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index e80d3790dbf..ae430b4aff5 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -1,5 +1,30 @@
+-# Contributing to Servo
++# Contributing to this Fork
+ 
+-Moved to the Servo book:
++This repository is a fork of servo, mainly carrying additional OpenHarmony related patches to achieve a
++faster development velocity.
++Patches that comply with upstream rules and are stable, should preferably be submitted upstream, to help keep this fork maintainable.
++Patches that are blocked upstream, and improve the experience on ohos can be merged here, to ease sharing between ohos contributors.
+ 
+-- [Contributing to Servo](https://book.servo.org/contributing/getting-started)
++The `main` branch follows `upstream/main` and carries no patches. 
++The `ohos-main` contains `main` + our patches and will be rebased regularly (via force-push).
++Previous states will be preserved by tagging commits before / after syncing.
++After a sync, update local branches with `git pull --rebase` / `git rebase ohos-main`
++(set `pull.rebase = true`), or deterministically with
++`git rebase --onto sync/<date> pre-sync/<date> <branch>` — see
++[docs/ohos-sync.md](docs/ohos-sync.md), "After a sync: updating your branches".
++`base/<date>` tags mark the base state of `main` on a given date of a sync.
++`pre-sync/<date>` tags mark the last commit on `ohos-main` before a rebase onto main.
++`sync/<date>` marks the last commit on `ohos-main` after a rebase onto main.
++
++
++The rules in this fork are roughly:
++
++- If something is trivial, fix is upstream
++- If something is OpenHarmony / arkweb specific, it can be merged here, however it should be mostly additive to minimize rebasing effort.
++- Each commit should have a `Validation: Test by doing XYZ` comment in the commit message, explaining which tests are relevant to ensure the commit
++  continues working as intended during rebasing.
++- The CI matrix is reduced (linux + ohos) to limit overhead, but try to not break other platforms. If regressions are discovered for other platforms, the patch should be fixed.
++- Otherwise, this is very much an experiment, so expect changes.
++
++
++Please also view the [upstream Contributing to Servo Guide](https://book.servo.org/contributing/getting-started).
+diff --git a/README.md b/README.md
+index 1481211a7cc..92753b611ac 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,18 @@
++# Fork of servo/servo
++
++> [!NOTE]
++> This is an **experimental downstream fork** of [servo/servo](https://github.com/servo/servo)
++> carrying additional OpenHarmony-related patches (e.g. the ArkWeb port and
++> OHOS-specific integration). The `ohos-main` branch is regularly rebased onto
++> upstream `main` and carries the downstream patches on top. For anything not
++> OHOS-specific, please contribute to upstream instead. 
++> See CONTRIBUTING.md for details
++
++
++Original upstream servo Readme below:
++
++-------------------
++
+ # The Servo Parallel Browser Engine Project
+ 
+ Servo is a prototype web browser engine written in the

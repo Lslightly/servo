@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 11 Oct 2026 17:50:19 +0000
+Subject: [PATCH] script: Release each microtask's autorelease pool entries
+ when it ends
+
+With the QuickJS backend (js-quickjs), the shim keeps every value it
+hands to Rust in an autorelease pool, which Servo drains between
+tasks. A microtask checkpoint therefore kept every microtask it ran,
+and everything the microtask referenced, alive until the task ended.
+The checkpoint loop now opens a servo-quickjs AutoreleasePoolScope for
+each microtask, JS jobs and Servo's own alike. The loop's roots are
+written before they are read in each iteration, and what a microtask
+leaves for later holds references of its own (Heap, Dom), which is
+what the scope requires.
+
+With release builds on ohos-main 4d542899ab6, whose Rust code is the
+same as here: RSS grows by 3 MiB instead of 252 MiB over 10^6 awaits
+in one task, and by 3 MiB instead of 69 MiB over a chain of 10^6
+queueMicrotask calls; dom-bench's await loop takes 97 instead of
+120 ms. 19 pages (7 runs each) are unchanged in time and memory.
+
+The servo-quickjs pin in support/quickjs/cargo-config.toml moves from
+879bfe9 to 78daccd ("mozjs: pool scopes for microtasks"), which adds
+the scope and drains the pool entries of the incumbent-global trap
+after each then()/await. The other four commits in between add pool
+statistics (only in builds with QJS_POOL_STATS=1), drain the pool
+through a raw pointer, fix two fuzz targets, and add tests. The
+raw-pointer drain avoids a miscompile that released pooled objects
+twice in optimized builds, but the shim still holds a &mut Cx across
+calls that re-enter it, which Rust's aliasing rules forbid; a
+servo-quickjs follow-up fixes that, the scope's drain included.
+
+One subtest of jsurl-form-submit.tentative.html, a race between a
+javascript: URL's result and the form submission it starts, passes
+with this under parallel load and fails alone, as with SpiderMonkey;
+it is marked [FAIL, PASS] for QuickJS.
+
+Fork note: QuickJS only (feature js-quickjs); not for upstream.
+
+Validation: WPT subset of 21 directories (7670 tests) with --js-engine quickjs and QJS_VERIFY_TRACING=1 (shim f4037c8; 78daccd only adds documentation, debug assertions and pool-statistics fixes): no verifier report; all unexpected results but three tests and three subtests also occur with the old pin 879bfe9, and of those six only the jsurl-form-submit subtest reproduced in 5 reruns; ./mach fmt and ./mach test-tidy.
+AI-assisted: Yes (agent session; written, tested and measured by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/runtime/job_queue.rs                       | 5 +++++
+ support/quickjs/cargo-config.toml                            | 2 +-
+ .../form-submission-0/jsurl-form-submit.tentative.html.ini   | 4 +++-
+ 3 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/components/script/runtime/job_queue.rs b/components/script/runtime/job_queue.rs
+index 6791a953180..a38a55909b5 100644
+--- a/components/script/runtime/job_queue.rs
++++ b/components/script/runtime/job_queue.rs
+@@ -232,6 +232,11 @@ pub(crate) fn job_queue_microtask_checkpoint(
+     // and https://searchfox.org/firefox-main/rev/7ae92e67d094086cd3e09918ec94b6278a948535/xpcom/base/CycleCollectedJSContext.cpp#1176
+     // and its helper functions
+     while unsafe { HasAnyMicroTasks(cx) } {
++        // QuickJS: release what this microtask kept alive in the autorelease pool, instead of at
++        // the end of the task. The roots above are written before they are read in each iteration,
++        // and what a microtask leaves for later holds references of its own.
++        #[cfg(feature = "js-quickjs")]
++        let _pool_scope = unsafe { js::quickjs::AutoreleasePoolScope::new() };
+         unsafe { JS_DequeueNextMicroTask(cx, generic_task.handle_mut()) };
+ 
+         // Notify the JS engine if the queue is now empty, enabling optimizations
+diff --git a/support/quickjs/cargo-config.toml b/support/quickjs/cargo-config.toml
+index 45b4de1fd31..b62d51e5349 100644
+--- a/support/quickjs/cargo-config.toml
++++ b/support/quickjs/cargo-config.toml
+@@ -5,4 +5,4 @@
+ # were tested with. The shim's version must match the mozjs version that Cargo.toml requires, or
+ # Cargo leaves the patch unused.
+ [patch.crates-io]
+-mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "879bfe90ee0855fe9a63b7faba8c414ecdf7a37f" }
++mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "78daccddca57c745b830b5486b0e6bec4de40587" }
+diff --git a/tests/wpt/meta/html/semantics/forms/form-submission-0/jsurl-form-submit.tentative.html.ini b/tests/wpt/meta/html/semantics/forms/form-submission-0/jsurl-form-submit.tentative.html.ini
+index 640bea3a8dd..ea8ff616877 100644
+--- a/tests/wpt/meta/html/semantics/forms/form-submission-0/jsurl-form-submit.tentative.html.ini
++++ b/tests/wpt/meta/html/semantics/forms/form-submission-0/jsurl-form-submit.tentative.html.ini
+@@ -1,3 +1,5 @@
+ [jsurl-form-submit.tentative.html]
+   [Verifies that form submissions scheduled inside javascript: urls take precedence over the javascript: url's return value.]
+-    expected: FAIL
++    expected:
++      if js_engine == "quickjs": [FAIL, PASS]
++      FAIL

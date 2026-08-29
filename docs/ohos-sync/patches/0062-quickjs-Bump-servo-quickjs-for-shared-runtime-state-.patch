@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 12 Oct 2026 06:32:06 +0000
+Subject: [PATCH] quickjs: Bump servo-quickjs for shared runtime-state access
+
+servo-quickjs cbf02ee reaches the shim's per-runtime state (Cx) only
+through shared references, and keeps the state that natives, hooks and
+finalizers change while Rust code uses it in cells. Before, the shim
+held a &mut Cx across calls that re-enter it, which Rust's aliasing
+rules forbid; 78daccd only avoided the miscompile this caused in the
+autorelease pool's drain. cbf02ee also stops keeping three borrows of
+object data (Intl objects, realm intrinsics, proxy slots) across frees
+and allocations.
+
+Validation: `./mach build --release --js-engine quickjs` and `xvfb-run ./mach smoketest --release` passed. A release build of the same Rust code (shim 809296d, the same tree as cbf02ee) ran the 7670-test WPT subset (dom, webidl, html/webappapis, html/semantics/scripting-1, fetch/api, streams, workers, IndexedDB, ...) with QJS_VERIFY_TRACING=1: no verifier report, and the same results as the previous shim but for seven tests, of which the four worse ones behaved the same with both shims in 5 reruns.
+AI-assisted: Yes (agent session; written by the agent, which also ran the build, smoketest and WPT runs above)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ support/quickjs/cargo-config.toml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/support/quickjs/cargo-config.toml b/support/quickjs/cargo-config.toml
+index b62d51e5349..3431cd22256 100644
+--- a/support/quickjs/cargo-config.toml
++++ b/support/quickjs/cargo-config.toml
+@@ -5,4 +5,4 @@
+ # were tested with. The shim's version must match the mozjs version that Cargo.toml requires, or
+ # Cargo leaves the patch unused.
+ [patch.crates-io]
+-mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "78daccddca57c745b830b5486b0e6bec4de40587" }
++mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "cbf02ee851f7f60b39c3b0ed99a81c99f759bd98" }

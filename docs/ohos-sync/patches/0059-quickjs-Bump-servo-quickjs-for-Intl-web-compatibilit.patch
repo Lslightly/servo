@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 11 Oct 2026 15:50:00 +0000
+Subject: [PATCH] quickjs: Bump servo-quickjs for Intl web compatibility
+
+servo-quickjs 879bfe9 formats dates and times as the other browsers do
+where CLDR's data differs from what sites expect: plain spaces instead
+of U+202F and U+2009, as SpiderMonkey does, and the date patterns of
+en-CA, sv-SE and the Chinese locales its table lacked (zh-SG, zh-MO,
+zh-Hans-HK, zh-Hans-MO). It also takes the system ICU's symbol suffix
+from the ICU headers.
+
+Validation: `./mach build --release --js-engine quickjs` of a tree with the same Rust code linked libicui18n.so.74, and `xvfb-run ./mach smoketest --release` passed. The 33 WPT tests that use Intl or locale APIs had the same 5 unexpected results (testdriver BiDi, web-bundle, WebRTC) as an earlier build of these shim changes; /ecmascript/locale-compat.html, which fails 4 subtests on fdb3eab, passes.
+AI-assisted: Yes (agent session; written by the agent, which also ran the build and WPT runs above)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ support/quickjs/cargo-config.toml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/support/quickjs/cargo-config.toml b/support/quickjs/cargo-config.toml
+index 357c02ca47d..45b4de1fd31 100644
+--- a/support/quickjs/cargo-config.toml
++++ b/support/quickjs/cargo-config.toml
+@@ -5,4 +5,4 @@
+ # were tested with. The shim's version must match the mozjs version that Cargo.toml requires, or
+ # Cargo leaves the patch unused.
+ [patch.crates-io]
+-mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "fdb3eab5a906abb563854f08eb9021d095fef18b" }
++mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "879bfe90ee0855fe9a63b7faba8c414ecdf7a37f" }

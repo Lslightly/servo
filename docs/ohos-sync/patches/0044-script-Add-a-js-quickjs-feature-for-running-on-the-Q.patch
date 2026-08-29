@@ -1,0 +1,677 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 9 Oct 2026 15:02:01 +0000
+Subject: [PATCH] script: Add a js-quickjs feature for running on the QuickJS
+ mozjs shim
+
+With the js-quickjs feature, Servo runs on servo-quickjs
+(https://github.com/openharmony-rs/servo-quickjs), which implements the
+mozjs API on QuickJS. The feature builds only with mozjs patched to the
+shim, e.g. in .cargo/config.toml:
+
+    [patch.crates-io]
+    mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "..." }
+
+QuickJS frees objects by reference counting and collects cycles, so
+under js-quickjs:
+- Dom<T> and DomRoot<T> hold a reference count on their target, also
+  when the target's reflector is set later (a DissimilarOriginWindow's
+  WindowProxy), and roots go through no root list;
+- the reflector of a DOM object holds none on its own object, and is
+  neither traced nor released by the Heap drop barrier; the reflector of
+  a TracedPromise holds a counted, traced one;
+- finalizers drop the Dom<T> fields of an object while the collector
+  knows which objects it frees, so WindowProxy finalizes through
+  finalize_common;
+- live Trusted references are counted until swept, and the shim's
+  autorelease pool is drained between tasks, on the script thread and
+  on worker threads;
+- reflectors are initialized before they are rooted, DOM objects are
+  left alone once the runtime is destroyed, and the Debugger API is
+  left out.
+
+Under SpiderMonkey, WindowProxy's finalizer does what it did before, and
+MutDom and MutNullableDom no longer copy Dom<T> bitwise, which is
+equivalent.
+
+Fork note: experimental, to evaluate QuickJS as the engine of a smaller
+profile (servo-quickjs docs/design.md). All QuickJS code is behind the
+feature, and the QuickJS workflow builds it and runs WPT with it. Not
+meant for upstream in this form.
+
+Rebasing: under js-quickjs a Dom<T> holds a count, so a bitwise copy of
+one, as upstream's ptr::read in MutDom and MutNullableDom was, releases
+it twice. This must find nothing; clone or borrow instead:
+
+    git grep ptr::read components/script_bindings components/script
+
+Removing such a copy can leave a crown unrooted_must_root expectation
+unfulfilled, which fails the Linux CI build (-D warnings) but no local
+build. Check with crown installed from the tree (cargo install --path
+support/crown):
+
+    RUSTFLAGS="-D warnings" ./mach check --use-crown
+
+Validation: On ohos-main 8fab1661b2c, before folding: servo-quickjs `just test`, `just test-verify` and `just test-asan` (79 tests each) and `just fuzz-smoke 60` pass; `./mach fmt` and `./mach test-tidy` are clean, and servoshell builds without warnings with and without js-quickjs. WPT with debug builds of the same commit, QuickJS with QJS_VERIFY_TRACING=1 against SpiderMonkey, `--processes 2`, html/semantics/scripting-1, html/webappapis/microtask-queuing, html/webappapis/scripting, import-maps, workers/modules, webidl and dom/events (1087 tests): no panics or verifier aborts; worse with QuickJS only the three dynamic-import/microtasks/basic variants, which time out in a debug build and pass with `--timeout-multiplier 4`; better on 3 tests. On af58e6041ff: release builds with both engines, the QuickJS one through the QuickJS workflow's patch step (servo-quickjs 0605066), and `./mach smoketest` passes with both. The worker sweep was added after these runs, from the ownership review: with it, 1000 XHRs in a worker no longer leave 1000 XMLHttpRequest objects alive (probe build of the spike). Full WPT on this stack, release builds with servo-quickjs ed76452, 58,101 tests, then 3 reruns per engine of every difference: outside the WebAssembly-dependent tests, QuickJS is consistently worse only in the three autoplay-*-permissions-policy tests, two WebGL conformance tests that time out on SpiderMonkey without JIT too, and single subtests of structured-cloning-error-stack and localeCompare (no Intl on desktop). After a review of these fixes, workers also release the pool after each batch, not only before the next one. With servo-quickjs 3286cd6, release build: `./mach smoketest` passes, and 2138 tests (cross-origin objects, WindowProxy, Location, history, windows, forms, structured cloning, WebIDL, DOM, fetch responses, workers) match the full run's QuickJS results, except one subtest that now passes and three tests that are flaky with SpiderMonkey too. Rebased onto 7f6279eb9b9 (the TimerListener and closed-pipeline leak fixes, and #48739, which this stack had carried as a backport): release builds with both engines and a checked-release QuickJS build pass the smoketest without warnings, and 2464 WPT tests (the 2138 above plus timers, iframes and cross-document navigation) match the full run's QuickJS results, except one test now passing, as on SpiderMonkey, and two customizable-select tests that are flaky on both engines (select-appearance-hover crashed once under load and fails 5 of 5 alone on both). `RUSTFLAGS="-D warnings" ./mach check --use-crown`, as the Linux CI job builds, passes: the crown expectation on `MutNullableDom::get_unrooted` went away with the `ptr::read` it covered.
+AI-assisted: Yes (agent session; agent sessions wrote and tested the js-quickjs commits, and the agent folded them into this patch and added the worker sweep)
+AI-assisted: Yes (agent session; 2026-10-13 sync -- mechanical conflict resolution in components/servo/Cargo.toml, next to upstream's new default_tooling feature (#47255), no semantic change)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/Cargo.toml                  |   1 +
+ .../dom/debugger/debuggerglobalscope.rs       |  10 +-
+ components/script/dom/promise/promise.rs      |   3 +
+ components/script/dom/window/windowproxy.rs   |   3 +-
+ .../dom/workers/abstractworkerglobalscope.rs  |  12 ++
+ components/script/event_loop/script_thread.rs |   6 +
+ components/script_bindings/Cargo.toml         |   2 +
+ components/script_bindings/dom.rs             |  13 +-
+ components/script_bindings/finalize.rs        |  14 +-
+ components/script_bindings/lib.rs             |   2 +-
+ components/script_bindings/refcounted.rs      |  23 +++
+ components/script_bindings/reflector.rs       |  51 +++++++
+ components/script_bindings/root.rs            | 136 +++++++++++++++++-
+ components/servo/Cargo.toml                   |   1 +
+ ports/servoshell/Cargo.toml                   |   1 +
+ 15 files changed, 263 insertions(+), 15 deletions(-)
+
+diff --git a/components/script/Cargo.toml b/components/script/Cargo.toml
+index f943380e33d..2188267f707 100644
+--- a/components/script/Cargo.toml
++++ b/components/script/Cargo.toml
+@@ -27,6 +27,7 @@ devtools = [
+     "servo-constellation-traits/devtools",
+ ]
+ gamepad = ["script_bindings/gamepad", "embedder_traits/gamepad"]
++js-quickjs = ["script_bindings/js-quickjs"]
+ jitspew = ['js/jitspew']
+ js_backtrace = []
+ js_jit = ["js/jit"]
+diff --git a/components/script/dom/debugger/debuggerglobalscope.rs b/components/script/dom/debugger/debuggerglobalscope.rs
+index 2b3e54b1822..5e8db17f4b7 100644
+--- a/components/script/dom/debugger/debuggerglobalscope.rs
++++ b/components/script/dom/debugger/debuggerglobalscope.rs
+@@ -14,10 +14,12 @@ use dom_struct::dom_struct;
+ use embedder_traits::ScriptToEmbedderChan;
+ use embedder_traits::resources::{self, Resource};
+ use js::context::JSContext;
++#[cfg(not(feature = "js-quickjs"))]
+ use js::rust::wrappers2::JS_DefineDebuggerObject;
+ use net_traits::ResourceThreads;
+ use profile_traits::{mem, time};
+ use script_bindings::interfaces::HasOrigin;
++#[cfg(not(feature = "js-quickjs"))]
+ use script_bindings::reflector::DomObject;
+ use servo_base::generic_channel::{GenericCallback, GenericSender, channel};
+ use servo_base::id::{Index, PipelineId, PipelineNamespaceId, WorkerId};
+@@ -88,7 +90,8 @@ impl DebuggerGlobalScope {
+     ///   pipeline ids, and they may contain debuggees from more than one pipeline
+     /// - in web worker threads, it should be set to the pipeline id of the page that created the thread, because
+     ///   those threads can’t generate pipeline ids, and they only contain one debuggee from one pipeline
+-    #[expect(unsafe_code, clippy::too_many_arguments)]
++    #[cfg_attr(not(feature = "js-quickjs"), expect(unsafe_code))]
++    #[expect(clippy::too_many_arguments)]
+     pub(crate) fn new(
+         debugger_pipeline_id: PipelineId,
+         script_to_devtools_sender: Option<GenericCallback<ScriptToDevtoolsControlMsg>>,
+@@ -133,6 +136,7 @@ impl DebuggerGlobalScope {
+         let mut realm = enter_auto_realm(cx, &*global);
+         let mut realm = realm.current_realm();
+         define_all_exposed_interfaces(&mut realm, global.upcast());
++        #[cfg(not(feature = "js-quickjs"))]
+         assert!(unsafe {
+             // Invariants: `obj` must be a handle to a JS global object.
+             JS_DefineDebuggerObject(&mut realm, global.global_scope.reflector().get_jsobject())
+@@ -150,6 +154,10 @@ impl DebuggerGlobalScope {
+     }
+ 
+     pub(crate) fn execute(&self, cx: &mut JSContext) {
++        // QuickJS has no Debugger API.
++        if cfg!(feature = "js-quickjs") {
++            return;
++        }
+         let mut realm = enter_auto_realm(cx, self);
+         let cx = &mut realm.current_realm();
+ 
+diff --git a/components/script/dom/promise/promise.rs b/components/script/dom/promise/promise.rs
+index ec651492798..987478e0e1c 100644
+--- a/components/script/dom/promise/promise.rs
++++ b/components/script/dom/promise/promise.rs
+@@ -210,6 +210,9 @@ impl Promise {
+         let promise = Rc::new(promise);
+         unsafe {
+             promise.init_reflector_without_associated_memory(self.reflector().get_jsobject().get());
++            // QuickJS: nothing else keeps the object of a `TracedPromise` alive.
++            #[cfg(feature = "js-quickjs")]
++            promise.reflector().hold_object();
+         }
+         promise
+     }
+diff --git a/components/script/dom/window/windowproxy.rs b/components/script/dom/window/windowproxy.rs
+index 168da6aae86..99eb25ef9ab 100644
+--- a/components/script/dom/window/windowproxy.rs
++++ b/components/script/dom/window/windowproxy.rs
+@@ -1831,13 +1831,12 @@ unsafe extern "C" fn finalize(_fop: *mut GCContext, obj: *mut JSObject) {
+         return;
+     }
+     unsafe {
+-        (*this).reflector.drop_memory(&*this);
+         let jsobject = (*this).reflector.get_jsobject().get();
+         debug!(
+             "WindowProxy finalize: {:p}, with reflector {:p} from {:p}.",
+             this, jsobject, obj
+         );
+-        let _ = Box::from_raw(this);
++        script_bindings::finalize::finalize_common(this);
+     }
+ }
+ 
+diff --git a/components/script/dom/workers/abstractworkerglobalscope.rs b/components/script/dom/workers/abstractworkerglobalscope.rs
+index 111b4839374..d59abe8181f 100644
+--- a/components/script/dom/workers/abstractworkerglobalscope.rs
++++ b/components/script/dom/workers/abstractworkerglobalscope.rs
+@@ -56,6 +56,9 @@ pub(crate) fn run_worker_event_loop<T, WorkerMsg, Event>(
+         + DerivedFrom<GlobalScope>
+         + DomObject,
+ {
++    #[cfg(feature = "js-quickjs")]
++    release_task_values();
++
+     let scope = worker_scope.upcast::<WorkerGlobalScope>();
+     let task_queue = worker_scope.task_queue();
+ 
+@@ -161,4 +164,13 @@ pub(crate) fn run_worker_event_loop<T, WorkerMsg, Event>(
+     worker_scope
+         .upcast::<GlobalScope>()
+         .perform_a_dom_garbage_collection_checkpoint();
++    #[cfg(feature = "js-quickjs")]
++    release_task_values();
++}
++
++/// QuickJS: no raw JS values live across tasks; release what the tasks kept alive.
++#[cfg(feature = "js-quickjs")]
++fn release_task_values() {
++    script_bindings::refcounted::sweep_live_references();
++    js::quickjs::drain_autorelease_pool();
+ }
+diff --git a/components/script/event_loop/script_thread.rs b/components/script/event_loop/script_thread.rs
+index 330284f776b..a6e130f38b2 100644
+--- a/components/script/event_loop/script_thread.rs
++++ b/components/script/event_loop/script_thread.rs
+@@ -1032,6 +1032,12 @@ impl ScriptThread {
+     pub(crate) fn start(&self, cx: &mut JSContext) {
+         debug!("Starting script thread.");
+         while self.handle_msgs(cx) {
++            // QuickJS: no raw JS values live across tasks; release what this task kept alive.
++            #[cfg(feature = "js-quickjs")]
++            {
++                script_bindings::refcounted::sweep_live_references();
++                js::quickjs::drain_autorelease_pool();
++            }
+             // Go on...
+             debug!("Running script thread.");
+         }
+diff --git a/components/script_bindings/Cargo.toml b/components/script_bindings/Cargo.toml
+index 96f0f4bad0f..f3de092817a 100644
+--- a/components/script_bindings/Cargo.toml
++++ b/components/script_bindings/Cargo.toml
+@@ -75,6 +75,8 @@ harness = false
+ bluetooth = []
+ devtools = []
+ gamepad = []
++# Build against the QuickJS implementation of the mozjs API (servo-quickjs).
++js-quickjs = []
+ testbinding = []
+ tracing = ["dep:tracing"]
+ webcrypto = []
+diff --git a/components/script_bindings/dom.rs b/components/script_bindings/dom.rs
+index 766bf648fdb..4575f30a054 100644
+--- a/components/script_bindings/dom.rs
++++ b/components/script_bindings/dom.rs
+@@ -4,8 +4,8 @@
+ use std::cell::UnsafeCell;
+ use std::hash::{Hash, Hasher};
+ use std::marker::PhantomData;
++use std::mem;
+ use std::ops::Deref;
+-use std::{mem, ptr};
+ 
+ use js::context::NoGC;
+ use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+@@ -47,7 +47,7 @@ impl<T: DomObject> MutDom<T> {
+     /// Get the value in this `MutDom`.
+     pub fn get(&self) -> DomRoot<T> {
+         assert_in_script();
+-        unsafe { DomRoot::from_ref(&*ptr::read(self.val.get())) }
++        unsafe { DomRoot::from_ref(&**self.val.get()) }
+     }
+ 
+     /// Get the [`DomObject`] without rooting it as an [`UnrootedDom`]. This is safe as
+@@ -56,7 +56,7 @@ impl<T: DomObject> MutDom<T> {
+     pub fn get_unrooted<'a>(&self, _: &'a NoGC) -> UnrootedDom<'a, T> {
+         assert_in_script();
+         UnrootedDom {
+-            inner: unsafe { ptr::read(self.val.get()) },
++            inner: unsafe { (*self.val.get()).clone() },
+             _phantom: PhantomData,
+         }
+     }
+@@ -243,7 +243,7 @@ impl<T: DomObject> MutNullableDom<T> {
+     /// [`MutNullableDom`].
+     pub fn get(&self) -> Option<DomRoot<T>> {
+         assert_in_script();
+-        unsafe { ptr::read(self.ptr.get()).map(|o| DomRoot::from_ref(&*o)) }
++        unsafe { (*self.ptr.get()).as_ref().map(|o| DomRoot::from_ref(&**o)) }
+     }
+ 
+     /// Get a reference to the traced inner value of this [`MutNullableDom`].
+@@ -261,11 +261,10 @@ impl<T: DomObject> MutNullableDom<T> {
+     /// Get the `DomObject` without rooting it. Constructing an UnrootedDom. This is safe
+     /// as we take a reference to NoGC and bound the lifetime by NoGC bound. This implies that
+     /// while the `UnrootedDom` is alive we do not have a GC run.
+-    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
+     pub fn get_unrooted<'a>(&self, _: &'a NoGC) -> Option<UnrootedDom<'a, T>> {
+         assert_in_script();
+-        let ptr = unsafe { ptr::read(self.ptr.get()) };
+-        ptr.map(|traced_value| Dom::from_ref(&*traced_value))
++        let ptr = unsafe { (*self.ptr.get()).as_ref() };
++        ptr.map(|traced_value| Dom::from_ref(&**traced_value))
+             .map(|dom| UnrootedDom {
+                 inner: dom,
+                 _phantom: PhantomData,
+diff --git a/components/script_bindings/finalize.rs b/components/script_bindings/finalize.rs
+index c9f0633351a..7267b466d52 100644
+--- a/components/script_bindings/finalize.rs
++++ b/components/script_bindings/finalize.rs
+@@ -32,11 +32,17 @@ unsafe fn do_finalize_global(obj: *mut JSObject) {
+ 
+ /// # Safety
+ /// `this` must point to a valid, non-null instance of T.
+-pub(crate) unsafe fn finalize_common<T: DomObject>(this: *const T) {
++pub unsafe fn finalize_common<T: DomObject>(this: *const T) {
+     if !this.is_null() {
+         // The pointer can be null if the object is the unforgeable holder of that interface.
+         let this = unsafe { Box::from_raw(this as *mut T) };
+         this.reflector().drop_memory(&*this);
++        #[cfg(feature = "js-quickjs")]
++        unsafe {
++            this.reflector().clear_for_finalize();
++            let reflector = this.reflector() as *const _ as *const crate::reflector::Reflector;
++            crate::root::quickjs_refs::finalizing(reflector, move || drop(this));
++        }
+     }
+     debug!("{} finalize: {:p}", type_name::<T>(), this);
+ }
+@@ -58,6 +64,12 @@ pub(crate) unsafe fn finalize_weak_referenceable<T: WeakReferenceable>(this: *co
+         // The pointer can be null if the object is the unforgeable holder of that interface.
+         let this = unsafe { Rc::from_raw(this) };
+         this.reflector().drop_memory(&*this);
++        #[cfg(feature = "js-quickjs")]
++        unsafe {
++            this.reflector().clear_for_finalize();
++            let reflector = this.reflector() as *const _ as *const crate::reflector::Reflector;
++            crate::root::quickjs_refs::finalizing(reflector, move || drop(this));
++        }
+     }
+     debug!("{} finalize: {:p}", type_name::<T>(), this);
+ }
+diff --git a/components/script_bindings/lib.rs b/components/script_bindings/lib.rs
+index 216136a125a..e4b3765b2b8 100644
+--- a/components/script_bindings/lib.rs
++++ b/components/script_bindings/lib.rs
+@@ -25,7 +25,7 @@ pub mod conversions;
+ pub mod dom;
+ pub mod domstring;
+ pub mod error;
+-mod finalize;
++pub mod finalize;
+ mod guard;
+ mod import;
+ pub mod inheritance;
+diff --git a/components/script_bindings/refcounted.rs b/components/script_bindings/refcounted.rs
+index 17a63496537..77aa4451e6a 100644
+--- a/components/script_bindings/refcounted.rs
++++ b/components/script_bindings/refcounted.rs
+@@ -166,6 +166,7 @@ impl LiveDOMReferences {
+         let len = table.len();
+         if (0 < capacity) && (capacity <= len) {
+             trace!("growing refcounted references by {}", len);
++            #[cfg(not(feature = "js-quickjs"))]
+             remove_nulls(&mut table);
+             table.reserve(len);
+         }
+@@ -179,6 +180,11 @@ impl LiveDOMReferences {
+                 },
+             },
+             Vacant(entry) => {
++                // QuickJS: a table entry holds a count on the object until it is swept.
++                #[cfg(feature = "js-quickjs")]
++                unsafe {
++                    js::quickjs::retain_object((*(ptr as *const Reflector)).get_jsobject().get())
++                };
+                 let refcount = Arc::new(unsafe { TrustedReference::new(ptr) });
+                 entry.insert(Arc::downgrade(&refcount));
+                 refcount
+@@ -200,6 +206,23 @@ fn remove_nulls<K: Eq + Hash + Clone, V>(table: &mut FxHashMap<K, Weak<V>>) {
+     }
+ }
+ 
++/// QuickJS: drops the counts of reflectable table entries whose `Trusted` values are all gone.
++#[cfg(feature = "js-quickjs")]
++pub fn sweep_live_references() {
++    LIVE_DOM_REFERENCES.with(|live_references| {
++        let mut table = live_references.reflectable_table.borrow_mut();
++        table.retain(|ptr, value| {
++            if Weak::upgrade(value).is_some() {
++                return true;
++            }
++            unsafe {
++                js::quickjs::release_object((*(*ptr as *const Reflector)).get_jsobject().get())
++            };
++            false
++        });
++    });
++}
++
+ unsafe impl<T: DomObject> crate::JSTraceable for Trusted<T> {
+     #[inline]
+     unsafe fn trace(&self, _: *mut JSTracer) {
+diff --git a/components/script_bindings/reflector.rs b/components/script_bindings/reflector.rs
+index bf21ae008e2..361a6130cb6 100644
+--- a/components/script_bindings/reflector.rs
++++ b/components/script_bindings/reflector.rs
+@@ -42,6 +42,8 @@ impl AssociatedMemorySize for AssociatedMemory {
+ #[derive(MallocSizeOf)]
+ #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+ // If you're renaming or moving this field, update the path in plugins::reflector as well
++// QuickJS: `Dom<T>` reads `object` through a `*const Reflector<()>`, whatever `T` is.
++#[cfg_attr(feature = "js-quickjs", repr(C))]
+ pub struct Reflector<T = ()> {
+     #[ignore_malloc_size_of = "defined and measured in rust-mozjs"]
+     object: Heap<*mut JSObject>,
+@@ -49,16 +51,37 @@ pub struct Reflector<T = ()> {
+     size: T,
+     /// Cached prototype ID for fast type checks.
+     proto_id: Cell<u16>,
++    /// QuickJS: whether `object` holds a count, see `hold_object`.
++    #[cfg(feature = "js-quickjs")]
++    counted: Cell<bool>,
+ }
+ 
+ unsafe impl<T> js::gc::Traceable for Reflector<T> {
+     unsafe fn trace(&self, tracer: *mut js::jsapi::JSTracer) {
++        // QuickJS: only a counted object may be marked.
++        #[cfg(feature = "js-quickjs")]
++        if !self.counted.get() {
++            return;
++        }
+         unsafe {
+             self.object.trace(tracer);
+         }
+     }
+ }
+ 
++/// QuickJS: an uncounted object pointer must not go through the `Heap` drop barrier. This matters
++/// for reflectors owned by Rust (e.g. a `RootedPromise`'s) rather than by their object; a counted
++/// one (`hold_object`) releases its count through the barrier.
++#[cfg(feature = "js-quickjs")]
++impl<T> Drop for Reflector<T> {
++    fn drop(&mut self) {
++        crate::root::quickjs_refs::unregister(self as *const Self as *const Reflector);
++        if !self.counted.get() {
++            unsafe { *self.object.get_unsafe() = std::ptr::null_mut() };
++        }
++    }
++}
++
+ impl<T> PartialEq for Reflector<T> {
+     fn eq(&self, other: &Reflector<T>) -> bool {
+         self.object.get() == other.object.get()
+@@ -93,9 +116,35 @@ impl<T> Reflector<T> {
+     unsafe fn set_jsobject(&self, object: *mut JSObject) {
+         assert!(self.object.get().is_null());
+         assert!(!object.is_null());
++        // QuickJS: the reflector does not hold a count on its own object (that would be a
++        // self-cycle only the cycle collector could break), so bypass the write barrier.
++        #[cfg(feature = "js-quickjs")]
++        unsafe {
++            *self.object.get_unsafe() = object;
++            crate::root::quickjs_refs::register(self as *const Self as *const Reflector, object);
++        }
++        #[cfg(not(feature = "js-quickjs"))]
+         self.object.set(object);
+     }
+ 
++    /// QuickJS: makes the reflector hold a count on its object, which tracing marks and dropping
++    /// releases. For reflectors owned by Rust (a `TracedPromise`'s); the reflector of a DOM object
++    /// holds none on its own object.
++    ///
++    /// # Safety
++    /// The reflector must be initialized and must not move afterwards.
++    #[cfg(feature = "js-quickjs")]
++    pub unsafe fn hold_object(&self) {
++        unsafe { js::quickjs::retain_object(self.object.get()) };
++        self.counted.set(true);
++    }
++
++    /// QuickJS: clears the uncounted object pointer before the reflector is dropped.
++    #[cfg(feature = "js-quickjs")]
++    pub(crate) unsafe fn clear_for_finalize(&self) {
++        unsafe { *self.object.get_unsafe() = std::ptr::null_mut() };
++    }
++
+     /// Return a pointer to the memory location at which the JS reflector
+     /// object is stored. Used to root the reflector, as
+     /// required by the JSAPI rooting APIs.
+@@ -113,6 +162,8 @@ impl<T: AssociatedMemorySize> Reflector<T> {
+             object: Heap::default(),
+             proto_id: Cell::new(u16::MAX),
+             size: T::default(),
++            #[cfg(feature = "js-quickjs")]
++            counted: Cell::new(false),
+         }
+     }
+ 
+diff --git a/components/script_bindings/root.rs b/components/script_bindings/root.rs
+index 66e2470c05f..559d07a5a1b 100644
+--- a/components/script_bindings/root.rs
++++ b/components/script_bindings/root.rs
+@@ -48,6 +48,14 @@ where
+             })
+         }
+ 
++        // QuickJS: roots hold counts (`Dom<T>`) and Rust roots are never traced.
++        if cfg!(feature = "js-quickjs") {
++            assert_in_script();
++            return Root {
++                value,
++                root_list: ptr::null(),
++            };
++        }
+         let root_list = unsafe { add_to_root_list(value.stable_trace_object()) };
+         Root { value, root_list }
+     }
+@@ -123,6 +131,9 @@ where
+     T: StableTraceObject,
+ {
+     fn drop(&mut self) {
++        if cfg!(feature = "js-quickjs") {
++            return;
++        }
+         unsafe {
+             (*self.root_list).unroot(self.value.stable_trace_object());
+         }
+@@ -189,14 +200,31 @@ impl<T> Clone for Dom<T> {
+     #[inline]
+     fn clone(&self) -> Self {
+         assert_in_script();
++        #[cfg(feature = "js-quickjs")]
++        unsafe {
++            quickjs_refs::retain(self.ptr.as_ptr() as *const crate::reflector::Reflector)
++        };
+         Dom { ptr: self.ptr }
+     }
+ }
+ 
++/// QuickJS: a `Dom<T>` holds a reference count on its target's reflector.
++#[cfg(feature = "js-quickjs")]
++impl<T> Drop for Dom<T> {
++    fn drop(&mut self) {
++        unsafe { quickjs_refs::release(self.ptr.as_ptr() as *const crate::reflector::Reflector) }
++    }
++}
++
+ impl<T: DomObject> Dom<T> {
+     /// Create a `Dom<T>` from a `&T`
+     pub fn from_ref(obj: &T) -> Dom<T> {
+         assert_in_script();
++        #[cfg(feature = "js-quickjs")]
++        unsafe {
++            debug_assert!(std::ptr::addr_eq(obj.reflector(), obj));
++            quickjs_refs::retain(obj.reflector() as *const _ as *const crate::reflector::Reflector)
++        };
+         Dom {
+             ptr: ptr::NonNull::from(obj),
+         }
+@@ -287,9 +315,8 @@ where
+     pub unsafe fn reflect_with(self, obj: *mut JSObject) -> DomRoot<T> {
+         let ptr = self.as_ptr();
+         drop(self);
+-        let root = DomRoot::from_ref(unsafe { &*ptr });
+-        unsafe { root.init_reflector::<T>(obj) };
+-        root
++        unsafe { (*ptr).init_reflector::<T>(obj) };
++        DomRoot::from_ref(unsafe { &*ptr })
+     }
+ }
+ 
+@@ -488,3 +515,106 @@ pub fn rooted_heap_handle<'a, T: DomObject, U: GCMethods + Copy>(
+     //   ensure that a &T is obtained via a root of T.
+     unsafe { Handle::from_raw(f(object).handle()) }
+ }
++
++/// QuickJS: reference counts held by `Dom<T>`.
++///
++/// Every DOM struct starts with its `Reflector` (see `trace_refcounted_objects`), so a `Dom<T>`
++/// reaches its target's JS object through the target's Rust struct. During finalization, though,
++/// the target's Rust struct may already have been freed by the same collection, so reflectors
++/// are also registered here and unregistered when their object is finalized: a target that is
++/// missing from the map during finalization has died in the same collection, and its count is
++/// gone with it.
++#[cfg(feature = "js-quickjs")]
++pub(crate) mod quickjs_refs {
++    use std::cell::{Cell, RefCell};
++    use std::collections::HashMap;
++
++    use js::jsapi::JSObject;
++
++    use crate::reflector::Reflector;
++
++    thread_local! {
++        static REFLECTORS: RefCell<HashMap<usize, *mut JSObject>> = RefCell::new(HashMap::new());
++        static FINALIZING: Cell<u32> = const { Cell::new(0) };
++        /// Counts taken by `Dom<T>`s created before their target was reflected (e.g. the
++        /// `WindowProxy` of a `DissimilarOriginWindow`), applied when it is.
++        static PENDING: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
++    }
++
++    pub(crate) fn register(reflector: *const Reflector, object: *mut JSObject) {
++        REFLECTORS.with(|r| r.borrow_mut().insert(reflector as usize, object));
++        let pending = PENDING.with(|p| p.borrow_mut().remove(&(reflector as usize)));
++        for _ in 0..pending.unwrap_or(0) {
++            unsafe { js::quickjs::retain_object(object) };
++        }
++    }
++
++    pub(crate) fn unregister(reflector: *const Reflector) {
++        REFLECTORS.with(|r| r.borrow_mut().remove(&(reflector as usize)));
++        PENDING.with(|p| p.borrow_mut().remove(&(reflector as usize)));
++    }
++
++    /// Drops a count taken while `reflector` was unreflected; false if there is none.
++    fn release_pending(reflector: *const Reflector) -> bool {
++        PENDING.with(|p| {
++            let mut pending = p.borrow_mut();
++            let Some(count) = pending.get_mut(&(reflector as usize)) else {
++                return false;
++            };
++            *count -= 1;
++            if *count == 0 {
++                pending.remove(&(reflector as usize));
++            }
++            true
++        })
++    }
++
++    /// Runs `f` (which drops a finalized DOM object) with `reflector` unregistered.
++    pub(crate) fn finalizing<R>(reflector: *const Reflector, f: impl FnOnce() -> R) -> R {
++        REFLECTORS.with(|r| r.borrow_mut().remove(&(reflector as usize)));
++        FINALIZING.with(|c| c.set(c.get() + 1));
++        let result = f();
++        FINALIZING.with(|c| c.set(c.get() - 1));
++        result
++    }
++
++    /// # Safety
++    /// `reflector` must be the reflector of a live DOM object.
++    pub(crate) unsafe fn retain(reflector: *const Reflector) {
++        let object = unsafe { (*reflector).get_jsobject().get() };
++        if object.is_null() {
++            PENDING.with(|p| *p.borrow_mut().entry(reflector as usize).or_insert(0) += 1);
++            return;
++        }
++        unsafe { js::quickjs::retain_object(object) };
++    }
++
++    /// # Safety
++    /// The caller must own a count taken by `retain`.
++    pub(crate) unsafe fn release(reflector: *const Reflector) {
++        // Destroying the runtime finalized every DOM object, including the one `reflector`
++        // belongs to.
++        if !js::quickjs::runtime_alive() {
++            return;
++        }
++        let object = if FINALIZING.with(|c| c.get()) > 0 {
++            match REFLECTORS.with(|r| r.borrow().get(&(reflector as usize)).copied()) {
++                Some(object) => object,
++                None => {
++                    release_pending(reflector);
++                    return;
++                },
++            }
++        } else {
++            unsafe { (*reflector).get_jsobject().get() }
++        };
++        if object.is_null() {
++            assert!(
++                release_pending(reflector),
++                "Dom<T> released without a count"
++            );
++            return;
++        }
++        unsafe { js::quickjs::release_object(object) };
++    }
++}
+diff --git a/components/servo/Cargo.toml b/components/servo/Cargo.toml
+index 9f695099cb6..defcfc5208a 100644
+--- a/components/servo/Cargo.toml
++++ b/components/servo/Cargo.toml
+@@ -19,6 +19,7 @@ crate-type = ["rlib"]
+ # Note: Servoshell does not use the default features of servo, so you also
+ # need to add feature-groups that should be default to ports/servoshell/Cargo.toml
+ default = ["bundled", "clipboard", "default_tooling", "js_jit", "multiprocess", "sqlite-backend"]
++js-quickjs = ["script/js-quickjs"]
+ ## Convenience feature groups, to select multiple related features for a sensible
+ #  configuration with `--no-default-features` build
+ #
+diff --git a/ports/servoshell/Cargo.toml b/ports/servoshell/Cargo.toml
+index 0fb2fe875ef..7c7169ff7f5 100644
+--- a/ports/servoshell/Cargo.toml
++++ b/ports/servoshell/Cargo.toml
+@@ -35,6 +35,7 @@ ProductName = "ServoShell"
+ [features]
+ # Don't add new features to `default` directly. Add to `default_without_allocator` instead.
+ default = ["default_without_allocator", "servo-allocator/use-jemalloc"]
++js-quickjs = ["servo/js-quickjs"]
+ # Feature groups:
+ # default features, without a custom allocator.
+ default_without_allocator = ["base", "sqlite-backend"]

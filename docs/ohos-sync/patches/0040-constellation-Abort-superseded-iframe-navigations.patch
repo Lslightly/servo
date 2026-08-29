@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 8 Oct 2026 22:30:51 +0000
+Subject: [PATCH] constellation: Abort superseded iframe navigations
+
+When an iframe is navigated again before the document of an earlier
+navigation has been activated, close the earlier navigation's pending
+pipeline. Previously both documents were activated in whatever order
+their responses arrived. If the earlier one arrived last, it replaced
+the newer document before that finished loading, while the iframe
+element kept waiting for the newer one, so the iframe's load event never
+fired and the parent document never finished loading.
+
+Starting a navigation aborts earlier ongoing navigations of the same
+navigable (step 20 of
+https://html.spec.whatwg.org/multipage/#navigate). History traversals
+that reload an entry are not aborted.
+
+iframe-loading-lazy-reload-location-reload.html no longer hangs but
+fails: location.reload() reaches the iframe element after the lazy src
+navigation, because it goes through the embedder's navigation approval
+first, so the reload wins.
+
+Fork note: meant for upstream, where it fixes upstream issue 29634 and
+the CRASH ("Browser not responding") intermittents of seven other tests
+that navigate one iframe twice. Same change as the upstream-bound
+commit; drop it (decision 3) once upstream has landed it.
+
+Testing: Adds a WPT test that times out without this change.
+
+Validation: Release build of ohos-main plus this patch. `./mach test-wpt --release --processes 1 --repeat 10 html/browsers/browsing-the-web/overlapping-navigations-and-traversals/cross-document-nav-cross-document-nav-slow-first-response.html`: 10/10 PASS; `--repeat 25 html/semantics/forms/form-submission-0/form-submit-iframe-then-location-navigate.html`: 25/25 as expected, no hang; `--processes 2 --repeat 10` of assign-replace-from-iframe.html, security_location_0.htm, replace-with-nested-iframe.html, sandbox-initial-empty-document-toward-same-origin.html, iframe-loading-lazy-nav-location-assign.html, iframe-loading-lazy-nav-location-replace.html, iframe-loading-lazy-reload-location-reload.html and navigating-across-documents/005.html: 80/80 as expected. `./mach test-wpt --release --processes 2 html/semantics/forms/form-submission-0 html/semantics/embedded-content/the-iframe-element html/browsers/browsing-the-web/navigating-across-documents html/browsers/history html/browsers/browsing-the-web/overlapping-navigations-and-traversals` (506 tests): 500 as expected. Of the 6 others, replace-before-load/form-submit-cross-frame.html FAIL and location_replace_session_history.html CRASH happen as often on plain ohos-main (A/B: 10 repeats each and 3 runs of replace-before-load/), and cross-origin-top-navigation-with-user-activation-in-parent.window.html TIMEOUT, navigation-unload-same-origin-fragment.html FAIL, refresh/same-document-refresh.html PASS and jsurl-form-submit.tentative.html PASS were unexpected or flaky without the patch in the upstream A/B. Upstream (8de25a1ab6b) before and after: the form test hung in 5/25 and 6/25 runs, then 0/75; the new test 5/5 TIMEOUT, then 35/35 PASS. `./mach fmt` and `./mach test-tidy` are clean.
+AI-assisted: Yes (agent session; root-caused, written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/constellation/constellation.rs     | 24 ++++++++++++++
+ tests/wpt/meta/MANIFEST.json                  |  7 ++++
+ ...ading-lazy-reload-location-reload.html.ini |  3 +-
+ ...ross-document-nav-slow-first-response.html | 33 +++++++++++++++++++
+ 4 files changed, 66 insertions(+), 1 deletion(-)
+ create mode 100644 tests/wpt/tests/html/browsers/browsing-the-web/overlapping-navigations-and-traversals/cross-document-nav-cross-document-nav-slow-first-response.html
+
+diff --git a/components/constellation/constellation.rs b/components/constellation/constellation.rs
+index 9e14962365b..406e6d8f0b2 100644
+--- a/components/constellation/constellation.rs
++++ b/components/constellation/constellation.rs
+@@ -3499,6 +3499,30 @@ where
+         let browsing_context_size = browsing_context.viewport_details;
+         debug_assert_eq!(browsing_context_size, load_info.viewport_details);
+ 
++        // Starting this navigation aborts any earlier navigation of the iframe that has not
++        // activated its document yet, so that the earlier document cannot replace this one later.
++        // See step 20 of <https://html.spec.whatwg.org/multipage/#navigate>. Pending reloads of
++        // history entries belong to traversals, which navigations don't abort.
++        let superseded_pipelines: Vec<_> = self
++            .webviews
++            .get(&webview_id)
++            .into_iter()
++            .flat_map(|webview| &webview.pending_changes)
++            .filter(|change| {
++                change.browsing_context_id == browsing_context_id &&
++                    !matches!(change.replace, Some(NeedsToReload::Yes(..)))
++            })
++            .map(|change| change.new_pipeline_id)
++            .collect();
++        for pipeline_id in superseded_pipelines {
++            debug!("{pipeline_id}: Closing pending pipeline superseded by {new_pipeline_id}");
++            self.close_pipeline(
++                pipeline_id,
++                DiscardBrowsingContext::No,
++                ExitPipelineMode::Normal,
++            );
++        }
++
+         // Create the new pipeline, attached to the parent and push to pending changes
+         self.new_pipeline(
+             new_pipeline_id,
+diff --git a/tests/wpt/meta/MANIFEST.json b/tests/wpt/meta/MANIFEST.json
+index 1fe348a032e..792ad44a82a 100644
+--- a/tests/wpt/meta/MANIFEST.json
++++ b/tests/wpt/meta/MANIFEST.json
+@@ -1270391,6 +1270391,13 @@
+          {}
+         ]
+        ],
++       "cross-document-nav-cross-document-nav-slow-first-response.html": [
++        "d05bd70d113ab4089ca9217689faf207526c79dc",
++        [
++         null,
++         {}
++        ]
++       ],
+        "cross-document-nav-cross-document-nav.html": [
+         "99d9a8fbb19996e5f3afe074871783c86433d252",
+         [
+diff --git a/tests/wpt/meta/html/semantics/embedded-content/the-iframe-element/iframe-loading-lazy-reload-location-reload.html.ini b/tests/wpt/meta/html/semantics/embedded-content/the-iframe-element/iframe-loading-lazy-reload-location-reload.html.ini
+index 5dd63e4b89a..247b8ee99a6 100644
+--- a/tests/wpt/meta/html/semantics/embedded-content/the-iframe-element/iframe-loading-lazy-reload-location-reload.html.ini
++++ b/tests/wpt/meta/html/semantics/embedded-content/the-iframe-element/iframe-loading-lazy-reload-location-reload.html.ini
+@@ -1,2 +1,3 @@
+ [iframe-loading-lazy-reload-location-reload.html]
+-  expected: CRASH
++  [Reloading iframe loading='lazy' before it is loaded: location.reload]
++    expected: FAIL
+diff --git a/tests/wpt/tests/html/browsers/browsing-the-web/overlapping-navigations-and-traversals/cross-document-nav-cross-document-nav-slow-first-response.html b/tests/wpt/tests/html/browsers/browsing-the-web/overlapping-navigations-and-traversals/cross-document-nav-cross-document-nav-slow-first-response.html
+new file mode 100644
+index 00000000000..d05bd70d113
+--- /dev/null
++++ b/tests/wpt/tests/html/browsers/browsing-the-web/overlapping-navigations-and-traversals/cross-document-nav-cross-document-nav-slow-first-response.html
+@@ -0,0 +1,33 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<title>Cross-document navigation after a cross-document navigation whose response arrives later</title>
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++
++<!--
++  According to the spec, the navigate algorithm synchronously cancels ongoing
++  non-mature navigations. The first navigation's response arrives after the
++  second navigation's document has been created but before it has finished
++  loading; it must not replace that document.
++-->
++
++<body>
++<script type="module">
++import { createIframe, waitForLoad, waitForPotentialNetworkLoads } from "./resources/helpers.mjs";
++
++promise_test(async t => {
++  const iframe = await createIframe(t);
++
++  const first = new URL("/common/slow.py?delay=500", location.href).href;
++  const second = new URL("/common/blank.html?pipe=trickle(d1.5)", location.href).href;
++  iframe.src = first;
++  iframe.src = second;
++
++  await waitForLoad(iframe);
++  assert_equals(iframe.contentWindow.location.href, second);
++
++  iframe.onload = t.unreached_func("second load event");
++  await waitForPotentialNetworkLoads(t);
++  assert_equals(iframe.contentWindow.location.href, second);
++}, "cross-document navigation then cross-document navigation whose document loads after the first navigation's response arrives");
++</script>

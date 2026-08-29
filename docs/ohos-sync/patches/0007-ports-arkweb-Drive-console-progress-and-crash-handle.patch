@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 8 Jul 2026 21:15:21 +0000
+Subject: [PATCH] ports/arkweb: Drive console, progress and crash handler
+ callbacks
+
+Wire the remaining MVP NWebHandler callbacks from the WebViewDelegate:
+- show_console_message -> OnConsoleLog (with a concrete NWebConsoleLog),
+  mapping the servo ConsoleLogLevel to NWebConsoleLogLevel.
+- notify_load_status_changed -> OnLoadingProgress, approximating the
+  0-100 progress ArkWeb expects from servo's discrete load stages.
+- notify_crashed -> OnPageLoadError; servo has no per-load network-error
+  callback, so a webview crash is the failure it does surface.
+
+Validation: Test by running uv run ports/arkweb/tools/test_navigation.py and checking hilog for console/progress callback lines while it runs.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/cpp/servo_handler_proxy.cpp | 32 +++++++++++++++--
+ ports/arkweb/src/runtime.rs              | 46 +++++++++++++++++++++---
+ 2 files changed, 71 insertions(+), 7 deletions(-)
+
+diff --git a/ports/arkweb/cpp/servo_handler_proxy.cpp b/ports/arkweb/cpp/servo_handler_proxy.cpp
+index 34781f680ca..f5e3ce13d9f 100644
+--- a/ports/arkweb/cpp/servo_handler_proxy.cpp
++++ b/ports/arkweb/cpp/servo_handler_proxy.cpp
+@@ -2,8 +2,29 @@
+ 
+ #include <utility>
+ 
++#include "ohos_nweb/nweb_console_log.h"
++
+ namespace servo::arkweb {
+ 
++namespace {
++// Concrete NWebConsoleLog carrying a servo console message across to OnConsoleLog. Servo provides
++// only the level and text; the line number and source id are unknown (0 / empty).
++class ServoConsoleLog : public OHOS::NWeb::NWebConsoleLog {
++public:
++    ServoConsoleLog(std::string message, NWebConsoleLogLevel level)
++        : message_(std::move(message)), level_(level) {}
++
++    int LineNumer() override { return 0; }
++    std::string Log() override { return message_; }
++    NWebConsoleLogLevel LogLevel() override { return level_; }
++    std::string SourceId() override { return {}; }
++
++private:
++    std::string message_;
++    NWebConsoleLogLevel level_;
++};
++}  // namespace
++
+ void NWebHandlerProxy::set_handler(std::shared_ptr<OHOS::NWeb::NWebHandler> handler) {
+     std::lock_guard<std::mutex> lock(mutex_);
+     handler_ = std::move(handler);
+@@ -50,9 +71,14 @@ void NWebHandlerProxy::on_progress(std::int32_t progress) const {
+ 
+ void NWebHandlerProxy::on_history_changed(bool /*can_back*/, bool /*can_fwd*/) const {}
+ 
+-// Forwarding requires constructing an NWebConsoleLog; deferred to the handler-breadth milestone.
+-void NWebHandlerProxy::on_console_message(std::int32_t /*level*/, const std::string& /*msg*/,
+-                                          std::int32_t /*line*/, const std::string& /*source*/) const {}
++void NWebHandlerProxy::on_console_message(std::int32_t level, const std::string& msg,
++                                          std::int32_t /*line*/, const std::string& /*source*/) const {
++    if (auto h = handler()) {
++        auto log = std::make_shared<ServoConsoleLog>(
++            msg, static_cast<OHOS::NWeb::NWebConsoleLog::NWebConsoleLogLevel>(level));
++        h->OnConsoleLog(std::move(log));
++    }
++}
+ 
+ // Presentation is driven directly on the servo side (EGL swap); nothing to forward.
+ void NWebHandlerProxy::on_frame_ready() const {}
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index 1c20725d159..9ef74a8cdc0 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -28,10 +28,10 @@ use raw_window_handle::{
+     WindowHandle,
+ };
+ use servo::{
+-    DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
+-    LoadStatus, NamedKey, Opts, RenderingContext, Scroll, Servo, ServoBuilder, TouchEvent,
+-    TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate,
+-    WindowRenderingContext,
++    ConsoleLogLevel, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, Key, KeyState,
++    KeyboardEvent, LoadStatus, NamedKey, Opts, RenderingContext, Scroll, Servo, ServoBuilder,
++    TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
++    WebViewDelegate, WindowRenderingContext,
+ };
+ use url::Url;
+ 
+@@ -554,9 +554,19 @@ impl WebViewDelegate for ArkWebViewDelegate {
+     }
+ 
+     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
++        // Servo reports load status as three discrete stages, not a percentage; approximate the
++        // 0-100 progress ArkWeb's OnLoadingProgress expects from those stages so the ArkTS
++        // onProgressChange handler (and any progress bar) advances.
++        let progress = match status {
++            LoadStatus::Started => 10,
++            LoadStatus::HeadParsed => 60,
++            LoadStatus::Complete => 100,
++        };
++        self.sync.progress.store(progress, Ordering::Relaxed);
+         let Some(client) = self.client.as_ref() else {
+             return;
+         };
++        client.on_progress(progress);
+         let url = webview.url().map(|url| url.to_string()).unwrap_or_default();
+         cxx::let_cxx_string!(url = &url);
+         match status {
+@@ -566,6 +576,34 @@ impl WebViewDelegate for ArkWebViewDelegate {
+         }
+     }
+ 
++    fn show_console_message(&self, _webview: WebView, level: ConsoleLogLevel, message: String) {
++        let Some(client) = self.client.as_ref() else {
++            return;
++        };
++        // Map to NWebConsoleLog::NWebConsoleLogLevel { DEBUG=1, INFO, WARNING, ERROR, UNKNOWN }.
++        let nweb_level = match level {
++            ConsoleLogLevel::Debug | ConsoleLogLevel::Trace | ConsoleLogLevel::Dir => 1,
++            ConsoleLogLevel::Log | ConsoleLogLevel::Info => 2,
++            ConsoleLogLevel::Warn => 3,
++            ConsoleLogLevel::Error => 4,
++        };
++        // Servo does not surface the source location with the message; ACE tolerates empty/0.
++        cxx::let_cxx_string!(msg = &message);
++        cxx::let_cxx_string!(source = "");
++        client.on_console_message(nweb_level, &msg, 0, &source);
++    }
++
++    fn notify_crashed(&self, webview: WebView, reason: String, _backtrace: Option<String>) {
++        // Servo has no per-load network-error callback; a webview/renderer crash is the one failure
++        // it does surface, so report it to ACE's page-load-error handler.
++        if let Some(client) = self.client.as_ref() {
++            let url = webview.url().map(|url| url.to_string()).unwrap_or_default();
++            cxx::let_cxx_string!(desc = &reason);
++            cxx::let_cxx_string!(url = &url);
++            client.on_load_error(-1, &desc, &url);
++        }
++    }
++
+     fn notify_history_changed(&self, _webview: WebView, entries: Vec<Url>, current: usize) {
+         let can_back = current > 0;
+         let can_fwd = current + 1 < entries.len();

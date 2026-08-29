@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 11 Oct 2026 15:20:44 +0000
+Subject: [PATCH] ci: Keep the QuickJS WPT run when a pull request needs a full
+ run
+
+`pr_jobs.py` returned the full set of jobs as soon as it met a file
+outside its lists, so a pull request that also changed the servo-quickjs
+pin or WPT expectations ran no QuickJS WPT, e.g. the Intl pin bump with
+its new packages. It now looks at every file and keeps the QuickJS WPT
+run: the whole suite for a QuickJS build change or too many directories,
+else the directories of the changed tests.
+
+Validation: `./mach test-scripts` passes, with tests for the pin and for tests next to shared code; `./mach test-tidy` passes.
+AI-assisted: Yes (agent session; from an independent agent review, written by the agent)
+AI-assisted: Yes (agent session; 2026-10-13 sync -- joined the wrapped Validation trailer onto one line so that it parses)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ python/servo/pr_jobs.py | 71 +++++++++++++++++++++++++++--------------
+ 1 file changed, 47 insertions(+), 24 deletions(-)
+
+diff --git a/python/servo/pr_jobs.py b/python/servo/pr_jobs.py
+index ac3a88b6dad..acb45bf39df 100644
+--- a/python/servo/pr_jobs.py
++++ b/python/servo/pr_jobs.py
+@@ -14,11 +14,14 @@ Every pull request runs the Linux unit tests and lint. On top of that:
+ - OHOS code: the OHOS build. The Linux WPT run never executes that code.
+ - The QuickJS workflow or the servo-quickjs pin: the QuickJS build and the whole QuickJS WPT suite.
+ - WPT tests or expectations: a Linux WPT run of the directories of those tests, with SpiderMonkey
+-  and QuickJS.
++  and QuickJS, or of the whole suites for more than `MAX_DIRECTORIES` directories.
+ - Files that no build or test reads, such as documentation: nothing.
+ - Anything else: the OHOS and QuickJS builds and the whole Linux WPT suite. The nightly QuickJS
+   workflow runs the whole QuickJS WPT suite.
+ 
++The selections of the changed files add up, so other files that need a full run keep the QuickJS
++WPT run of changed tests or of a changed QuickJS build.
++
+ The path lists are explicit on purpose: a path missing from them only costs a full run.
+ """
+ 
+@@ -125,46 +128,45 @@ def outermost(directories: Iterable[str]) -> list[str]:
+ def select(changed: Iterable[str], count_files: Callable[[str], int]) -> Config:
+     """Chooses the jobs for the changed paths. `count_files` returns the number of files in a
+     directory of the merged tree, 0 if it does not exist."""
+-    ohos = quickjs = False
++    ohos = quickjs = full = False
+     directories = set()
+     for path in changed:
+         if is_not_built(path):
+             continue
+         if path.startswith(OHOS_ONLY):
+             ohos = True
+-            continue
+-        if path.startswith(QUICKJS_ONLY):
++        elif path.startswith(QUICKJS_ONLY):
+             quickjs = True
+-            continue
+-        directory = wpt_directory(path)
+-        if directory is None:
+-            return Config(FULL)
+-        if directory:
++        elif (directory := wpt_directory(path)) is None:
++            full = True
++        elif directory:
+             directories.add(directory)
+ 
+     counts = {directory: count_files(directory) for directory in outermost(directories)}
+     counts = {directory: count for directory, count in counts.items() if count}
+-    if len(counts) > MAX_DIRECTORIES:
+-        return Config(FULL)
+-
+-    # The WPT run is added after the unit tests, so that both share one Linux job.
+-    jobs = [
+-        ALWAYS,
+-        *(["ohos"] if ohos else []),
+-        *(["quickjs"] if quickjs or counts else []),
+-        *(["linux-wpt"] if counts else []),
+-    ]
+-    config = Config(" ".join(jobs))
++    too_many = len(counts) > MAX_DIRECTORIES
++
++    if full or too_many:
++        config = Config(FULL)
++    else:
++        # The WPT run is added after the unit tests, so that both share one Linux job.
++        jobs = [
++            ALWAYS,
++            *(["ohos"] if ohos else []),
++            *(["quickjs"] if quickjs or counts else []),
++            *(["linux-wpt"] if counts else []),
++        ]
++        config = Config(" ".join(jobs))
+     wpt_args = " ".join(f"./{directory}" for directory in counts)
+     number_of_wpt_chunks = min(20, math.ceil(sum(counts.values()) / FILES_PER_CHUNK))
+     for job in config.matrix:
+-        if job.workflow is Workflow.QUICKJS:
++        if job.workflow is Workflow.QUICKJS and (quickjs or counts):
+             job.wpt = True
+             # A change to the QuickJS build runs the whole suite.
+-            if not quickjs:
++            if not quickjs and not too_many:
+                 job.wpt_args, job.number_of_wpt_chunks = wpt_args, number_of_wpt_chunks
+             job.update_name()
+-        elif job.workflow is Workflow.LINUX and counts:
++        elif job.workflow is Workflow.LINUX and counts and not full and not too_many:
+             job.wpt_args, job.number_of_wpt_chunks = wpt_args, number_of_wpt_chunks
+     return config
+ 
+@@ -285,7 +287,28 @@ class TestSelect(unittest.TestCase):
+     def test_too_many_directories_run_everything(self) -> None:
+         changed = [f"tests/wpt/tests/css/dir{i}/test.html" for i in range(MAX_DIRECTORIES + 1)]
+         self.FILES = {f"tests/wpt/tests/css/dir{i}": 1 for i in range(MAX_DIRECTORIES + 1)}
+-        self.assertEqual(self.select(*changed), json.loads(Config(FULL).to_json()))
++        self.assertEqual(self.jobs(*changed), [("linux", True, True, "", 20), self.LINT, self.OHOS, self.QUICKJS_WPT])
++
++    def test_quickjs_pin_and_shared_code(self) -> None:
++        self.assertEqual(
++            self.jobs(
++                "python/servo/platform/linux_packages/apt/apt_common.txt",
++                "support/quickjs/cargo-config.toml",
++                "tests/wpt/mozilla/meta/mozilla/svg/svg-text-web-font.html.ini",
++            ),
++            [("linux", True, True, "", 20), self.LINT, self.OHOS, self.QUICKJS_WPT],
++        )
++
++    def test_tests_and_shared_code(self) -> None:
++        self.assertEqual(
++            self.jobs("components/layout/flow.rs", "tests/wpt/meta/dom/nodes/Node-cloneNode.html.ini"),
++            [
++                ("linux", True, True, "", 20),
++                self.LINT,
++                self.OHOS,
++                ("quickjs", False, True, "./tests/wpt/tests/dom/nodes", 1),
++            ],
++        )
+ 
+ 
+ def run_tests() -> bool:

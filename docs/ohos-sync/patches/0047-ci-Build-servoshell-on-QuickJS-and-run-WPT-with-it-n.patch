@@ -1,0 +1,335 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 9 Oct 2026 17:33:31 +0000
+Subject: [PATCH] ci: Build servoshell on QuickJS, and run WPT with it nightly
+
+The QuickJS workflow patches mozjs to openharmony-rs/servo-quickjs (a
+pinned commit, or a branch, tag or full commit hash given to a manual
+run), builds a release servoshell with js-quickjs, runs the smoketest
+and runs WPT through linux-wpt.yml. WPT compares against the
+SpiderMonkey expectations, so its unexpected results are the gaps of the
+QuickJS backend: the WPT jobs pass regardless, and the
+stable-unexpected-results-linux artifact lists the gaps. It runs nightly
+and by hand. linux-common.yml can't be reused because it builds with
+--locked, and the patch changes Cargo.lock.
+
+Pull requests and the merge queue build it too, in addition to the
+SpiderMonkey build: the try configuration gets a quickjs job
+(try_parser.py, dispatch-workflow.yml), which runs the workflow in the
+job's profile (checked-release) without WPT. pr_jobs.py adds it where
+the OHOS build and the whole WPT suite run, and for changes to the
+workflow itself; the merge queue runs it with linux-wpt and ohos. The
+job gets no secrets, so QuickJS results never reach the intermittent
+tracker. The servo-quickjs commit is pinned (SERVO_QUICKJS_REF), so that
+updates there don't change what older commits build with; it is bumped
+with mozjs at syncs. A try run with both linux-wpt and a QuickJS WPT run
+would upload two artifacts of the same name.
+
+Validation: The patch step run locally against a file:// clone of servo-quickjs (`mozjs-0.26`, 7b4141b): it resolves the branch to the commit, Cargo.lock then takes mozjs 0.26.7 and servo-quickjs from it, `./mach build --profile release --features js-quickjs` builds and `xvfb-run ./mach smoketest --profile release` passes. The ref resolution was checked against a scratch repository with branches main and wip/main, an annotated and a lightweight tag: only exact branches and tags and full hashes resolve. For the pull request job: the try_parser and pr_jobs tests pass, with a new case for changes to the workflow alone; actionlint with shellcheck reports nothing new for quickjs.yml, dispatch-workflow.yml and main.yml; the merge queue string yields the jobs Linux (WPT), OpenHarmony and Linux QuickJS. On 7f6279eb9b9 with the pinned servo-quickjs commit (72fa2b6697a; its tree was built), the QuickJS build and smoketest pass with --profile checked-release, the pull request job's, and release, the nightly's. The patch step resolves the pin to itself and still takes branches and tags from a manual run, and cargo resolves the pinned rev to mozjs 0.26.7. The workflow itself has not run yet: the pinned commit is not public until servo-quickjs main is pushed.
+AI-assisted: Yes (agent session; written by the agent, and its build steps tested locally by the agent)
+AI-assisted: Yes (agent session; 2026-10-13 sync -- mechanical conflict resolution in python/servo/try_parser.py: the QuickJS workflow sits next to upstream's new perf-analysis one (#47820), no semantic change)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/dispatch-workflow.yml |  10 ++
+ .github/workflows/main.yml              |   2 +-
+ .github/workflows/quickjs.yml           | 133 ++++++++++++++++++++++++
+ python/servo/pr_jobs.py                 |  28 ++++-
+ python/servo/try_parser.py              |   7 +-
+ 5 files changed, 173 insertions(+), 7 deletions(-)
+ create mode 100644 .github/workflows/quickjs.yml
+
+diff --git a/.github/workflows/dispatch-workflow.yml b/.github/workflows/dispatch-workflow.yml
+index a1fdad36af1..68c7371b1d8 100644
+--- a/.github/workflows/dispatch-workflow.yml
++++ b/.github/workflows/dispatch-workflow.yml
+@@ -155,3 +155,13 @@ jobs:
+     with:
+       profile: ${{ inputs.profile }}
+       bencher: ${{ inputs.bencher }}
++
++  quickjs:
++    if: ${{ inputs.workflow == 'quickjs' }}
++    name: Linux QuickJS
++    # No secrets: QuickJS's WPT results must not reach the intermittent tracker.
++    uses: ./.github/workflows/quickjs.yml
++    with:
++      profile: ${{ inputs.profile }}
++      wpt: ${{ inputs.wpt }}
++      wpt-args: ${{ inputs.wpt-args }}
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index a14b93c6bea..ae1a88f16be 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -54,7 +54,7 @@ jobs:
+             if [ "${{ github.event_name }}" = pull_request ]; then
+               python -m python.servo.pr_jobs "$BASE_SHA"
+             else
+-              python ./python/servo/try_parser.py ${{ github.event_name == 'pull_request' && 'linux-unit-tests lint' || github.event_name == 'push' && 'full' || 'fail-fast linux-wpt ohos' }}
++              python ./python/servo/try_parser.py ${{ github.event_name == 'pull_request' && 'linux-unit-tests lint' || github.event_name == 'push' && 'full' || 'fail-fast linux-wpt ohos quickjs' }}
+             fi
+             echo EOF
+            } >> $GITHUB_OUTPUT
+diff --git a/.github/workflows/quickjs.yml b/.github/workflows/quickjs.yml
+new file mode 100644
+index 00000000000..a0f74ad489d
+--- /dev/null
++++ b/.github/workflows/quickjs.yml
+@@ -0,0 +1,133 @@
++# Builds servoshell on the QuickJS mozjs shim (openharmony-rs/servo-quickjs) and runs WPT with it.
++# The results are compared against the SpiderMonkey expectations, so the unexpected results are
++# the gaps of the QuickJS backend; the WPT jobs succeed regardless. Pull requests and the merge
++# queue run the build and smoketest only (the `quickjs` job of the try configuration).
++name: QuickJS
++on:
++  schedule:
++    - cron: "30 1 * * *"
++  workflow_call:
++    inputs:
++      profile:
++        required: true
++        type: string
++      wpt:
++        default: false
++        required: false
++        type: boolean
++      wpt-args:
++        default: ""
++        required: false
++        type: string
++  workflow_dispatch:
++    inputs:
++      servo-quickjs-ref:
++        description: Branch, tag or commit of openharmony-rs/servo-quickjs, instead of the pinned commit
++        default: ""
++        required: false
++        type: string
++      wpt:
++        description: Run WPT
++        default: true
++        required: false
++        type: boolean
++      wpt-args:
++        description: Extra arguments for `mach test-wpt`, e.g. test paths
++        default: ""
++        required: false
++        type: string
++
++permissions:
++  contents: read
++
++env:
++  RUST_BACKTRACE: 1
++  SHELL: /bin/bash
++  SERVO_QUICKJS_URL: https://github.com/openharmony-rs/servo-quickjs
++  # The servo-quickjs commit this tree builds with. Bump it with mozjs at each sync, so that older
++  # commits keep building with the shim they were tested with.
++  SERVO_QUICKJS_REF: ${{ inputs.servo-quickjs-ref || '72fa2b6697a60889969397313ad23405196c5b4e' }}
++  PROFILE: ${{ inputs.profile || 'release' }}
++  RUN_WPT: ${{ github.event_name == 'schedule' || inputs.wpt }}
++
++jobs:
++  build:
++    name: Linux Build (QuickJS)
++    # The WPT runners are Ubuntu 22.04, so build against its glibc.
++    runs-on: ubuntu-22.04
++    steps:
++      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
++      - name: Free Disk Space (Ubuntu)
++        uses: jlumbroso/free-disk-space@main
++        with:
++          tool-cache: false
++          large-packages: false
++          swap-storage: false
++      - name: Install LLVM and Clang
++        uses: KyleMayes/install-llvm-action@v2
++        with:
++          version: "20.1"
++          directory: ${{ runner.temp }}/llvm
++      - name: Set LIBCLANG_PATH env
++        run: echo "LIBCLANG_PATH=${LLVM_PATH}/lib" >> "$GITHUB_ENV"
++      - name: Setup Python
++        uses: ./.github/actions/setup-python
++      - name: Change Mirror Priorities
++        uses: ./.github/actions/apt-mirrors
++      - name: Bootstrap dependencies
++        timeout-minutes: 30
++        run: |
++          sudo apt update
++          ./mach bootstrap --yes --skip-lints --skip-nextest
++      - name: Install sccache
++        if: ${{ vars.SCCACHE_GHA_ENABLED != 'false' }}
++        uses: mozilla-actions/sccache-action@v0.0.11
++      - name: Enable sccache
++        if: ${{ vars.SCCACHE_GHA_ENABLED != 'false' }}
++        run: |
++          {
++            echo "SCCACHE_GHA_VERSION=${{ vars.SCCACHE_GHA_VERSION || '1' }}"
++            echo "SCCACHE_GHA_ENABLED=true"
++            echo "RUSTC_WRAPPER=sccache"
++            echo "CARGO_INCREMENTAL=0"
++          } >> "$GITHUB_ENV"
++      # `mach` cannot pass `--config`, so the patch goes into `.cargo/config.toml`. It changes
++      # Cargo.lock, so the build below is not `--locked`.
++      - name: Patch mozjs to the QuickJS shim
++        run: |
++          refs=$(git ls-remote "$SERVO_QUICKJS_URL")
++          rev=
++          for ref in "refs/tags/$SERVO_QUICKJS_REF^{}" "refs/tags/$SERVO_QUICKJS_REF" "refs/heads/$SERVO_QUICKJS_REF"; do
++            rev=$(awk -v ref="$ref" '$2 == ref { print $1 }' <<< "$refs")
++            [ -n "$rev" ] && break
++          done
++          rev=${rev:-$SERVO_QUICKJS_REF}
++          if ! [[ $rev =~ ^[0-9a-f]{40}$ ]]; then
++            echo "::error::$SERVO_QUICKJS_REF is not a branch or tag of $SERVO_QUICKJS_URL, nor a full commit hash"
++            exit 1
++          fi
++          printf '\n[patch.crates-io]\nmozjs = { git = "%s", rev = "%s" }\n' "$SERVO_QUICKJS_URL" "$rev" >> .cargo/config.toml
++          echo "servo-quickjs: \`$SERVO_QUICKJS_REF\` ($rev)" >> "$GITHUB_STEP_SUMMARY"
++      - name: Build
++        run: ./mach build --profile "$PROFILE" --features js-quickjs
++      - name: Smoketest
++        run: xvfb-run ./mach smoketest --profile "$PROFILE"
++      - name: Build mach package
++        if: ${{ env.RUN_WPT == 'true' }}
++        run: ./mach package --profile "$PROFILE"
++      - name: Upload artifact for mach package
++        if: ${{ env.RUN_WPT == 'true' }}
++        uses: actions/upload-artifact@v7
++        with:
++          name: ${{ env.PROFILE }}-binary-linux
++          path: target/${{ env.PROFILE }}/servo-tech-demo.tar.gz
++          if-no-files-found: error
++
++  wpt:
++    needs: build
++    if: ${{ github.event_name == 'schedule' || inputs.wpt }}
++    uses: ./.github/workflows/linux-wpt.yml
++    with:
++      profile: ${{ inputs.profile || 'release' }}
++      binary-path: servo/servoshell
++      wpt-args: --always-succeed ${{ inputs.wpt-args }}
+diff --git a/python/servo/pr_jobs.py b/python/servo/pr_jobs.py
+index aaf8ac1f676..0b3016dab2a 100644
+--- a/python/servo/pr_jobs.py
++++ b/python/servo/pr_jobs.py
+@@ -12,9 +12,10 @@
+ Every pull request runs the Linux unit tests and lint. On top of that:
+ 
+ - OHOS code: the OHOS build. The Linux WPT run never executes that code.
++- The QuickJS workflow: the QuickJS build.
+ - WPT tests or expectations: a Linux WPT run of the directories of those tests.
+ - Files that no build or test reads, such as documentation: nothing.
+-- Anything else: the OHOS build and the whole Linux WPT suite.
++- Anything else: the OHOS and QuickJS builds and the whole Linux WPT suite.
+ 
+ The path lists are explicit on purpose: a path missing from them only costs a full run.
+ """
+@@ -35,7 +36,7 @@ from .try_parser import Config, Workflow
+ ALWAYS = "linux-unit-tests lint"
+ 
+ # The jobs of a change to code that every platform builds.
+-FULL = f"{ALWAYS} linux-wpt ohos"
++FULL = f"{ALWAYS} linux-wpt ohos quickjs"
+ 
+ # Files that no build or test reads, besides Markdown files.
+ NOT_BUILT = (
+@@ -62,6 +63,9 @@ OHOS_ONLY = (
+     "support/openharmony/",
+ )
+ 
++# Files that only the QuickJS build reads.
++QUICKJS_ONLY = (".github/workflows/quickjs.yml",)
++
+ # Test and expectation roots, mapped to the directory that holds their tests.
+ WPT_ROOTS = {
+     "tests/wpt/tests/": "tests/wpt/tests/",
+@@ -119,7 +123,7 @@ def outermost(directories: Iterable[str]) -> list[str]:
+ def select(changed: Iterable[str], count_files: Callable[[str], int]) -> Config:
+     """Chooses the jobs for the changed paths. `count_files` returns the number of files in a
+     directory of the merged tree, 0 if it does not exist."""
+-    ohos = False
++    ohos = quickjs = False
+     directories = set()
+     for path in changed:
+         if is_not_built(path):
+@@ -127,6 +131,9 @@ def select(changed: Iterable[str], count_files: Callable[[str], int]) -> Config:
+         if path.startswith(OHOS_ONLY):
+             ohos = True
+             continue
++        if path.startswith(QUICKJS_ONLY):
++            quickjs = True
++            continue
+         directory = wpt_directory(path)
+         if directory is None:
+             return Config(FULL)
+@@ -139,7 +146,8 @@ def select(changed: Iterable[str], count_files: Callable[[str], int]) -> Config:
+         return Config(FULL)
+ 
+     # The WPT run is added after the unit tests, so that both share one Linux job.
+-    config = Config(" ".join([ALWAYS, *(["ohos"] if ohos else []), *(["linux-wpt"] if counts else [])]))
++    jobs = [ALWAYS, *(["ohos"] if ohos else []), *(["quickjs"] if quickjs else []), *(["linux-wpt"] if counts else [])]
++    config = Config(" ".join(jobs))
+     for job in config.matrix:
+         if job.workflow is Workflow.LINUX and counts:
+             job.wpt_args = " ".join(f"./{directory}" for directory in counts)
+@@ -184,10 +192,14 @@ class TestSelect(unittest.TestCase):
+     LINUX = ("linux", True, False, "", 20)
+     LINT = ("lint", False, False, "", 20)
+     OHOS = ("ohos", False, False, "", 20)
++    QUICKJS = ("quickjs", False, False, "", 20)
+ 
+     def test_shared_code_runs_everything(self) -> None:
+         full = json.loads(Config(FULL).to_json())
+-        self.assertEqual(self.jobs("components/layout/flow.rs"), [("linux", True, True, "", 20), self.LINT, self.OHOS])
++        self.assertEqual(
++            self.jobs("components/layout/flow.rs"),
++            [("linux", True, True, "", 20), self.LINT, self.OHOS, self.QUICKJS],
++        )
+         self.assertEqual(self.select("components/layout/flow.rs"), full)
+         self.assertEqual(self.select("ports/arkweb/src/lib.rs", "Cargo.lock"), full)
+         self.assertEqual(self.select("components/storage/webstorage/mod.rs"), full)
+@@ -202,6 +214,12 @@ class TestSelect(unittest.TestCase):
+             [self.LINUX, self.LINT, self.OHOS],
+         )
+ 
++    def test_quickjs_workflow(self) -> None:
++        self.assertEqual(
++            self.jobs(".github/workflows/quickjs.yml", "ports/arkweb/src/lib.rs"),
++            [self.LINUX, self.LINT, self.OHOS, self.QUICKJS],
++        )
++
+     def test_not_built_only(self) -> None:
+         self.assertEqual(
+             self.jobs("docs/ohos-sync/STACK.md", "README.md", ".github/workflows/integrity.yml"),
+diff --git a/python/servo/try_parser.py b/python/servo/try_parser.py
+index eb6adb8d923..4d545522895 100644
+--- a/python/servo/try_parser.py
++++ b/python/servo/try_parser.py
+@@ -31,6 +31,7 @@ class Workflow(str, Enum):
+     OHOS = "ohos"
+     LINT = "lint"
+     PERF_ANALYSIS = "perf-analysis"
++    QUICKJS = "quickjs"
+ 
+ 
+ @dataclass
+@@ -87,6 +88,8 @@ class JobConfig(object):
+             self.name = "OpenHarmony"
+         elif self.workflow is Workflow.PERF_ANALYSIS:
+             self.name = "Perf analysis"
++        elif self.workflow is Workflow.QUICKJS:
++            self.name = "Linux QuickJS"
+         modifier = []
+         if self.profile != "checked-release":
+             modifier.append(self.profile.title())
+@@ -113,7 +116,9 @@ class JobConfig(object):
+ def handle_preset(s: str) -> Optional[JobConfig]:
+     s = s.lower()
+ 
+-    if any(word in s for word in ["linux-arm", "linux-arm64"]):
++    if "quickjs" in s:
++        return JobConfig("Linux QuickJS", Workflow.QUICKJS)
++    elif any(word in s for word in ["linux-arm", "linux-arm64"]):
+         return JobConfig("Linux Arm64", Workflow.LINUX_ARM)
+     elif any(word in s for word in ["linux"]):
+         return JobConfig("Linux", Workflow.LINUX)

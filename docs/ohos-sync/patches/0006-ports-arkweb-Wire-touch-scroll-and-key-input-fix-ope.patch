@@ -1,0 +1,457 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 8 Jul 2026 21:05:35 +0000
+Subject: [PATCH] ports/arkweb: Wire touch, scroll and key input; fix
+ open/close leaks
+
+Translate ACE touch/scroll/key events into servo InputEvents:
+- touch tap/drag -> InputEvent::Touch (servo derives scroll from the
+  sequence). ACE forwards touch-move through the batched
+  OnTouchMove(vector<NWebTouchPointInfo>) overload, so override it or
+  drags are dropped.
+- key input via SendKeyboardEvent (the path this ACE version uses),
+  mapping the OHOS keycode/unicode to a servo Key. A key dispatched before the
+  engine is running is reported as unhandled, so ACE falls back to its own key
+  handling instead of assuming we consumed the event.
+- ExecuteJavaScript wired fire-and-forget.
+
+Fix the open/close leaks: release the OHNativeWindow from
+CreateNativeWindowFromSurface on destroy, and hold the nwebs_ map as
+weak_ptr so a destroyed component's NWeb and its handler proxy are freed.
+
+License the port as Apache-2.0 and ignore it in servo-tidy.
+
+Validation: Test by running uv run ports/arkweb/tools/test_scroll.py on a device; key input is covered by test_ime.py.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/Cargo.toml                  |   2 +-
+ ports/arkweb/cpp/servo_native_window.cpp |  15 +++
+ ports/arkweb/cpp/servo_native_window.h   |   4 +
+ ports/arkweb/cpp/servo_nweb.cpp          |  24 +++-
+ ports/arkweb/cpp/servo_nweb.h            |   4 +
+ ports/arkweb/cpp/servo_nweb_engine.cpp   |   6 +-
+ ports/arkweb/cpp/servo_nweb_engine.h     |   5 +-
+ ports/arkweb/src/bridge.rs               |  10 +-
+ ports/arkweb/src/runtime.rs              | 157 ++++++++++++++++++++---
+ 9 files changed, 201 insertions(+), 26 deletions(-)
+
+diff --git a/ports/arkweb/Cargo.toml b/ports/arkweb/Cargo.toml
+index 8f60fb1338c..5dc124cf01a 100644
+--- a/ports/arkweb/Cargo.toml
++++ b/ports/arkweb/Cargo.toml
+@@ -2,7 +2,7 @@
+ name = "arkweb"
+ version.workspace = true
+ authors.workspace = true
+-license.workspace = true
++license = "Apache-2.0"
+ edition.workspace = true
+ publish = false
+ rust-version.workspace = true
+diff --git a/ports/arkweb/cpp/servo_native_window.cpp b/ports/arkweb/cpp/servo_native_window.cpp
+index 17ca832a071..003e4612861 100644
+--- a/ports/arkweb/cpp/servo_native_window.cpp
++++ b/ports/arkweb/cpp/servo_native_window.cpp
+@@ -15,6 +15,7 @@ namespace {
+ // Variadic, matching the public NDK declaration. Resolved at runtime from libnative_window.so
+ // (already loaded in the app process), consistent with how CreateNativeWindowFromSurface is used.
+ using HandleOptFn = int32_t (*)(OHNativeWindow*, int, ...);
++using DestroyWindowFn = void (*)(OHNativeWindow*);
+ }  // namespace
+ 
+ void set_native_window_buffer_geometry(std::size_t window, std::uint32_t width, std::uint32_t height) {
+@@ -33,4 +34,18 @@ void set_native_window_buffer_geometry(std::size_t window, std::uint32_t width,
+     SERVO_LOGI("SET_BUFFER_GEOMETRY %{public}ux%{public}u ret=%{public}d", width, height, ret);
+ }
+ 
++void destroy_native_window(std::size_t window) {
++    auto* native_window = reinterpret_cast<OHNativeWindow*>(window);
++    if (native_window == nullptr) {
++        return;
++    }
++    auto destroy =
++        reinterpret_cast<DestroyWindowFn>(dlsym(RTLD_DEFAULT, "OH_NativeWindow_DestroyNativeWindow"));
++    if (destroy == nullptr) {
++        SERVO_LOGE("OH_NativeWindow_DestroyNativeWindow not found: %{public}s", dlerror());
++        return;
++    }
++    destroy(native_window);
++}
++
+ }  // namespace servo::arkweb
+diff --git a/ports/arkweb/cpp/servo_native_window.h b/ports/arkweb/cpp/servo_native_window.h
+index 54ecd2a6673..b7325d3387a 100644
+--- a/ports/arkweb/cpp/servo_native_window.h
++++ b/ports/arkweb/cpp/servo_native_window.h
+@@ -11,4 +11,8 @@ namespace servo::arkweb {
+ // is created (and on resize) or WebRender renders into degenerate buffers and reports OutOfMemory.
+ void set_native_window_buffer_geometry(std::size_t window, std::uint32_t width, std::uint32_t height);
+ 
++// Release an OHNativeWindow obtained from CreateNativeWindowFromSurface. Call once, after the
++// surfman rendering context using it has been dropped (i.e. after destroy_webview returns).
++void destroy_native_window(std::size_t window);
++
+ }  // namespace servo::arkweb
+diff --git a/ports/arkweb/cpp/servo_nweb.cpp b/ports/arkweb/cpp/servo_nweb.cpp
+index 196b6504d76..ae7f4b5ff72 100644
+--- a/ports/arkweb/cpp/servo_nweb.cpp
++++ b/ports/arkweb/cpp/servo_nweb.cpp
+@@ -54,12 +54,34 @@ void ServoNWeb::OnTouchMove(int32_t id, double x, double y, bool /*fromOverlay*/
+     servo::embedder::touch_event(id_, kTouchMove, static_cast<float>(x), static_cast<float>(y), id);
+ }
+ 
++// ACE forwards touch-move during a pan through this batched overload (web_delegate.cpp
++// HandleTouchMove), not the single-point one, so it must be overridden or drags are dropped.
++void ServoNWeb::OnTouchMove(const std::vector<std::shared_ptr<NWebTouchPointInfo>>& touch_point_infos,
++                            bool /*fromOverlay*/) {
++    for (const auto& point : touch_point_infos) {
++        if (point) {
++            servo::embedder::touch_event(id_, kTouchMove, static_cast<float>(point->GetX()),
++                                         static_cast<float>(point->GetY()), point->GetId());
++        }
++    }
++}
++
+ void ServoNWeb::OnTouchCancel() {
+     servo::embedder::touch_event(id_, kTouchCancel, 0.0F, 0.0F, -1);
+ }
+ 
+ bool ServoNWeb::SendKeyEvent(int32_t keyCode, int32_t keyAction) {
+-    return servo::arkweb::send_key_event(id_, keyCode, keyAction);
++    return servo::arkweb::key_event(id_, keyCode, keyAction, 0);
++}
++
++// ACE routes physical key input through here (web_pattern.cpp WebOnKeyEvent), not SendKeyEvent.
++// NWebKeyboardEvent additionally carries the resolved unicode value, used for text characters.
++bool ServoNWeb::SendKeyboardEvent(const std::shared_ptr<NWebKeyboardEvent>& keyboardEvent) {
++    if (!keyboardEvent) {
++        return false;
++    }
++    return servo::arkweb::key_event(id_, keyboardEvent->GetKeyCode(), keyboardEvent->GetAction(),
++                                    keyboardEvent->GetUnicode());
+ }
+ 
+ int ServoNWeb::Load(const std::string& url) {
+diff --git a/ports/arkweb/cpp/servo_nweb.h b/ports/arkweb/cpp/servo_nweb.h
+index d8c5d016bb6..e562dae9d20 100644
+--- a/ports/arkweb/cpp/servo_nweb.h
++++ b/ports/arkweb/cpp/servo_nweb.h
+@@ -4,6 +4,7 @@
+ #include <cstdint>
+ #include <memory>
+ #include <string>
++#include <vector>
+ 
+ #include "generated/servo_nweb_stub_base.h"
+ #include "servo_handler_proxy.h"
+@@ -26,8 +27,11 @@ public:
+     void OnTouchPress(int32_t id, double x, double y, bool fromOverlay) override;
+     void OnTouchRelease(int32_t id, double x, double y, bool fromOverlay) override;
+     void OnTouchMove(int32_t id, double x, double y, bool fromOverlay) override;
++    void OnTouchMove(const std::vector<std::shared_ptr<NWebTouchPointInfo>>& touch_point_infos,
++                     bool fromOverlay) override;
+     void OnTouchCancel() override;
+     bool SendKeyEvent(int32_t keyCode, int32_t keyAction) override;
++    bool SendKeyboardEvent(const std::shared_ptr<NWebKeyboardEvent>& keyboardEvent) override;
+     int Load(const std::string& url) override;
+     bool IsNavigatebackwardAllowed() override;
+     bool IsNavigateForwardAllowed() override;
+diff --git a/ports/arkweb/cpp/servo_nweb_engine.cpp b/ports/arkweb/cpp/servo_nweb_engine.cpp
+index fb4cf2328f5..c135ddeee72 100644
+--- a/ports/arkweb/cpp/servo_nweb_engine.cpp
++++ b/ports/arkweb/cpp/servo_nweb_engine.cpp
+@@ -82,6 +82,10 @@ std::shared_ptr<NWeb> ServoNWebEngine::CreateNWeb(std::shared_ptr<NWebCreateInfo
+     auto nweb = std::make_shared<ServoNWeb>(id, proxy);
+     {
+         std::lock_guard<std::mutex> lock(mutex_);
++        // Prune entries whose web component has been destroyed.
++        for (auto it = nwebs_.begin(); it != nwebs_.end();) {
++            it = it->second.expired() ? nwebs_.erase(it) : std::next(it);
++        }
+         nwebs_[id] = nweb;
+     }
+     return nweb;
+@@ -90,7 +94,7 @@ std::shared_ptr<NWeb> ServoNWebEngine::CreateNWeb(std::shared_ptr<NWebCreateInfo
+ std::shared_ptr<NWeb> ServoNWebEngine::GetNWeb(int32_t nweb_id) {
+     std::lock_guard<std::mutex> lock(mutex_);
+     auto it = nwebs_.find(static_cast<uint32_t>(nweb_id));
+-    return it == nwebs_.end() ? nullptr : it->second;
++    return it == nwebs_.end() ? nullptr : it->second.lock();
+ }
+ 
+ // The Servo thread is started here rather than only in InitializeWebEngine: the OHOS lifecycle
+diff --git a/ports/arkweb/cpp/servo_nweb_engine.h b/ports/arkweb/cpp/servo_nweb_engine.h
+index 31c81877ce9..4b68fe3775b 100644
+--- a/ports/arkweb/cpp/servo_nweb_engine.h
++++ b/ports/arkweb/cpp/servo_nweb_engine.h
+@@ -30,7 +30,10 @@ public:
+ 
+ private:
+     std::mutex mutex_;
+-    std::unordered_map<uint32_t, std::shared_ptr<NWeb>> nwebs_;
++    // Weak, so a destroyed web component's NWeb (and the ACE handler its proxy pins) is released
++    // once ACE drops its shared_ptr, rather than leaked here on every open/close. GetNWeb locks it;
++    // expired entries are pruned on the next CreateNWeb.
++    std::unordered_map<uint32_t, std::weak_ptr<NWeb>> nwebs_;
+ };
+ 
+ }  // namespace OHOS::NWeb
+diff --git a/ports/arkweb/src/bridge.rs b/ports/arkweb/src/bridge.rs
+index 0692ab2b2ac..60406c605b5 100644
+--- a/ports/arkweb/src/bridge.rs
++++ b/ports/arkweb/src/bridge.rs
+@@ -78,7 +78,7 @@ pub mod ffi {
+ #[cxx::bridge(namespace = "servo::arkweb")]
+ pub mod ffi_arkweb {
+     extern "Rust" {
+-        fn send_key_event(id: u32, oh_keycode: i32, oh_action: i32) -> bool;
++        fn key_event(id: u32, keycode: i32, action: i32, unicode: i32) -> bool;
+         fn init_logging(min_level: i32);
+     }
+ 
+@@ -87,6 +87,10 @@ pub mod ffi_arkweb {
+ 
+         /// Set the OHNativeWindow buffer geometry before surfman creates/resizes its EGL surface.
+         fn set_native_window_buffer_geometry(window: usize, width: u32, height: u32);
++
++        /// Release an OHNativeWindow from CreateNativeWindowFromSurface (call after the rendering
++        /// context using it is dropped).
++        fn destroy_native_window(window: usize);
+     }
+ }
+ 
+@@ -160,8 +164,8 @@ fn can_go_back(id: u32) -> bool {
+ fn can_go_forward(id: u32) -> bool {
+     crate::runtime::can_go_forward(id)
+ }
+-fn send_key_event(id: u32, oh_keycode: i32, oh_action: i32) -> bool {
+-    crate::runtime::send_key_event(id, oh_keycode, oh_action)
++fn key_event(id: u32, keycode: i32, action: i32, unicode: i32) -> bool {
++    crate::runtime::key_event(id, keycode, action, unicode)
+ }
+ fn init_logging(min_level: i32) {
+     crate::runtime::init_logging(min_level)
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index 0dd1b33366d..1c20725d159 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -6,7 +6,7 @@
+ //! ArkTS side reads synchronously (`getUrl()`, `accessBackward()`, ...) are cached in a shared
+ //! [`SyncState`] that the [`ArkWebViewDelegate`] updates on the servo thread.
+ //!
+-//! Not yet wired (tracked as `TODO(arkweb)`): input injection (touch/key/scroll — M2) and the
++//! Touch, scroll and key input are translated into servo `InputEvent`s here. Not yet wired: the
+ //! OHOS vsync refresh driver (this uses the default timer-based driver for now).
+ 
+ use std::collections::HashMap;
+@@ -28,8 +28,10 @@ use raw_window_handle::{
+     WindowHandle,
+ };
+ use servo::{
+-    EventLoopWaker, LoadStatus, Opts, RenderingContext, Servo, ServoBuilder, WebView,
+-    WebViewBuilder, WebViewDelegate, WindowRenderingContext,
++    DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
++    LoadStatus, NamedKey, Opts, RenderingContext, Scroll, Servo, ServoBuilder, TouchEvent,
++    TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate,
++    WindowRenderingContext,
+ };
+ use url::Url;
+ 
+@@ -85,6 +87,18 @@ enum Action {
+         id: u32,
+         throttled: bool,
+     },
++    Touch {
++        id: u32,
++        kind: u8,
++        x: f32,
++        y: f32,
++        pointer_id: i32,
++    },
++    Scroll {
++        id: u32,
++        dx: f32,
++        dy: f32,
++    },
+     Focus(u32),
+     SetPageZoom {
+         id: u32,
+@@ -94,6 +108,38 @@ enum Action {
+         id: u32,
+         code: String,
+     },
++    Key {
++        id: u32,
++        key: Key,
++        state: KeyState,
++    },
++}
++
++/// Map an OHOS (ArkUI/MMI) key code plus its unicode value to a servo [`Key`]. Named keys are
++/// matched first; any other key with a printable unicode value becomes a `Character`.
++fn oh_key_to_servo_key(keycode: i32, unicode: i32) -> Option<Key> {
++    let named = match keycode {
++        2054 | 2119 => NamedKey::Enter, // KEY_ENTER / KEY_NUMPAD_ENTER
++        2055 => NamedKey::Backspace,    // KEY_DEL (deletes backwards)
++        2071 => NamedKey::Delete,       // KEY_FORWARD_DEL
++        2049 => NamedKey::Tab,          // KEY_TAB
++        2070 => NamedKey::Escape,       // KEY_ESCAPE
++        2012 => NamedKey::ArrowUp,      // KEY_DPAD_UP
++        2013 => NamedKey::ArrowDown,    // KEY_DPAD_DOWN
++        2014 => NamedKey::ArrowLeft,    // KEY_DPAD_LEFT
++        2015 => NamedKey::ArrowRight,   // KEY_DPAD_RIGHT
++        2081 => NamedKey::Home,         // KEY_MOVE_HOME
++        2082 => NamedKey::End,          // KEY_MOVE_END
++        _ => {
++            return u32::try_from(unicode)
++                .ok()
++                .filter(|&u| u != 0)
++                .and_then(char::from_u32)
++                .filter(|c| !c.is_control())
++                .map(|c| Key::Character(c.to_string()));
++        },
++    };
++    Some(Key::Named(named))
+ }
+ 
+ static SERVO_CHANNEL: OnceLock<Sender<Action>> = OnceLock::new();
+@@ -222,7 +268,14 @@ impl ServoThread {
+                 let _ = ack.send(());
+             },
+             Action::DestroyWebView { id, ack } => {
+-                self.webviews.remove(&id);
++                if let Some(entry) = self.webviews.remove(&id) {
++                    // Drop the WebView + rendering context first (releases the EGL surface bound to
++                    // the native window), then release the native window obtained from
++                    // CreateNativeWindowFromSurface, which is otherwise leaked on every close.
++                    let window_handle = entry.window_handle;
++                    drop(entry);
++                    crate::bridge::ffi_arkweb::destroy_native_window(window_handle);
++                }
+                 SYNC_STATES.lock().unwrap().remove(&id);
+                 let _ = ack.send(());
+             },
+@@ -281,12 +334,61 @@ impl ServoThread {
+                 // not painted and its animations and timers are throttled.
+                 self.with_webview(id, |wv| if throttled { wv.hide() } else { wv.show() })
+             },
++            Action::Touch {
++                id,
++                kind,
++                x,
++                y,
++                pointer_id,
++            } => {
++                let event_type = match kind {
++                    0 => TouchEventType::Down,
++                    1 => TouchEventType::Move,
++                    2 => TouchEventType::Up,
++                    _ => TouchEventType::Cancel,
++                };
++                self.with_webview(id, |wv| {
++                    wv.notify_input_event(InputEvent::Touch(TouchEvent::new(
++                        event_type,
++                        TouchId(pointer_id),
++                        DevicePoint::new(x, y).into(),
++                        TouchPointerType::Touch,
++                    )));
++                });
++            },
++            Action::Scroll { id, dx, dy } => {
++                // ACE's ScrollBy/ScrollTo carry no anchor; scroll about the viewport centre.
++                // Touch-drag scrolling does not use this path — Servo derives it from the touch
++                // event sequence itself.
++                if let Some(entry) = self.webviews.get(&id) {
++                    if let Some(built) = entry.built.as_ref() {
++                        let point = DevicePoint::new(
++                            entry.size.width as f32 / 2.0,
++                            entry.size.height as f32 / 2.0,
++                        )
++                        .into();
++                        built.webview.notify_scroll_event(
++                            Scroll::Delta(DeviceVector2D::new(dx, dy).into()),
++                            point,
++                        );
++                    }
++                }
++            },
+             Action::Focus(id) => self.focus_webview(id),
+             Action::SetPageZoom { id, zoom } => self.with_webview(id, |wv| wv.set_page_zoom(zoom)),
+-            Action::EvaluateJavaScript { id, code } => {
+-                // TODO(arkweb): WebView JS evaluation + result callback (M3).
+-                let _ = (id, code);
+-            },
++            Action::EvaluateJavaScript { id, code } => self.with_webview(id, |wv| {
++                // Fire-and-forget for M2; the result callback is surfaced to ACE in M3.
++                wv.evaluate_javascript(code, |result| {
++                    if let Err(error) = result {
++                        error!("[arkweb] evaluate_javascript failed: {error:?}");
++                    }
++                });
++            }),
++            Action::Key { id, key, state } => self.with_webview(id, |wv| {
++                wv.notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(
++                    state, key,
++                )));
++            }),
+         }
+     }
+ 
+@@ -643,17 +745,19 @@ pub fn blur(id: u32) {
+ }
+ 
+ pub fn touch_event(id: u32, kind: u8, x: f32, y: f32, pointer_id: i32) {
+-    // TODO(arkweb): translate to servo InputEvent/TouchEvent (M2).
+     guard("touch_event", || {
+-        info!("[arkweb] touch id={id} kind={kind} ({x},{y}) pointer={pointer_id}")
++        send(Action::Touch {
++            id,
++            kind,
++            x,
++            y,
++            pointer_id,
++        })
+     })
+ }
+ 
+ pub fn scroll_by(id: u32, dx: f32, dy: f32) {
+-    // TODO(arkweb): translate to a servo scroll/wheel InputEvent (M2).
+-    guard("scroll_by", || {
+-        info!("[arkweb] scroll_by id={id} ({dx},{dy})")
+-    })
++    guard("scroll_by", || send(Action::Scroll { id, dx, dy }))
+ }
+ 
+ pub fn set_page_zoom(id: u32, zoom: f32) {
+@@ -699,10 +803,25 @@ pub fn can_go_forward(id: u32) -> bool {
+     })
+ }
+ 
+-pub fn send_key_event(id: u32, oh_keycode: i32, oh_action: i32) -> bool {
+-    // TODO(arkweb): translate to a servo KeyboardEvent (M2).
+-    guard("send_key_event", || {
+-        info!("[arkweb] key id={id} code={oh_keycode} action={oh_action}");
+-        false
++/// Translate an OHOS key event into a servo `KeyboardEvent`. `action`: 0 = down, 1 = up (ArkUI
++/// `KeyAction`). `unicode` is the character value if any (0 otherwise). Returns whether the key was
++/// mapped and dispatched, so ACE can fall back to its own handling for keys we do not consume.
++pub fn key_event(id: u32, keycode: i32, action: i32, unicode: i32) -> bool {
++    guard("key_event", || {
++        let state = match action {
++            0 => KeyState::Down,
++            1 => KeyState::Up,
++            _ => return false,
++        };
++        let Some(key) = oh_key_to_servo_key(keycode, unicode) else {
++            return false;
++        };
++        // Report the dispatch as unhandled if the engine is not running, so ACE falls back to its
++        // own key handling instead of assuming we consumed the event.
++        let Some(tx) = SERVO_CHANNEL.get() else {
++            error!("[arkweb] key_event before InitializeWebEngine");
++            return false;
++        };
++        tx.send(Action::Key { id, key, state }).is_ok()
+     })
+ }

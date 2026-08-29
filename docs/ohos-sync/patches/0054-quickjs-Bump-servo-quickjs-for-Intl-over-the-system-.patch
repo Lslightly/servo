@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 11 Oct 2026 12:45:23 +0000
+Subject: [PATCH] quickjs: Bump servo-quickjs for Intl over the system ICU
+
+servo-quickjs fdb3eab builds its Intl subset over the system ICU on
+Linux, with the same code as over the NDK's ICU on OpenHarmony, so the
+desktop QuickJS build has Intl like the device. Building it now needs
+ICU's development package, which `mach bootstrap` installs.
+
+localeCompare now passes on QuickJS. The _mozilla/interfaces tests
+still fail, now on AsyncDisposableStack.
+
+Fork note: the self-hosted Linux runners bootstrap when their image is built, so their QuickJS builds need an image built from a revision with this patch.
+
+Validation: `./mach build --release --js-engine quickjs` linked libicui18n.so.74, and `xvfb-run ./mach smoketest --release` passed. A full WPT run of the same tree built from a local clone (74848c3, identical to fdb3eab) had 59 tests with unexpected results; 3 more runs of the 19 not seen with the previous build matched the previous build and SpiderMonkey, except localeCompare, which now passes as with SpiderMonkey. `./mach test-tidy` passes.
+AI-assisted: Yes (agent session; written by the agent, which also ran the build and WPT runs above)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ python/servo/platform/linux_packages/apt/apt_common.txt | 1 +
+ python/servo/platform/linux_packages/dnf/dnf_base.txt   | 1 +
+ python/servo/platform/linux_packages/xbps/xbps_base.txt | 1 +
+ support/quickjs/cargo-config.toml                       | 2 +-
+ tests/wpt/mozilla/meta/mozilla/localeCompare.html.ini   | 4 ----
+ 5 files changed, 4 insertions(+), 5 deletions(-)
+ delete mode 100644 tests/wpt/mozilla/meta/mozilla/localeCompare.html.ini
+
+diff --git a/python/servo/platform/linux_packages/apt/apt_common.txt b/python/servo/platform/linux_packages/apt/apt_common.txt
+index 115db0fb77a..669dcb70709 100644
+--- a/python/servo/platform/linux_packages/apt/apt_common.txt
++++ b/python/servo/platform/linux_packages/apt/apt_common.txt
+@@ -28,6 +28,7 @@ libgstrtspserver-1.0-dev
+ gstreamer1.0-tools
+ libges-1.0-dev
+ libharfbuzz-dev
++libicu-dev
+ liblzma-dev
+ libudev-dev
+ libunwind-dev
+diff --git a/python/servo/platform/linux_packages/dnf/dnf_base.txt b/python/servo/platform/linux_packages/dnf/dnf_base.txt
+index 07b06a38f23..2674cf33d48 100644
+--- a/python/servo/platform/linux_packages/dnf/dnf_base.txt
++++ b/python/servo/platform/linux_packages/dnf/dnf_base.txt
+@@ -20,6 +20,7 @@ libXmu-devel
+ dbus-devel
+ ncurses-devel
+ harfbuzz-devel
++libicu-devel
+ ccache
+ clang
+ clang-libs
+diff --git a/python/servo/platform/linux_packages/xbps/xbps_base.txt b/python/servo/platform/linux_packages/xbps/xbps_base.txt
+index 3c759c556ad..e66bc22ba0c 100644
+--- a/python/servo/platform/linux_packages/xbps/xbps_base.txt
++++ b/python/servo/platform/linux_packages/xbps/xbps_base.txt
+@@ -20,6 +20,7 @@ libXmu-devel
+ dbus-devel
+ ncurses-devel
+ harfbuzz-devel
++icu-devel
+ ccache
+ glu-devel
+ clang
+diff --git a/support/quickjs/cargo-config.toml b/support/quickjs/cargo-config.toml
+index a39f5ff8a7f..357c02ca47d 100644
+--- a/support/quickjs/cargo-config.toml
++++ b/support/quickjs/cargo-config.toml
+@@ -5,4 +5,4 @@
+ # were tested with. The shim's version must match the mozjs version that Cargo.toml requires, or
+ # Cargo leaves the patch unused.
+ [patch.crates-io]
+-mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "72fa2b6697a60889969397313ad23405196c5b4e" }
++mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "fdb3eab5a906abb563854f08eb9021d095fef18b" }
+diff --git a/tests/wpt/mozilla/meta/mozilla/localeCompare.html.ini b/tests/wpt/mozilla/meta/mozilla/localeCompare.html.ini
+deleted file mode 100644
+index 434f7c0e455..00000000000
+--- a/tests/wpt/mozilla/meta/mozilla/localeCompare.html.ini
++++ /dev/null
+@@ -1,4 +0,0 @@
+-[localeCompare.html]
+-  [localeCompare should return the same as other browsers, even though it's implementation-dependent]
+-    expected:
+-      if js_engine == "quickjs": FAIL

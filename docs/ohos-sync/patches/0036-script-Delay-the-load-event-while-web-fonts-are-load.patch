@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 22 Sep 2026 19:39:08 +0000
+Subject: [PATCH] script: Delay the load event while web fonts are loading
+
+A web font is only fetched once layout finds text that needs it, so nothing
+kept the load event from firing before the fonts a page uses had loaded.
+`load` event handlers that measure text, like the ones in check-layout-th.js
+tests, then saw the fallback font. Chrome and Firefox also only load the fonts
+a page uses, and css/css-flexbox/flex-item-compressible-001.html passes in both.
+
+While any web font is loading after a reflow, the document now holds a load
+blocker, which is released once the loads have been applied to the page. To
+let fonts that newly loaded stylesheets need take part, the document lays out
+pending changes before it stops waiting for load blockers.
+
+Fork note: fixes a regression from "fonts: Only load @font-face fonts that the
+page uses", but is meant for upstream on its own: with eager loading the same
+race existed, the font download just usually won it.
+
+Testing: css/css-flexbox/flex-item-compressible-001.html,
+css/css-grid/subgrid/subgrid-baseline-016.html and -018.html,
+css/css-grid/alignment/self-baseline/grid-self-baseline-two-dimensional.html
+and css/cssom-view/offsetTopLeft-border-box.html pass again, and five subtests
+of css/css-flexbox/text-as-flexitem-size-001.html now pass.
+
+Validation: `./mach test-wpt --release css/css-fonts css/css-font-loading css/css-flexbox css/css-grid css/cssom-view html/canvas/element/text html/canvas/offscreen/text` (4921 tests): the text-as-flexitem-size-001 subtests pass in 5 of 5 repeats (0 of 5 without this patch); the only other unexpected results are font-variant-emoji-1 FAIL (also on plain ohos-main) and the known intermittent grid-self-alignment-fit-content-001 (servo/servo#47515).
+AI-assisted: Yes (agent session; root-caused from the servo-ohos PR 12 try run and written by the agent)
+AI-assisted: Yes (agent session; 2026-10-08 sync -- mechanical conflict resolution of the layout_api imports; upstream's WPT sync f9b43a6f0b9 already removed the text-as-flexitem-size-001 expectations this patch deleted)
+AI-assisted: Yes (agent session; 2026-10-13 sync -- mechanical conflict resolution of the layout_api imports (upstream added ContainerTimingRecord); LoadBlocker::terminate now takes the JSContext first (#48795))
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/document/document.rs    | 40 ++++++++++++++++++-
+ components/script/dom/window/window.rs        |  1 +
+ .../script/event_loop/document_loader.rs      |  2 +
+ components/script/event_loop/script_thread.rs |  1 +
+ 4 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 3b331734393..d10055ffa94 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -37,7 +37,7 @@ use js::jsapi::JSObject;
+ use js::realm::CurrentRealm;
+ use js::rust::{HandleObject, HandleValue, MutableHandleValue};
+ use layout_api::{
+-    ContainerTimingRecord, LCPCandidate, PendingRestyle, ReflowGoal, ReflowPhasesRun,
++    ContainerTimingRecord, LCPCandidate, PendingRestyle, QueryMsg, ReflowGoal, ReflowPhasesRun,
+     ReflowStatistics, RestyleReason, ScrollContainerQueryFlags, TrustedNodeAddress,
+ };
+ use malloc_size_of::MallocSizeOfOps;
+@@ -223,7 +223,7 @@ use crate::dom::windowproxy::WindowProxy;
+ use crate::dom::xpathevaluator::XPathEvaluator;
+ use crate::dom::xpathexpression::XPathExpression;
+ use crate::dom::{FlatTreeParent, RootedPromise, WeakRangeVec};
+-use crate::event_loop::document_loader::{DocumentLoader, LoadType};
++use crate::event_loop::document_loader::{DocumentLoader, LoadBlocker, LoadType};
+ use crate::event_loop::script_thread::{ScriptThread, SharedRwLocks};
+ use crate::event_loop::timers::{OneshotTimerCallback, OneshotTimers};
+ use crate::fetch::fetch::DeferredFetchRecordInvokeState;
+@@ -608,6 +608,8 @@ pub(crate) struct Document {
+     delayed_tasks: DomRefCell<Vec<Box<dyn NonSendTaskBox>>>,
+     /// <https://html.spec.whatwg.org/multipage/#completely-loaded>
+     completely_loaded: Cell<bool>,
++    /// Delays the load event while web fonts that the page needs are loading.
++    web_font_load_blocker: DomRefCell<Option<LoadBlocker>>,
+     /// Set of shadow roots connected to the document tree.
+     shadow_roots: DomRefCell<FxHashSet<Dom<ShadowRoot>>>,
+     /// Whether any of the shadow roots need the stylesheets flushed.
+@@ -2900,11 +2902,44 @@ impl Document {
+             }
+         }
+ 
++        // Web fonts are only loaded once layout finds text that needs them, so lay out
++        // pending changes, such as stylesheets that just finished loading, to let the fonts
++        // they need delay the load event.
++        if !self.restyle_reason(cx.no_gc()).is_empty() {
++            self.window()
++                .reflow(cx, ReflowGoal::LayoutQuery(QueryMsg::BoxArea));
++            if self.loader.borrow().is_blocked() {
++                return;
++            }
++        }
++
+         self.current_the_end_loading_phase
+             .set(TheEndLoadingPhase::Done);
+         self.queue_document_completion(cx);
+     }
+ 
++    /// Delay the load event while web fonts are loading, so that `load` event handlers see
++    /// the page laid out with the fonts that it needs.
++    pub(crate) fn delay_load_event_for_web_fonts(&self) {
++        if self.current_the_end_loading_phase.get() == TheEndLoadingPhase::Done ||
++            self.web_font_load_blocker.borrow().is_some() ||
++            self.window().font_context().web_fonts_still_loading() == 0
++        {
++            return;
++        }
++        *self.web_font_load_blocker.borrow_mut() = Some(LoadBlocker::new(self, LoadType::WebFonts));
++    }
++
++    /// Stop delaying the load event once all web fonts that were loading have been applied.
++    pub(crate) fn maybe_stop_delaying_load_event_for_web_fonts(&self, cx: &mut JSContext) {
++        if self.web_font_load_blocker.borrow().is_none() ||
++            self.window().font_context().web_fonts_still_loading() != 0
++        {
++            return;
++        }
++        LoadBlocker::terminate(cx, &self.web_font_load_blocker);
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#destroy-a-document-and-its-descendants>
+     pub(crate) fn destroy_document_and_its_descendants(&self, cx: &mut JSContext) {
+         // Step 1. If document is not fully active, then:
+@@ -4271,6 +4306,7 @@ impl Document {
+             navigation_timing: Default::default(),
+             resource_fetch_timing: RefCell::new(None),
+             completely_loaded: Cell::new(false),
++            web_font_load_blocker: Default::default(),
+             script_and_layout_blockers: Cell::new(0),
+             delayed_tasks: Default::default(),
+             shadow_roots: Default::default(),
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index 849f4f52b16..2a29a04ad6d 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -2833,6 +2833,7 @@ impl Window {
+             // must wait for them even if it had already been fulfilled.
+             self.Document().Fonts(cx).switch_to_loading(cx);
+         }
++        document.delay_load_event_for_web_fonts();
+         self.handle_new_or_removed_web_fonts_post_reflow(cx, reflow_result.changed_web_fonts);
+ 
+         self.handle_pending_images_post_reflow(
+diff --git a/components/script/event_loop/document_loader.rs b/components/script/event_loop/document_loader.rs
+index fdd2ad258a7..c00376640e7 100644
+--- a/components/script/event_loop/document_loader.rs
++++ b/components/script/event_loop/document_loader.rs
+@@ -25,6 +25,8 @@ pub(crate) enum LoadType {
+     Stylesheet(#[no_trace] ServoUrl),
+     PageSource(#[no_trace] ServoUrl),
+     Media,
++    /// Web fonts that layout found the page to need.
++    WebFonts,
+ }
+ 
+ /// Canary value ensuring that manually added blocking loads are always removed by the
+diff --git a/components/script/event_loop/script_thread.rs b/components/script/event_loop/script_thread.rs
+index 0d6e31623c6..3bad36294c2 100644
+--- a/components/script/event_loop/script_thread.rs
++++ b/components/script/event_loop/script_thread.rs
+@@ -1350,6 +1350,7 @@ impl ScriptThread {
+     fn maybe_fulfill_font_ready_promises(&self, cx: &mut JSContext) {
+         let mut sent_message = false;
+         for (_, document) in self.documents.borrow().iter() {
++            document.maybe_stop_delaying_load_event_for_web_fonts(cx);
+             sent_message = document.maybe_fulfill_font_ready_promise(cx) || sent_message;
+         }
+ 

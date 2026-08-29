@@ -1,0 +1,956 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 18 Sep 2026 08:44:49 +0000
+Subject: [PATCH] fonts: Only load @font-face fonts that the page uses
+
+Every @font-face rule was fetched, sanitised and kept in memory as soon as
+its stylesheet applied, even when no style used its family or its
+unicode-range covered no character on the page. CSS Fonts 4 requires user
+agents to only download fonts that are used.
+
+A new rule now only registers an unloaded face, matched by its descriptors.
+Font matching asks for the face once it selects it for a character, and the
+loads it asked for start after layout. `FontFace.load()` and
+`FontFaceSet.load()` ask for faces the same way. Faces whose sources are all
+`local()` are still loaded right away.
+
+Because matching now decides which faces load, adding @font-face rules
+dirties the document so that text is matched again, `document.fonts.ready`
+flushes layout, and a reflow that starts loads makes it pending again.
+
+The font store now holds templates for faces whose data has not been
+downloaded. `FontGroupFamilyTemplate::font_if_matches` skips them, but
+`FontContext::matching_templates` and `FontContext::font` are also used
+directly by the SVG font resolver, which would hit the "Should never create
+a web font without data" panic in `PlatformFont::new_from_template` for any
+SVG `<text>` using a web font. `FontContext::font` returns `None` for a web
+font template without data, without caching the failure, so the face can be
+used once it has loaded. The SVG font resolver asks for the face to be
+loaded, like layout does when it matches one, and falls back to the next
+family in the meantime.
+
+An element whose font-family names a web font but that has no text never
+picks the font for a character, but its first available font is needed
+too, for instance for `line-height: normal` and font-relative lengths, and
+Chrome and Firefox load it. After an element is restyled, layout asks for
+the first available font of its style to be loaded if it is a web font that
+has not been fetched. Only elements whose font differs from their parent's
+are looked at, nothing is done while the document has no web fonts, and the
+lookup runs once per font group. It does not create fonts, so system fonts
+are not loaded for elements that never draw text.
+
+Testing: A new WPT test checks that unused faces stay "unloaded". A canvas
+test that expected a font not used by the page to be loaded now fails, as it
+does in Chrome, Firefox and Safari. svg/painting/svg-with-outline.html,
+css/css-transforms/transform-box/view-box-mutation-002.html and
+resize-observer/svg.html keep their expected results instead of crashing,
+and content-security-policy/font-src/font-stylesheet-font-blocked.sub.html
+(a body without text) and preload/preload-resource-match.https.html (an
+empty paragraph) still see the font fetched.
+
+Fork note: second of four patches, meant for upstream. The upstream-based
+version (branch lazy-webfonts) does not have the two fixes for SVG text and
+for elements without text yet, which the servo-ohos PR 12 try run found.
+Motivation: generated-UI pages that link Google Fonts CJK families declare
+hundreds of unicode-range subsets (441 @font-face rules on the "keai"
+concert-article test page), and Servo downloaded all of them (437 files,
+10.5 MiB) where ArkWeb downloads 64.
+
+Relies on: the previous patch (the load state on `FontFaceRuleInfo`, which is
+how matching tells unloaded faces apart and how `FontFace.status` shows it);
+upstream a8d5fdaa915 (#47564, its `FontFaceSet.load` font query is what makes
+`document.fonts.load()` ask for faces); matching going through
+`FontGroupFamilyTemplate::font_if_matches` and `char_in_unicode_range`
+(components/shared/fonts/font_template.rs); `LayoutThread::reflow` returning a
+`ReflowResult` and `can_skip_reflow_request_entirely` gating it; and the
+readiness checks in `Document::maybe_fulfill_font_ready_promise` and
+`Window::maybe_resolve_pending_screenshot_readiness_requests` reading
+`FontContext::web_fonts_still_loading`.
+
+Drop when upstream loads @font-face rules lazily: the test this patch adds,
+css/css-font-loading/fontface-unused-stays-unloaded.html, passes on plain
+upstream.
+
+Validation: `./mach test-wpt --release --processes 1 css/css-font-loading css/css-fonts html/canvas/element/text html/canvas/offscreen/text` (948 tests): the new fontface-unused-stays-unloaded passes; 2d.text.draw.fontface.notinpage now fails as in Chrome/Firefox/Safari; six "(drawing text in a canvas)" subtests of generic-family-keywords-003 failed with this patch on base/2026-08-29 (Chrome and Firefox pass them) and pass again since base/2026-10-08, so their expectations were dropped; the two @font-face layer-override subtests of css/css-cascade/layer-font-face-override (FAIL on plain upstream) pass with this patch, so their expectations were dropped too; matching/font-unicode-PUA subtests are intermittent (test race, both results seen); the only other unexpected result, font-variant-emoji-1 FAIL, also happens on plain ohos-main. `./mach test-wpt --release svg resize-observer css/css-transforms/transform-box` (1355 tests): all as expected (svg-with-outline, view-box-mutation-002 and resize-observer/svg crash without the SVG font resolver change). `./mach test-wpt --release css/css-fonts css/css-font-loading css/css-flexbox css/css-grid css/cssom-view css/css-inline css/css-text html/canvas/element/text html/canvas/offscreen/text content-security-policy/font-src preload svg` (8650 tests): no new unexpected results besides font-variant-emoji-1 and the known intermittent grid-self-alignment-fit-content-001; font-stylesheet-font-blocked.sub.html and preload-resource-match.https.html pass, and fail without the first-available-font change. Host release build, keai page served locally over HTTP/1.1 keep-alive (3 runs each): font files fetched 437 -> 66, RSS 525.3 -> 471.6 MiB, heap 340.1 -> 286.4 MiB, `--exit -o` screenshot byte-identical to ohos-main. The servo-webfont-eager-download reproducer (6 @font-face rules, 1 needed) fetches 1 font instead of 6. On a PLR-AL00, production build with `--features tracing-hitrace`, the keai page served from the host through `hdc rport`, measured with this patch and the next two applied (they change invalidation, not which fonts load): 437 -> 66 font files per load in each of 5 `servoperf page` loads, and PSS 30 s after launch 507.6 -> 467.9 MB (-7.8%, 4 interleaved loads each, every pair 35-49 MB apart).
+AI-assisted: Yes (agent session; designed with the maintainer, written and tested by the agent, ported from upstream main to ohos-main's Rc<Promise> API)
+AI-assisted: Yes (agent session; root-caused from the servo-ohos PR 12 try run and written by the agent)
+AI-assisted: Yes (agent session; 2026-10-08 sync -- conflict resolution for upstream's RootedPromise and `icu_locale_core` changes, resolved to the code of the upstream-bound lazy-webfonts branch; MANIFEST.json entry re-inserted; dropped the generic-family-keywords-003 and layer-font-face-override FAIL expectations that now pass)
+AI-assisted: Yes (agent session; 2026-10-09 restack -- folded in "fonts: Do not create fonts for web font faces that are not loaded yet" and "fonts: Load the first available web font of elements without text", which fixed regressions of this patch; the upstream FontFaceSet.load change replaces the dropped backport placeholder in "Relies on")
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/fonts/font.rs                      |  54 +++++-
+ components/fonts/font_context.rs              | 171 ++++++++++++++++--
+ components/fonts/font_store.rs                |  55 ++++++
+ components/layout/layout_impl.rs              |  13 ++
+ components/layout/traversal.rs                |  26 +++
+ components/script/dom/css/fontface.rs         |  16 +-
+ components/script/dom/css/fontfaceset.rs      |  23 ++-
+ components/script/dom/window/window.rs        |  19 +-
+ components/script/event_loop/svg_font.rs      |   7 +
+ components/shared/fonts/lib.rs                |  20 +-
+ components/shared/layout/lib.rs               |   2 +
+ tests/wpt/meta/MANIFEST.json                  |   7 +
+ .../layer-font-face-override.html.ini         |   6 -
+ .../matching/font-unicode-PUA.html.ini        |   6 +-
+ .../2d.text.draw.fontface.notinpage.html.ini  |   3 +
+ .../fontface-unused-stays-unloaded.html       |  62 +++++++
+ 16 files changed, 450 insertions(+), 40 deletions(-)
+ delete mode 100644 tests/wpt/meta/css/css-cascade/layer-font-face-override.html.ini
+ create mode 100644 tests/wpt/meta/html/canvas/element/text/2d.text.draw.fontface.notinpage.html.ini
+ create mode 100644 tests/wpt/tests/css/css-font-loading/fontface-unused-stays-unloaded.html
+
+diff --git a/components/fonts/font.rs b/components/fonts/font.rs
+index af92640ec6c..666cc382a71 100644
+--- a/components/fonts/font.rs
++++ b/components/fonts/font.rs
+@@ -6,6 +6,7 @@ use std::borrow::ToOwned;
+ use std::collections::HashMap;
+ use std::hash::Hash;
+ use std::ops::Deref;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, OnceLock};
+ use std::{iter, str};
+ 
+@@ -15,7 +16,7 @@ use bitflags::bitflags;
+ use euclid::default::{Point2D, Rect};
+ use euclid::num::Zero;
+ use font_types::NameId;
+-use fonts_traits::FontDescriptor;
++use fonts_traits::{FontDescriptor, WebFontLoadState};
+ use icu_locale_core::subtags::Language;
+ use icu_properties::props::{EnumeratedProperty, GeneralCategory};
+ use log::debug;
+@@ -795,6 +796,8 @@ pub struct FontGroup {
+     /// It's unclear if this is the right thing to do. Perhaps fallbacks should
+     /// always be stored here as it's quite likely that they will be used again.
+     fallbacks: RwLock<HashMap<FallbackKey, FontRef>>,
++    /// Whether [`FontGroup::request_first_available_web_font`] has already run.
++    requested_first_available_web_font: AtomicBool,
+ }
+ 
+ impl FontGroup {
+@@ -810,6 +813,40 @@ impl FontGroup {
+             descriptor,
+             families,
+             fallbacks: Default::default(),
++            requested_first_available_web_font: Default::default(),
++        }
++    }
++
++    /// Ask for the first available font of this group to be loaded if it is a web font
++    /// that has not been fetched yet. Unlike [`FontGroup::first`], this does not need any
++    /// text and does not create fonts, so that it can be done for every element: the first
++    /// available font determines `line-height: normal` and font-relative lengths even for
++    /// elements without text.
++    pub fn request_first_available_web_font(&self, font_context: &FontContext) {
++        if self
++            .requested_first_available_web_font
++            .swap(true, Ordering::Relaxed)
++        {
++            return;
++        }
++
++        for template in self
++            .families
++            .iter()
++            .flat_map(|family| family.templates(font_context, &self.descriptor))
++            .filter(|template| template.template.char_in_unicode_range(' '))
++        {
++            let Some(font_face_rule) = template.template.font_face_rule() else {
++                return;
++            };
++            match font_face_rule.load_state() {
++                WebFontLoadState::Unloaded => {
++                    font_context.request_web_font_load(&font_face_rule);
++                    return;
++                },
++                WebFontLoadState::Loading | WebFontLoadState::Loaded => return,
++                WebFontLoadState::Failed => {},
++            }
+         }
+     }
+ 
+@@ -1028,6 +1065,21 @@ impl FontGroupFamilyTemplate {
+         if !template_predicate(self.template.clone()) {
+             return None;
+         }
++
++        // This is the point at which a web font is known to be needed: the face matches the
++        // style and its `unicode-range` covers the character. If its `src` has not been
++        // fetched yet, ask for it now and fall through to the next family in the meantime.
++        if let Some(font_face_rule) = self.template.font_face_rule() {
++            match font_face_rule.load_state() {
++                WebFontLoadState::Loaded => {},
++                WebFontLoadState::Unloaded => {
++                    font_context.request_web_font_load(&font_face_rule);
++                    return None;
++                },
++                WebFontLoadState::Loading | WebFontLoadState::Failed => return None,
++            }
++        }
++
+         self.font(font_context, font_descriptor)
+             .filter(font_predicate)
+     }
+diff --git a/components/fonts/font_context.rs b/components/fonts/font_context.rs
+index 4d87a441320..acff5d65d08 100644
+--- a/components/fonts/font_context.rs
++++ b/components/fonts/font_context.rs
+@@ -14,8 +14,9 @@ use app_units::Au;
+ use content_security_policy::Violation;
+ use fonts_traits::{
+     CSSFontFaceDescriptors, FontDescriptor, FontFaceRuleInfo, FontIdentifier, FontTemplate,
+-    FontTemplateRef, FontTemplateRefMethods, StylesheetWebFontLoadFinishedCallback,
+-    WebFontLoadEvent, WebFontLoadState, WebFontSetDifference,
++    FontTemplateDescriptor, FontTemplateRef, FontTemplateRefMethods,
++    StylesheetWebFontLoadFinishedCallback, WebFontLoadEvent, WebFontLoadState,
++    WebFontSetDifference,
+ };
+ use log::{debug, trace};
+ use malloc_size_of::MallocSizeOf;
+@@ -131,6 +132,12 @@ pub struct FontContext {
+ 
+     /// The number of fonts that are currently loading.
+     number_of_loading_web_fonts: AtomicUsize,
++
++    /// The `@font-face` rules that font matching has selected, but whose `src` has not been
++    /// fetched yet. Filled in while laying out and drained by
++    /// [`FontContextWebFontMethods::process_pending_web_font_loads`] afterwards.
++    #[ignore_malloc_size_of = "The rules are measured as part of `known_font_face_rules`."]
++    pending_web_font_loads: Mutex<Vec<ServoArc<FontFaceRuleInfo>>>,
+ }
+ 
+ /// A callback that will be invoked on the Fetch thread if a web font download
+@@ -192,6 +199,7 @@ impl FontContext {
+             known_font_face_rules: Default::default(),
+             font_feature_value_map: Default::default(),
+             number_of_loading_web_fonts: Default::default(),
++            pending_web_font_loads: Default::default(),
+         }
+     }
+ 
+@@ -208,6 +216,16 @@ impl FontContext {
+         }
+     }
+ 
++    /// Ask for the first available font for `style` to be loaded if it is a web font that has
++    /// not been fetched yet. See [`FontGroup::request_first_available_web_font`].
++    pub fn request_first_available_web_font(&self, style: ServoArc<FontStyleStruct>) {
++        if self.web_fonts.read().families.is_empty() {
++            return;
++        }
++        self.font_group(style)
++            .request_first_available_web_font(self);
++    }
++
+     /// Returns a `FontGroup` representing fonts which can be used for layout, given the `style`.
+     /// Font groups are cached, so subsequent calls with the same `style` will return a reference
+     /// to an existing `FontGroup`.
+@@ -284,6 +302,17 @@ impl FontContext {
+             return font;
+         }
+ 
++        // A web font template can describe a face that has not been downloaded yet. It
++        // cannot be turned into a `Font`, and caching the failure would hide the face
++        // once its data arrives.
++        if matches!(
++            &*font_template.identifier(),
++            FontIdentifier::Web(_) | FontIdentifier::ArrayBuffer(_)
++        ) && self.get_font_data(&font_template.identifier()).is_none()
++        {
++            return None;
++        }
++
+         debug!(
+             "FontContext::font cache miss for font_template={:?} font_descriptor={:?}",
+             font_template, font_descriptor
+@@ -517,10 +546,16 @@ impl FontContext {
+                         .families
+                         .get(family_name)
+                         .is_some_and(|templates| {
+-                            templates
+-                                .templates
+-                                .iter()
+-                                .any(|template| template.borrow().identifier == font_identifier)
++                            templates.templates.iter().any(|template| {
++                                let template = template.borrow();
++                                // A template that has not been loaded yet only describes the
++                                // face by its descriptors and names the URL it will be loaded
++                                // from, so it is not a reason to skip that URL.
++                                template.identifier == font_identifier &&
++                                    template.font_face_rule.as_ref().is_none_or(|rule| {
++                                        rule.load_state() == WebFontLoadState::Loaded
++                                    })
++                            })
+                         })
+                 }),
+             Source::Local(_) => true,
+@@ -665,10 +700,16 @@ impl WebFontDownloadState {
+                     return;
+                 }
+ 
++                // The face was registered as unloaded when its rule was added, so replace
++                // that entry rather than adding a second one for the same rule.
+                 self.font_context
+                     .web_fonts
+                     .write()
+-                    .add_new_template(family_name, new_template);
++                    .set_template_for_font_face_rule(
++                        family_name,
++                        &initiator.font_face_rule,
++                        new_template,
++                    );
+                 initiator
+                     .font_face_rule
+                     .set_load_state(WebFontLoadState::Loaded);
+@@ -695,6 +736,10 @@ impl WebFontDownloadState {
+                 initiator
+                     .font_face_rule
+                     .set_load_state(WebFontLoadState::Failed);
++                self.font_context
++                    .web_fonts
++                    .write()
++                    .remove_template_for_font_face_rule(&initiator.font_face_rule);
+                 if self
+                     .font_context
+                     .number_of_loading_web_fonts
+@@ -739,6 +784,12 @@ pub trait FontContextWebFontMethods {
+         document_context: &WebFontDocumentContext,
+     );
+     fn handle_web_font_request_failed(&self, url: ServoUrl);
++    fn process_pending_web_font_loads(
++        &self,
++        webview_id: WebViewId,
++        callback: StylesheetWebFontLoadFinishedCallback,
++        document_context: &WebFontDocumentContext,
++    ) -> bool;
+ }
+ 
+ impl FontContextWebFontMethods for Arc<FontContext> {
+@@ -783,18 +834,27 @@ impl FontContextWebFontMethods for Arc<FontContext> {
+             .diff_old_and_new_font_face_rules(stylist, guards);
+ 
+         for added_rule in &difference.added_font_faces {
+-            self.load_single_font_face_rule(
+-                webview_id,
+-                added_rule.clone(),
+-                callback.clone(),
+-                document_context,
+-            );
++            // A face that only has `local()` sources costs nothing to fetch, so it is
++            // loaded here instead of waiting for font matching to ask for it.
++            if !self.register_font_face_rule(added_rule) {
++                self.load_single_font_face_rule(
++                    webview_id,
++                    added_rule.clone(),
++                    callback.clone(),
++                    document_context,
++                );
++            }
+         }
+         for removed_rule in &difference.removed_font_faces {
+             self.remove_single_font_face_rule(removed_rule, &mut self.web_fonts.write());
+         }
+ 
+-        if !difference.removed_font_faces.is_empty() || difference.cascade_index_of_any_rule_changed
++        // A new rule can make font matching pick a different face, either because it is the
++        // face that will now be used or because it is unloaded and the text has to be
++        // rendered with a fallback until it arrives.
++        if !difference.added_font_faces.is_empty() ||
++            !difference.removed_font_faces.is_empty() ||
++            difference.cascade_index_of_any_rule_changed
+         {
+             // Font matching may now yield different results, so invalidate resolved font groups.
+             self.resolved_font_groups.write().clear();
+@@ -808,6 +868,26 @@ impl FontContextWebFontMethods for Arc<FontContext> {
+         difference
+     }
+ 
++    /// Start the loads that font matching asked for while laying out. Returns true if any
++    /// load was started, in which case `document.fonts.ready` is blocked again.
++    fn process_pending_web_font_loads(
++        &self,
++        webview_id: WebViewId,
++        callback: StylesheetWebFontLoadFinishedCallback,
++        document_context: &WebFontDocumentContext,
++    ) -> bool {
++        let pending = std::mem::take(&mut *self.pending_web_font_loads.lock());
++        for font_face_rule in &pending {
++            self.load_single_font_face_rule(
++                webview_id,
++                font_face_rule.clone(),
++                callback.clone(),
++                document_context,
++            );
++        }
++        !pending.is_empty()
++    }
++
+     fn load_web_font_for_script(
+         &self,
+         webview_id: Option<WebViewId>,
+@@ -951,6 +1031,69 @@ impl FontContext {
+         true
+     }
+ 
++    /// Add an unloaded [`FontTemplate`] for a new `@font-face` rule, so that font matching
++    /// can see the face without its `src` having been fetched.
++    ///
++    /// Until the face is loaded, the only thing known about it are the descriptors on the
++    /// rule, which is what the face is matched against. Returns false for a rule that has
++    /// nothing to fetch, because all of its sources are `local()`; the caller loads those
++    /// right away.
++    fn register_font_face_rule(&self, font_face_rule: &ServoArc<FontFaceRuleInfo>) -> bool {
++        let Some(family) = font_face_rule.descriptors.font_family.as_ref() else {
++            return true;
++        };
++        let Some(identifier) = Self::first_remote_source(font_face_rule) else {
++            return false;
++        };
++
++        let mut descriptor = FontTemplateDescriptor::default();
++        descriptor.override_values_with_css_font_template_descriptors(
++            &CSSFontFaceDescriptors::from(&font_face_rule.descriptors),
++        );
++
++        self.web_fonts.write().add_new_template(
++            family.name.clone().into(),
++            FontTemplate::new(identifier, descriptor, Some(font_face_rule.clone())),
++        );
++        true
++    }
++
++    /// The URL that a face will be fetched from first, or `None` if it has no source that
++    /// this build can fetch and use.
++    fn first_remote_source(font_face_rule: &ServoArc<FontFaceRuleInfo>) -> Option<FontIdentifier> {
++        font_face_rule
++            .descriptors
++            .src
++            .as_ref()?
++            .0
++            .iter()
++            .filter(Self::is_supported_web_font_source)
++            .find_map(|source| match source {
++                Source::Url(url_source) => url_source.url.url().cloned(),
++                Source::Local(_) => None,
++            })
++            .map(|url| FontIdentifier::Web(url.into()))
++    }
++
++    /// Ask for the `src` of an `@font-face` rule to be fetched, because font matching
++    /// selected the face for text on the page.
++    ///
++    /// This is called while laying out, possibly from several threads at once and without
++    /// the document context needed to start a fetch, so the request is only recorded here.
++    /// [`FontContextWebFontMethods::process_pending_web_font_loads`] starts it.
++    pub fn request_web_font_load(&self, font_face_rule: &ServoArc<FontFaceRuleInfo>) {
++        if font_face_rule.start_loading() {
++            self.pending_web_font_loads
++                .lock()
++                .push(font_face_rule.clone());
++        }
++    }
++
++    /// Whether any web font loads have been asked for but not started yet.
++    pub fn has_pending_web_font_loads(&self) -> bool {
++        !self.pending_web_font_loads.lock().is_empty()
++    }
++
+     pub fn add_template_to_font_context(
+         &self,
+         family_name: LowercaseFontFamilyName,
+diff --git a/components/fonts/font_store.rs b/components/fonts/font_store.rs
+index 63b3595edd1..318a848ce45 100644
+--- a/components/fonts/font_store.rs
++++ b/components/fonts/font_store.rs
+@@ -46,6 +46,34 @@ impl FontStore {
+             .or_default()
+             .add_template(new_template);
+     }
++
++    /// Replace the template of a face that finished loading. Until then the family held a
++    /// template describing the face by its `@font-face` descriptors alone.
++    pub(crate) fn set_template_for_font_face_rule(
++        &mut self,
++        family_name: LowercaseFontFamilyName,
++        font_face_rule: &ServoArc<FontFaceRuleInfo>,
++        new_template: FontTemplate,
++    ) {
++        let family = self.families.entry(family_name).or_default();
++        if !family.replace_template_for_font_face_rule(font_face_rule, &new_template) {
++            family.add_template(new_template);
++        }
++    }
++
++    /// Drop the template of a face that could not be loaded, so that font matching stops
++    /// considering it.
++    pub(crate) fn remove_template_for_font_face_rule(
++        &mut self,
++        font_face_rule: &ServoArc<FontFaceRuleInfo>,
++    ) {
++        let Some(family) = font_face_rule.descriptors.font_family.as_ref() else {
++            return;
++        };
++        if let Some(templates) = self.families.get_mut(&family.name.clone().into()) {
++            templates.remove_template_for_font_face_rule(font_face_rule);
++        }
++    }
+ }
+ 
+ /// A struct that represents the available templates in a "simple family." A simple family
+@@ -187,6 +215,33 @@ impl FontTemplates {
+         self.update_simple_family(new_template);
+     }
+ 
++    /// Replace the template that a given `@font-face` rule contributed, returning false if
++    /// the family does not have one.
++    ///
++    /// The descriptor of a face changes when it loads, because the values that the rule
++    /// leaves out are taken from the font file, so the simple family has to be given up.
++    fn replace_template_for_font_face_rule(
++        &mut self,
++        font_face_rule: &ServoArc<FontFaceRuleInfo>,
++        new_template: &FontTemplate,
++    ) -> bool {
++        let Some(index) = self.templates.iter().position(|template| {
++            template
++                .borrow()
++                .is_defined_by_font_face_rule(font_face_rule)
++        }) else {
++            return false;
++        };
++
++        // Put in a new [`FontTemplateRef`] rather than writing through the old one: font
++        // groups hold on to the refs they matched, and a layout thread may be reading one
++        // while the load finishes. Those groups are dropped by
++        // `invalidate_font_groups_after_web_font_load`.
++        self.templates[index] = FontTemplateRef::new(new_template.clone());
++        self.simple_family = None;
++        true
++    }
++
+     fn update_simple_family(&mut self, added_template: FontTemplateRef) {
+         // If this was detected to not be a simple family before, it cannot ever be one
+         // in the future.
+diff --git a/components/layout/layout_impl.rs b/components/layout/layout_impl.rs
+index 4f7463cbda8..64c7384b1dd 100644
+--- a/components/layout/layout_impl.rs
++++ b/components/layout/layout_impl.rs
+@@ -926,6 +926,10 @@ impl LayoutThread {
+         if self.needs_accessibility_update() || reflow_request.accessibility.is_some() {
+             return false;
+         }
++        // Script asked for web fonts to be loaded, and loads are started by reflow.
++        if self.font_context.has_pending_web_font_loads() {
++            return false;
++        }
+ 
+         // If we have a fragment tree and it's up-to-date and this reflow
+         // doesn't need more reflow results, we can skip the rest of layout.
+@@ -1142,6 +1146,14 @@ impl LayoutThread {
+             fragment_tree.print();
+         }
+ 
++        // Font matching only records which web fonts the page turned out to need; start
++        // their loads now that laying out and building the display list are done.
++        let started_web_font_loads = self.font_context.process_pending_web_font_loads(
++            self.webview_id,
++            self.web_font_finished_loading_callback.clone(),
++            &reflow_request.document_context,
++        );
++
+         let pending_images = std::mem::take(&mut *image_resolver.pending_images.lock());
+         let pending_rasterization_images =
+             std::mem::take(&mut *image_resolver.pending_rasterization_images.lock());
+@@ -1163,6 +1175,7 @@ impl LayoutThread {
+             iframe_sizes: Some(iframe_sizes),
+             reflow_statistics,
+             changed_web_fonts,
++            started_web_font_loads,
+             lcp_candidate,
+             pending_accessibility_actions,
+             container_timing_records: std::mem::take(
+diff --git a/components/layout/traversal.rs b/components/layout/traversal.rs
+index b9297ed1cba..1bfed01a6fe 100644
+--- a/components/layout/traversal.rs
++++ b/components/layout/traversal.rs
+@@ -10,6 +10,7 @@ use layout_api::{
+ use script::layout_dom::ServoLayoutNode;
+ use style::context::{SharedStyleContext, StyleContext};
+ use style::dom::{NodeInfo, TElement, TNode};
++use style::properties::ComputedValues;
+ use style::selector_parser::RestyleDamage;
+ use style::traversal::{DomTraversal, recalc_style_at};
+ 
+@@ -65,6 +66,18 @@ where
+             &mut element_data,
+             note_child,
+         );
++
++        // The first available font of an element is needed even if it has no text, for
++        // instance for `line-height: normal`, so make sure that it gets loaded. Fonts are
++        // inherited, so only elements that change them need to be looked at.
++        if let Some(style) = element_data.styles.get_primary() &&
++            !style.get_box().display.is_none() &&
++            !parent_has_same_font(dangerous_style_element, style)
++        {
++            self.context
++                .font_context
++                .request_first_available_web_font(style.clone_font());
++        }
+     }
+ 
+     #[inline]
+@@ -81,6 +94,19 @@ where
+     }
+ }
+ 
++fn parent_has_same_font<E: TElement>(element: E, style: &ComputedValues) -> bool {
++    let Some(parent) = element.traversal_parent() else {
++        return false;
++    };
++    let Some(parent_data) = parent.borrow_data() else {
++        return false;
++    };
++    parent_data
++        .styles
++        .get_primary()
++        .is_some_and(|parent_style| std::ptr::eq(parent_style.get_font(), style.get_font()))
++}
++
+ #[servo_tracing::instrument(skip_all)]
+ pub(crate) fn compute_damage_and_rebuild_box_tree<'dom>(
+     box_tree: &mut Option<Arc<BoxTree>>,
+diff --git a/components/script/dom/css/fontface.rs b/components/script/dom/css/fontface.rs
+index 4939c9a47ad..64150e13504 100644
+--- a/components/script/dom/css/fontface.rs
++++ b/components/script/dom/css/fontface.rs
+@@ -12,6 +12,7 @@ use fonts::{
+ };
+ use js::context::JSContext;
+ use js::rust::HandleObject;
++use layout_api::{QueryMsg, ReflowGoal};
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
+ use servo_arc::Arc as ServoArc;
+@@ -699,9 +700,18 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
+     /// loaded, it does nothing.
+     /// <https://drafts.csswg.org/css-font-loading/#font-face-load>
+     fn Load(&self, cx: &mut JSContext) -> RootedPromise {
+-        // A css-connected face is loaded by the `FontContext` together with its
+-        // `@font-face` rule.
+-        if self.is_css_connected() {
++        // A css-connected face is owned by the `FontContext`, which loads it when the page
++        // needs it. Asking for it here makes it needed, and the load starts at the next
++        // reflow together with the ones that font matching asked for.
++        // Clone the rule out first: the reflow below may disconnect this face from its rule,
++        // which needs the borrow to have ended.
++        let font_face_rule = self.css_font_face_rule().clone();
++        if let Some(font_face_rule) = font_face_rule {
++            let global = self.global();
++            let window = global.as_window();
++            window.font_context().request_web_font_load(&font_face_rule);
++            // Loads that have been asked for are started by the next reflow.
++            window.reflow(cx, ReflowGoal::LayoutQuery(QueryMsg::BoxArea));
+             return self.font_status_promise.root(cx);
+         }
+ 
+diff --git a/components/script/dom/css/fontfaceset.rs b/components/script/dom/css/fontfaceset.rs
+index b14b1a7477d..8a62a2b0dbd 100644
+--- a/components/script/dom/css/fontfaceset.rs
++++ b/components/script/dom/css/fontfaceset.rs
+@@ -100,7 +100,7 @@ impl FontFaceSet {
+     }
+ 
+     /// Settle the promises of css-connected faces whose `@font-face` rules have finished
+-    /// loading. Those faces are loaded by the `FontContext`, so nothing else tells them.
++    /// loading. Those faces are loaded by font matching, so nothing else tells them.
+     pub(crate) fn update_css_connected_face_statuses(&self, cx: &mut JSContext) {
+         let entries: Vec<DomRoot<FontFace>> = self
+             .set_entries
+@@ -171,10 +171,10 @@ impl FontFaceSet {
+         //        We query for the box area here, but we're not interested in the result.
+         // FIXME: Figure out what to do for worker scopes.
+         if let Some(window) = DomRoot::downcast::<Window>(self.global()) {
+-            let document = window.Document();
+-            if document.stylesheets_changed_since_last_reflow() {
+-                window.reflow(cx, ReflowGoal::LayoutQuery(QueryMsg::BoxArea));
+-            }
++            // This must flush layout and not just the cascade: a web font is only loaded
++            // once font matching finds that the page needs it, so pending layout is what
++            // decides whether this set is still waiting on anything.
++            window.reflow(cx, ReflowGoal::LayoutQuery(QueryMsg::BoxArea));
+         }
+     }
+ 
+@@ -401,6 +401,10 @@ impl FontFaceSetMethods<crate::DomTypeHolder> for FontFaceSet {
+                 };
+                 let document = window.Document();
+ 
++                // The css-connected faces of stylesheets that have not been through the
++                // cascade yet are not in the set, so bring it up to date first.
++                this.flush_author_font_set(cx);
++
+                 // Step 3. Find the matching font faces from font face set using the font and text
+                 // arguments passed to the function, and let font face list be the return value (ignoring
+                 // the found faces flag). If a syntax error was returned, reject promise with a SyntaxError
+@@ -411,11 +415,16 @@ impl FontFaceSetMethods<crate::DomTypeHolder> for FontFaceSet {
+                 };
+ 
+                 // Step 4.1. For all of the font faces in the font face list, call their load()
+-                // method.
++                // method. Faces declared by `@font-face` rules are only fetched once
++                // something needs them, and this call is what makes them needed.
++                for font_face in font_face_objects.iter() {
++                    font_face.Load(cx);
++                }
++
+                 // Step 4.2. Resolve promise with the result of waiting for all of the
+                 // [[FontStatusPromise]]s of each font face in the font face list, in order.
+                 //
+-                // TODO: These steps are not implemented. Instead we wait until all fonts
++                // TODO: This step is not implemented. Instead we wait until all fonts
+                 // are loaded by resolving the returned promise when
+                 // `document.fonts.ready` is resolved. The return list of fonts will not
+                 // be correct, but any code that waits on the promise will have
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index f105a2116e3..cba84887daf 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -2805,6 +2805,11 @@ impl Window {
+             self.emit_timeline_marker(marker.end());
+         }
+ 
++        if reflow_result.started_web_font_loads {
++            // Font matching found web fonts that the page needs, so `document.fonts.ready`
++            // must wait for them even if it had already been fulfilled.
++            self.Document().Fonts(cx).switch_to_loading(cx);
++        }
+         self.handle_new_or_removed_web_fonts_post_reflow(cx, reflow_result.changed_web_fonts);
+ 
+         self.handle_pending_images_post_reflow(
+@@ -3750,15 +3755,19 @@ impl Window {
+             fonts.notify_font_face_rules_removed(&changed_web_fonts.removed_font_faces);
+         }
+ 
+-        if !changed_web_fonts.removed_font_faces.is_empty() ||
+-            changed_web_fonts.cascade_index_of_any_rule_changed
+-        {
+-            // TODO: This should only dirty nodes that are rendered using any of the removed
+-            // web fonts!
++        // A face that was added is unloaded, and only font matching can tell whether the
++        // page needs it. Adding an `@font-face` rule does not change any computed style, so
++        // without dirtying nothing would be laid out again and the face would never be
++        // asked for.
++        //
++        // TODO: This should only dirty nodes that could use any of the changed web fonts!
++        if !changed_web_fonts.is_empty() || changed_web_fonts.cascade_index_of_any_rule_changed {
+             document.dirty_all_nodes(cx.no_gc());
+         }
+ 
+         if !changed_web_fonts.added_font_faces.is_empty() {
++            // The faces are not loading yet, but the reflow that this dirtying causes may
++            // start loading them, so `document.fonts.ready` must not stay fulfilled.
+             fonts.switch_to_loading(cx);
+ 
+             for new_web_font in changed_web_fonts.added_font_faces {
+diff --git a/components/script/event_loop/svg_font.rs b/components/script/event_loop/svg_font.rs
+index 1821f1314ef..b45b4e6d2e3 100644
+--- a/components/script/event_loop/svg_font.rs
++++ b/components/script/event_loop/svg_font.rs
+@@ -9,6 +9,7 @@ use fonts::{
+     FallbackFontSelectionOptions, FontContext, FontDescriptor, FontFamilyDescriptor,
+     FontSearchScope, fallback_font_families,
+ };
++use fonts_traits::FontTemplateRefMethods;
+ use net_traits::image_cache::FontResolver;
+ use resvg::usvg::{Font, FontFamily, FontStretch, FontStyle, fontdb};
+ use rustc_hash::FxHashMap;
+@@ -67,6 +68,12 @@ impl SvgFontResolver {
+                 continue;
+             };
+ 
++            // A face that has not been downloaded yet cannot be rasterized. Ask for it, like
++            // layout does when it matches the face, and fall back to the next family for now.
++            if let Some(font_face_rule) = font_template.font_face_rule() {
++                self.context.request_web_font_load(&font_face_rule);
++            }
++
+             let Some(font_ref) = self.context.font(font_template, &font_descriptor) else {
+                 continue;
+             };
+diff --git a/components/shared/fonts/lib.rs b/components/shared/fonts/lib.rs
+index b37348df2f0..2ba88411422 100644
+--- a/components/shared/fonts/lib.rs
++++ b/components/shared/fonts/lib.rs
+@@ -134,9 +134,13 @@ impl WebFontSetDifference {
+ }
+ 
+ /// How far the font described by an `@font-face` rule has got towards being usable.
++///
++/// A rule starts out [`WebFontLoadState::Unloaded`]: its `src` is only fetched once font
++/// matching picks the face for a character, as required by
++/// <https://drafts.csswg.org/css-fonts-4/#font-face-loading>.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum WebFontLoadState {
+-    /// The face has not started loading.
++    /// Nothing has asked for this face yet, so it has not been fetched.
+     Unloaded,
+     /// The face is being fetched, or is waiting to be.
+     Loading,
+@@ -196,4 +200,18 @@ impl FontFaceRuleInfo {
+     pub fn set_load_state(&self, state: WebFontLoadState) {
+         self.load_state.store(state as usize, Ordering::SeqCst);
+     }
++
++    /// Move this rule from [`WebFontLoadState::Unloaded`] to [`WebFontLoadState::Loading`],
++    /// returning true if this call was the one that started the load. Font matching runs on
++    /// several threads at once, so only one of them may request the load.
++    pub fn start_loading(&self) -> bool {
++        self.load_state
++            .compare_exchange(
++                WebFontLoadState::Unloaded as usize,
++                WebFontLoadState::Loading as usize,
++                Ordering::SeqCst,
++                Ordering::SeqCst,
++            )
++            .is_ok()
++    }
+ }
+diff --git a/components/shared/layout/lib.rs b/components/shared/layout/lib.rs
+index 4fd5db6141a..255bd29618b 100644
+--- a/components/shared/layout/lib.rs
++++ b/components/shared/layout/lib.rs
+@@ -662,6 +662,8 @@ pub struct ReflowResult {
+     pub iframe_sizes: Option<IFrameSizes>,
+     /// Enumerates web fonts that were added or removed as part of restyling.
+     pub changed_web_fonts: WebFontSetDifference,
++    /// Whether font matching found web fonts that the page needs and started loading them.
++    pub started_web_font_loads: bool,
+     /// The LCP candidate during this layout pass, if any.
+     pub lcp_candidate: Option<LCPCandidate>,
+     /// Actions which have been requested by assistive technology, if any.
+diff --git a/tests/wpt/meta/MANIFEST.json b/tests/wpt/meta/MANIFEST.json
+index 0d9ef98c6d9..1fe348a032e 100644
+--- a/tests/wpt/meta/MANIFEST.json
++++ b/tests/wpt/meta/MANIFEST.json
+@@ -1174235,6 +1174235,13 @@
+        {}
+       ]
+      ],
++     "fontface-unused-stays-unloaded.html": [
++      "7c13cff440ebcb54b8d6fe7027cec246f22b8ed0",
++      [
++       null,
++       {}
++      ]
++     ],
+      "fontface-width.html": [
+       "1fa1c93aa5aba6df19870d81556d702a14125a88",
+       [
+diff --git a/tests/wpt/meta/css/css-cascade/layer-font-face-override.html.ini b/tests/wpt/meta/css/css-cascade/layer-font-face-override.html.ini
+deleted file mode 100644
+index 96ea20f554f..00000000000
+--- a/tests/wpt/meta/css/css-cascade/layer-font-face-override.html.ini
++++ /dev/null
+@@ -1,6 +0,0 @@
+-[layer-font-face-override.html]
+-  [@font-face override between layers]
+-    expected: FAIL
+-
+-  [@font-face override update with appended sheet 2]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/css/css-fonts/matching/font-unicode-PUA.html.ini b/tests/wpt/meta/css/css-fonts/matching/font-unicode-PUA.html.ini
+index e187b9e3e56..40a98c655bf 100644
+--- a/tests/wpt/meta/css/css-fonts/matching/font-unicode-PUA.html.ini
++++ b/tests/wpt/meta/css/css-fonts/matching/font-unicode-PUA.html.ini
+@@ -1,9 +1,9 @@
+ [font-unicode-PUA.html]
+   [PUA character U+F000 is rendered with a non-generic font.]
+-    expected: FAIL
++    expected: [FAIL, PASS]
+ 
+   [PUA character U+F001 is rendered with a non-generic font.]
+-    expected: FAIL
++    expected: [FAIL, PASS]
+ 
+   [PUA character U+F002 is rendered with a non-generic font.]
+-    expected: FAIL
++    expected: [FAIL, PASS]
+diff --git a/tests/wpt/meta/html/canvas/element/text/2d.text.draw.fontface.notinpage.html.ini b/tests/wpt/meta/html/canvas/element/text/2d.text.draw.fontface.notinpage.html.ini
+new file mode 100644
+index 00000000000..5de0c0d20bb
+--- /dev/null
++++ b/tests/wpt/meta/html/canvas/element/text/2d.text.draw.fontface.notinpage.html.ini
+@@ -0,0 +1,3 @@
++[2d.text.draw.fontface.notinpage.html]
++  [@font-face fonts should work even if they are not used in the page]
++    expected: FAIL
+diff --git a/tests/wpt/tests/css/css-font-loading/fontface-unused-stays-unloaded.html b/tests/wpt/tests/css/css-font-loading/fontface-unused-stays-unloaded.html
+new file mode 100644
+index 00000000000..7c13cff440e
+--- /dev/null
++++ b/tests/wpt/tests/css/css-font-loading/fontface-unused-stays-unloaded.html
+@@ -0,0 +1,62 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<title>Font faces that the document does not use are not loaded</title>
++<link rel="help" href="https://drafts.csswg.org/css-fonts-4/#font-face-loading">
++<link rel="help" href="https://drafts.csswg.org/css-fonts-4/#unicode-range-desc">
++<link rel="help" href="https://drafts.csswg.org/css-font-loading/#dom-fontface-status">
++<meta name="assert" content="A @font-face whose family no style rule uses, or whose unicode-range covers no character in the document, is not loaded.">
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<style>
++@font-face {
++    font-family: "used-family";
++    src: url("resources/Rochester.otf") format("opentype");
++    unicode-range: U+0000-00FF;
++}
++@font-face {
++    font-family: "used-family";
++    src: url("resources/GenR102.woff2") format("woff2");
++    unicode-range: U+4E00-9FFF;
++}
++@font-face {
++    font-family: "unused-family";
++    src: url("resources/GenI102.woff2") format("woff2");
++}
++#target {
++    font-family: "used-family";
++}
++</style>
++<div id="target">Hello</div>
++<script>
++function facesFor(family) {
++    return [...document.fonts].filter(face => face.family === family);
++}
++
++promise_test(async () => {
++    await document.fonts.ready;
++
++    const used = facesFor("used-family");
++    assert_equals(used.length, 2, "both faces of the used family are in document.fonts");
++    const cjk = used.find(face => /4E00/i.test(face.unicodeRange));
++    const latin = used.find(face => face !== cjk);
++
++    assert_equals(latin.status, "loaded",
++        "the face whose unicode-range covers the text on the page is loaded");
++    assert_equals(cjk.status, "unloaded",
++        "a face whose unicode-range covers no character on the page is not loaded");
++
++    const [unused] = facesFor("unused-family");
++    assert_equals(unused.status, "unloaded",
++        "a face of a family that no style rule uses is not loaded");
++}, "unused @font-face rules are not loaded");
++
++promise_test(async () => {
++    await document.fonts.ready;
++
++    const [face] = facesFor("unused-family");
++    assert_equals(face.status, "unloaded", "precondition: not loaded yet");
++
++    await face.load();
++    assert_equals(face.status, "loaded", "load() loads a face that is not otherwise used");
++}, "FontFace.load() loads an unused @font-face rule");
++</script>

@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 11 Sep 2026 10:26:13 +0000
+Subject: [PATCH] layout: emit a trace marker when a reflow actually laid out
+
+Tools that count layouts have nothing to count. `handle_reflow` fires once
+per reflow *request*, and `restyle_and_build_trees` is entered for requests
+that lay nothing out and returns early in three places: no restyle in the
+request, `!token.should_traverse()`, or damage that is Repaint /
+RecalculateOverflow with no layout root. That last case is what a CSS
+transition or a hover toggle produces.
+
+So neither span answers "did this reflow lay out?", and using either as the
+denominator of an instructions-per-layout metric inflates it. Measured on a
+HarmonyOS phone over one 20 s load of a commercial site: 704 `handle_reflow`,
+449 `restyle_and_build_trees`, 283 layouts that ran.
+
+`ReflowPhasesRun::RanLayout` already carries the answer; this just emits it.
+The marker is the counterpart of Blink's `LocalFrameView::performLayout`,
+which is what makes a cross-engine comparison meaningful.
+
+Behind `feature = "tracing"`, like the other direct `tracing::` call sites in
+this crate, so a default build is unaffected.
+
+Validation: built `--ohos --profile production --features tracing-hitrace` and run on a PLR-AL00; `hitrace -b 204800 --overwrite --trace_begin app nweb` over a 20 s page load records 283 `RanLayout` against 449 `restyle_and_build_trees` and 704 `handle_reflow`.
+AI-assisted: Yes (agent session; 2026-10-08 sync -- mechanical conflict resolution, no semantic change)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/layout/layout_impl.rs | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/components/layout/layout_impl.rs b/components/layout/layout_impl.rs
+index dfa770b4b66..4f7463cbda8 100644
+--- a/components/layout/layout_impl.rs
++++ b/components/layout/layout_impl.rs
+@@ -1107,6 +1107,14 @@ impl LayoutThread {
+                 accessibility_damage.as_mut(),
+             );
+ 
++        // A reflow that actually laid out, as opposed to one that found style and
++        // the trees already clean and returned. `restyle_and_build_trees` is
++        // entered for both, so its span cannot be used to count layouts; this
++        // marker is the counterpart of Blink's `LocalFrameView::performLayout`.
++        #[cfg(feature = "tracing")]
++        if reflow_phases_run.contains(ReflowPhasesRun::RanLayout) {
++            tracing::debug!(name: "RanLayout", goal = ?reflow_request.reflow_goal);
++        }
+         if self.build_stacking_context_tree_for_reflow(&reflow_request) {
+             reflow_phases_run.insert(ReflowPhasesRun::BuiltStackingContextTree);
+         }

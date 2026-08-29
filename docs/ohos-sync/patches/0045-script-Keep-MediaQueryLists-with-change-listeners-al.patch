@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 9 Oct 2026 11:17:03 +0000
+Subject: [PATCH] script: Keep MediaQueryLists with change listeners alive
+
+The window only held its MediaQueryLists weakly, so a list that the page
+no longer referenced was collected with its listeners, and later changes
+were not reported. Chromium and Gecko keep such lists alive while they
+have change listeners; do the same.
+
+Fork note: meant for upstream; found with the QuickJS backend, but
+SpiderMonkey loses the listeners too once a GC runs in between (the new
+test times out without this change). Drop once upstream has it.
+
+Testing: Adds a WPT test that times out without this change.
+
+Validation: Release builds of this stack (QuickJS through the QuickJS workflow's patch step, servo-quickjs 0605066) with `./mach test-wpt --processes 4` of html/webappapis/microtask-queuing, user-timing and /_mozilla/mozilla/media-query-list-gc-listener.html (72 tests): all as expected with QuickJS; with SpiderMonkey all as expected except an unexpected PASS of a subtest of measure_associated_with_navigation_timing.html that compares a sum of measure durations, without measure options.
+AI-assisted: Yes (agent session; root-caused, written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/event/eventtarget.rs    |  6 ++++++
+ components/script/dom/media/mediaquerylist.rs |  5 +++++
+ components/script/dom/window/window.rs        | 18 ++++++++++++++++
+ tests/wpt/mozilla/meta/MANIFEST.json          |  7 +++++++
+ .../mozilla/media-query-list-gc-listener.html | 21 +++++++++++++++++++
+ 5 files changed, 57 insertions(+)
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/media-query-list-gc-listener.html
+
+diff --git a/components/script/dom/event/eventtarget.rs b/components/script/dom/event/eventtarget.rs
+index a3112dddeff..4226bf87608 100644
+--- a/components/script/dom/event/eventtarget.rs
++++ b/components/script/dom/event/eventtarget.rs
+@@ -67,6 +67,7 @@ use crate::dom::html::htmlformelement::FormControlElementHelpers;
+ use crate::dom::indexeddb::idbdatabase::IDBDatabase;
+ use crate::dom::indexeddb::idbrequest::IDBRequest;
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
++use crate::dom::mediaquerylist::MediaQueryList;
+ use crate::dom::node::virtualmethods::VirtualMethods;
+ use crate::dom::node::{Node, NodeTraits};
+ use crate::dom::shadowroot::shadowroot::ShadowRoot;
+@@ -478,6 +479,11 @@ impl EventTarget {
+         if let Some(interest) = self.interest_for_event_type(ty) {
+             self.global().register_interest(interest);
+         }
++        if *ty == atom!("change") &&
++            let Some(mql) = self.downcast::<MediaQueryList>()
++        {
++            mql.keep_alive_for_listeners();
++        }
+     }
+ 
+     /// Notify the global about a listener being removed for a given event type.
+diff --git a/components/script/dom/media/mediaquerylist.rs b/components/script/dom/media/mediaquerylist.rs
+index 6ae7443ea10..45897aa7f5f 100644
+--- a/components/script/dom/media/mediaquerylist.rs
++++ b/components/script/dom/media/mediaquerylist.rs
+@@ -79,6 +79,11 @@ impl MediaQueryList {
+         result
+     }
+ 
++    /// Called when a change listener is added.
++    pub(crate) fn keep_alive_for_listeners(&self) {
++        self.document.window().keep_media_query_list_alive(self);
++    }
++
+     pub(crate) fn evaluate(&self) -> bool {
+         let quirks_mode = self.document.quirks_mode();
+         self.media_query_list.evaluate(
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index 2a29a04ad6d..db590ecb3ca 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -405,6 +405,10 @@ pub(crate) struct Window {
+     /// All the MediaQueryLists we need to update
+     media_query_lists: DOMTracker<MediaQueryList>,
+ 
++    /// The MediaQueryLists with change listeners, which are kept alive as long as the
++    /// listeners can be called, like in other browsers.
++    media_query_lists_with_listeners: DomRefCell<Vec<Dom<MediaQueryList>>>,
++
+     #[cfg(feature = "bluetooth")]
+     test_runner: MutNullableDom<TestRunner>,
+ 
+@@ -3732,6 +3736,12 @@ impl Window {
+         let cx = &mut realm.current_realm();
+         rooted_vec!(let mut mql_list);
+ 
++        self.media_query_lists_with_listeners
++            .borrow_mut()
++            .retain(|mql| {
++                mql.upcast::<EventTarget>()
++                    .has_listeners_for(&atom!("change"))
++            });
+         self.media_query_lists.for_each(|mql| {
+             if let MediaQueryListMatchState::Changed = mql.evaluate_changes() {
+                 // Recording list of changed Media Queries
+@@ -3755,6 +3765,13 @@ impl Window {
+         }
+     }
+ 
++    pub(crate) fn keep_media_query_list_alive(&self, mql: &MediaQueryList) {
++        let mut lists = self.media_query_lists_with_listeners.borrow_mut();
++        if !lists.iter().any(|list| &**list == mql) {
++            lists.push(Dom::from_ref(mql));
++        }
++    }
++
+     /// Set whether to use less resources by running timers at a heavily limited rate.
+     pub(crate) fn set_throttled(&self, throttled: bool) {
+         self.throttled.set(throttled);
+@@ -4153,6 +4170,7 @@ impl Window {
+             webdriver_load_status_sender: Default::default(),
+             error_reporter,
+             media_query_lists: DOMTracker::new(),
++            media_query_lists_with_listeners: Default::default(),
+             #[cfg(feature = "bluetooth")]
+             test_runner: Default::default(),
+             #[cfg(feature = "webgl")]
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index bc7cf755893..db69d3f6dff 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -14829,6 +14829,13 @@
+       {}
+      ]
+     ],
++    "media-query-list-gc-listener.html": [
++     "5439e6dcf2588ee99222c49c8fa2963d9527d6ee",
++     [
++      null,
++      {}
++     ]
++    ],
+     "media-query-list-gc.html": [
+      "c24500e1674b802883e4a33bdfa7823a218c81b9",
+      [
+diff --git a/tests/wpt/mozilla/tests/mozilla/media-query-list-gc-listener.html b/tests/wpt/mozilla/tests/mozilla/media-query-list-gc-listener.html
+new file mode 100644
+index 00000000000..5439e6dcf25
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/media-query-list-gc-listener.html
+@@ -0,0 +1,21 @@
++<!doctype html>
++<meta charset="utf-8">
++<title>A MediaQueryList with a change listener is not collected</title>
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<iframe id="frame" width="600" height="600"></iframe>
++<script>
++promise_test(async function() {
++  const frame = document.getElementById("frame");
++  const matched = new Promise(resolve => {
++    frame.contentWindow.matchMedia("(max-width: 500px)").addEventListener("change", event => {
++      if (event.matches) {
++        resolve();
++      }
++    });
++  });
++  await TestUtils.gc();
++  frame.width = 400;
++  await matched;
++});
++</script>

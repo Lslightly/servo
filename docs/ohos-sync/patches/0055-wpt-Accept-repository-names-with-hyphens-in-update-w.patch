@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 11 Oct 2026 15:10:36 +0000
+Subject: [PATCH] wpt: Accept repository names with hyphens in update-wpt run
+ URLs
+
+`./mach update-wpt <run URL>` matched the repository with `\w+/\w+`,
+so a run of openharmony-rs/servo-ohos was taken for a log file. GitHub
+names can contain hyphens and dots.
+
+Validation: `./mach test-scripts` passes, with a servo-ohos run URL added to the regex test.
+AI-assisted: Yes (agent session; from an independent agent review, written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ python/wpt/test.py   | 5 +++++
+ python/wpt/update.py | 2 +-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/python/wpt/test.py b/python/wpt/test.py
+index f5d5179a62a..67781ed7a1a 100644
+--- a/python/wpt/test.py
++++ b/python/wpt/test.py
+@@ -597,6 +597,11 @@ class TestGithubActionRunURLRegex(unittest.TestCase):
+         assert match
+         self.assertEquals(match.group(1), "CaMeL/CaSe")
+ 
++        url_with_hyphens = "https://github.com/openharmony-rs/servo-ohos/actions/runs/38135694194"
++        match = update.GITHUB_ACTION_RUN_URL_REGEX.search(url_with_hyphens)
++        assert match
++        self.assertEquals(match.group(1), "openharmony-rs/servo-ohos")
++
+         url_with_bad_run_id = "https://github.com/servo/servo/actions/runs/19952aa163512"
+         match = update.GITHUB_ACTION_RUN_URL_REGEX.search(url_with_bad_run_id)
+         self.assertIsNone(match)
+diff --git a/python/wpt/update.py b/python/wpt/update.py
+index e8037622161..64a2a5f2876 100644
+--- a/python/wpt/update.py
++++ b/python/wpt/update.py
+@@ -25,7 +25,7 @@ from . import WPT_PATH, manifestupdate
+ 
+ TEST_ROOT = os.path.join(WPT_PATH, "tests")
+ META_ROOTS = [os.path.join(WPT_PATH, "meta"), os.path.join(WPT_PATH, "meta-legacy")]
+-GITHUB_ACTION_RUN_URL_REGEX = re.compile(r"github\.com\/(\w+\/\w+)\/actions\/runs\/(\d+)$")
++GITHUB_ACTION_RUN_URL_REGEX = re.compile(r"github\.com\/([\w.-]+\/[\w.-]+)\/actions\/runs\/(\d+)$")
+ 
+ # The run-info property of the JavaScript engine, and the engine of the expectations without a condition on it.
+ JS_ENGINE = "js_engine"

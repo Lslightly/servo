@@ -1,0 +1,471 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 18 Sep 2026 09:45:46 +0000
+Subject: [PATCH] script: Lay out once for web fonts that finish loading
+ together
+
+The document was laid out again for every web font that finished loading.
+A family split into unicode-range subsets arrives as many small fonts, one
+after the other, and the page was laid out once per frame in which one of
+them arrived.
+
+Loads that finish while other web fonts are still loading are now applied
+together: once no web font is loading anymore, or 100ms after the first one
+finished, which is the block period `font-display: swap` allows. The
+`FontFace` promises are settled and `document.fonts.ready` is unblocked when
+the loads are applied, so they never resolve before the layout that uses
+the fonts.
+
+Applying a batch also renders SVG text again whose web font was not loaded
+yet when the image was parsed. usvg turns SVG text into paths when it parses
+the image, using the fonts the SVG font resolver hands it at that point; the
+resolver asks for a face that is not downloaded yet and falls back, and the
+parsed image is cached under the element's serialized `data:` URL, so the
+text kept the fallback, or was not drawn at all when the web font was the
+only family. The SVG font resolver now records on the `FontContext` when it
+skipped a face that is still unloaded or loading. When a batch of web font
+loads is applied and that happened, every serialized `<svg>` element that
+contains text is invalidated, which evicts its parsed and rasterized image
+and serializes it again, so that it is parsed with the loaded font.
+
+Testing: Covered by existing tests, plus a new test,
+tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font.html, for the SVG
+text, which fails without that part.
+
+Fork note: last of four patches, meant for upstream. The upstream-based
+version (branch lazy-webfonts) does not have the SVG text part yet. The
+100 ms cap is `WEB_FONT_BATCH_DELAY` in window.rs.
+
+Relies on: the previous patch (`LoadedSuccessfully { affects_laid_out_text }`);
+`FontContext::web_fonts_still_loading` counting a load until script
+decrements it, so that finished-but-unapplied loads keep
+`document.fonts.ready` and screenshot readiness pending; the script thread's
+oneshot timers (`GlobalScope::schedule_callback`, `OneshotTimerCallback`).
+
+Drop when upstream stops laying out the whole document once per finished web
+font: on the keai page from the Validation line, `-Z relayout-event` on plain
+upstream then shows a handful of reflows during font loading instead of one
+per arriving font.
+
+Validation: `./mach test-wpt --release --processes 1 css/css-font-loading css/css-fonts html/canvas/element/text html/canvas/offscreen/text` (948 tests) unchanged from the previous patch, and 4 repeats of the timing-sensitive subset (css-font-loading, generic-family-keywords-001/003, variations/at-font-face-font-matching, font-palette-add/-2, matching/, font-size-adjust-006, remove-loaded-font-face-rule, font-face-unicode-range-2) all ran as expected. The new svg-text-web-font reftest passes 3 of 3 runs (fails 3 of 3 without the SVG part); `./mach test-wpt --release svg resize-observer css/css-transforms/transform-box` (1355 tests) all as expected. Headless screenshot of a page with SVG `<text>` in a web font Ahem: 20000 green pixels (two 100x100 squares) vs 0 before. `-Z relayout-event` on the keai page served at 2 MB/s with 30 ms latency (66 subsets arriving over about a second): 39 -> 16-17 reflows, full invalidations 33 -> 10-11, CPU 1.2 -> 1.04 s (plain ohos-main: 152-163 reflows, 2.3 s). On a PLR-AL00, production build with `--features tracing-hitrace`, `servoperf page <dir> --entry page/xuezhiqian-keai_article.html --ohos --legs servo --only load --iterations 5 --no-instructions --bin <hap>`, whole stack against plain ohos-main: `RanLayout` markers per load 17/40/41/40/38 -> 6/7/8/8/7 (median 40 -> 7); first contentful paint median 1345 -> 1161 ms, inside the 21% spread of 5 loads.
+AI-assisted: Yes (agent session; designed with the maintainer, written and tested by the agent)
+AI-assisted: Yes (agent session; designed, written and tested by the agent)
+AI-assisted: Yes (agent session; 2026-10-08 sync -- followed upstream's rename of `traverse_preorder_non_rooting` to `traverse_preorder_unrooted` (#48555))
+AI-assisted: Yes (agent session; 2026-10-09 restack -- folded in "script: Render SVG text again once the web font it uses has loaded", which hooks the batch application this patch adds)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/fonts/font_context.rs              | 24 +++++-
+ components/script/dom/document/document.rs    | 26 +++++-
+ components/script/dom/svg/svgsvgelement.rs    | 18 ++++-
+ components/script/dom/window/window.rs        | 80 ++++++++++++++++++-
+ components/script/event_loop/script_thread.rs | 10 +--
+ components/script/event_loop/svg_font.rs      | 12 ++-
+ components/script/event_loop/timers.rs        |  5 ++
+ tests/wpt/mozilla/meta/MANIFEST.json          | 17 ++++
+ .../mozilla/svg/svg-text-web-font-ref.html    |  7 ++
+ .../tests/mozilla/svg/svg-text-web-font.html  | 14 ++++
+ 10 files changed, 198 insertions(+), 15 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font-ref.html
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font.html
+
+diff --git a/components/fonts/font_context.rs b/components/fonts/font_context.rs
+index d117c987ff0..cec050c8fa0 100644
+--- a/components/fonts/font_context.rs
++++ b/components/fonts/font_context.rs
+@@ -133,6 +133,10 @@ pub struct FontContext {
+     /// The number of fonts that are currently loading.
+     number_of_loading_web_fonts: AtomicUsize,
+ 
++    /// Whether an SVG image was rendered with a fallback because a web font that it uses
++    /// was not loaded yet.
++    svg_waiting_for_web_font: AtomicBool,
++
+     /// The `@font-face` rules that font matching has selected, but whose `src` has not been
+     /// fetched yet. Filled in while laying out and drained by
+     /// [`FontContextWebFontMethods::process_pending_web_font_loads`] afterwards.
+@@ -204,6 +208,7 @@ impl FontContext {
+             known_font_face_rules: Default::default(),
+             font_feature_value_map: Default::default(),
+             number_of_loading_web_fonts: Default::default(),
++            svg_waiting_for_web_font: Default::default(),
+             pending_web_font_loads: Default::default(),
+             used_font_families: Default::default(),
+         }
+@@ -640,8 +645,13 @@ impl FontContext {
+ 
+     /// Decrement the count of font loads blocking the `document.fonts.ready` promise by one.
+     pub fn decrement_count_of_loading_fonts_by_one(&self) {
++        self.decrement_count_of_loading_fonts(1);
++    }
++
++    /// Decrement the count of font loads blocking the `document.fonts.ready` promise.
++    pub fn decrement_count_of_loading_fonts(&self, count: usize) {
+         self.number_of_loading_web_fonts
+-            .fetch_sub(1, Ordering::SeqCst);
++            .fetch_sub(count, Ordering::SeqCst);
+     }
+ 
+     /// Returns true iff a `@font-face` rule is part of the active set.
+@@ -1124,6 +1134,18 @@ impl FontContext {
+             .is_some_and(|family| self.is_font_family_used(&family.name.clone().into()))
+     }
+ 
++    /// Record that an SVG image was rendered with a fallback font because a web font that
++    /// it uses has not been loaded yet.
++    pub fn note_svg_waiting_for_web_font(&self) {
++        self.svg_waiting_for_web_font.store(true, Ordering::Relaxed);
++    }
++
++    /// Whether an SVG image was rendered with a fallback font for a web font that was not
++    /// loaded yet since the last call, and so might look different now.
++    pub fn take_svg_waiting_for_web_font(&self) -> bool {
++        self.svg_waiting_for_web_font.swap(false, Ordering::Relaxed)
++    }
++
+     /// Whether any web font loads have been asked for but not started yet.
+     pub fn has_pending_web_font_loads(&self) -> bool {
+         !self.pending_web_font_loads.lock().is_empty()
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index e878bb472c7..3b331734393 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -209,6 +209,7 @@ use crate::dom::selection::Selection;
+ use crate::dom::servoparser::ServoParser;
+ use crate::dom::shadowroot::shadowroot::ShadowRoot;
+ use crate::dom::storageevent::StorageEvent;
++use crate::dom::svg::svgsvgelement::SVGSVGElement;
+ use crate::dom::text::Text;
+ use crate::dom::textevent::TextEvent;
+ use crate::dom::touchevent::TouchEvent as DomTouchEvent;
+@@ -1730,6 +1731,24 @@ impl Document {
+         }
+     }
+ 
++    /// Render the `<svg>` elements that contain text again, for instance because a web font
++    /// that their text might use has loaded.
++    pub(crate) fn invalidate_svg_images_with_text(&self, no_gc: &NoGC) {
++        let Some(root) = self.GetDocumentElement() else {
++            return;
++        };
++        for node in root
++            .upcast::<Node>()
++            .traverse_preorder_unrooted(no_gc, ShadowIncluding::Yes)
++        {
++            if let Some(svg) = node.downcast::<SVGSVGElement>() &&
++                svg.contains_text(no_gc)
++            {
++                svg.invalidate_cached_serialized_subtree_and_rasterization_result(no_gc);
++            }
++        }
++    }
++
+     /// <https://drafts.csswg.org/cssom-view/#document-run-the-scroll-steps>
+     pub(crate) fn run_the_scroll_steps(&self, cx: &mut JSContext) {
+         // Step 1: For each scrolling box `box` that was scrolled:
+@@ -3401,7 +3420,12 @@ impl Document {
+         }
+ 
+         let fonts = self.Fonts(cx);
+-        fonts.update_css_connected_face_statuses(cx);
++        // Faces that loaded while others were still loading are only applied in batches,
++        // and their promises are settled then, so only look for failures once nothing is
++        // loading anymore.
++        if self.window().font_context().web_fonts_still_loading() == 0 {
++            fonts.update_css_connected_face_statuses(cx);
++        }
+         if !fonts.waiting_to_fullfill_promise() {
+             return false;
+         }
+diff --git a/components/script/dom/svg/svgsvgelement.rs b/components/script/dom/svg/svgsvgelement.rs
+index 7a497b55da2..a4a36c92cf9 100644
+--- a/components/script/dom/svg/svgsvgelement.rs
++++ b/components/script/dom/svg/svgsvgelement.rs
+@@ -163,7 +163,23 @@ impl SVGSVGElement {
+         let _ = root_node.AppendChild(cx, &cloned_node);
+     }
+ 
+-    fn invalidate_cached_serialized_subtree_and_rasterization_result(&self, no_gc: &NoGC) {
++    /// Whether this element has been serialized into an image and contains SVG text.
++    pub(crate) fn contains_text(&self, no_gc: &NoGC) -> bool {
++        matches!(*self.cached_serialized_data_url.borrow(), Some(Ok(_))) &&
++            self.upcast::<Node>()
++                .traverse_preorder_unrooted(no_gc, ShadowIncluding::No)
++                .any(|node| {
++                    node.downcast::<Element>().is_some_and(|element| {
++                        *element.namespace() == ns!(svg) &&
++                            element.local_name() == &local_name!("text")
++                    })
++                })
++    }
++
++    pub(crate) fn invalidate_cached_serialized_subtree_and_rasterization_result(
++        &self,
++        no_gc: &NoGC,
++    ) {
+         let owner_window = self.owner_window();
+         owner_window
+             .image_cache()
+diff --git a/components/script/dom/window/window.rs b/components/script/dom/window/window.rs
+index 59d8b5f15b5..849f4f52b16 100644
+--- a/components/script/dom/window/window.rs
++++ b/components/script/dom/window/window.rs
+@@ -200,7 +200,9 @@ use crate::dom::worklet::Worklet;
+ use crate::dom::workletglobalscope::WorkletGlobalScopeType;
+ use crate::event_loop::script_thread::ScriptThread;
+ use crate::event_loop::script_window_proxies::ScriptWindowProxies;
+-use crate::event_loop::timers::{IsInterval, OneshotTimers, TimerCallback};
++use crate::event_loop::timers::{
++    IsInterval, OneshotTimerCallback, OneshotTimerHandle, OneshotTimers, TimerCallback,
++};
+ use crate::event_loop::webdriver_handlers::find_node_by_unique_id_in_document;
+ use crate::fetch::fetch;
+ use crate::fetch::network_listener::{ResourceTimingListener, submit_timing};
+@@ -281,6 +283,23 @@ struct PendingLayoutImageAncillaryData {
+     destination: LayoutImageDestination,
+ }
+ 
++/// The longest time a web font that finished loading waits for the ones that are still
++/// loading before the page is laid out with it. `font-display: swap`, which most web font
++/// services use, allows fonts to block rendering for up to 100ms, see
++/// <https://drafts.csswg.org/css-fonts-4/#font-display-desc>.
++const WEB_FONT_BATCH_DELAY: Duration = Duration::from_millis(100);
++
++/// Web fonts that finished loading but that the document has not been laid out with yet.
++#[derive(Clone, Copy, Default, JSTraceable, MallocSizeOf)]
++struct PendingWebFontLoads {
++    /// How many loads finished.
++    count: usize,
++    /// Whether any of them can change the fonts of text that has been laid out.
++    affects_laid_out_text: bool,
++    /// The timer that applies the loads if the other ones take too long.
++    timer: Option<OneshotTimerHandle>,
++}
++
+ #[dom_struct]
+ pub(crate) struct Window {
+     globalscope: GlobalScope,
+@@ -480,6 +499,10 @@ pub(crate) struct Window {
+     /// Whether or not this [`Window`] has a pending screenshot readiness request.
+     has_pending_screenshot_readiness_request: Cell<bool>,
+ 
++    /// Web fonts that finished loading, but that the document has not been laid out with
++    /// yet. See [`Window::handle_web_font_loaded`].
++    pending_web_font_loads: Cell<PendingWebFontLoads>,
++
+     /// Visual viewport interface that is associated to this [`Window`].
+     /// <https://drafts.csswg.org/cssom-view/#dom-window-visualviewport>
+     visual_viewport: MutNullableDom<VisualViewport>,
+@@ -2844,6 +2867,60 @@ impl Window {
+         )
+     }
+ 
++    /// Called when a web font used by this document finished loading.
++    ///
++    /// Laying the page out again after every load would lay it out once per font when many
++    /// fonts arrive one after the other, which is what happens when a family is split into
++    /// `unicode-range` subsets. So loads are applied in batches: once no other web font is
++    /// loading, or [`WEB_FONT_BATCH_DELAY`] after the first load of the batch finished.
++    pub(crate) fn handle_web_font_loaded(&self, cx: &mut JSContext, affects_laid_out_text: bool) {
++        let mut pending = self.pending_web_font_loads.get();
++        pending.count += 1;
++        pending.affects_laid_out_text |= affects_laid_out_text;
++
++        // Loads that finished still count as loading until they are applied, so that
++        // `document.fonts.ready` waits for the layout that uses them.
++        if self.font_context().web_fonts_still_loading() <= pending.count {
++            self.pending_web_font_loads.set(pending);
++            self.apply_pending_web_font_loads(cx);
++            return;
++        }
++
++        if pending.timer.is_none() {
++            pending.timer = Some(
++                self.as_global_scope()
++                    .schedule_callback(OneshotTimerCallback::WebFontLoadsDue, WEB_FONT_BATCH_DELAY),
++            );
++        }
++        self.pending_web_font_loads.set(pending);
++    }
++
++    /// Lay the document out again with the web fonts that finished loading since the last
++    /// time, and settle the promises of their `FontFace`s.
++    pub(crate) fn apply_pending_web_font_loads(&self, cx: &mut JSContext) {
++        let pending = self.pending_web_font_loads.take();
++        if let Some(timer) = pending.timer {
++            self.as_global_scope().unschedule_callback(timer);
++        }
++        if pending.count == 0 {
++            return;
++        }
++
++        // TODO: This should only dirty nodes that are waiting for a web font to finish loading!
++        let document = self.Document();
++        if pending.affects_laid_out_text {
++            document.dirty_all_nodes(cx.no_gc());
++        }
++        // Text in SVG images is turned into paths when the image is parsed, so an image that
++        // fell back to another font has to be parsed again to use the web font.
++        if self.font_context().take_svg_waiting_for_web_font() {
++            document.invalidate_svg_images_with_text(cx.no_gc());
++        }
++        document.Fonts(cx).update_css_connected_face_statuses(cx);
++        self.font_context()
++            .decrement_count_of_loading_fonts(pending.count);
++    }
++
+     pub(crate) fn request_screenshot_readiness(&self, cx: &mut JSContext) {
+         self.has_pending_screenshot_readiness_request.set(true);
+         self.maybe_resolve_pending_screenshot_readiness_requests(cx);
+@@ -4105,6 +4182,7 @@ impl Window {
+             endpoints_list: Default::default(),
+             script_window_proxies: ScriptThread::window_proxies(),
+             has_pending_screenshot_readiness_request: Default::default(),
++            pending_web_font_loads: Default::default(),
+             visual_viewport: Default::default(),
+             weak_script_thread,
+             has_changed_visual_viewport_dimension: Default::default(),
+diff --git a/components/script/event_loop/script_thread.rs b/components/script/event_loop/script_thread.rs
+index 66963bf6a4c..0d6e31623c6 100644
+--- a/components/script/event_loop/script_thread.rs
++++ b/components/script/event_loop/script_thread.rs
+@@ -3342,17 +3342,9 @@ impl ScriptThread {
+             return;
+         };
+ 
+-        // TODO: This should only dirty nodes that are waiting for a web font to finish loading!
+-        if affects_laid_out_text {
+-            document.dirty_all_nodes(cx.no_gc());
+-        }
+-
+-        document.Fonts(cx).update_css_connected_face_statuses(cx);
+-
+         document
+             .window()
+-            .font_context()
+-            .decrement_count_of_loading_fonts_by_one();
++            .handle_web_font_loaded(cx, affects_laid_out_text);
+     }
+ 
+     /// Handles a worklet being loaded by triggering a relayout of the page. Does nothing if the
+diff --git a/components/script/event_loop/svg_font.rs b/components/script/event_loop/svg_font.rs
+index b45b4e6d2e3..1c8c52f2364 100644
+--- a/components/script/event_loop/svg_font.rs
++++ b/components/script/event_loop/svg_font.rs
+@@ -9,7 +9,7 @@ use fonts::{
+     FallbackFontSelectionOptions, FontContext, FontDescriptor, FontFamilyDescriptor,
+     FontSearchScope, fallback_font_families,
+ };
+-use fonts_traits::FontTemplateRefMethods;
++use fonts_traits::{FontTemplateRefMethods, WebFontLoadState};
+ use net_traits::image_cache::FontResolver;
+ use resvg::usvg::{Font, FontFamily, FontStretch, FontStyle, fontdb};
+ use rustc_hash::FxHashMap;
+@@ -70,8 +70,16 @@ impl SvgFontResolver {
+ 
+             // A face that has not been downloaded yet cannot be rasterized. Ask for it, like
+             // layout does when it matches the face, and fall back to the next family for now.
+-            if let Some(font_face_rule) = font_template.font_face_rule() {
++            // The SVG is rendered again once the face has loaded.
++            if let Some(font_face_rule) = font_template.font_face_rule() &&
++                matches!(
++                    font_face_rule.load_state(),
++                    WebFontLoadState::Unloaded | WebFontLoadState::Loading
++                )
++            {
+                 self.context.request_web_font_load(&font_face_rule);
++                self.context.note_svg_waiting_for_web_font();
++                continue;
+             }
+ 
+             let Some(font_ref) = self.context.font(font_template, &font_descriptor) else {
+diff --git a/components/script/event_loop/timers.rs b/components/script/event_loop/timers.rs
+index 557828c0203..7c57c8ada18 100644
+--- a/components/script/event_loop/timers.rs
++++ b/components/script/event_loop/timers.rs
+@@ -206,6 +206,8 @@ pub(crate) enum OneshotTimerCallback {
+     #[cfg(feature = "testbinding")]
+     TestBindingCallback(TestBindingCallback),
+     RefreshRedirectDue(RefreshRedirectDue),
++    /// Apply the web fonts that finished loading, see `Window::handle_web_font_loaded`.
++    WebFontLoadsDue,
+     /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
+     RunStepsAfterTimeout {
+         /// Step 1. timerKey
+@@ -229,6 +231,9 @@ impl OneshotTimerCallback {
+             #[cfg(feature = "testbinding")]
+             OneshotTimerCallback::TestBindingCallback(callback) => callback.invoke(cx),
+             OneshotTimerCallback::RefreshRedirectDue(callback) => callback.invoke(cx, global),
++            OneshotTimerCallback::WebFontLoadsDue => {
++                global.as_window().apply_pending_web_font_loads(cx)
++            },
+             OneshotTimerCallback::RunStepsAfterTimeout { completion, .. } => {
+                 // <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
+                 // Step 4.4 Perform completionSteps.
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 5718e8a7d45..bc7cf755893 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -8284,6 +8284,19 @@
+        {}
+       ]
+      ],
++     "svg-text-web-font.html": [
++      "a9117f27538e04fd9d4f473399c80bbbe7180ba8",
++      [
++       null,
++       [
++        [
++         "/_mozilla/mozilla/svg/svg-text-web-font-ref.html",
++         "=="
++        ]
++       ],
++       {}
++      ]
++     ],
+      "svg.html": [
+       "5b57e5f27c34b1b73e9b3d91a5fd472606be7b73",
+       [
+@@ -11304,6 +11317,10 @@
+      "svg-relative-units-ref.html": [
+       "4631d475a68d0a99c43475887e5d644b49ecfff7",
+       []
++     ],
++     "svg-text-web-font-ref.html": [
++      "e1dbbb1c78b2f8c0f12fb0249ac93b2db22c516d",
++      []
+      ]
+     },
+     "table-valign-bottom-ref.html": [
+diff --git a/tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font-ref.html b/tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font-ref.html
+new file mode 100644
+index 00000000000..e1dbbb1c78b
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font-ref.html
+@@ -0,0 +1,7 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<style>
++body { margin: 0; }
++div { position: absolute; left: 0; top: 20px; width: 200px; height: 100px; background: green; }
++</style>
++<div></div>
+diff --git a/tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font.html b/tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font.html
+new file mode 100644
+index 00000000000..a9117f27538
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/svg/svg-text-web-font.html
+@@ -0,0 +1,14 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<title>SVG text is rendered again with a web font once it has loaded</title>
++<link rel="match" href="svg-text-web-font-ref.html">
++<style>
++@font-face {
++  font-family: "TestWebFont";
++  src: url(/fonts/Ahem.ttf);
++}
++body { margin: 0; }
++</style>
++<svg width="300" height="150">
++  <text x="0" y="100" font-family="TestWebFont" font-size="100" fill="green">XX</text>
++</svg>

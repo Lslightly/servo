@@ -1,0 +1,18 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 11 Oct 2026 15:50:00 +0000
+Subject: [PATCH] wpt: Run the ecmascript tests
+
+Dropped in favour of upstream 28d2258a4e1 (#48810), which adds the same
+`[ecmascript] skip: false` section to tests/wpt/include.ini and which
+every base from base/2026-10-13 on contains. Equivalence:
+`git log --cherry-mark base/2026-10-13...pre-sync/2026-10-13` marks this
+commit `=` (identical patch-id to 28d2258a4e1), and it applies empty on
+base/2026-10-13. Verified by the sync of 2026-10-13.
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: 28d2258a4e1
+Validation: applies empty on base/2026-10-13; patch-id identity with 28d2258a4e1 (`git log --cherry-mark`); the ecmascript tests run in the 2026-10-13 sync's QuickJS WPT run.
+AI-assisted: Yes (agent session; 2026-10-13 sync -- applied empty, since upstream 28d2258a4e1 is the identical patch; kept as a placeholder)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>

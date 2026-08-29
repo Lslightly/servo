@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 10 Oct 2026 17:52:31 +0000
+Subject: [PATCH] ci: Run the Linux build, lint and QuickJS jobs on the
+ self-hosted runners
+
+The x86_64 Linux build, the lint job and the QuickJS build now run on the
+self-hosted runners labelled servo-ohos-linux. Their image has a checkout
+and a target directory prebuilt at a recent ohos-main with the commands
+and environment of these jobs, so cargo only rebuilds what a change
+touches. On GitHub-hosted runners, the build with unit tests takes 37 to
+57 minutes, the lint job 19 to 24 and the QuickJS build 18.
+
+An expression chooses the runner, instead of servo's runner-select
+action, which asks servo's own CI servers for a runner and so always fell
+back to GitHub-hosted runners here. Pull requests from forks, the arm64
+build (no self-hosted-image-name) and runs while the repository variable
+NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners. There is no
+fallback while no self-hosted runner is online: the jobs wait for one,
+and setting NO_SELF_HOSTED_RUNNERS sends later jobs to GitHub-hosted
+runners. The job names lose the runner-select id.
+
+On self-hosted runners the jobs don't install LLVM: the image has the
+same release, and a download into runner.temp would change
+LIBCLANG_PATH, which a build script watches, and so rebuild most of the
+target directory. They don't set up sccache either, and the QuickJS build
+also skips the setup steps that the other two jobs already skip there.
+
+Pull requests from branches of this repository ran on GitHub-hosted runners.
+`github.event.pull_request.head.repo.fork` is the head repository's fork
+flag, and servo-ohos is a fork of servo/servo, so it is true for every pull
+request. Compare the head repository with this one instead; without a pull
+request (push, schedule, merge queue, dispatch) the runner stays self-hosted.
+
+Validation: actionlint reports nothing new for the three workflows (its findings exist on ohos-main too), and `./mach test-tidy` passes. pr_jobs chooses Linux (unit tests, WPT), Lint, OpenHarmony and Linux QuickJS for this change, so its pull request runs all three jobs on the self-hosted runners and WPT tests the build from there. The runner image was built from ohos-main a02f323f8bf. In a container of it, in the jobs' workspace and with their environment, the jobs' commands compiled nothing for the build (crown, -D warnings), clippy (CARGO_INCREMENTAL=0, as lint.yml sets it) and the QuickJS build; the unit tests took 7 s (1068 tests); after a one-line change in the script crate, the build recompiled script, layout, servo and servoshell in 65 s on 32 cores. Two runners are online, but no job has run on them yet. Pull requests from branches of this repository: PR #25 (branch of this repository, Main run 38135694194) ran its Lint, Linux Build (x86_64) and Linux Build (QuickJS) jobs on ubuntu-22.04, and the API reports `"fork": true` for openharmony-rs/servo-ohos. actionlint 1.7.12 reports nothing new for the three workflows.
+AI-assisted: Yes (agent session; written by the agent, which also built and tested the runner image these jobs use)
+AI-assisted: Yes (agent session; diagnosed from the PR's job data and written by the agent)
+AI-assisted: Yes (agent session; 2026-10-13 sync -- folded in "squash! ci: Run the Linux build, lint and QuickJS jobs on the self-hosted runners" (the fork check for pull requests from branches of this repository))
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/lint.yml         | 39 ++++++----------------------
+ .github/workflows/linux-common.yml | 41 ++++++++++--------------------
+ .github/workflows/quickjs.yml      | 18 ++++++++++---
+ 3 files changed, 35 insertions(+), 63 deletions(-)
+
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index e8f0053d4f2..1bb6ab0c68e 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -9,49 +9,26 @@ env:
+   CARGO_INCREMENTAL: 0
+ 
+ jobs:
+-  # Runs the underlying job (“workload”) on a self-hosted runner if available,
+-  # with the help of a `runner-select` job and a `runner-timeout` job.
+-  runner-select:
+-    runs-on: ubuntu-24.04
+-    outputs:
+-      unique-id: ${{ steps.select.outputs.unique-id }}
+-      selected-runner-label: ${{ steps.select.outputs.selected-runner-label }}
+-      runner-type-label: ${{ steps.select.outputs.runner-type-label }}
+-      is-self-hosted: ${{ steps.select.outputs.is-self-hosted }}
+-    steps:
+-      - name: Runner select
+-        id: select
+-        uses: servo/ci-runners/actions/runner-select@b42c96524cdd72126255602c69c4ad649c750ebf
+-        with:
+-          GITHUB_TOKEN: ${{ github.token }}
+-          # Before updating the GH action runner image for the nightly job, ensure
+-          # that the system has a glibc version that is compatible with the one
+-          # used by the wpt.fyi runners.
+-          github-hosted-runner-label: ubuntu-22.04
+-          self-hosted-image-name: servo-ubuntu2204
+-          # You can disable self-hosted runners globally by creating a repository variable named
+-          # NO_SELF_HOSTED_RUNNERS with any non-empty value.
+-          # <https://github.com/servo/servo/settings/variables/actions>
+-          NO_SELF_HOSTED_RUNNERS: ${{ vars.NO_SELF_HOSTED_RUNNERS }}
+-          # Any other boolean conditions that disable self-hosted runners go here.
+-          force-github-hosted-runner: ${{ inputs.force-github-hosted-runner }}
+-
+   lint:
+-    needs:
+-      - runner-select
+-    name: Lint [${{ needs.runner-select.outputs.unique-id }}]
+-    runs-on: ${{ needs.runner-select.outputs.selected-runner-label }}
++    name: Lint
++    # The self-hosted runners labelled servo-ohos-linux have the clippy artifacts of a recent
++    # ohos-main. Pull requests from forks and runs while the repository variable
++    # NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners.
++    runs-on: ${{ (vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-22.04' || 'servo-ohos-linux' }}
+     steps:
+       - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
+         with:
+           # Fetch all commits, for `mach test-tidy`
+           fetch-depth: 0
++      # The self-hosted runners have the same LLVM release, see linux-common.yml.
+       - name: Install LLVM and Clang
++        if: ${{ runner.environment != 'self-hosted' }}
+         uses: KyleMayes/install-llvm-action@v2
+         with:
+           version: "20.1"
+           directory: ${{ runner.temp }}/llvm
+       - name: Set LIBCLANG_PATH env
++        if: ${{ runner.environment != 'self-hosted' }}
+         run: echo "LIBCLANG_PATH=${LLVM_PATH}/lib" >> $GITHUB_ENV
+       - name: Setup Python
+         if: ${{ runner.environment != 'self-hosted' }}
+diff --git a/.github/workflows/linux-common.yml b/.github/workflows/linux-common.yml
+index 50b596aa807..133bb6b77a9 100644
+--- a/.github/workflows/linux-common.yml
++++ b/.github/workflows/linux-common.yml
+@@ -79,33 +79,14 @@ env:
+   SHELL: /bin/bash
+ 
+ jobs:
+-  runner-select:
+-    runs-on: ubuntu-24.04
+-    outputs:
+-      unique-id: ${{ steps.select.outputs.unique-id }}
+-      selected-runner-label: ${{ steps.select.outputs.selected-runner-label }}
+-      runner-type-label: ${{ steps.select.outputs.runner-type-label }}
+-      is-self-hosted: ${{ steps.select.outputs.is-self-hosted }}
+-    steps:
+-      - name: Runner select
+-        id: select
+-        uses: servo/ci-runners/actions/runner-select@b42c96524cdd72126255602c69c4ad649c750ebf
+-        with:
+-          GITHUB_TOKEN: ${{ github.token }}
+-          github-hosted-runner-label: ${{ inputs.github-runner-label }}
+-          self-hosted-image-name: ${{ inputs.self-hosted-image-name }}
+-          # You can disable self-hosted runners globally by creating a repository variable named
+-          # NO_SELF_HOSTED_RUNNERS with any non-empty value.
+-          # <https://github.com/servo/servo/settings/variables/actions>
+-          NO_SELF_HOSTED_RUNNERS: ${{ vars.NO_SELF_HOSTED_RUNNERS }}
+-          # Any other boolean conditions that disable self-hosted runners go here.
+-          force-github-hosted-runner: ${{ inputs.force-github-hosted-runner }}
+-
+   build:
+-    needs:
+-      - runner-select
+-    name: Linux Build (${{ inputs.arch }}) [${{ needs.runner-select.outputs.unique-id }}]
+-    runs-on: ${{ needs.runner-select.outputs.selected-runner-label }}
++    name: Linux Build (${{ inputs.arch }})
++    # The self-hosted runners labelled servo-ohos-linux have a target directory that is prebuilt
++    # at a recent ohos-main. Pull requests from forks, architectures without self-hosted runners
++    # (an empty self-hosted-image-name) and runs while the repository variable
++    # NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners. `head.repo.fork` is no test for
++    # forks here: it is true for this repository too, a fork of servo/servo.
++    runs-on: ${{ (inputs.self-hosted-image-name == '' || inputs.force-github-hosted-runner || vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository) && inputs.github-runner-label || 'servo-ohos-linux' }}
+     outputs:
+       artifact_ids: ${{ steps.artifact_ids.outputs.artifact_ids }}
+     steps:
+@@ -117,12 +98,16 @@ jobs:
+           tool-cache: false
+           large-packages: false
+           swap-storage: false
++      # The self-hosted runners have the same LLVM release. A download into runner.temp would
++      # change LIBCLANG_PATH, which build scripts watch, and so rebuild most of the target directory.
+       - name: Install LLVM and Clang
++        if: ${{ runner.environment != 'self-hosted' }}
+         uses: KyleMayes/install-llvm-action@v2
+         with:
+           version: "20.1"
+           directory: ${{ runner.temp }}/llvm
+       - name: Set LIBCLANG_PATH env
++        if: ${{ runner.environment != 'self-hosted' }}
+         run: echo "LIBCLANG_PATH=${LLVM_PATH}/lib" >> $GITHUB_ENV
+       - name: Setup Python
+         if: ${{ runner.environment != 'self-hosted' }}
+@@ -151,10 +136,10 @@ jobs:
+       # `sccache` can be turned off by adding a repository-level variable SCCACHE_GHA_ENABLED and
+       # setting the value to `false`. See <https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-variables#creating-configuration-variables-for-a-repository>.
+       - name: Install sccache
+-        if: ${{ github.repository != 'servo/servo' && vars.SCCACHE_GHA_ENABLED != 'false' }}
++        if: ${{ runner.environment != 'self-hosted' && github.repository != 'servo/servo' && vars.SCCACHE_GHA_ENABLED != 'false' }}
+         uses: mozilla-actions/sccache-action@v0.0.11
+       - name: Enable sccache
+-        if: ${{ github.repository != 'servo/servo' && vars.SCCACHE_GHA_ENABLED != 'false' }}
++        if: ${{ runner.environment != 'self-hosted' && github.repository != 'servo/servo' && vars.SCCACHE_GHA_ENABLED != 'false' }}
+         run: |
+           {
+             # Set / Increment SCCACHE_GHA_VERSION as a repository level variable in your fork
+diff --git a/.github/workflows/quickjs.yml b/.github/workflows/quickjs.yml
+index a0f74ad489d..ee77453600e 100644
+--- a/.github/workflows/quickjs.yml
++++ b/.github/workflows/quickjs.yml
+@@ -53,37 +53,47 @@ env:
+ jobs:
+   build:
+     name: Linux Build (QuickJS)
+-    # The WPT runners are Ubuntu 22.04, so build against its glibc.
+-    runs-on: ubuntu-22.04
++    # The WPT runners are Ubuntu 22.04, so build against its glibc, as the self-hosted runners
++    # labelled servo-ohos-linux do. Their target directory has the checked-release QuickJS build of
++    # a recent ohos-main. Pull requests from forks and runs while the repository variable
++    # NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners.
++    runs-on: ${{ (vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-22.04' || 'servo-ohos-linux' }}
+     steps:
+       - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
+       - name: Free Disk Space (Ubuntu)
++        if: ${{ runner.environment != 'self-hosted' }}
+         uses: jlumbroso/free-disk-space@main
+         with:
+           tool-cache: false
+           large-packages: false
+           swap-storage: false
++      # The self-hosted runners have the same LLVM release, see linux-common.yml.
+       - name: Install LLVM and Clang
++        if: ${{ runner.environment != 'self-hosted' }}
+         uses: KyleMayes/install-llvm-action@v2
+         with:
+           version: "20.1"
+           directory: ${{ runner.temp }}/llvm
+       - name: Set LIBCLANG_PATH env
++        if: ${{ runner.environment != 'self-hosted' }}
+         run: echo "LIBCLANG_PATH=${LLVM_PATH}/lib" >> "$GITHUB_ENV"
+       - name: Setup Python
++        if: ${{ runner.environment != 'self-hosted' }}
+         uses: ./.github/actions/setup-python
+       - name: Change Mirror Priorities
++        if: ${{ runner.environment != 'self-hosted' }}
+         uses: ./.github/actions/apt-mirrors
+       - name: Bootstrap dependencies
++        if: ${{ runner.environment != 'self-hosted' }}
+         timeout-minutes: 30
+         run: |
+           sudo apt update
+           ./mach bootstrap --yes --skip-lints --skip-nextest
+       - name: Install sccache
+-        if: ${{ vars.SCCACHE_GHA_ENABLED != 'false' }}
++        if: ${{ runner.environment != 'self-hosted' && vars.SCCACHE_GHA_ENABLED != 'false' }}
+         uses: mozilla-actions/sccache-action@v0.0.11
+       - name: Enable sccache
+-        if: ${{ vars.SCCACHE_GHA_ENABLED != 'false' }}
++        if: ${{ runner.environment != 'self-hosted' && vars.SCCACHE_GHA_ENABLED != 'false' }}
+         run: |
+           {
+             echo "SCCACHE_GHA_VERSION=${{ vars.SCCACHE_GHA_VERSION || '1' }}"

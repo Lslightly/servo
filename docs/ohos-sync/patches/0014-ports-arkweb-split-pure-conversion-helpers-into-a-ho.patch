@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 6 Aug 2026 15:55:09 +0000
+Subject: [PATCH] ports/arkweb: split pure conversion helpers into a
+ host-tested module
+
+Move the pure number/char formatting out of runtime.rs into a
+dependency-free `convert` module that compiles on the host so it can carry
+unit tests. The crate-level `#![cfg(target_env = "ohos")]` becomes per-item
+gates, with `convert` compiled where it is used (ohos) or tested (host).
+
+Fixes +/-Infinity rendering and the i64 saturation of large numbers such as
+1e20, and registers the crate with `./mach test-unit` so the tests run.
+
+Validation: Test by running ./mach test-unit -p arkweb on the host.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/src/convert.rs      | 83 ++++++++++++++++++++++++++++++++
+ ports/arkweb/src/lib.rs          | 19 ++++++--
+ ports/arkweb/src/runtime.rs      | 15 +-----
+ python/servo/testing_commands.py |  1 +
+ 4 files changed, 101 insertions(+), 17 deletions(-)
+ create mode 100644 ports/arkweb/src/convert.rs
+
+diff --git a/ports/arkweb/src/convert.rs b/ports/arkweb/src/convert.rs
+new file mode 100644
+index 00000000000..caecf1e96be
+--- /dev/null
++++ b/ports/arkweb/src/convert.rs
+@@ -0,0 +1,83 @@
++//! Pure value/format conversions used by the bridge, kept free of any `servo`/OHOS types so they
++//! can be unit-tested on the host. The rest of the crate is `target_env = "ohos"`-only, so this
++//! module is compiled only where it is used (ohos) or exercised (host `cfg(test)`).
++
++/// Render an `f64` JS number as the text form ArkWeb's string-typed `runJavaScript` result expects:
++/// whole values in `i64` range without a trailing `.0`, `±Infinity` spelled out the JS way. Values
++/// at or beyond `2^63` fall through to the full decimal form so the `as i64` cast cannot saturate.
++pub(crate) fn format_js_number(number: f64) -> String {
++    if number.is_infinite() {
++        if number.is_sign_negative() {
++            "-Infinity".to_owned()
++        } else {
++            "Infinity".to_owned()
++        }
++    } else if number.fract() == 0.0 && number.abs() < 9_223_372_036_854_775_808.0 {
++        format!("{}", number as i64)
++    } else {
++        number.to_string()
++    }
++}
++
++/// Decode an OHOS key event's unicode value into a printable character, if any. A zero value (no
++/// character), an out-of-range value, or a control character yields `None`.
++pub(crate) fn printable_char(unicode: i32) -> Option<char> {
++    u32::try_from(unicode)
++        .ok()
++        .filter(|&u| u != 0)
++        .and_then(char::from_u32)
++        .filter(|c| !c.is_control())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn format_js_number_whole_values() {
++        assert_eq!(format_js_number(42.0), "42");
++        assert_eq!(format_js_number(0.0), "0");
++        assert_eq!(format_js_number(-0.0), "0");
++        assert_eq!(format_js_number(-7.0), "-7");
++        // Large but still inside i64 range: rendered as an integer, not scientific notation.
++        assert_eq!(format_js_number(9_000_000_000_000.0), "9000000000000");
++    }
++
++    #[test]
++    fn format_js_number_fractional_values() {
++        assert_eq!(format_js_number(1.5), "1.5");
++        assert_eq!(format_js_number(-0.25), "-0.25");
++    }
++
++    #[test]
++    fn format_js_number_beyond_i64_does_not_saturate() {
++        // The old `as i64` fast-path clamped 1e20 to i64::MAX; it must now round-trip instead.
++        let big = 1e20;
++        let rendered = format_js_number(big);
++        assert_ne!(rendered, i64::MAX.to_string());
++        assert_eq!(rendered.parse::<f64>().unwrap(), big);
++    }
++
++    #[test]
++    fn format_js_number_non_finite() {
++        assert_eq!(format_js_number(f64::INFINITY), "Infinity");
++        assert_eq!(format_js_number(f64::NEG_INFINITY), "-Infinity");
++        assert_eq!(format_js_number(f64::NAN), "NaN");
++    }
++
++    #[test]
++    fn printable_char_maps_text() {
++        assert_eq!(printable_char('a' as i32), Some('a'));
++        assert_eq!(printable_char('A' as i32), Some('A'));
++        assert_eq!(printable_char(0x1F600), Some('😀'));
++    }
++
++    #[test]
++    fn printable_char_rejects_non_text() {
++        assert_eq!(printable_char(0), None); // no character
++        assert_eq!(printable_char(-1), None); // out of range
++        assert_eq!(printable_char(9), None); // tab (control)
++        assert_eq!(printable_char(13), None); // carriage return (control)
++        assert_eq!(printable_char(0xD800), None); // lone surrogate, not a scalar value
++    }
++}
+diff --git a/ports/arkweb/src/lib.rs b/ports/arkweb/src/lib.rs
+index f9a21b6c6ec..3540de69f5f 100644
+--- a/ports/arkweb/src/lib.rs
++++ b/ports/arkweb/src/lib.rs
+@@ -5,13 +5,20 @@
+ //! Servo can be selected at runtime as an alternative to the Chromium-based ArkWeb engine
+ //! behind the same ArkTS `Web` / `WebviewController` API.
+ //!
+-//! The port is only meaningful on OpenHarmony targets. The whole crate is gated on
+-//! `target_env = "ohos"`, so on any other target (e.g. host `./mach check`) it compiles to
+-//! an empty library.
+-#![cfg(target_env = "ohos")]
++//! The port is only meaningful on OpenHarmony targets: everything that touches `servo` or the
++//! C++ NWeb bridge is gated on `target_env = "ohos"`, so on any other target (e.g. host
++//! `./mach check`) the crate compiles to an empty library. The exception is [`convert`], a
++//! dependency-free module of pure conversion helpers kept host-compilable so it can be unit-tested.
+ 
++// Pure helpers with no `servo`/OHOS coupling; compiled where they are used (ohos) or tested (host).
++#[cfg(any(target_env = "ohos", test))]
++mod convert;
++
++#[cfg(target_env = "ohos")]
+ mod bridge;
++#[cfg(target_env = "ohos")]
+ mod resources;
++#[cfg(target_env = "ohos")]
+ mod runtime;
+ 
+ // The factory / ABI entry points dlsym'd by the patched nweb_helper.cpp SERVO branch. A Rust
+@@ -19,18 +26,22 @@ mod runtime;
+ // be exported directly. Instead these thin `#[unsafe(no_mangle)] pub extern "C"` wrappers (which
+ // rustc always exports) forward to the C++ `_impl` halves in entry.cpp; referencing the impls
+ // also forces `entry.o` to be linked in.
++#[cfg(target_env = "ohos")]
+ use core::ffi::{c_int, c_void};
+ 
++#[cfg(target_env = "ohos")]
+ unsafe extern "C" {
+     fn servo_arkweb_create_nweb_engine_impl() -> *mut c_void;
+     fn servo_arkweb_abi_version_impl() -> c_int;
+ }
+ 
++#[cfg(target_env = "ohos")]
+ #[unsafe(no_mangle)]
+ pub extern "C" fn servo_arkweb_create_nweb_engine() -> *mut c_void {
+     unsafe { servo_arkweb_create_nweb_engine_impl() }
+ }
+ 
++#[cfg(target_env = "ohos")]
+ #[unsafe(no_mangle)]
+ pub extern "C" fn servo_arkweb_abi_version() -> c_int {
+     unsafe { servo_arkweb_abi_version_impl() }
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index eec7eea62f6..ca1b12c12f7 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -148,13 +148,7 @@ fn js_value_to_string(value: &JSValue) -> String {
+     match value {
+         JSValue::String(string) => string.clone(),
+         JSValue::Boolean(boolean) => boolean.to_string(),
+-        JSValue::Number(number) => {
+-            if number.fract() == 0.0 && number.is_finite() {
+-                format!("{}", *number as i64)
+-            } else {
+-                number.to_string()
+-            }
+-        },
++        JSValue::Number(number) => crate::convert::format_js_number(*number),
+         JSValue::Null => "null".to_owned(),
+         JSValue::Undefined => "undefined".to_owned(),
+         other => format!("{other:?}"),
+@@ -177,12 +171,7 @@ fn oh_key_to_servo_key(keycode: i32, unicode: i32) -> Option<Key> {
+         2081 => NamedKey::Home,         // KEY_MOVE_HOME
+         2082 => NamedKey::End,          // KEY_MOVE_END
+         _ => {
+-            return u32::try_from(unicode)
+-                .ok()
+-                .filter(|&u| u != 0)
+-                .and_then(char::from_u32)
+-                .filter(|c| !c.is_control())
+-                .map(|c| Key::Character(c.to_string()));
++            return crate::convert::printable_char(unicode).map(|c| Key::Character(c.to_string()));
+         },
+     };
+     Some(Key::Named(named))
+diff --git a/python/servo/testing_commands.py b/python/servo/testing_commands.py
+index 5cc881d9e11..0b0e47294bf 100644
+--- a/python/servo/testing_commands.py
++++ b/python/servo/testing_commands.py
+@@ -194,6 +194,7 @@ class MachCommands(CommandBase):
+             packages = set()
+ 
+         self_contained_tests = [
++            "arkweb",
+             "servo-background-hang-monitor",
+             "servo-base",
+             "servo-constellation",

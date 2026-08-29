@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 9 Jul 2026 07:10:21 +0000
+Subject: [PATCH] ports/arkweb: Optional network proxy for on-device testing
+
+The dev board has no direct network route, so read an HTTP(S) proxy URI
+from the web.engine.servo.proxy system param and set Servo's proxy prefs.
+Combined with an `hdc rport` reverse-forward to a host proxy, live
+http/https URLs load through the development host. tools/dev_proxy.py is
+that host proxy.
+
+Validation: Test by setting the web.engine.servo.proxy param with ports/arkweb/tools/dev_proxy.py and loading an external URL on device.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/cpp/servo_nweb_engine.cpp | 16 ++++++
+ ports/arkweb/src/bridge.rs             |  2 +
+ ports/arkweb/src/runtime.rs            | 32 +++++++----
+ ports/arkweb/tools/dev_proxy.py        | 80 ++++++++++++++++++++++++++
+ 4 files changed, 119 insertions(+), 11 deletions(-)
+ create mode 100644 ports/arkweb/tools/dev_proxy.py
+
+diff --git a/ports/arkweb/cpp/servo_nweb_engine.cpp b/ports/arkweb/cpp/servo_nweb_engine.cpp
+index c135ddeee72..1616ed273ab 100644
+--- a/ports/arkweb/cpp/servo_nweb_engine.cpp
++++ b/ports/arkweb/cpp/servo_nweb_engine.cpp
+@@ -22,8 +22,24 @@ using CreateNativeWindowFromSurfaceFn = void* (*)(void*);
+ 
+ #define SERVO_LOGI(...) OH_LOG_Print(LOG_APP, LOG_INFO, 0xE0C3, "ServoArkWeb", __VA_ARGS__)
+ 
++// Read an OHOS system parameter. GetParameter (libbegetutil) is not in the NDK, so it is resolved
++// at runtime from the app process, like the other inner-API symbols this shim uses.
++std::string ReadSystemParam(const char* key) {
++    using GetParameterFn = int (*)(const char*, const char*, char*, unsigned int);
++    static auto get_parameter = reinterpret_cast<GetParameterFn>(dlsym(RTLD_DEFAULT, "GetParameter"));
++    if (get_parameter == nullptr) {
++        return {};
++    }
++    char buffer[256] = {0};
++    int len = get_parameter(key, "", buffer, sizeof(buffer));
++    return len > 0 ? std::string(buffer, static_cast<size_t>(len)) : std::string{};
++}
++
+ servo::embedder::InitOptions ParseInitOptions(const std::shared_ptr<NWebEngineInitArgs>& init_args) {
+     servo::embedder::InitOptions options{};
++    // Dev/testing aid: route Servo's networking through an HTTP proxy (e.g. an `hdc rport`
++    // reverse-forward to a host proxy). Set via `param set web.engine.servo.proxy <uri>`.
++    options.proxy = ReadSystemParam("web.engine.servo.proxy");
+     if (init_args) {
+         constexpr std::string_view kUserDataDir = "--user-data-dir=";
+         constexpr std::string_view kLang = "--lang=";
+diff --git a/ports/arkweb/src/bridge.rs b/ports/arkweb/src/bridge.rs
+index 9d8a87f78fb..5c468b3dbcb 100644
+--- a/ports/arkweb/src/bridge.rs
++++ b/ports/arkweb/src/bridge.rs
+@@ -18,6 +18,8 @@ pub mod ffi {
+     struct InitOptions {
+         user_data_dir: String,
+         lang: String,
++        /// HTTP(S) proxy URI (from the `web.engine.servo.proxy` system param); empty for none.
++        proxy: String,
+         extra_args: Vec<String>,
+     }
+ 
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index 47118960d8a..369e21b4818 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -30,9 +30,9 @@ use raw_window_handle::{
+ };
+ use servo::{
+     ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent,
+-    JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts, RenderingContext, Scroll,
+-    Servo, ServoBuilder, TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView,
+-    WebViewBuilder, WebViewDelegate, WindowRenderingContext,
++    JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts, Preferences,
++    RenderingContext, Scroll, Servo, ServoBuilder, TouchEvent, TouchEventType, TouchId,
++    TouchPointerType, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
+ };
+ use url::Url;
+ 
+@@ -260,7 +260,7 @@ struct ServoThread {
+ }
+ 
+ impl ServoThread {
+-    fn run(rx: Receiver<Action>, waker_chan: Sender<Action>, config_dir: PathBuf) {
++    fn run(rx: Receiver<Action>, waker_chan: Sender<Action>, config_dir: PathBuf, proxy: String) {
+         // Install the crypto provider Servo's rustls-based networking requires for TLS.
+         if rustls::crypto::aws_lc_rs::default_provider()
+             .install_default()
+@@ -275,10 +275,19 @@ impl ServoThread {
+             config_dir: Some(config_dir),
+             ..Default::default()
+         };
+-        let servo = ServoBuilder::default()
+-            .opts(opts)
+-            .event_loop_waker(waker)
+-            .build();
++        // Route networking through an HTTP(S) proxy when one is configured (dev/testing aid; the
++        // device typically has no direct route, so an `hdc rport` reverse-forward to a host proxy
++        // is used). Both schemes go through the same CONNECT-capable proxy.
++        let mut builder = ServoBuilder::default().opts(opts).event_loop_waker(waker);
++        if !proxy.is_empty() {
++            info!("[arkweb] using network proxy {proxy}");
++            builder = builder.preferences(Preferences {
++                network_http_proxy_uri: proxy.clone(),
++                network_https_proxy_uri: proxy,
++                ..Default::default()
++            });
++        }
++        let servo = builder.build();
+         let mut thread = ServoThread {
+             servo,
+             webviews: HashMap::new(),
+@@ -766,8 +775,8 @@ pub fn initialize(options: InitOptions) -> bool {
+         init_logging(2);
+         panic::set_hook(Box::new(|info| error!("[arkweb] servo panic: {info}")));
+         info!(
+-            "[arkweb] initialize: user_data_dir={:?} lang={:?} extra_args={:?}",
+-            options.user_data_dir, options.lang, options.extra_args
++            "[arkweb] initialize: user_data_dir={:?} lang={:?} proxy={:?} extra_args={:?}",
++            options.user_data_dir, options.lang, options.proxy, options.extra_args
+         );
+ 
+         // Servo needs a writable `config_dir` (used for the OHOS font cache and prefs). The OHOS
+@@ -788,9 +797,10 @@ pub fn initialize(options: InitOptions) -> bool {
+         }
+         let (tx, rx) = mpsc::channel::<Action>();
+         let waker_chan = tx.clone();
++        let proxy = options.proxy;
+         match thread::Builder::new()
+             .name("servo-main".into())
+-            .spawn(move || ServoThread::run(rx, waker_chan, config_dir))
++            .spawn(move || ServoThread::run(rx, waker_chan, config_dir, proxy))
+         {
+             Ok(_) => {
+                 // Publish the channel only once the draining thread is alive. On a spawn failure the
+diff --git a/ports/arkweb/tools/dev_proxy.py b/ports/arkweb/tools/dev_proxy.py
+new file mode 100644
+index 00000000000..d1f2163eb94
+--- /dev/null
++++ b/ports/arkweb/tools/dev_proxy.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++"""Minimal HTTP/HTTPS(CONNECT) forward proxy for on-device Servo ArkWeb testing.
++
++The rk3568 dev board has no direct network route, so route Servo's networking through the
++development host instead:
++
++    # on the host
++    python3 ports/arkweb/tools/dev_proxy.py 8899
++    hdc rport tcp:8899 tcp:8899          # device 127.0.0.1:8899 -> host 127.0.0.1:8899
++
++    # on the device (read by the shim at engine init, sets Servo's proxy prefs)
++    hdc shell param set web.engine.servo.proxy http://127.0.0.1:8899
++
++Then (re)launch the app; live http/https URLs load through the host's connection. Unset with
++`param set web.engine.servo.proxy ""` (takes effect on the next engine init).
++"""
++
++import socket
++import sys
++import threading
++
++
++def pipe(src: socket.socket, dst: socket.socket) -> None:
++    try:
++        while True:
++            data = src.recv(65536)
++            if not data:
++                break
++            dst.sendall(data)
++    except OSError:
++        pass
++    finally:
++        for sock in (src, dst):
++            try:
++                sock.shutdown(socket.SHUT_RDWR)
++            except OSError:
++                pass
++
++
++def handle(client: socket.socket) -> None:
++    client.settimeout(30)
++    try:
++        head = b""
++        while b"\r\n\r\n" not in head:
++            chunk = client.recv(4096)
++            if not chunk:
++                return
++            head += chunk
++        method, target, _ = head.split(b"\r\n", 1)[0].decode("latin1").split(" ", 2)
++        if method == "CONNECT":
++            host, _, port = target.partition(":")
++            upstream = socket.create_connection((host, int(port or 443)), timeout=15)
++            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
++        else:
++            hostport, _, path = target.split("//", 1)[1].partition("/")
++            host, _, port = hostport.partition(":")
++            upstream = socket.create_connection((host, int(port or 80)), timeout=15)
++            upstream.sendall(head.replace(target.encode(), b"/" + path.encode(), 1))
++        threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
++        pipe(upstream, client)
++    except Exception as exc:  # noqa: BLE001
++        print(f"proxy error: {exc}", file=sys.stderr)
++    finally:
++        client.close()
++
++
++def main() -> None:
++    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8899
++    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++    server.bind(("127.0.0.1", port))
++    server.listen(128)
++    print(f"dev proxy listening on 127.0.0.1:{port}", flush=True)
++    while True:
++        client, _ = server.accept()
++        threading.Thread(target=handle, args=(client,), daemon=True).start()
++
++
++if __name__ == "__main__":
++    main()

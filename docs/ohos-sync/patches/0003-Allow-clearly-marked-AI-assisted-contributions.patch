@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 13 Jul 2026 11:36:41 +0000
+Subject: [PATCH] Allow clearly marked AI assisted contributions
+
+Validation: not required (documentation-only change).
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ AGENTS.md       | 38 ++++++++++++++++++++++++++++++++++++++
+ CONTRIBUTING.md |  7 +++++++
+ 2 files changed, 45 insertions(+)
+ create mode 100644 AGENTS.md
+
+diff --git a/AGENTS.md b/AGENTS.md
+new file mode 100644
+index 00000000000..717d02c6fe1
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,38 @@
++# Information for agents
++
++This is a downstream fork of the servo project, which allows AI assisted contributions.
++Read @CONTRIBUTING.md before helping the user generate any code.
++
++
++### Servoshell
++
++The Servoshell crate shouldn't depend on private servo crates. The public API is in the `servo` crate, and if some functionality
++from another internal servo crate is needed, it should be re-exported via `servo` instead of directly accessing it from servoshell.
++Items can be marked with `#[doc(hidden)]` if the usage is only meant for development purposes in servoshell, and shouldn't be part
++of the general embedder API.
++
++### Formatting
++
++Format by running `./mach fmt`.
++
++### Lints
++
++Run `./mach test-tidy` to run lints. 
++
++### Testing
++
++Run unit and integration tests with `./mach test-unit -p <package>` and wpt tests with `./mach test-wpt [--release|--profile=<cargo_profile>] [test-subset].
++If you need more control over running integration tests, please always use `cargo nextest` as the test runner, never `cargo test`.
++With `cargo nextest` please note that `--profile` refers to the nextest profile and you need to use `--cargo-profile=[dev|medium|release|production|profiling]` to specify the cargo build profile.
++
++### Style guide
++
++The style guide is available in the servo book at <https://book.servo.org/contributing/style-guide.html>.
++
++## Web Standards
++
++Servo is a web-rendering engine, and thus should adhere to the web specifications. There is not a single file, but many documents.
++When implementing features, or analyzing existing features, we should always compare against the web standard documents.
++Deviations should be an exception, well-documented and only occur when other browsers also deviate from the spec.
++
++* CSS related specification documents can be found at <https://drafts.csswg.org/>.
+\ No newline at end of file
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index ae430b4aff5..66df66ff346 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -24,6 +24,13 @@ The rules in this fork are roughly:
+ - Each commit should have a `Validation: Test by doing XYZ` comment in the commit message, explaining which tests are relevant to ensure the commit
+   continues working as intended during rebasing.
+ - The CI matrix is reduced (linux + ohos) to limit overhead, but try to not break other platforms. If regressions are discovered for other platforms, the patch should be fixed.
++- AI assisted contributions, are allowed in this fork but must follow these rules:
++  - Must be disclosed with an `AI-assisted` trailer in the commit message, and further information on how AI was used.
++  - This mainly targets code generation, local usage to do research or review (without modifying) does not require disclosure.
++  - The author remains responsible for their patch. Don't submit patches you don't understand.
++  - Low quality PRs may be rejected and closed.
++  - The PR description, PR comments and any discussion with reviewers must be fully written by a human. Respect the reviewers time.
++    Any AI generated prose must be clearly marked as such, and there is no expectation that a reviewer will read it.
+ - Otherwise, this is very much an experiment, so expect changes.
+ 
+ 

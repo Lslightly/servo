@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <55576758+jschwe@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 15:28:51 +0000
+Subject: [PATCH] script: Fix TimerListener leak (#48752)
+
+Dropped in favour of upstream 5f65837a45d (#48752), which this commit
+backported and which every base from base/2026-10-13 on contains.
+Equivalence: `git log --cherry-mark base/2026-10-13...pre-sync/2026-10-13`
+marks this commit `=` (identical patch-id to 5f65837a45d); the rebase
+stopped only because a later upstream commit (667d03341f6, #48795) made
+the JSContext the first argument of the same functions. Verified by the
+sync of 2026-10-13.
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: 5f65837a45d
+Validation: patch-id identity with 5f65837a45d (`git log --cherry-mark`); the WPT set of this commit's original Validation (timers, browsing-the-web, history, event loops, workers) is run on the rebased stack by the 2026-10-13 sync. The leak checks of the original Validation were not re-run on plain upstream; equivalence rests on the identical patch.
+AI-assisted: Yes (agent session; 2026-10-13 sync -- emptied in favor of upstream 5f65837a45d, which has the identical patch (`git log --cherry-mark`))
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>

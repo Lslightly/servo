@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 12 Oct 2026 17:58:00 +0000
+Subject: [PATCH] servoshell: Print a backtrace when the headless executable
+ crashes on OpenHarmony
+
+A native crash of the headless servoshell executable only showed its exit
+status, since OpenHarmony writes no fault report for executables started from a
+shell, and servoshell's crash handler wasn't installed there.
+
+Before `main`, OpenHarmony installs a handler that ends the process, which
+`signal_hook_registry` calls before its own handlers. So on OpenHarmony the
+crash handler replaces it with `sigaction` instead. The system's crash dump
+handler still runs first, since musl's signal chain calls it before any handler
+set with `sigaction`, and SpiderMonkey's handler for faults in wasm code passes
+other faults on to servoshell's.
+
+Validation: on an API 26 HarmonyOS phone and a HiHope DAYU200 (OpenHarmony 7.0, API 26), `kill -SEGV` on a running headless servoshell printed `Caught signal 11 in thread "main"` and a symbolized backtrace through SpiderMonkey's `WasmTrapHandler`, and the process still ended with signal 11 and, on the phone, with the kernel's crash dump. A panic with `--hard-fail` is reported as before, without the handler. With the runner of patches 82 and 83, `/infrastructure/` on the phone has the same results as before. `./mach build --ohos --release --no-package` still builds the library of the app, and `./mach test-tidy` passes.
+AI-assisted: Yes (agent session; written by the agent, which also ran the checks above)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/servoshell/crash_handler.rs     | 32 +++++++++++++++++++++++----
+ ports/servoshell/egl/ohos/headless.rs |  1 +
+ 2 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/ports/servoshell/crash_handler.rs b/ports/servoshell/crash_handler.rs
+index bf3ac851692..2eb61f8f323 100644
+--- a/ports/servoshell/crash_handler.rs
++++ b/ports/servoshell/crash_handler.rs
+@@ -5,10 +5,7 @@
+ #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+ pub fn install() {}
+ 
+-#[cfg(any(
+-    target_os = "macos",
+-    all(target_os = "linux", not(target_env = "ohos"))
+-))]
++#[cfg(any(target_os = "macos", target_os = "linux"))]
+ pub fn install() {
+     use std::io::Write;
+     use std::sync::atomic;
+@@ -48,6 +45,7 @@ pub fn install() {
+         raise_signal_or_exit_with_error(siginfo.si_signo);
+     }
+ 
++    #[cfg(not(target_env = "ohos"))]
+     unsafe {
+         signal_hook_registry::register_unchecked(libc::SIGSEGV, handler)
+             .expect("Could not register SIGSEGV handler");
+@@ -58,6 +56,32 @@ pub fn install() {
+         signal_hook_registry::register_unchecked(libc::SIGBUS, handler)
+             .expect("Could not register SIGBUS handler");
+     }
++
++    // Before `main`, OpenHarmony installs a handler that ends the process, which
++    // `signal_hook_registry` would call before `handler`, so replace it instead. The system's
++    // crash dump handler still runs first, since musl's signal chain calls it before any
++    // handler set with `sigaction`.
++    #[cfg(target_env = "ohos")]
++    {
++        extern "C" fn ohos_handler(_: libc::c_int, siginfo: *mut siginfo_t, _: *mut libc::c_void) {
++            // SAFETY: The kernel passes a valid `siginfo_t` to `SA_SIGINFO` handlers.
++            handler(unsafe { &*siginfo });
++        }
++
++        for signal in [libc::SIGSEGV, libc::SIGILL, libc::SIGIOT, libc::SIGBUS] {
++            // SAFETY: `sigaction` is plain old data, for which all zeroes are valid.
++            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
++            action.sa_sigaction = ohos_handler as *const () as libc::sighandler_t;
++            action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
++            // SAFETY: `action` is initialized and `handler` is the same that the other
++            // platforms register.
++            let result = unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };
++            assert_eq!(
++                result, 0,
++                "Could not register the handler of signal {signal}"
++            );
++        }
++    }
+ }
+ 
+ #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+diff --git a/ports/servoshell/egl/ohos/headless.rs b/ports/servoshell/egl/ohos/headless.rs
+index 17f03544a10..5273fdce226 100644
+--- a/ports/servoshell/egl/ohos/headless.rs
++++ b/ports/servoshell/egl/ohos/headless.rs
+@@ -28,6 +28,7 @@ use crate::running_app_state::RunningAppState;
+ use crate::window::{PlatformWindow, TopLevelWebViewCreationRequest};
+ 
+ pub(crate) fn main() {
++    crate::crash_handler::install();
+     init_logging();
+     panic::set_hook(Box::new(crate::panic_hook::panic_hook));
+     crate::init_crypto();

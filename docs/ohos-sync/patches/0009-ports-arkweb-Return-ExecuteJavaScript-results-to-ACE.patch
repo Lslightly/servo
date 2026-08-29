@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 9 Jul 2026 06:03:12 +0000
+Subject: [PATCH] ports/arkweb: Return ExecuteJavaScript results to ACE
+
+Implement the result-returning ExecuteJavaScript overload that ArkTS
+runJavaScript(script, callback) routes through. The NWebMessageValueCallback
+is parked by id (servo_js.cpp), the script is evaluated on the servo thread,
+and the JSValue result is rendered to a string and delivered back through the
+callback as a STRING NWebMessage. The fire-and-forget overload is unchanged.
+
+Evaluation failures are delivered as an ERROR NWebMessage so the ArkTS promise
+rejects, rather than resolving with an internal debug string as a fake success
+value. A call arriving before the engine is running releases its parked callback
+immediately, so the promise cannot hang forever.
+
+Validation: Test by running uv run ports/arkweb/tools/test_controller.py (ControllerPage runJavaScript reports results via hilog).
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/build.rs           |  1 +
+ ports/arkweb/cpp/servo_js.cpp   | 54 ++++++++++++++++++++++
+ ports/arkweb/cpp/servo_js.h     | 19 ++++++++
+ ports/arkweb/cpp/servo_nweb.cpp | 10 +++++
+ ports/arkweb/cpp/servo_nweb.h   |  3 ++
+ ports/arkweb/src/bridge.rs      | 11 +++++
+ ports/arkweb/src/runtime.rs     | 80 ++++++++++++++++++++++++++++++---
+ 7 files changed, 173 insertions(+), 5 deletions(-)
+ create mode 100644 ports/arkweb/cpp/servo_js.cpp
+ create mode 100644 ports/arkweb/cpp/servo_js.h
+
+diff --git a/ports/arkweb/build.rs b/ports/arkweb/build.rs
+index 3f9fcf89ede..b284b42241d 100644
+--- a/ports/arkweb/build.rs
++++ b/ports/arkweb/build.rs
+@@ -16,6 +16,7 @@ fn main() {
+         "cpp/servo_handler_proxy.cpp",
+         "cpp/servo_stub_managers.cpp",
+         "cpp/servo_native_window.cpp",
++        "cpp/servo_js.cpp",
+     ];
+ 
+     cxx_build::bridge("src/bridge.rs")
+diff --git a/ports/arkweb/cpp/servo_js.cpp b/ports/arkweb/cpp/servo_js.cpp
+new file mode 100644
+index 00000000000..2cf7ae1959d
+--- /dev/null
++++ b/ports/arkweb/cpp/servo_js.cpp
+@@ -0,0 +1,54 @@
++#include "servo_js.h"
++
++#include <mutex>
++#include <unordered_map>
++#include <utility>
++
++#include "ohos_nweb/nweb_web_message.h"
++
++namespace servo::arkweb {
++
++namespace {
++std::mutex g_mutex;
++std::unordered_map<std::uint64_t, std::shared_ptr<OHOS::NWeb::NWebMessageValueCallback>> g_callbacks;
++std::uint64_t g_next_id = 1;
++}  // namespace
++
++std::uint64_t register_js_callback(std::shared_ptr<OHOS::NWeb::NWebMessageValueCallback> callback) {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    std::uint64_t id = g_next_id++;
++    g_callbacks[id] = std::move(callback);
++    return id;
++}
++
++void deliver_js_result(std::uint64_t eval_id, const std::string& value, bool success) {
++    std::shared_ptr<OHOS::NWeb::NWebMessageValueCallback> callback;
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        auto it = g_callbacks.find(eval_id);
++        if (it != g_callbacks.end()) {
++            callback = std::move(it->second);
++            g_callbacks.erase(it);
++        }
++    }
++    if (!callback) {
++        return;
++    }
++    if (success) {
++        // runJavaScript (non-Ext) expects a string result; wrap it in a STRING NWebMessage.
++        auto message =
++            std::make_shared<OHOS::NWeb::NWebMessage>(OHOS::NWeb::NWebValue::Type::STRING);
++        message->SetString(value);
++        callback->OnReceiveValue(std::move(message));
++    } else {
++        // Evaluation failed: deliver an ERROR message so the ArkTS `runJavaScript` promise rejects,
++        // rather than resolving with an internal debug string as a fake success value.
++        auto message =
++            std::make_shared<OHOS::NWeb::NWebMessage>(OHOS::NWeb::NWebValue::Type::ERROR);
++        message->SetErrName("EvaluationError");
++        message->SetErrMsg(value);
++        callback->OnReceiveValue(std::move(message));
++    }
++}
++
++}  // namespace servo::arkweb
+diff --git a/ports/arkweb/cpp/servo_js.h b/ports/arkweb/cpp/servo_js.h
+new file mode 100644
+index 00000000000..f4503b5d67f
+--- /dev/null
++++ b/ports/arkweb/cpp/servo_js.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include <cstdint>
++#include <memory>
++#include <string>
++
++#include "ohos_nweb/nweb_value_callback.h"
++
++namespace servo::arkweb {
++
++// Register an ArkWeb JS-result callback, returning an id to hand to the Rust evaluator. The
++// matching deliver_js_result later invokes and removes it.
++std::uint64_t register_js_callback(std::shared_ptr<OHOS::NWeb::NWebMessageValueCallback> callback);
++
++// Deliver a JavaScript evaluation result (rendered as a string) to the registered callback, from
++// the servo thread once evaluation completes. No-op if the id is unknown.
++void deliver_js_result(std::uint64_t eval_id, const std::string& value, bool success);
++
++}  // namespace servo::arkweb
+diff --git a/ports/arkweb/cpp/servo_nweb.cpp b/ports/arkweb/cpp/servo_nweb.cpp
+index ae7f4b5ff72..77ccb72d99b 100644
+--- a/ports/arkweb/cpp/servo_nweb.cpp
++++ b/ports/arkweb/cpp/servo_nweb.cpp
+@@ -3,6 +3,7 @@
+ #include <utility>
+ 
+ #include "arkweb/src/bridge.rs.h"
++#include "servo_js.h"
+ #include "servo_stub_managers.h"
+ 
+ namespace OHOS::NWeb {
+@@ -122,6 +123,15 @@ void ServoNWeb::ExecuteJavaScript(const std::string& code) {
+     servo::embedder::evaluate_javascript(id_, code);
+ }
+ 
++// The result-returning form ArkTS `runJavaScript(script, callback)` routes through. The callback
++// is parked by id and invoked from the servo thread once evaluation completes (servo_js.cpp).
++void ServoNWeb::ExecuteJavaScript(const std::string& code,
++                                  std::shared_ptr<NWebMessageValueCallback> callback,
++                                  bool /*extention*/) {
++    std::uint64_t eval_id = servo::arkweb::register_js_callback(std::move(callback));
++    servo::arkweb::evaluate_javascript_with_callback(id_, eval_id, code);
++}
++
+ unsigned int ServoNWeb::GetWebId() {
+     return id_;
+ }
+diff --git a/ports/arkweb/cpp/servo_nweb.h b/ports/arkweb/cpp/servo_nweb.h
+index e562dae9d20..b248af7997b 100644
+--- a/ports/arkweb/cpp/servo_nweb.h
++++ b/ports/arkweb/cpp/servo_nweb.h
+@@ -41,6 +41,9 @@ public:
+     void Reload() override;
+     int Zoom(float zoomFactor) override;
+     void ExecuteJavaScript(const std::string& code) override;
++    void ExecuteJavaScript(const std::string& code,
++                           std::shared_ptr<NWebMessageValueCallback> callback,
++                           bool extention) override;
+     unsigned int GetWebId() override;
+     void SetNWebHandler(std::shared_ptr<NWebHandler> handler) override;
+     std::string GetUrl() override;
+diff --git a/ports/arkweb/src/bridge.rs b/ports/arkweb/src/bridge.rs
+index 9f203a87306..9d8a87f78fb 100644
+--- a/ports/arkweb/src/bridge.rs
++++ b/ports/arkweb/src/bridge.rs
+@@ -84,6 +84,9 @@ pub mod ffi {
+ pub mod ffi_arkweb {
+     extern "Rust" {
+         fn key_event(id: u32, keycode: i32, action: i32, unicode: i32) -> bool;
++        /// Evaluate JavaScript and deliver the result to the C++ callback registered under
++        /// `eval_id` (see `servo_js.h`) once it completes.
++        fn evaluate_javascript_with_callback(id: u32, eval_id: u64, code: &CxxString);
+         fn init_logging(min_level: i32);
+     }
+ 
+@@ -96,6 +99,11 @@ pub mod ffi_arkweb {
+         /// Release an OHNativeWindow from CreateNativeWindowFromSurface (call after the rendering
+         /// context using it is dropped).
+         fn destroy_native_window(window: usize);
++
++        include!("servo_js.h");
++
++        /// Deliver a JavaScript evaluation result to the callback registered under `eval_id`.
++        fn deliver_js_result(eval_id: u64, value: &CxxString, success: bool);
+     }
+ }
+ 
+@@ -181,6 +189,9 @@ fn cookie_clear() {
+ fn key_event(id: u32, keycode: i32, action: i32, unicode: i32) -> bool {
+     crate::runtime::key_event(id, keycode, action, unicode)
+ }
++fn evaluate_javascript_with_callback(id: u32, eval_id: u64, code: &CxxString) {
++    crate::runtime::evaluate_javascript_with_callback(id, eval_id, code)
++}
+ fn init_logging(min_level: i32) {
+     crate::runtime::init_logging(min_level)
+ }
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index d5f37412662..47118960d8a 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -29,10 +29,10 @@ use raw_window_handle::{
+     WindowHandle,
+ };
+ use servo::{
+-    ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, Key,
+-    KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts, RenderingContext, Scroll, Servo,
+-    ServoBuilder, TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
+-    WebViewDelegate, WindowRenderingContext,
++    ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent,
++    JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts, RenderingContext, Scroll,
++    Servo, ServoBuilder, TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView,
++    WebViewBuilder, WebViewDelegate, WindowRenderingContext,
+ };
+ use url::Url;
+ 
+@@ -109,6 +109,11 @@ enum Action {
+         id: u32,
+         code: String,
+     },
++    EvaluateJavaScriptWithCallback {
++        id: u32,
++        eval_id: u64,
++        code: String,
++    },
+     Key {
+         id: u32,
+         key: Key,
+@@ -129,6 +134,26 @@ enum Action {
+     },
+ }
+ 
++/// Render a JavaScript evaluation result as the string ArkWeb's `runJavaScript` callback expects.
++/// Strings pass through verbatim; other scalars use their JS text form; compound values fall back
++/// to a debug rendering (structured results are an `ExecuteJavaScriptExt` concern, not wired yet).
++fn js_value_to_string(value: &JSValue) -> String {
++    match value {
++        JSValue::String(string) => string.clone(),
++        JSValue::Boolean(boolean) => boolean.to_string(),
++        JSValue::Number(number) => {
++            if number.fract() == 0.0 && number.is_finite() {
++                format!("{}", *number as i64)
++            } else {
++                number.to_string()
++            }
++        },
++        JSValue::Null => "null".to_owned(),
++        JSValue::Undefined => "undefined".to_owned(),
++        other => format!("{other:?}"),
++    }
++}
++
+ /// Map an OHOS (ArkUI/MMI) key code plus its unicode value to a servo [`Key`]. Named keys are
+ /// matched first; any other key with a printable unicode value becomes a `Character`.
+ fn oh_key_to_servo_key(keycode: i32, unicode: i32) -> Option<Key> {
+@@ -391,13 +416,35 @@ impl ServoThread {
+             Action::Focus(id) => self.focus_webview(id),
+             Action::SetPageZoom { id, zoom } => self.with_webview(id, |wv| wv.set_page_zoom(zoom)),
+             Action::EvaluateJavaScript { id, code } => self.with_webview(id, |wv| {
+-                // Fire-and-forget for M2; the result callback is surfaced to ACE in M3.
++                // Fire-and-forget variant (ArkTS `runJavaScript` without a result callback).
+                 wv.evaluate_javascript(code, |result| {
+                     if let Err(error) = result {
+                         error!("[arkweb] evaluate_javascript failed: {error:?}");
+                     }
+                 });
+             }),
++            Action::EvaluateJavaScriptWithCallback { id, eval_id, code } => {
++                let webview = self
++                    .webviews
++                    .get(&id)
++                    .and_then(|entry| entry.built.as_ref())
++                    .map(|built| built.webview.clone());
++                match webview {
++                    Some(webview) => webview.evaluate_javascript(code, move |result| {
++                        let (value, success) = match result {
++                            Ok(value) => (js_value_to_string(&value), true),
++                            Err(error) => (format!("{error:?}"), false),
++                        };
++                        cxx::let_cxx_string!(value = &value);
++                        crate::bridge::ffi_arkweb::deliver_js_result(eval_id, &value, success);
++                    }),
++                    // No live WebView: still release the parked C++ callback.
++                    None => {
++                        cxx::let_cxx_string!(value = "");
++                        crate::bridge::ffi_arkweb::deliver_js_result(eval_id, &value, false);
++                    },
++                }
++            },
+             Action::Key { id, key, state } => self.with_webview(id, |wv| {
+                 wv.notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(
+                     state, key,
+@@ -876,6 +923,29 @@ pub fn evaluate_javascript(id: u32, code: &CxxString) {
+     })
+ }
+ 
++pub fn evaluate_javascript_with_callback(id: u32, eval_id: u64, code: &CxxString) {
++    guard("evaluate_javascript_with_callback", || {
++        let action = Action::EvaluateJavaScriptWithCallback {
++            id,
++            eval_id,
++            code: code.to_string_lossy().into_owned(),
++        };
++        let queued = SERVO_CHANNEL
++            .get()
++            .is_some_and(|tx| tx.send(action).is_ok());
++        // The C++ side already parked a callback under `eval_id`. If the engine is not running the
++        // action is dropped and that callback (and the ArkTS `runJavaScript` promise) would hang
++        // forever, so release it here. The live-engine paths deliver from the servo thread instead.
++        if !queued {
++            error!(
++                "[arkweb] evaluate_javascript_with_callback before engine ready; releasing callback"
++            );
++            cxx::let_cxx_string!(value = "");
++            crate::bridge::ffi_arkweb::deliver_js_result(eval_id, &value, false);
++        }
++    })
++}
++
+ pub fn get_url(id: u32) -> String {
+     guard("get_url", || {
+         with_sync(id, |sync| sync.url.lock().unwrap().clone())

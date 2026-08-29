@@ -1,0 +1,1209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 10 Jul 2026 17:17:33 +0000
+Subject: [PATCH] ports/arkweb: wire Tier-1 NWeb methods
+
+Wire the Tier-1 batch of NWeb controller methods to Servo, backed by new
+nav-step, page-scroll and media-session bridge fns.
+
+On-device coverage: ControllerPage in the test app exposes one button per
+wired API, reporting `ArkWebTest: <name>=<value>` to hilog;
+test_controller.py drives them via its invoke() helper and
+test_throttle.py covers the render-throttle composition; since throttling
+hides the WebView, it also checks that a page backgrounded and foregrounded
+again paints and handles a tap. test_focus.py checks that a page in a newly
+built WebView sees `document.hasFocus()`. ControllerPage's cookie buttons
+let test_cookies.py check the cookie manager: cookies from `Set-Cookie` and
+`document.cookie` are returned, and a cookie set from ArkTS reaches the
+server on the next load. The history-nav test asserts a fresh title after
+back/forward (relies on the URL-bar sync fix in the preceding commits).
+
+Validation: Test by running uv run ports/arkweb/tools/test_controller.py, uv run ports/arkweb/tools/test_throttle.py, uv run ports/arkweb/tools/test_focus.py and uv run ports/arkweb/tools/test_cookies.py on a device (after uv run ports/arkweb/tools/build_test_app.py).
+AI-assisted: Yes (agent session; implementation and on-device testing)
+AI-assisted: Yes (agent session; 2026-10-08 sync -- added test_focus.py, test_cookies.py with the ControllerPage cookie buttons, and repaint and tap checks after foregrounding to test_throttle.py, for upstream's focus, visibility and cookie changes)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/README.md                        |   6 +-
+ ports/arkweb/cpp/servo_nweb.cpp               | 152 +++++++++++++-
+ ports/arkweb/cpp/servo_nweb.h                 |  37 ++++
+ ports/arkweb/src/bridge.rs                    |  23 +++
+ ports/arkweb/src/runtime.rs                   |  97 ++++++++-
+ .../main/ets/entryability/EntryAbility.ets    |   3 +
+ .../src/main/ets/pages/ControllerPage.ets     | 185 ++++++++++++++++++
+ .../resources/base/profile/main_pages.json    |   3 +-
+ ports/arkweb/tools/conftest.py                |  22 +++
+ ports/arkweb/tools/test_controller.py         | 157 +++++++++++++++
+ ports/arkweb/tools/test_cookies.py            |  84 ++++++++
+ ports/arkweb/tools/test_focus.py              |  39 ++++
+ ports/arkweb/tools/test_throttle.py           |  81 ++++++++
+ 13 files changed, 881 insertions(+), 8 deletions(-)
+ create mode 100644 ports/arkweb/test-app/entry/src/main/ets/pages/ControllerPage.ets
+ create mode 100644 ports/arkweb/tools/test_controller.py
+ create mode 100644 ports/arkweb/tools/test_cookies.py
+ create mode 100644 ports/arkweb/tools/test_focus.py
+ create mode 100644 ports/arkweb/tools/test_throttle.py
+
+diff --git a/ports/arkweb/README.md b/ports/arkweb/README.md
+index 6fbb3725656..1edcbfa870a 100644
+--- a/ports/arkweb/README.md
++++ b/ports/arkweb/README.md
+@@ -84,7 +84,9 @@ Every device command is bounded by `CMD_TIMEOUT` so a wedged device fails instea
+ hanging the run.
+ 
+ APIs only reachable through `WebviewController` (e.g. `getTitle`, `pageDown`) need a
+-trigger inside the app: add a button (or page) to `test-app/` that invokes the API and
+-reports the result via `console.info`, then tap it via `dump_layout` and assert on the log.
++trigger inside the app: `test-app` `ControllerPage` (`launch(page="controller")`) is the
++pattern — one button per API, each reporting `ArkWebTest: <name>=<value>` to hilog, driven
++by `test_controller.py`'s `invoke()` helper. Extend that page (and `test_controller.py`)
++when wiring new controller APIs.
+ 
+ Keep this file up to date when the tooling, harness idioms, or test-app hooks change.
+diff --git a/ports/arkweb/cpp/servo_nweb.cpp b/ports/arkweb/cpp/servo_nweb.cpp
+index 7001076da4f..d64d836f6a8 100644
+--- a/ports/arkweb/cpp/servo_nweb.cpp
++++ b/ports/arkweb/cpp/servo_nweb.cpp
+@@ -3,6 +3,7 @@
+ #include <utility>
+ 
+ #include "arkweb/src/bridge.rs.h"
++#include "ohos_nweb/nweb_web_message.h"
+ #include "servo_js.h"
+ #include "servo_stub_managers.h"
+ 
+@@ -14,6 +15,42 @@ constexpr std::uint8_t kTouchDown = 0;
+ constexpr std::uint8_t kTouchMove = 1;
+ constexpr std::uint8_t kTouchUp = 2;
+ constexpr std::uint8_t kTouchCancel = 3;
++
++// Media-session actions, matching the `action` argument of the `media_session_action` bridge
++// function.
++constexpr std::int32_t kMediaActionPlay = 0;
++constexpr std::int32_t kMediaActionPause = 1;
++constexpr std::int32_t kMediaActionStop = 2;
++
++// ACE stores and dereferences the returned drag data (web_delegate.cpp GetOrCreateDragData), so
++// GetOrCreateDragData must return non-null even though Servo exposes no drag payload yet.
++class ServoDragData : public NWebDragData {
++public:
++    std::string GetLinkURL() override { return {}; }
++    std::string GetFragmentText() override { return {}; }
++    std::string GetFragmentHtml() override { return {}; }
++    bool GetPixelMapSetting(const void** /*data*/, size_t& /*len*/, int& /*width*/,
++                            int& /*height*/) override {
++        return false;
++    }
++    bool SetFragmentHtml(const std::string& /*html*/) override { return false; }
++    bool SetPixelMapSetting(const void* /*data*/, size_t /*len*/, int /*width*/,
++                            int /*height*/) override {
++        return false;
++    }
++    bool SetLinkURL(const std::string& /*url*/) override { return false; }
++    bool SetFragmentText(const std::string& /*text*/) override { return false; }
++    std::string GetLinkTitle() override { return {}; }
++    bool SetLinkTitle(const std::string& /*title*/) override { return false; }
++    void GetDragStartPosition(int& x, int& y) override {
++        x = 0;
++        y = 0;
++    }
++    bool IsSingleImageContent() override { return false; }
++    bool SetFileUri(const std::string& /*uri*/) override { return false; }
++    std::string GetImageFileName() override { return {}; }
++    void ClearImageFileNames() override {}
++};
+ }  // namespace
+ 
+ ServoNWeb::ServoNWeb(uint32_t id, std::shared_ptr<servo::arkweb::NWebHandlerProxy> proxy)
+@@ -24,14 +61,35 @@ void ServoNWeb::Resize(uint32_t width, uint32_t height, bool /*isKeyboard*/) {
+ }
+ 
+ void ServoNWeb::OnPause() {
+-    servo::embedder::set_throttled(id_, true);
++    paused_ = true;
++    UpdateThrottled();
+ }
+ 
+ void ServoNWeb::OnContinue() {
+-    servo::embedder::set_throttled(id_, false);
++    paused_ = false;
++    UpdateThrottled();
++}
++
++// The RS surface-occlusion callback is not on the OnPause path, so without these Servo keeps
++// rendering at full rate while fully covered by another window.
++void ServoNWeb::OnOccluded() {
++    occluded_ = true;
++    UpdateThrottled();
++}
++
++void ServoNWeb::OnUnoccluded() {
++    occluded_ = false;
++    UpdateThrottled();
++}
++
++void ServoNWeb::UpdateThrottled() {
++    servo::embedder::set_throttled(id_, paused_ || occluded_);
+ }
+ 
+ void ServoNWeb::OnDestroy() {
++    if (native_destroy_callback_ != nullptr) {
++        native_destroy_callback_(native_destroy_web_name_.c_str());
++    }
+     servo::embedder::destroy_webview(id_);
+ }
+ 
+@@ -117,6 +175,10 @@ void ServoNWeb::NavigateForward() {
+     servo::embedder::go_forward(id_);
+ }
+ 
++void ServoNWeb::NavigateBackOrForward(int step) {
++    servo::embedder::navigate_back_or_forward(id_, step);
++}
++
+ void ServoNWeb::Reload() {
+     servo::embedder::reload(id_);
+ }
+@@ -154,6 +216,21 @@ std::string ServoNWeb::GetUrl() {
+     return std::string(url.data(), url.size());
+ }
+ 
++std::string ServoNWeb::Title() {
++    auto title = servo::embedder::get_title(id_);
++    return std::string(title.data(), title.size());
++}
++
++int ServoNWeb::PageLoadProgress() {
++    return servo::embedder::get_progress(id_);
++}
++
++// Servo tracks no pre-redirect URL; the committed URL is the closest available answer.
++const std::string ServoNWeb::GetOriginalUrl() {
++    auto url = servo::embedder::get_url(id_);
++    return std::string(url.data(), url.size());
++}
++
+ // ScrollTo is absolute; the bridge currently exposes only relative scrolling. Approximated
+ // for the MVP (proper absolute scroll tracked for a later milestone).
+ void ServoNWeb::ScrollTo(float x, float y) {
+@@ -164,6 +241,38 @@ void ServoNWeb::ScrollBy(float delta_x, float delta_y) {
+     servo::embedder::scroll_by(id_, delta_x, delta_y);
+ }
+ 
++// Nested-scroll handoff from an enclosing ArkUI scrollable. The fling velocity is dropped:
++// Servo exposes no velocity-scroll injection, and the delta alone keeps content tracking.
++void ServoNWeb::ScrollByRefScreen(float delta_x, float delta_y, float /*vx*/, float /*vy*/) {
++    servo::embedder::scroll_by(id_, delta_x, delta_y);
++}
++
++void ServoNWeb::PageUp(bool top) {
++    servo::embedder::page_scroll(id_, true, top);
++}
++
++void ServoNWeb::PageDown(bool bottom) {
++    servo::embedder::page_scroll(id_, false, bottom);
++}
++
++// These reach the page's *active media session* only; a page that never touches the
++// MediaSession API may not respond (documented Tier-1 limitation).
++void ServoNWeb::PauseAllMedia() {
++    servo::embedder::media_session_action(id_, kMediaActionPause);
++}
++
++void ServoNWeb::ResumeAllMedia() {
++    servo::embedder::media_session_action(id_, kMediaActionPlay);
++}
++
++void ServoNWeb::StopAllMedia() {
++    servo::embedder::media_session_action(id_, kMediaActionStop);
++}
++
++int ServoNWeb::GetMediaPlaybackState() {
++    return servo::embedder::get_media_playback_state(id_);
++}
++
+ void ServoNWeb::PutBackgroundColor(int color) {
+     background_color_ = color;
+ }
+@@ -172,4 +281,43 @@ std::shared_ptr<NWebPreference> ServoNWeb::GetPreference() {
+     return GetServoPreference();
+ }
+ 
++void ServoNWeb::SetNWebJavaScriptResultCallBack(
++    std::shared_ptr<NWebJavaScriptResultCallBack> callback) {
++    js_result_callback_ = std::move(callback);
++}
++
++void ServoNWeb::RegisterNativeValideCallback(const char* webName,
++                                             const NativeArkWebOnValidCallback callback) {
++    if (callback != nullptr && webName != nullptr) {
++        callback(webName);
++    }
++}
++
++void ServoNWeb::RegisterNativeDestroyCallback(const char* webName,
++                                              const NativeArkWebOnDestroyCallback callback) {
++    native_destroy_web_name_ = webName != nullptr ? webName : "";
++    native_destroy_callback_ = callback;
++}
++
++std::shared_ptr<NWebDragData> ServoNWeb::GetOrCreateDragData() {
++    if (!drag_data_) {
++        drag_data_ = std::make_shared<ServoDragData>();
++    }
++    return drag_data_;
++}
++
++// Servo has no JS precompile/code-cache API. The NAPI callback unconditionally reads GetInt64()
++// off the message and rejects the ArkTS promise for any non-OK (non-zero) code, so deliver an
++// INTEGER message immediately rather than leaving the promise hanging.
++void ServoNWeb::PrecompileJavaScript(const std::string& /*url*/, const std::string& /*script*/,
++                                     std::shared_ptr<CacheOptions>& /*cacheOptions*/,
++                                     std::shared_ptr<NWebMessageValueCallback> callback) {
++    if (!callback) {
++        return;
++    }
++    auto message = std::make_shared<NWebMessage>(NWebValue::Type::INTEGER);
++    message->SetInt64(-1);
++    callback->OnReceiveValue(std::move(message));
++}
++
+ }  // namespace OHOS::NWeb
+diff --git a/ports/arkweb/cpp/servo_nweb.h b/ports/arkweb/cpp/servo_nweb.h
+index 6d88e850575..9086311c930 100644
+--- a/ports/arkweb/cpp/servo_nweb.h
++++ b/ports/arkweb/cpp/servo_nweb.h
+@@ -21,6 +21,8 @@ public:
+     void Resize(uint32_t width, uint32_t height, bool isKeyboard) override;
+     void OnPause() override;
+     void OnContinue() override;
++    void OnOccluded() override;
++    void OnUnoccluded() override;
+     void OnDestroy() override;
+     void OnFocus(const FocusReason& focusReason) override;
+     void OnBlur(const BlurReason& blurReason) override;
+@@ -39,6 +41,7 @@ public:
+     bool CanNavigateBackOrForward(int numSteps) override;
+     void NavigateBack() override;
+     void NavigateForward() override;
++    void NavigateBackOrForward(int step) override;
+     void Reload() override;
+     int Zoom(float zoomFactor) override;
+     void ExecuteJavaScript(const std::string& code) override;
+@@ -48,15 +51,49 @@ public:
+     unsigned int GetWebId() override;
+     void SetNWebHandler(std::shared_ptr<NWebHandler> handler) override;
+     std::string GetUrl() override;
++    std::string Title() override;
++    int PageLoadProgress() override;
++    const std::string GetOriginalUrl() override;
+     void ScrollTo(float x, float y) override;
+     void ScrollBy(float delta_x, float delta_y) override;
++    void ScrollByRefScreen(float delta_x, float delta_y, float vx, float vy) override;
++    void PageUp(bool top) override;
++    void PageDown(bool bottom) override;
++    void PauseAllMedia() override;
++    void ResumeAllMedia() override;
++    void StopAllMedia() override;
++    int GetMediaPlaybackState() override;
+     void PutBackgroundColor(int color) override;
+     std::shared_ptr<NWebPreference> GetPreference() override;
++    void SetNWebJavaScriptResultCallBack(
++        std::shared_ptr<NWebJavaScriptResultCallBack> callback) override;
++    void RegisterNativeValideCallback(const char* webName,
++                                      const NativeArkWebOnValidCallback callback) override;
++    void RegisterNativeDestroyCallback(const char* webName,
++                                       const NativeArkWebOnDestroyCallback callback) override;
++    std::shared_ptr<NWebDragData> GetOrCreateDragData() override;
++    void PrecompileJavaScript(const std::string& url, const std::string& script,
++                              std::shared_ptr<CacheOptions>& cacheOptions,
++                              std::shared_ptr<NWebMessageValueCallback> callback) override;
+ 
+ private:
++    // OnPause/OnContinue (window hide, app background) and OnOccluded/OnUnoccluded (covered by
++    // another window) are independent signals; throttle while either says invisible.
++    void UpdateThrottled();
++
+     uint32_t id_;
+     std::shared_ptr<servo::arkweb::NWebHandlerProxy> proxy_;
+     int background_color_ = 0;
++    bool paused_ = false;
++    bool occluded_ = false;
++    // Sink for injected-JS-proxy calls; set unconditionally by every WebviewController attach.
++    // Only invoked once a JS-proxy implementation exists (not wired yet); stored so it is ready.
++    std::shared_ptr<NWebJavaScriptResultCallBack> js_result_callback_;
++    // Native ArkWeb C API (`OH_NativeArkWeb_*`) destroy callback, keyed by web tag; the valid
++    // callback is fired directly on registration (the instance is live by then).
++    std::string native_destroy_web_name_;
++    NativeArkWebOnDestroyCallback native_destroy_callback_ = nullptr;
++    std::shared_ptr<NWebDragData> drag_data_;
+ };
+ 
+ }  // namespace OHOS::NWeb
+diff --git a/ports/arkweb/src/bridge.rs b/ports/arkweb/src/bridge.rs
+index 5e8bd4a71de..6eeb343ac40 100644
+--- a/ports/arkweb/src/bridge.rs
++++ b/ports/arkweb/src/bridge.rs
+@@ -37,12 +37,23 @@ pub mod ffi {
+         fn reload(id: u32);
+         fn go_back(id: u32);
+         fn go_forward(id: u32);
++        /// Traverse the session history by `step` entries (negative = back, positive = forward).
++        fn navigate_back_or_forward(id: u32, step: i32);
+         fn resize(id: u32, width: u32, height: u32);
+         fn set_throttled(id: u32, throttled: bool);
+         fn focus(id: u32);
+         fn blur(id: u32);
+         fn touch_event(id: u32, kind: u8, x: f32, y: f32, pointer_id: i32);
+         fn scroll_by(id: u32, dx: f32, dy: f32);
++        /// Scroll one viewport up/down; `to_edge` jumps to the start/end of the page instead
++        /// (`NWeb::PageUp(top)` / `PageDown(bottom)`).
++        fn page_scroll(id: u32, up: bool, to_edge: bool);
++        /// Drive the page's active media session: 0 = play, 1 = pause, 2 = stop (constants
++        /// mirrored in servo_nweb.cpp).
++        fn media_session_action(id: u32, action: i32);
++        /// Last known playback state as OHOS `MediaPlaybackState` values
++        /// (0 = NONE, 1 = PLAYING, 2 = PAUSED).
++        fn get_media_playback_state(id: u32) -> i32;
+         fn set_page_zoom(id: u32, zoom: f32);
+         fn evaluate_javascript(id: u32, code: &CxxString);
+         fn get_url(id: u32) -> String;
+@@ -193,6 +204,9 @@ fn go_back(id: u32) {
+ fn go_forward(id: u32) {
+     crate::runtime::go_forward(id)
+ }
++fn navigate_back_or_forward(id: u32, step: i32) {
++    crate::runtime::navigate_back_or_forward(id, step)
++}
+ fn resize(id: u32, width: u32, height: u32) {
+     crate::runtime::resize(id, width, height)
+ }
+@@ -211,6 +225,15 @@ fn touch_event(id: u32, kind: u8, x: f32, y: f32, pointer_id: i32) {
+ fn scroll_by(id: u32, dx: f32, dy: f32) {
+     crate::runtime::scroll_by(id, dx, dy)
+ }
++fn page_scroll(id: u32, up: bool, to_edge: bool) {
++    crate::runtime::page_scroll(id, up, to_edge)
++}
++fn media_session_action(id: u32, action: i32) {
++    crate::runtime::media_session_action(id, action)
++}
++fn get_media_playback_state(id: u32) -> i32 {
++    crate::runtime::get_media_playback_state(id)
++}
+ fn set_page_zoom(id: u32, zoom: f32) {
+     crate::runtime::set_page_zoom(id, zoom)
+ }
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index ed1611ff6f1..3b861e36b16 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -36,9 +36,10 @@ use servo::{
+     CompositionEvent, CompositionState, ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D,
+     EmbedderControl, EmbedderControlId, EventLoopWaker, FilePicker, ImeEvent, InputEvent,
+     InputMethodControl, InputMethodType, JSValue, Key, KeyState, KeyboardEvent, LoadStatus,
+-    NamedKey, Opts, Preferences, RefreshDriver, RenderingContext, Scroll, SelectElement,
+-    SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog, TouchEvent, TouchEventType,
+-    TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
++    MediaSessionActionType, MediaSessionEvent, NamedKey, Opts, Preferences, RefreshDriver,
++    RenderingContext, Scroll, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder,
++    SimpleDialog, TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
++    WebViewDelegate, WindowRenderingContext,
+ };
+ use url::Url;
+ 
+@@ -64,6 +65,9 @@ struct SyncState {
+     /// `ServoNWeb::NeedSoftKeyboard` so ACE performs keyboard-avoidance layout; set on the servo
+     /// thread from the IME show/hide delegate callbacks.
+     ime_active: AtomicBool,
++    /// Last media-session playback state, stored as the OHOS `MediaPlaybackState` values
++    /// (0 = NONE, 1 = PLAYING, 2 = PAUSED). Read by `ServoNWeb::GetMediaPlaybackState`.
++    playback_state: AtomicI32,
+ }
+ 
+ /// Messages sent from ACE threads to the servo thread. Every variant carries only `Send` data.
+@@ -94,6 +98,10 @@ enum Action {
+     Reload(u32),
+     GoBack(u32),
+     GoForward(u32),
++    GoBackOrForward {
++        id: u32,
++        step: i32,
++    },
+     Resize {
+         id: u32,
+         width: u32,
+@@ -115,6 +123,16 @@ enum Action {
+         dx: f32,
+         dy: f32,
+     },
++    PageScroll {
++        id: u32,
++        up: bool,
++        to_edge: bool,
++    },
++    /// See the `media_session_action` bridge doc for the `action` values.
++    MediaSessionAction {
++        id: u32,
++        action: i32,
++    },
+     Focus(u32),
+     SetPageZoom {
+         id: u32,
+@@ -605,6 +623,13 @@ impl ServoThread {
+             Action::GoForward(id) => self.with_webview(id, |wv| {
+                 wv.go_forward(1);
+             }),
++            Action::GoBackOrForward { id, step } => self.with_webview(id, |wv| {
++                if step < 0 {
++                    wv.go_back(step.unsigned_abs() as usize);
++                } else if step > 0 {
++                    wv.go_forward(step as usize);
++                }
++            }),
+             Action::Resize { id, width, height } => {
+                 info!("[arkweb] resize id={id} {width}x{height}");
+                 let size = PhysicalSize::new(width.max(1), height.max(1));
+@@ -640,6 +665,8 @@ impl ServoThread {
+                 }
+             },
+             Action::SetThrottled { id, throttled } => {
++                // Observability marker for the on-device throttle tests (test_throttle.py).
++                info!("[arkweb] set_throttled id={id} {throttled}");
+                 // A paused or occluded web component is not visible. A hidden WebView is
+                 // not painted and its animations and timers are throttled.
+                 self.with_webview(id, |wv| if throttled { wv.hide() } else { wv.show() })
+@@ -684,6 +711,36 @@ impl ServoThread {
+                     }
+                 }
+             },
++            Action::PageScroll { id, up, to_edge } => {
++                if let Some(entry) = self.webviews.get(&id) {
++                    if let Some(built) = entry.built.as_ref() {
++                        let height = entry.size.height as f32;
++                        let scroll = match (up, to_edge) {
++                            (true, true) => Scroll::Start,
++                            (false, true) => Scroll::End,
++                            (up, false) => {
++                                let dy = if up { -height } else { height };
++                                Scroll::Delta(DeviceVector2D::new(0.0, dy).into())
++                            },
++                        };
++                        let point =
++                            DevicePoint::new(entry.size.width as f32 / 2.0, height / 2.0).into();
++                        built.webview.notify_scroll_event(scroll, point);
++                    }
++                }
++            },
++            Action::MediaSessionAction { id, action } => self.with_webview(id, |wv| {
++                let action = match action {
++                    0 => MediaSessionActionType::Play,
++                    1 => MediaSessionActionType::Pause,
++                    2 => MediaSessionActionType::Stop,
++                    other => {
++                        error!("[arkweb] unknown media session action {other}");
++                        return;
++                    },
++                };
++                wv.notify_media_session_action_event(action);
++            }),
+             Action::Focus(id) => self.focus_webview(id),
+             Action::SetPageZoom { id, zoom } => self.with_webview(id, |wv| wv.set_page_zoom(zoom)),
+             Action::EvaluateJavaScript { id, code } => self.with_webview(id, |wv| {
+@@ -1133,6 +1190,16 @@ impl WebViewDelegate for ArkWebViewDelegate {
+         }
+     }
+ 
++    fn notify_media_session_event(&self, _webview: WebView, event: MediaSessionEvent) {
++        if let MediaSessionEvent::PlaybackStateChange(state) = event {
++            // Servo's MediaSessionPlaybackState is 1-based (None_=1); OHOS MediaPlaybackState is
++            // 0-based (NONE=0, PLAYING=1, PAUSED=2).
++            self.sync
++                .playback_state
++                .store(state as i32 - 1, Ordering::Relaxed);
++        }
++    }
++
+     fn notify_new_frame_ready(&self, webview: WebView) {
+         // ACE creates the NWeb at a 1x1 placeholder and resizes to the real size once laid out.
+         // Presenting into a 1x1 surface makes WebRender report OutOfMemory every frame and panic
+@@ -1480,6 +1547,12 @@ pub fn go_back(id: u32) {
+     guard("go_back", || send(Action::GoBack(id)))
+ }
+ 
++pub fn navigate_back_or_forward(id: u32, step: i32) {
++    guard("navigate_back_or_forward", || {
++        send(Action::GoBackOrForward { id, step })
++    })
++}
++
+ pub fn go_forward(id: u32) {
+     guard("go_forward", || send(Action::GoForward(id)))
+ }
+@@ -1519,6 +1592,18 @@ pub fn scroll_by(id: u32, dx: f32, dy: f32) {
+     guard("scroll_by", || send(Action::Scroll { id, dx, dy }))
+ }
+ 
++pub fn page_scroll(id: u32, up: bool, to_edge: bool) {
++    guard("page_scroll", || {
++        send(Action::PageScroll { id, up, to_edge })
++    })
++}
++
++pub fn media_session_action(id: u32, action: i32) {
++    guard("media_session_action", || {
++        send(Action::MediaSessionAction { id, action })
++    })
++}
++
+ pub fn set_page_zoom(id: u32, zoom: f32) {
+     guard("set_page_zoom", || send(Action::SetPageZoom { id, zoom }))
+ }
+@@ -1591,6 +1676,12 @@ pub fn need_soft_keyboard(id: u32) -> bool {
+     })
+ }
+ 
++pub fn get_media_playback_state(id: u32) -> i32 {
++    guard("get_media_playback_state", || {
++        with_sync(id, |sync| sync.playback_state.load(Ordering::Relaxed))
++    })
++}
++
+ pub fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString) {
+     guard("resolve_js_dialog", || {
+         send(Action::ResolveJsDialog {
+diff --git a/ports/arkweb/test-app/entry/src/main/ets/entryability/EntryAbility.ets b/ports/arkweb/test-app/entry/src/main/ets/entryability/EntryAbility.ets
+index 43a0d16c8e6..9ce46891834 100644
+--- a/ports/arkweb/test-app/entry/src/main/ets/entryability/EntryAbility.ets
++++ b/ports/arkweb/test-app/entry/src/main/ets/entryability/EntryAbility.ets
+@@ -37,6 +37,9 @@ export default class EntryAbility extends UIAbility {
+         if (page === 'dialog') {
+           return 'pages/DialogPage';
+         }
++        if (page === 'controller') {
++          return 'pages/ControllerPage';
++        }
+       }
+     }
+     return 'pages/Index';
+diff --git a/ports/arkweb/test-app/entry/src/main/ets/pages/ControllerPage.ets b/ports/arkweb/test-app/entry/src/main/ets/pages/ControllerPage.ets
+new file mode 100644
+index 00000000000..a0853d9c63c
+--- /dev/null
++++ b/ports/arkweb/test-app/entry/src/main/ets/pages/ControllerPage.ets
+@@ -0,0 +1,185 @@
++import { webview } from '@kit.ArkWeb';
++import { router } from '@kit.ArkUI';
++import { hilog } from '@kit.PerformanceAnalysisKit';
++import { BusinessError } from '@kit.BasicServicesKit';
++
++const DOMAIN = 0x0000;
++
++// A page for exercising WebviewController APIs from the on-device pytest suite
++// (tools/test_controller.py). Each button invokes one controller API and reports the outcome
++// to hilog as `ArkWebTest: <name>=<value>`; the tests tap buttons via `uitest dumpLayout` and
++// assert on the log markers.
++function report(name: string, value: string): void {
++  hilog.info(DOMAIN, 'ArkWebTest', '%{public}s=%{public}s', name, value);
++}
++
++// Tall page so pageUp/pageDown have room to scroll; the title is asserted by getTitle.
++function tallPage(): string {
++  const html = `<html><head><title>ctrl-page</title>
++<meta name=viewport content="width=device-width,initial-scale=1"></head>
++<body style="margin:0;height:6000px;background:linear-gradient(#eeeeee,#333333)"></body></html>`;
++  return 'data:text/html,' + encodeURIComponent(html);
++}
++
++// Distinctly named and coloured pages for the backOrForward history tests.
++function colorPage(name: string, color: string): string {
++  const html = `<html><head><title>${name}</title></head>
++<body style="margin:0;background:${color}"></body></html>`;
++  return 'data:text/html,' + encodeURIComponent(html);
++}
++
++@Entry
++@Component
++struct ControllerPage {
++  @StorageProp('startUrl') startUrl: string = '';
++  private controller: webview.WebviewController = new webview.WebviewController();
++
++  private pageUrl(): string {
++    return this.startUrl.length > 0 && this.startUrl !== 'about:blank' ? this.startUrl : tallPage();
++  }
++
++  private invoke(name: string, action: () => string): void {
++    try {
++      report(name, action());
++    } catch (e) {
++      report(name, `error:${(e as BusinessError).code}`);
++    }
++  }
++
++  @Builder
++  navBar() {
++    Row({ space: 6 }) {
++      Button('Browser').height(32).onClick(() => router.replaceUrl({ url: 'pages/Index' }))
++      Button('Tabs').height(32).onClick(() => router.replaceUrl({ url: 'pages/TabsPage' }))
++      Button('Split').height(32).onClick(() => router.replaceUrl({ url: 'pages/SplitPage' }))
++      Button('Controller').height(32).enabled(false)
++    }
++    .width('100%')
++    .padding(6)
++  }
++
++  @Builder
++  apiButton(label: string, onClick: () => void) {
++    Button(label)
++      .height(30)
++      .fontSize(11)
++      .layoutWeight(1)
++      .type(ButtonType.Normal)
++      .onClick(onClick)
++  }
++
++  @Builder
++  buttonGrid() {
++    Column({ space: 2 }) {
++      Row({ space: 2 }) {
++        this.apiButton('getTitle', () => this.invoke('getTitle', () => this.controller.getTitle()))
++        this.apiButton('getProgress', () => this.invoke('getProgress', () => `${this.controller.getProgress()}`))
++        this.apiButton('getUrl', () => this.invoke('getUrl', () => this.controller.getUrl()))
++        this.apiButton('getOrigUrl', () => this.invoke('getOrigUrl', () => this.controller.getOriginalUrl()))
++      }
++      Row({ space: 2 }) {
++        this.apiButton('scrollY', () => {
++          try {
++            this.controller.runJavaScript('window.scrollY')
++              .then((result: string) => report('scrollY', result))
++              .catch((e: Object) => report('scrollY', 'rejected:' + JSON.stringify(e)));
++          } catch (e) {
++            report('scrollY', `error:${(e as BusinessError).code}`);
++          }
++        })
++        this.apiButton('pageDn', () => this.invoke('pageDn', () => {
++          this.controller.pageDown(false);
++          return 'ok';
++        }))
++        this.apiButton('pageDnEnd', () => this.invoke('pageDnEnd', () => {
++          this.controller.pageDown(true);
++          return 'ok';
++        }))
++        this.apiButton('pageUp', () => this.invoke('pageUp', () => {
++          this.controller.pageUp(false);
++          return 'ok';
++        }))
++        this.apiButton('pageUpTop', () => this.invoke('pageUpTop', () => {
++          this.controller.pageUp(true);
++          return 'ok';
++        }))
++      }
++      Row({ space: 2 }) {
++        this.apiButton('loadA', () => this.invoke('loadA', () => {
++          this.controller.loadUrl(colorPage('page-a', '#cc0000'));
++          return 'ok';
++        }))
++        this.apiButton('loadB', () => this.invoke('loadB', () => {
++          this.controller.loadUrl(colorPage('page-b', '#00cc00'));
++          return 'ok';
++        }))
++        this.apiButton('loadC', () => this.invoke('loadC', () => {
++          this.controller.loadUrl(colorPage('page-c', '#2244cc'));
++          return 'ok';
++        }))
++        this.apiButton('back2', () => this.invoke('back2', () => {
++          this.controller.backOrForward(-2);
++          return 'ok';
++        }))
++        this.apiButton('fwd1', () => this.invoke('fwd1', () => {
++          this.controller.backOrForward(1);
++          return 'ok';
++        }))
++      }
++      Row({ space: 2 }) {
++        this.apiButton('precompile', () => {
++          try {
++            this.controller.precompileJavaScript('https://test.invalid/t.js', 'console.log(1)',
++              { responseHeaders: [] })
++              .then((code: number) => report('precompile', `resolved:${code}`))
++              .catch((e: Object) => report('precompile', 'rejected:' + JSON.stringify(e)));
++          } catch (e) {
++            report('precompile', `error:${(e as BusinessError).code}`);
++          }
++        })
++        this.apiButton('mediaState', () => this.invoke('mediaState', () => `${this.controller.getMediaPlaybackState()}`))
++        this.apiButton('pauseMedia', () => this.invoke('pauseMedia', () => {
++          this.controller.pauseAllMedia();
++          return 'ok';
++        }))
++        this.apiButton('resumeMedia', () => this.invoke('resumeMedia', () => {
++          this.controller.resumeAllMedia();
++          return 'ok';
++        }))
++      }
++      // Cookie manager (WebCookieManager), for the page passed as the start URL.
++      Row({ space: 2 }) {
++        this.apiButton('getCookie', () => this.invoke('getCookie',
++          () => webview.WebCookieManager.fetchCookieSync(this.pageUrl())))
++        this.apiButton('setCookie', () => this.invoke('setCookie', () => {
++          webview.WebCookieManager.configCookieSync(this.pageUrl(), 'fromarkts=2');
++          return 'ok';
++        }))
++        this.apiButton('reload', () => this.invoke('reload', () => {
++          this.controller.refresh();
++          return 'ok';
++        }))
++      }
++    }
++    .width('100%')
++    .padding({ left: 6, right: 6, bottom: 4 })
++  }
++
++  build() {
++    Column() {
++      this.navBar()
++      this.buttonGrid()
++      Web({ src: this.pageUrl(), controller: this.controller })
++        .javaScriptAccess(true)
++        .layoutWeight(1)
++        .width('100%')
++        .onPageEnd((event) => {
++          if (event) {
++            report('pageEnd', event.url.substring(0, 80));
++          }
++        })
++    }
++    .width('100%')
++    .height('100%')
++  }
++}
+diff --git a/ports/arkweb/test-app/entry/src/main/resources/base/profile/main_pages.json b/ports/arkweb/test-app/entry/src/main/resources/base/profile/main_pages.json
+index 8f1b0ec1acb..f5cafddbfc7 100644
+--- a/ports/arkweb/test-app/entry/src/main/resources/base/profile/main_pages.json
++++ b/ports/arkweb/test-app/entry/src/main/resources/base/profile/main_pages.json
+@@ -3,6 +3,7 @@
+     "pages/Index",
+     "pages/TabsPage",
+     "pages/SplitPage",
+-    "pages/DialogPage"
++    "pages/DialogPage",
++    "pages/ControllerPage"
+   ]
+ }
+diff --git a/ports/arkweb/tools/conftest.py b/ports/arkweb/tools/conftest.py
+index 93f43cd9a19..28611cc915f 100644
+--- a/ports/arkweb/tools/conftest.py
++++ b/ports/arkweb/tools/conftest.py
+@@ -149,6 +149,28 @@ def find_center(tree: dict, text: str) -> tuple[int, int] | None:
+     return found[0] if found else None
+ 
+ 
++def web_box(tree: dict) -> tuple[int, int, int, int]:
++    """Return the screen bounds (left, top, right, bottom) of the first `Web` component.
++
++    Servo's content is a GPU surface, so this is the only way to know where the web area is
++    on pages whose chrome (button grids etc.) pushes it down.
++    """
++    found: list[tuple[int, int, int, int]] = []
++
++    def walk(node: dict) -> None:
++        attributes = node.get("attributes", node)
++        if attributes.get("type") == "Web":
++            bounds = re.match(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]", attributes.get("bounds", ""))
++            if bounds:
++                found.append(tuple(int(v) for v in bounds.groups()))  # type: ignore[arg-type]
++        for child in node.get("children", []):
++            walk(child)
++
++    walk(tree)
++    assert found, "no Web component in the layout tree"
++    return found[0]
++
++
+ def url_bar_text(tree: dict) -> str | None:
+     """Return the text of the app's URL bar (the first `TextInput` in the ArkUI tree)."""
+ 
+diff --git a/ports/arkweb/tools/test_controller.py b/ports/arkweb/tools/test_controller.py
+new file mode 100644
+index 00000000000..51741076a09
+--- /dev/null
++++ b/ports/arkweb/tools/test_controller.py
+@@ -0,0 +1,157 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""WebviewController API coverage for the wired inbound `NWeb` methods.
++
++Drives the test-app's ControllerPage (`--ps page controller`): a button grid where each
++button invokes one `WebviewController` API and reports the outcome to hilog as
++``ArkWebTest: <name>=<value>``. Tests tap buttons via the layout dump and assert on the
++markers; navigation effects are additionally verified with pixel checks (ground truth,
++independent of the getters under test). See conftest.py for harness notes.
++"""
++
++from __future__ import annotations
++
++import re
++import time
++
++import pytest
++
++from conftest import (
++    clear_log,
++    find_center,
++    is_blue,
++    is_green,
++    is_red,
++    read_log,
++    tap,
++    wait_for_pixel,
++    wait_log,
++    web_box,
++)
++
++MARKER = re.compile(r"ArkWebTest: (\w+)=(.*)")
++
++
++def press(device, tree: dict, label: str) -> None:
++    center = find_center(tree, label)
++    assert center, f"button {label!r} not found in the layout tree"
++    tap(device, center)
++
++
++def invoke(device, tree: dict, label: str, timeout: float = 8.0) -> str:
++    """Tap `label` and return the value of its ``ArkWebTest: <label>=...`` marker."""
++    clear_log(device)
++    press(device, tree, label)
++    pattern = re.compile(rf"ArkWebTest: {re.escape(label)}=(.*)")
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        match = pattern.search(read_log(device))
++        if match:
++            return match.group(1).strip()
++        time.sleep(0.4)
++    raise AssertionError(f"no ArkWebTest marker for {label!r} within {timeout}s")
++
++
++def scroll_y(device, tree: dict) -> float:
++    return float(invoke(device, tree, "scrollY"))
++
++
++def wait_scroll(device, tree: dict, predicate, tries: int = 8) -> float:
++    value = scroll_y(device, tree)
++    for _ in range(tries):
++        if predicate(value):
++            return value
++        time.sleep(0.5)
++        value = scroll_y(device, tree)
++    return value
++
++
++@pytest.fixture
++def controller_page(launch, device, dump):
++    launch(page="controller")
++    assert wait_log(device, "ArkWebTest: pageEnd="), "initial page never finished loading"
++    return device, dump()
++
++
++def test_sync_getters(controller_page):
++    device, tree = controller_page
++    assert invoke(device, tree, "getTitle") == "ctrl-page"
++    assert invoke(device, tree, "getProgress") == "100"
++    assert invoke(device, tree, "getUrl").startswith("data:")
++    # Servo tracks no pre-redirect URL; the wire returns the committed URL.
++    assert invoke(device, tree, "getOrigUrl").startswith("data:")
++
++
++def test_page_up_down(controller_page):
++    device, tree = controller_page
++    assert scroll_y(device, tree) == 0
++
++    assert invoke(device, tree, "pageDn") == "ok"
++    one_page = wait_scroll(device, tree, lambda v: v > 300)
++    assert 300 < one_page < 2000, f"pageDown(false) scrolled {one_page}, want ~one viewport"
++
++    assert invoke(device, tree, "pageDnEnd") == "ok"
++    bottom = wait_scroll(device, tree, lambda v: v > 4000)
++    assert bottom > 4000, f"pageDown(true) reached {bottom}, want near 6000-viewport"
++
++    assert invoke(device, tree, "pageUp") == "ok"
++    up_one = wait_scroll(device, tree, lambda v: v < bottom - 300)
++    assert up_one < bottom - 300, f"pageUp(false) reached {up_one}, want ~one viewport above {bottom}"
++
++    assert invoke(device, tree, "pageUpTop") == "ok"
++    top = wait_scroll(device, tree, lambda v: v < 5)
++    assert top < 5, f"pageUp(true) reached {top}, want 0"
++
++
++def test_back_or_forward(controller_page, cap):
++    device, tree = controller_page
++    left, top, right, bottom = web_box(tree)
++    center = ((left + right) // 2, (top + bottom) // 2)
++
++    assert invoke(device, tree, "loadA") == "ok"
++    assert is_red(wait_for_pixel(cap, center, is_red).getpixel(center)[:3]), "page-a (red) never showed"
++    assert invoke(device, tree, "loadB") == "ok"
++    wait_for_pixel(cap, center, is_green)
++    assert invoke(device, tree, "loadC") == "ok"
++    img = wait_for_pixel(cap, center, is_blue)
++    assert is_blue(img.getpixel(center)[:3]), "page-c (blue) never showed"
++
++    # backOrForward(-2): C -> A, verified by pixels (ground truth).
++    assert invoke(device, tree, "back2") == "ok"
++    img = wait_for_pixel(cap, center, is_red)
++    assert is_red(img.getpixel(center)[:3]), "backOrForward(-2) did not land on page-a"
++
++    # backOrForward(1): A -> B.
++    assert invoke(device, tree, "fwd1") == "ok"
++    img = wait_for_pixel(cap, center, is_green)
++    assert is_green(img.getpixel(center)[:3]), "backOrForward(1) did not land on page-b"
++
++    # Getters must be fresh after history traversal: servo fires notify_url_changed (and title
++    # updates) on back/forward without a fresh load — regression for the c3f4cf6 fix.
++    assert invoke(device, tree, "getTitle") == "page-b"
++
++
++def test_precompile_javascript(controller_page):
++    # The wire's contract: the ArkTS promise settles (previously it hung forever). The shim
++    # reports "unsupported" as a non-zero code, which the NAPI maps to a rejection.
++    device, tree = controller_page
++    assert invoke(device, tree, "precompile") == "rejected:-1"
++
++
++def test_media_playback_state(controller_page):
++    # No media session is active on a plain page: state must be NONE (0), and the
++    # pause/resume controls must be safely callable. A playing-state transition needs real
++    # on-device media playback -- deferred until media fixtures exist.
++    device, tree = controller_page
++    assert invoke(device, tree, "mediaState") == "0"
++    assert invoke(device, tree, "pauseMedia") == "ok"
++    assert invoke(device, tree, "resumeMedia") == "ok"
++    assert invoke(device, tree, "mediaState") == "0"
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/ports/arkweb/tools/test_cookies.py b/ports/arkweb/tools/test_cookies.py
+new file mode 100644
+index 00000000000..f04a10bec46
+--- /dev/null
++++ b/ports/arkweb/tools/test_cookies.py
+@@ -0,0 +1,84 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""Cookie manager (`WebCookieManager`) backed by Servo's cookie jar.
++
++Drives ControllerPage's cookie buttons against a page served by the host fixture server
++(cookies need an http(s) origin). The page gets one cookie from a `Set-Cookie` header and one
++from `document.cookie`; `fetchCookieSync` must return both, and a cookie set with
++`configCookieSync` must reach the server on the next load, which paints the page green.
++
++Not covered: persistence across app restarts and `fetchCookieSync` without any cookie, both
++known not to work yet.
++"""
++
++from __future__ import annotations
++
++import http.server
++import subprocess
++import threading
++
++import pytest
++
++from conftest import CMD_TIMEOUT, is_green, sample, wait_for_pixel, wait_log
++from test_controller import invoke
++
++COOKIE_PAGE = """<html><head><title>cookie-page</title></head>
++<body style="margin:0;background:#cc0000">
++<script>document.cookie = "fromjs=3; path=/";</script></body></html>"""
++COOKIE_OK_PAGE = "<html><head><title>cookie-ok</title></head><body style='margin:0;background:#00cc00'></body></html>"
++PROBE = (360, 900)
++
++
++class _CookieHandler(http.server.BaseHTTPRequestHandler):
++    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
++        cookies = self.headers.get("Cookie", "")
++        received = "fromarkts=2" in cookies
++        body = (COOKIE_OK_PAGE if received else COOKIE_PAGE).encode()
++        self.send_response(200)
++        self.send_header("Content-Type", "text/html")
++        self.send_header("Content-Length", str(len(body)))
++        self.send_header("Cache-Control", "no-store")
++        if not received:
++            self.send_header("Set-Cookie", "fromserver=1; Path=/")
++        self.end_headers()
++        self.wfile.write(body)
++
++    def log_message(self, format: str, *args) -> None:  # quiet
++        pass
++
++
++@pytest.fixture
++def cookie_server(device, hdc_target: str):
++    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CookieHandler)
++    port = server.server_address[1]
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    forward = f"tcp:{port}"
++    subprocess.run(["hdc", "-t", hdc_target, "rport", forward, forward], capture_output=True, timeout=CMD_TIMEOUT)
++    yield f"http://127.0.0.1:{port}/cookie"
++    subprocess.run(["hdc", "-t", hdc_target, "fport", "rm", forward, forward], capture_output=True, timeout=CMD_TIMEOUT)
++    server.shutdown()
++
++
++def test_cookie_manager_round_trip(launch, device, dump, cap, cookie_server):
++    launch(page="controller", url=cookie_server)
++    assert wait_log(device, "ArkWebTest: pageEnd="), "cookie page never finished loading"
++    tree = dump()
++
++    cookies = invoke(device, tree, "getCookie")
++    assert "fromserver=1" in cookies, f"Set-Cookie cookie missing: {cookies!r}"
++    assert "fromjs=3" in cookies, f"document.cookie cookie missing: {cookies!r}"
++
++    assert invoke(device, tree, "setCookie") == "ok"
++    assert "fromarkts=2" in invoke(device, tree, "getCookie")
++
++    assert invoke(device, tree, "reload") == "ok"
++    img = wait_for_pixel(cap, PROBE, is_green, timeout=10.0)
++    assert is_green(sample(img, PROBE)), "cookie set through WebCookieManager did not reach the server"
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/ports/arkweb/tools/test_focus.py b/ports/arkweb/tools/test_focus.py
+new file mode 100644
+index 00000000000..0419e3bff87
+--- /dev/null
++++ b/ports/arkweb/tools/test_focus.py
+@@ -0,0 +1,39 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""System focus of the Servo WebView.
++
++Servo has the embedder report system focus per WebView (`WebView::set_focused`), and the
++port gives it to a WebView when ACE focuses it and when it is built. A page in a newly
++built WebView must therefore see `document.hasFocus()` as in a focused window.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from conftest import data_url, is_green, sample, wait_for_pixel
++
++PAGE = """<html><body style="margin:0;height:100vh;background:#cc0000">
++<script>
++function paint() {
++  document.body.style.background = document.hasFocus() ? "#00cc00" : "#cc0000";
++}
++addEventListener("focus", paint);
++addEventListener("blur", paint);
++addEventListener("load", () => setTimeout(paint, 300));
++</script></body></html>"""
++PROBE = (360, 600)
++
++
++def test_new_webview_has_system_focus(launch, cap):
++    launch(url=data_url(PAGE))
++    img = wait_for_pixel(cap, PROBE, is_green, timeout=10.0)
++    assert is_green(sample(img, PROBE)), "document.hasFocus() is false in a newly built WebView"
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/ports/arkweb/tools/test_throttle.py b/ports/arkweb/tools/test_throttle.py
+new file mode 100644
+index 00000000000..96cb9d874ba
+--- /dev/null
++++ b/ports/arkweb/tools/test_throttle.py
+@@ -0,0 +1,81 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""Background/foreground rendering throttle.
++
++Regression guard for the `paused_ || occluded_` throttle composition in `ServoNWeb`
++(`OnPause`/`OnContinue` and `OnOccluded`/`OnUnoccluded` both feed `set_throttled`): sending
++the app to the background must throttle Servo, foregrounding must unthrottle. Observed via
++the `[arkweb] set_throttled` hilog marker.
++
++Throttling hides the WebView, which also stops Servo painting it, so foregrounding must
++show it again: the page has to repaint and handle input afterwards.
++
++True `OnOccluded` coverage would need another window fully covering the web surface (the RS
++occlusion callback); on the rk3568 that is not reliably triggerable from the harness, so
++only the pause path is asserted.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from conftest import (
++    clear_log,
++    data_url,
++    is_blue,
++    is_green,
++    key,
++    launch_page,
++    sample,
++    tap,
++    wait_for_pixel,
++    wait_log,
++)
++
++KEYCODE_HOME = 1
++
++PAGE = "<html><body style='background:#00cc00'>throttle</body></html>"
++
++TAP_PAGE = (
++    "<html><body style='margin:0;height:100vh;background:#00cc00' "
++    "onclick=\"document.body.style.background='#0000cc'\">throttle</body></html>"
++)
++PROBE = (360, 600)
++
++
++def test_background_throttles(launch, device):
++    launch(url=data_url(PAGE))
++    clear_log(device)
++
++    key(device, KEYCODE_HOME)
++    assert wait_log(device, "set_throttled id=1 true"), "backgrounding did not throttle Servo"
++
++    launch_page(device)  # foreground again (no force-stop: same process, OnContinue path)
++    assert wait_log(device, "set_throttled id=1 false"), "foregrounding did not unthrottle Servo"
++
++
++def test_foreground_repaints_and_takes_input(launch, device, cap):
++    launch(url=data_url(TAP_PAGE))
++    assert is_green(sample(wait_for_pixel(cap, PROBE, is_green), PROBE)), "page did not render"
++    clear_log(device)
++
++    key(device, KEYCODE_HOME)
++    assert wait_log(device, "set_throttled id=1 true"), "backgrounding did not throttle Servo"
++    # The test app ignores a start URL equal to the current one, so this foregrounds the
++    # same page instead of navigating.
++    launch_page(device, url=data_url(TAP_PAGE))
++    assert wait_log(device, "set_throttled id=1 false"), "foregrounding did not unthrottle Servo"
++
++    img = wait_for_pixel(cap, PROBE, is_green)
++    assert is_green(sample(img, PROBE)), "page not painted again after foregrounding"
++    tap(device, PROBE)
++    img = wait_for_pixel(cap, PROBE, is_blue)
++    assert is_blue(sample(img, PROBE)), "tap after foregrounding did not repaint the page"
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))

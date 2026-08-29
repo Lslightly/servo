@@ -1,0 +1,397 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 9 Jul 2026 21:33:41 +0000
+Subject: [PATCH] ports/arkweb: <input type=file> pickers
+
+Wire EmbedderControl::FilePicker to ACE's OnFileSelectorShow: hand the accept
+filters + multiplicity to the ACE handler (which routes to the system file
+picker by default), park the !Send FilePicker, and resolve it with the chosen
+paths via file_picker_continue/file_picker_cancel (select+submit, else dismiss).
+
+Add test_file_picker.py: tapping an <input type=file> reaches the control and
+opens a picker, and `multiple` reaches the shim (asserted via a hilog marker,
+since ACE's picker UI leaves no page-observable signal on the unhandled path).
+
+Validation: Test by running uv run ports/arkweb/tools/test_file_picker.py on a device.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/cpp/servo_client.h          |  5 ++
+ ports/arkweb/cpp/servo_handler_proxy.cpp | 64 ++++++++++++++++
+ ports/arkweb/cpp/servo_handler_proxy.h   |  2 +
+ ports/arkweb/src/bridge.rs               | 21 ++++++
+ ports/arkweb/src/runtime.rs              | 95 +++++++++++++++++++++++-
+ ports/arkweb/tools/test_file_picker.py   | 67 +++++++++++++++++
+ 6 files changed, 251 insertions(+), 3 deletions(-)
+ create mode 100644 ports/arkweb/tools/test_file_picker.py
+
+diff --git a/ports/arkweb/cpp/servo_client.h b/ports/arkweb/cpp/servo_client.h
+index 8837828b05c..4763a44ba3a 100644
+--- a/ports/arkweb/cpp/servo_client.h
++++ b/ports/arkweb/cpp/servo_client.h
+@@ -41,6 +41,11 @@ public:
+     virtual bool show_select_popup(std::uint64_t select_id, const std::string& labels,
+                                    std::int32_t selected, bool multiple, std::int32_t x,
+                                    std::int32_t y, std::int32_t width, std::int32_t height) const = 0;
++    // Asks ACE to show an <input type=file> picker (accept filters joined by '\n', empty for none;
++    // multiple = allow several files). Returns whether a handler took it; the chosen paths arrive
++    // via servo::arkweb::file_picker_continue / file_picker_cancel.
++    virtual bool show_file_picker(std::uint64_t picker_id, const std::string& accept_types,
++                                  bool multiple) const = 0;
+ };
+ 
+ }  // namespace servo::embedder
+diff --git a/ports/arkweb/cpp/servo_handler_proxy.cpp b/ports/arkweb/cpp/servo_handler_proxy.cpp
+index b6773715451..daca9b4a09e 100644
+--- a/ports/arkweb/cpp/servo_handler_proxy.cpp
++++ b/ports/arkweb/cpp/servo_handler_proxy.cpp
+@@ -6,8 +6,10 @@
+ 
+ #include "arkweb/src/bridge.rs.h"
+ #include "ohos_nweb/nweb_console_log.h"
++#include "ohos_nweb/nweb_file_selector_params.h"
+ #include "ohos_nweb/nweb_js_dialog_result.h"
+ #include "ohos_nweb/nweb_select_popup_menu.h"
++#include "ohos_nweb/nweb_value_callback.h"
+ 
+ namespace servo::arkweb {
+ 
+@@ -207,6 +209,68 @@ bool NWebHandlerProxy::show_select_popup(std::uint64_t select_id, const std::str
+     return true;
+ }
+ 
++namespace {
++
++// The <input type=file> parameters handed to ACE / the app's file-selector handler.
++class ServoFileSelectorParams : public NWebFileSelectorParams {
++public:
++    ServoFileSelectorParams(std::vector<std::string> accept_types, bool multiple)
++        : accept_types_(std::move(accept_types)), multiple_(multiple) {}
++    const std::string Title() override { return {}; }
++    FileSelectorMode Mode() override {
++        return multiple_ ? FILE_OPEN_MULTIPLE_MODE : FILE_OPEN_MODE;
++    }
++    const std::string DefaultFilename() override { return {}; }
++    const AcceptTypeList AcceptType() override { return accept_types_; }
++    bool IsCapture() override { return false; }
++
++private:
++    std::vector<std::string> accept_types_;
++    bool multiple_;
++};
++
++// The value callback ACE / the app invokes with the chosen file paths (an empty list means the
++// selection was cancelled), routed back to the parked Servo FilePicker by id.
++class ServoFileSelectorCallback : public NWebStringVectorValueCallback {
++public:
++    explicit ServoFileSelectorCallback(std::uint64_t picker_id) : picker_id_(picker_id) {}
++    void OnReceiveValue(const std::vector<std::string>& value) override {
++        if (value.empty()) {
++            servo::arkweb::file_picker_cancel(picker_id_);
++        } else {
++            servo::arkweb::file_picker_continue(picker_id_, value);
++        }
++    }
++
++private:
++    std::uint64_t picker_id_;
++};
++}  // namespace
++
++bool NWebHandlerProxy::show_file_picker(std::uint64_t picker_id, const std::string& accept_types,
++                                        bool multiple) const {
++    auto h = handler();
++    if (!h) {
++        return false;
++    }
++    std::vector<std::string> types;
++    if (!accept_types.empty()) {
++        std::size_t start = 0;
++        while (start <= accept_types.size()) {
++            std::size_t end = accept_types.find('\n', start);
++            types.push_back(accept_types.substr(
++                start, end == std::string::npos ? std::string::npos : end - start));
++            if (end == std::string::npos) {
++                break;
++            }
++            start = end + 1;
++        }
++    }
++    auto params = std::make_shared<ServoFileSelectorParams>(std::move(types), multiple);
++    auto callback = std::make_shared<ServoFileSelectorCallback>(picker_id);
++    return h->OnFileSelectorShow(callback, params);
++}
++
+ bool NWebHandlerProxy::show_js_dialog(std::uint64_t dialog_id, std::int32_t kind,
+                                       const std::string& message,
+                                       const std::string& default_value) const {
+diff --git a/ports/arkweb/cpp/servo_handler_proxy.h b/ports/arkweb/cpp/servo_handler_proxy.h
+index cede766ef39..355f946a38e 100644
+--- a/ports/arkweb/cpp/servo_handler_proxy.h
++++ b/ports/arkweb/cpp/servo_handler_proxy.h
+@@ -34,6 +34,8 @@ public:
+     bool show_select_popup(std::uint64_t select_id, const std::string& labels, std::int32_t selected,
+                            bool multiple, std::int32_t x, std::int32_t y, std::int32_t width,
+                            std::int32_t height) const override;
++    bool show_file_picker(std::uint64_t picker_id, const std::string& accept_types,
++                          bool multiple) const override;
+ 
+ private:
+     std::shared_ptr<OHOS::NWeb::NWebHandler> handler() const;
+diff --git a/ports/arkweb/src/bridge.rs b/ports/arkweb/src/bridge.rs
+index ada6d518d35..5e8bd4a71de 100644
+--- a/ports/arkweb/src/bridge.rs
++++ b/ports/arkweb/src/bridge.rs
+@@ -109,6 +109,16 @@ pub mod ffi {
+             width: i32,
+             height: i32,
+         ) -> bool;
++        /// Ask ACE to show a `<input type=file>` picker. `accept_types` are the accept filter
++        /// patterns joined by `\n` (empty for none); `multiple` allows selecting several files.
++        /// Returns whether a handler took it; the chosen paths come back via
++        /// `file_picker_continue`/`file_picker_cancel`.
++        fn show_file_picker(
++            self: &WebViewClient,
++            picker_id: u64,
++            accept_types: &CxxString,
++            multiple: bool,
++        ) -> bool;
+     }
+ }
+ 
+@@ -128,6 +138,11 @@ pub mod ffi_arkweb {
+         fn select_popup_continue(select_id: u64, indices: &CxxVector<i32>);
+         /// The `<select>` popup was dismissed without a choice.
+         fn select_popup_cancel(select_id: u64);
++        /// Deliver the chosen file paths from ACE back to the parked `FilePicker` (see
++        /// `show_file_picker`).
++        fn file_picker_continue(picker_id: u64, paths: &CxxVector<CxxString>);
++        /// The file picker was dismissed without a selection.
++        fn file_picker_cancel(picker_id: u64);
+     }
+ 
+     unsafe extern "C++" {
+@@ -247,3 +262,9 @@ fn select_popup_continue(select_id: u64, indices: &CxxVector<i32>) {
+ fn select_popup_cancel(select_id: u64) {
+     crate::runtime::select_popup_cancel(select_id)
+ }
++fn file_picker_continue(picker_id: u64, paths: &CxxVector<CxxString>) {
++    crate::runtime::file_picker_continue(picker_id, paths)
++}
++fn file_picker_cancel(picker_id: u64) {
++    crate::runtime::file_picker_cancel(picker_id)
++}
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index da48ccdc9cf..6291c916c6e 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -34,9 +34,9 @@ use raw_window_handle::{
+ };
+ use servo::{
+     CompositionEvent, CompositionState, ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D,
+-    EmbedderControl, EmbedderControlId, EventLoopWaker, ImeEvent, InputEvent, InputMethodControl,
+-    InputMethodType, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts,
+-    Preferences, RefreshDriver, RenderingContext, Scroll, SelectElement,
++    EmbedderControl, EmbedderControlId, EventLoopWaker, FilePicker, ImeEvent, InputEvent,
++    InputMethodControl, InputMethodType, JSValue, Key, KeyState, KeyboardEvent, LoadStatus,
++    NamedKey, Opts, Preferences, RefreshDriver, RenderingContext, Scroll, SelectElement,
+     SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog, TouchEvent, TouchEventType,
+     TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
+ };
+@@ -162,6 +162,13 @@ enum Action {
+         indices: Vec<usize>,
+         cancelled: bool,
+     },
++    /// The user chose files (or dismissed) an `<input type=file>` picker (from the ACE
++    /// file-selector value-callback thread).
++    ResolveFilePicker {
++        picker_id: u64,
++        paths: Vec<String>,
++        cancelled: bool,
++    },
+     GetCookie {
+         url: String,
+         include_http_only: bool,
+@@ -266,6 +273,31 @@ fn resolve_select_popup(select_id: u64, indices: Vec<usize>, cancelled: bool) {
+     });
+ }
+ 
++static NEXT_FILE_PICKER_ID: AtomicU64 = AtomicU64::new(1);
++
++thread_local! {
++    /// `<input type=file>` pickers awaiting a selection. Like the other `!Send` embedder controls
++    /// the `FilePicker` is parked on the servo thread; ACE (or the app's file-selector handler)
++    /// reports the chosen paths through the value callback, routed back as an `Action`.
++    static FILE_PICKERS: RefCell<HashMap<u64, FilePicker>> = RefCell::new(HashMap::new());
++}
++
++/// Resolve a parked file picker. On a selection, set the chosen paths and submit; otherwise
++/// dismiss it (leaving the `<input>` unchanged).
++fn resolve_file_picker(picker_id: u64, paths: Vec<String>, cancelled: bool) {
++    FILE_PICKERS.with(|pickers| {
++        if let Some(mut picker) = pickers.borrow_mut().remove(&picker_id) {
++            if cancelled || paths.is_empty() {
++                picker.dismiss();
++            } else {
++                let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
++                picker.select(&paths);
++                picker.submit();
++            }
++        }
++    });
++}
++
+ /// Resolve a parked JS dialog with the user's response and unblock the page's script. A prompt
+ /// carries the entered text on confirm; everything else confirms or cancels.
+ fn resolve_parked_dialog(dialog_id: u64, confirmed: bool, value: String) {
+@@ -699,6 +731,11 @@ impl ServoThread {
+                 indices,
+                 cancelled,
+             } => resolve_select_popup(select_id, indices, cancelled),
++            Action::ResolveFilePicker {
++                picker_id,
++                paths,
++                cancelled,
++            } => resolve_file_picker(picker_id, paths, cancelled),
+             Action::GetCookie {
+                 url,
+                 include_http_only,
+@@ -1181,6 +1218,35 @@ impl WebViewDelegate for ArkWebViewDelegate {
+                     resolve_select_popup(select_id, Vec::new(), true);
+                 }
+             },
++            // A `<input type=file>` picker. Hand ACE the accept filters + multiplicity, park the
++            // (`!Send`) picker, and let the file-selector value callback resolve it. ACE has no
++            // built-in picker UI, so with no app file-selector handler this resolves as dismissed
++            // (the `<input>` keeps its previous files).
++            EmbedderControl::FilePicker(picker) => {
++                let picker_id = NEXT_FILE_PICKER_ID.fetch_add(1, Ordering::Relaxed);
++                let accept: Vec<String> = picker
++                    .filter_patterns()
++                    .iter()
++                    .map(|pattern| pattern.0.clone())
++                    .collect();
++                let multiple = picker.allow_select_multiple();
++                FILE_PICKERS.with(|pickers| pickers.borrow_mut().insert(picker_id, picker));
++                let handled = match self.client.as_ref() {
++                    Some(client) => {
++                        cxx::let_cxx_string!(accept = accept.join("\n"));
++                        client.show_file_picker(picker_id, &accept, multiple)
++                    },
++                    None => false,
++                };
++                // ACE has no built-in file picker, so with no app handler this path is otherwise
++                // invisible on screen; log it so the wiring stays observable (and testable).
++                info!(
++                    "[arkweb] file picker: accept={accept:?} multiple={multiple} handled={handled}"
++                );
++                if !handled {
++                    resolve_file_picker(picker_id, Vec::new(), true);
++                }
++            },
+             _ => {},
+         }
+     }
+@@ -1536,6 +1602,29 @@ pub fn select_popup_cancel(select_id: u64) {
+     })
+ }
+ 
++pub fn file_picker_continue(picker_id: u64, paths: &CxxVector<CxxString>) {
++    guard("file_picker_continue", || {
++        send(Action::ResolveFilePicker {
++            picker_id,
++            paths: paths
++                .iter()
++                .map(|path| path.to_string_lossy().into_owned())
++                .collect(),
++            cancelled: false,
++        })
++    })
++}
++
++pub fn file_picker_cancel(picker_id: u64) {
++    guard("file_picker_cancel", || {
++        send(Action::ResolveFilePicker {
++            picker_id,
++            paths: Vec::new(),
++            cancelled: true,
++        })
++    })
++}
++
+ /// Translate an OHOS key event into a servo `KeyboardEvent`. `action`: 0 = down, 1 = up (ArkUI
+ /// `KeyAction`). `unicode` is the character value if any (0 otherwise). Returns whether the key was
+ /// mapped and dispatched, so ACE can fall back to its own handling for keys we do not consume.
+diff --git a/ports/arkweb/tools/test_file_picker.py b/ports/arkweb/tools/test_file_picker.py
+new file mode 100644
+index 00000000000..f5bef70dacc
+--- /dev/null
++++ b/ports/arkweb/tools/test_file_picker.py
+@@ -0,0 +1,67 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""`<input type=file>` pickers for the Servo ArkWeb backend.
++
++Servo surfaces the picker via `show_embedder_control(EmbedderControl::FilePicker)`; the shim
++bridges it to ACE's `OnFileSelectorShow(callback, params)` and routes the chosen paths back
++through the value callback (`file_picker_continue`/`file_picker_cancel`).
++
++ACE's ArkTS `Web` layer takes `OnFileSelectorShow` by default (even with no app
++`onShowFileSelector`) and routes it to the system file picker -- so the shim reports
++`handled=true` and a real picker opens. There is no page-observable signal to assert on
++(Servo does not fire a `cancel` event on dismiss; only a real selection fires
++`input`/`change`), so this smoke test asserts the wiring via a hilog marker the shim logs
++when the control is shown -- proving tap -> activation -> embedder control -> shim -> ACE.
++The `accept`/`multiple` variant checks those attributes reach the shim. Each test taps BACK
++afterwards to dismiss the system picker it opened. See conftest.py for the harness notes.
++"""
++
++import time
++
++import pytest
++
++from conftest import back, data_url, tap, wait_log
++
++# Viewport-filling input so a centre tap is guaranteed to hit it.
++PLAIN = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
++<body style="margin:0"><input type=file style="width:100vw;height:100vh;font-size:40px"></body>"""
++
++MULTI = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
++<body style="margin:0"><input type=file multiple accept="image/png,image/jpeg"
++ style="width:100vw;height:100vh;font-size:40px"></body>"""
++
++TAP_XY = (360, 640)
++
++
++def test_file_input_opens_picker(launch):
++    device = launch(url=data_url(PLAIN))
++    time.sleep(1.5)  # let the first layout settle before activating the input
++    tap(device, TAP_XY)
++    try:
++        assert wait_log(device, "[arkweb] file picker"), (
++            "tapping <input type=file> did not reach the FilePicker embedder control"
++        )
++        # ACE's Web layer takes it by default and shows the system picker.
++        assert wait_log(device, "handled=true"), "ACE did not route the file input to a picker"
++    finally:
++        back(device)  # dismiss the system file picker
++
++
++def test_file_input_multiple_and_accept(launch):
++    device = launch(url=data_url(MULTI))
++    time.sleep(1.5)
++    tap(device, TAP_XY)
++    try:
++        assert wait_log(device, "[arkweb] file picker"), "multiple <input type=file> did not open the picker"
++        # `multiple` must reach the shim (accept filters ride the same path).
++        assert wait_log(device, "multiple=true"), "the input's `multiple` did not reach the shim"
++    finally:
++        back(device)
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))

@@ -1,0 +1,17 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <55576758+jschwe@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 03:02:28 +0000
+Subject: [PATCH] script: ClearKeptObjects in microtask checkpoint (#48739)
+
+Dropped in favour of upstream 10c8149c3c8 (#48739), which this commit
+backported and which every base from base/2026-10-13 on contains.
+Equivalence: `git log --cherry-mark base/2026-10-13...pre-sync/2026-10-13`
+marks this commit `=` (identical patch-id to 10c8149c3c8), and it applies
+empty on base/2026-10-13. Verified by the sync of 2026-10-13.
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: 10c8149c3c8
+Validation: applies empty on base/2026-10-13; patch-id identity with 10c8149c3c8 (`git log --cherry-mark`). The leak checks of the original Validation were not re-run on plain upstream; equivalence rests on the identical patch.
+AI-assisted: Yes (agent session; 2026-10-13 sync -- applied empty, since upstream 10c8149c3c8 is the identical patch; kept as a placeholder)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>

@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 11 Oct 2026 07:28:07 +0000
+Subject: [PATCH] mach: Add a --js-engine option to build on QuickJS
+
+`./mach build --js-engine quickjs`, or `js-engine = "quickjs"` in
+.servobuild, builds Servo on servo-quickjs, the QuickJS implementation
+of the mozjs API. mach passes support/quickjs/cargo-config.toml, which
+patches mozjs to the servo-quickjs commit it pins, to every cargo
+command of a build configuration, also with `-p`, and enables the
+js-quickjs feature where it passes features. Before, a QuickJS build
+needed a hand-written patch in .cargo/config.toml, and the pinned commit
+lived in quickjs.yml, from where the runner image and the servo-ohos-wpt
+nightly had to extract it.
+
+The patch replaces mozjs in Cargo.lock, so a QuickJS build can't be
+`--locked`, and a cargo command without the configuration, e.g. from
+rust-analyzer, switches Cargo.lock back to SpiderMonkey. SpiderMonkey
+builds are unchanged. quickjs.yml builds with the option, and its
+servo-quickjs-ref input now replaces the commit in the file. A change
+under support/quickjs/ runs only the QuickJS build.
+
+Fork note: the pinned commit is bumped with mozjs at each sync, as it
+was in quickjs.yml.
+
+Validation: `./mach build --release --js-engine quickjs` built servoshell on servo-quickjs 72fa2b6 (cargo's command had the configuration and js-quickjs; the binary has the QuickJS symbols and no SpiderMonkey ones) and `xvfb-run ./mach smoketest --release` passed. With a nonexistent extra `--config`, mach printed the expected cargo commands for `--js-engine quickjs`, for js-engine = "quickjs" in .servobuild, for no option (unchanged) and for `--js-engine spidermonkey` overriding .servobuild; an unknown value in .servobuild is an error. `./mach check --js-engine quickjs -p servo-url` left the QuickJS Cargo.lock. `./mach test-scripts` and `./mach test-tidy` pass; actionlint reports for quickjs.yml only its two findings on ohos-main.
+AI-assisted: Yes (agent session; written by the agent, which also ran the builds and checks above)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/quickjs.yml     | 15 +++++++--------
+ python/servo/command_base.py      | 27 +++++++++++++++++++++++++++
+ python/servo/pr_jobs.py           |  4 ++--
+ servobuild.example                |  5 +++++
+ support/quickjs/cargo-config.toml |  8 ++++++++
+ 5 files changed, 49 insertions(+), 10 deletions(-)
+ create mode 100644 support/quickjs/cargo-config.toml
+
+diff --git a/.github/workflows/quickjs.yml b/.github/workflows/quickjs.yml
+index ee77453600e..2a29c84798e 100644
+--- a/.github/workflows/quickjs.yml
++++ b/.github/workflows/quickjs.yml
+@@ -44,9 +44,8 @@ env:
+   RUST_BACKTRACE: 1
+   SHELL: /bin/bash
+   SERVO_QUICKJS_URL: https://github.com/openharmony-rs/servo-quickjs
+-  # The servo-quickjs commit this tree builds with. Bump it with mozjs at each sync, so that older
+-  # commits keep building with the shim they were tested with.
+-  SERVO_QUICKJS_REF: ${{ inputs.servo-quickjs-ref || '72fa2b6697a60889969397313ad23405196c5b4e' }}
++  # Replaces the servo-quickjs commit pinned in support/quickjs/cargo-config.toml, if set.
++  SERVO_QUICKJS_REF: ${{ inputs.servo-quickjs-ref }}
+   PROFILE: ${{ inputs.profile || 'release' }}
+   RUN_WPT: ${{ github.event_name == 'schedule' || inputs.wpt }}
+ 
+@@ -101,9 +100,8 @@ jobs:
+             echo "RUSTC_WRAPPER=sccache"
+             echo "CARGO_INCREMENTAL=0"
+           } >> "$GITHUB_ENV"
+-      # `mach` cannot pass `--config`, so the patch goes into `.cargo/config.toml`. It changes
+-      # Cargo.lock, so the build below is not `--locked`.
+-      - name: Patch mozjs to the QuickJS shim
++      - name: Use another servo-quickjs commit
++        if: ${{ env.SERVO_QUICKJS_REF != '' }}
+         run: |
+           refs=$(git ls-remote "$SERVO_QUICKJS_URL")
+           rev=
+@@ -116,10 +114,11 @@ jobs:
+             echo "::error::$SERVO_QUICKJS_REF is not a branch or tag of $SERVO_QUICKJS_URL, nor a full commit hash"
+             exit 1
+           fi
+-          printf '\n[patch.crates-io]\nmozjs = { git = "%s", rev = "%s" }\n' "$SERVO_QUICKJS_URL" "$rev" >> .cargo/config.toml
++          sed -i -E "s/rev = \"[0-9a-f]{40}\"/rev = \"$rev\"/" support/quickjs/cargo-config.toml
+           echo "servo-quickjs: \`$SERVO_QUICKJS_REF\` ($rev)" >> "$GITHUB_STEP_SUMMARY"
++      # `--js-engine quickjs` changes Cargo.lock, so the build is not `--locked`.
+       - name: Build
+-        run: ./mach build --profile "$PROFILE" --features js-quickjs
++        run: ./mach build --profile "$PROFILE" --js-engine quickjs
+       - name: Smoketest
+         run: xvfb-run ./mach smoketest --profile "$PROFILE"
+       - name: Build mach package
+diff --git a/python/servo/command_base.py b/python/servo/command_base.py
+index 7953aa8c25e..0a82680765f 100644
+--- a/python/servo/command_base.py
++++ b/python/servo/command_base.py
+@@ -41,6 +41,9 @@ from python.servo.platform.build_target import SanitizerKind
+ from python.servo.util import get_target_dir
+ 
+ ASAN_LEAK_SUPPRESSION_FILE = "support/suppressed_leaks_for_asan.txt"
++JS_ENGINES = ["spidermonkey", "quickjs"]
++# The Cargo configuration of `--js-engine quickjs`, with the pinned servo-quickjs commit.
++QUICKJS_CARGO_CONFIG = "support/quickjs/cargo-config.toml"
+ 
+ 
+ @dataclass
+@@ -275,6 +278,7 @@ class CommandBase(object):
+         self.enable_media = False
+         self.enable_code_coverage = False
+         self.features = []
++        self.js_engine = "spidermonkey"
+ 
+         # Default to native build target. This will later be overriden
+         # by `configure_build_target`
+@@ -322,6 +326,7 @@ class CommandBase(object):
+         self.config["build"].setdefault("debug-assertions", False)
+         self.config["build"].setdefault("debug-mozjs", False)
+         self.config["build"].setdefault("media-stack", "auto")
++        self.config["build"].setdefault("js-engine", "spidermonkey")
+         self.config["build"].setdefault("ccache", "")
+         self.config["build"].setdefault("rustflags", "")
+         self.config["build"].setdefault("incremental", None)
+@@ -528,6 +533,14 @@ class CommandBase(object):
+                     choices=["gstreamer", "dummy"],
+                     help="Which media stack to use",
+                 ),
++                CommandArgument(
++                    "--js-engine",
++                    default=None,
++                    group="Feature Selection",
++                    choices=JS_ENGINES,
++                    help="Which JavaScript engine to build with. quickjs replaces mozjs with servo-quickjs "
++                    "and changes Cargo.lock",
++                ),
+                 CommandArgument(
+                     "--debug-mozjs",
+                     default=False,
+@@ -600,6 +613,7 @@ class CommandBase(object):
+                     self.configure_build_target(kwargs)
+                     self.features = kwargs.get("features", None) or []
+                     self.enable_media = self.is_media_enabled(kwargs["media_stack"])
++                    self.js_engine = self.configure_js_engine(kwargs["js_engine"])
+ 
+                 if build_configuration or binary_selection:
+                     self.enable_code_coverage = kwargs.pop("coverage", False)
+@@ -751,6 +765,13 @@ class CommandBase(object):
+ 
+         return media_stack != "dummy"
+ 
++    def configure_js_engine(self, js_engine: Optional[str]) -> str:
++        js_engine = js_engine or self.config["build"]["js-engine"]
++        if js_engine not in JS_ENGINES:
++            print(f"Error: unknown js-engine `{js_engine}` in .servobuild, expected one of {', '.join(JS_ENGINES)}")
++            sys.exit(1)
++        return js_engine
++
+     def run_cargo_build_like_command(
+         self,
+         command: str,
+@@ -793,6 +814,10 @@ class CommandBase(object):
+         elif target_override:
+             args += ["--target", target_override]
+ 
++        # Also with `-p`, so that every command resolves the same Cargo.lock.
++        if self.js_engine == "quickjs":
++            args += ["--config", path.join(self.context.topdir, QUICKJS_CARGO_CONFIG)]
++
+         features = []
+ 
+         if use_crown:
+@@ -816,6 +841,8 @@ class CommandBase(object):
+             features += list(self.features)
+             if self.enable_media:
+                 features.append("media-gstreamer")
++            if self.js_engine == "quickjs":
++                features.append("js-quickjs")
+             if self.config["build"]["debug-mozjs"] or debug_mozjs:
+                 features.append("debugmozjs")
+ 
+diff --git a/python/servo/pr_jobs.py b/python/servo/pr_jobs.py
+index 0b3016dab2a..e4f44d365be 100644
+--- a/python/servo/pr_jobs.py
++++ b/python/servo/pr_jobs.py
+@@ -64,7 +64,7 @@ OHOS_ONLY = (
+ )
+ 
+ # Files that only the QuickJS build reads.
+-QUICKJS_ONLY = (".github/workflows/quickjs.yml",)
++QUICKJS_ONLY = (".github/workflows/quickjs.yml", "support/quickjs/")
+ 
+ # Test and expectation roots, mapped to the directory that holds their tests.
+ WPT_ROOTS = {
+@@ -216,7 +216,7 @@ class TestSelect(unittest.TestCase):
+ 
+     def test_quickjs_workflow(self) -> None:
+         self.assertEqual(
+-            self.jobs(".github/workflows/quickjs.yml", "ports/arkweb/src/lib.rs"),
++            self.jobs(".github/workflows/quickjs.yml", "support/quickjs/cargo-config.toml", "ports/arkweb/src/lib.rs"),
+             [self.LINUX, self.LINT, self.OHOS, self.QUICKJS],
+         )
+ 
+diff --git a/servobuild.example b/servobuild.example
+index a43894a9e96..315faa55f4a 100644
+--- a/servobuild.example
++++ b/servobuild.example
+@@ -19,6 +19,11 @@ android = false
+ # Enable `debug_assert!` macros in release mode
+ debug-assertions = true
+ 
++# Set "js-engine" or use `mach build --js-engine` to pick the JavaScript engine: "spidermonkey" or
++# "quickjs", which builds on servo-quickjs (see support/quickjs/cargo-config.toml) and changes
++# Cargo.lock.
++js-engine = "spidermonkey"
++
+ # Set "debug-mozjs" or use `mach build --debug-mozjs` to build a debug spidermonkey.
+ debug-mozjs = false
+ 
+diff --git a/support/quickjs/cargo-config.toml b/support/quickjs/cargo-config.toml
+new file mode 100644
+index 00000000000..a39f5ff8a7f
+--- /dev/null
++++ b/support/quickjs/cargo-config.toml
+@@ -0,0 +1,8 @@
++# The Cargo configuration of `./mach build --js-engine quickjs`. It replaces mozjs with
++# servo-quickjs, which implements the mozjs API on QuickJS.
++#
++# Bump the commit with mozjs at each sync, so that older commits keep building with the shim they
++# were tested with. The shim's version must match the mozjs version that Cargo.toml requires, or
++# Cargo leaves the patch unused.
++[patch.crates-io]
++mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "72fa2b6697a60889969397313ad23405196c5b4e" }

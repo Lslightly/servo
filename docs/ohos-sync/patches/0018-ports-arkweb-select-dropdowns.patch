@@ -1,0 +1,700 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 9 Jul 2026 20:24:27 +0000
+Subject: [PATCH] ports/arkweb: <select> dropdowns
+
+Bridge Servo's show_embedder_control(EmbedderControl::SelectElement) to
+ACE's OnSelectPopupMenu. Unlike JS dialogs, ACE renders the dropdown menu
+itself (via its overlay manager) and drives the callback, so no app
+handler is needed: the shim hands ACE the flattened option labels + the
+select's on-screen rect (concrete NWebSelectPopupMenuParam / MenuItem /
+MenuBound), and ACE returns the picked option indices through an
+NWebSelectPopupMenuCallback -> select_popup_continue/cancel -> an Action.
+The (!Send) SelectElement is parked on the servo thread keyed by an id;
+on a pick we select(indices) + submit(), on cancel we drop it (Drop
+resubmits the unchanged selection). Option indices are the flat DOM order,
+matching servo's option ids.
+
+test_select.py opens the ACE menu, finds the option row via uitest
+dumpLayout, taps it, and asserts the page's onchange fired (body colour).
+
+Add wait_for_pixel / wait_until_stable to conftest and use them wherever a test
+asserts on the result of a discrete interaction -- the select pick, but equally
+the dialog resolve and link/back navigation, which had a fixed sleep-then-
+capture. Polling for the expected frame removes the race with its present: a
+lone capture is the premature-capture artifact that earlier read as blank frames
+/ render latency.
+
+hdc_py.cmd forwards to subprocess.run, which has no default timeout, so a servo
+bug that wedges the ArkUI thread (blocking `uitest dumpLayout`) could hang a test
+inside a command, never reaching the poll helpers' wall-clock deadlines. Pass a
+30s timeout through sh() so such a hang surfaces as a TimeoutExpired failure
+instead of stalling the run.
+
+Verified on rk3568: tapping a <select> opens the ACE dropdown and picking
+an option fires the page's change event with the chosen value (no crash;
+the servo-thread OnSelectPopupMenu call, which ACE does not marshal, is
+tolerated). Item font size/height are set so the labels render.
+
+Validation: Test by running uv run ports/arkweb/tools/test_select.py on a device, then the full suite (uv run --with pytest --with hdc-py --with pillow python -m pytest ports/arkweb/tools); it must pass without hangs.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/cpp/servo_client.h          |   6 ++
+ ports/arkweb/cpp/servo_handler_proxy.cpp |  98 ++++++++++++++++++++++
+ ports/arkweb/cpp/servo_handler_proxy.h   |   3 +
+ ports/arkweb/src/bridge.rs               |  27 +++++-
+ ports/arkweb/src/runtime.rs              | 102 ++++++++++++++++++++++-
+ ports/arkweb/tools/conftest.py           |  64 +++++++++++++-
+ ports/arkweb/tools/test_dialogs.py       |  26 +++---
+ ports/arkweb/tools/test_navigation.py    |  15 ++--
+ ports/arkweb/tools/test_select.py        |  80 ++++++++++++++++++
+ 9 files changed, 392 insertions(+), 29 deletions(-)
+ create mode 100644 ports/arkweb/tools/test_select.py
+
+diff --git a/ports/arkweb/cpp/servo_client.h b/ports/arkweb/cpp/servo_client.h
+index 3e76f68e615..8837828b05c 100644
+--- a/ports/arkweb/cpp/servo_client.h
++++ b/ports/arkweb/cpp/servo_client.h
+@@ -35,6 +35,12 @@ public:
+     virtual bool show_js_dialog(std::uint64_t dialog_id, std::int32_t kind,
+                                 const std::string& message,
+                                 const std::string& default_value) const = 0;
++    // Asks ACE to show a <select> dropdown (labels joined by '\n'; selected = current index or -1;
++    // x/y/width/height = the select's on-screen rect). ACE renders the menu itself and reports the
++    // choice via servo::arkweb::select_popup_continue / select_popup_cancel.
++    virtual bool show_select_popup(std::uint64_t select_id, const std::string& labels,
++                                   std::int32_t selected, bool multiple, std::int32_t x,
++                                   std::int32_t y, std::int32_t width, std::int32_t height) const = 0;
+ };
+ 
+ }  // namespace servo::embedder
+diff --git a/ports/arkweb/cpp/servo_handler_proxy.cpp b/ports/arkweb/cpp/servo_handler_proxy.cpp
+index 36347c812a3..b6773715451 100644
+--- a/ports/arkweb/cpp/servo_handler_proxy.cpp
++++ b/ports/arkweb/cpp/servo_handler_proxy.cpp
+@@ -7,6 +7,7 @@
+ #include "arkweb/src/bridge.rs.h"
+ #include "ohos_nweb/nweb_console_log.h"
+ #include "ohos_nweb/nweb_js_dialog_result.h"
++#include "ohos_nweb/nweb_select_popup_menu.h"
+ 
+ namespace servo::arkweb {
+ 
+@@ -109,6 +110,103 @@ void NWebHandlerProxy::update_text_field_status(bool show_keyboard, bool attach_
+     }
+ }
+ 
++namespace {
++using namespace OHOS::NWeb;
++
++class ServoSelectMenuBound : public NWebSelectMenuBound {
++public:
++    ServoSelectMenuBound(int x, int y, int width, int height)
++        : x_(x), y_(y), width_(width), height_(height) {}
++    int GetX() override { return x_; }
++    int GetY() override { return y_; }
++    int GetWidth() override { return width_; }
++    int GetHeight() override { return height_; }
++
++private:
++    int x_, y_, width_, height_;
++};
++
++// One `<option>` presented to ACE's dropdown menu.
++class ServoSelectPopupMenuItem : public NWebSelectPopupMenuItem {
++public:
++    ServoSelectPopupMenuItem(std::string label, bool checked)
++        : label_(std::move(label)), checked_(checked) {}
++    SelectPopupMenuItemType GetType() override { return SP_OPTION; }
++    std::string GetLabel() override { return label_; }
++    uint32_t GetAction() override { return 0; }
++    std::string GetToolTip() override { return {}; }
++    bool GetIsChecked() override { return checked_; }
++    bool GetIsEnabled() override { return true; }
++    TextDirection GetTextDirection() override { return SP_LTR; }
++    bool GetHasTextDirectionOverride() override { return false; }
++
++private:
++    std::string label_;
++    bool checked_;
++};
++
++class ServoSelectPopupMenuParam : public NWebSelectPopupMenuParam {
++public:
++    ServoSelectPopupMenuParam(std::vector<std::shared_ptr<NWebSelectPopupMenuItem>> items, int selected,
++                              bool multiple, std::shared_ptr<NWebSelectMenuBound> bound)
++        : items_(std::move(items)), selected_(selected), multiple_(multiple), bound_(std::move(bound)) {}
++    std::vector<std::shared_ptr<NWebSelectPopupMenuItem>> GetMenuItems() override { return items_; }
++    // Item height (vp) and font size (fp) for the ACE-rendered rows; 0 leaves the labels invisible.
++    int GetItemHeight() override { return 48; }
++    int GetSelectedItem() override { return selected_; }
++    double GetItemFontSize() override { return 16.0; }
++    bool GetIsRightAligned() override { return false; }
++    std::shared_ptr<NWebSelectMenuBound> GetSelectMenuBound() override { return bound_; }
++    bool GetIsAllowMultipleSelection() override { return multiple_; }
++
++private:
++    std::vector<std::shared_ptr<NWebSelectPopupMenuItem>> items_;
++    int selected_;
++    bool multiple_;
++    std::shared_ptr<NWebSelectMenuBound> bound_;
++};
++
++// The callback ACE invokes when the user picks an option (Continue) or dismisses the menu (Cancel).
++class ServoSelectPopupMenuCallback : public NWebSelectPopupMenuCallback {
++public:
++    explicit ServoSelectPopupMenuCallback(std::uint64_t select_id) : select_id_(select_id) {}
++    void Continue(const std::vector<int32_t>& indices) override {
++        servo::arkweb::select_popup_continue(select_id_, indices);
++    }
++    void Cancel() override { servo::arkweb::select_popup_cancel(select_id_); }
++
++private:
++    std::uint64_t select_id_;
++};
++}  // namespace
++
++bool NWebHandlerProxy::show_select_popup(std::uint64_t select_id, const std::string& labels,
++                                         std::int32_t selected, bool multiple, std::int32_t x,
++                                         std::int32_t y, std::int32_t width,
++                                         std::int32_t height) const {
++    auto h = handler();
++    if (!h) {
++        return false;
++    }
++    std::vector<std::shared_ptr<OHOS::NWeb::NWebSelectPopupMenuItem>> items;
++    std::size_t start = 0;
++    for (int index = 0; start <= labels.size(); ++index) {
++        std::size_t end = labels.find('\n', start);
++        std::string label = labels.substr(start, end == std::string::npos ? std::string::npos : end - start);
++        items.push_back(std::make_shared<ServoSelectPopupMenuItem>(std::move(label), index == selected));
++        if (end == std::string::npos) {
++            break;
++        }
++        start = end + 1;
++    }
++    auto bound = std::make_shared<ServoSelectMenuBound>(x, y, width, height);
++    auto param =
++        std::make_shared<ServoSelectPopupMenuParam>(std::move(items), selected, multiple, std::move(bound));
++    auto callback = std::make_shared<ServoSelectPopupMenuCallback>(select_id);
++    h->OnSelectPopupMenu(param, callback);
++    return true;
++}
++
+ bool NWebHandlerProxy::show_js_dialog(std::uint64_t dialog_id, std::int32_t kind,
+                                       const std::string& message,
+                                       const std::string& default_value) const {
+diff --git a/ports/arkweb/cpp/servo_handler_proxy.h b/ports/arkweb/cpp/servo_handler_proxy.h
+index e67a81853e7..cede766ef39 100644
+--- a/ports/arkweb/cpp/servo_handler_proxy.h
++++ b/ports/arkweb/cpp/servo_handler_proxy.h
+@@ -31,6 +31,9 @@ public:
+     void update_text_field_status(bool show_keyboard, bool attach_ime) const override;
+     bool show_js_dialog(std::uint64_t dialog_id, std::int32_t kind, const std::string& message,
+                         const std::string& default_value) const override;
++    bool show_select_popup(std::uint64_t select_id, const std::string& labels, std::int32_t selected,
++                           bool multiple, std::int32_t x, std::int32_t y, std::int32_t width,
++                           std::int32_t height) const override;
+ 
+ private:
+     std::shared_ptr<OHOS::NWeb::NWebHandler> handler() const;
+diff --git a/ports/arkweb/src/bridge.rs b/ports/arkweb/src/bridge.rs
+index 3498130ee10..ada6d518d35 100644
+--- a/ports/arkweb/src/bridge.rs
++++ b/ports/arkweb/src/bridge.rs
+@@ -8,7 +8,7 @@
+ //! and simply delegate to [`crate::runtime`]. The `WebViewClient` opaque C++ type is the
+ //! engine -> embedder callback sink (implemented by `NWebHandlerProxy` on the C++ side).
+ 
+-use cxx::{CxxString, SharedPtr};
++use cxx::{CxxString, CxxVector, SharedPtr};
+ 
+ use crate::bridge::ffi::WebViewClient;
+ 
+@@ -95,6 +95,20 @@ pub mod ffi {
+             message: &CxxString,
+             default_value: &CxxString,
+         ) -> bool;
++        /// Ask ACE to show a `<select>` dropdown. `labels` are the flat option labels joined by
++        /// `\n`; `selected` is the currently-selected option index (-1 if none). The user's picked
++        /// option indices come back via `select_popup_continue`/`select_popup_cancel`.
++        fn show_select_popup(
++            self: &WebViewClient,
++            select_id: u64,
++            labels: &CxxString,
++            selected: i32,
++            multiple: bool,
++            x: i32,
++            y: i32,
++            width: i32,
++            height: i32,
++        ) -> bool;
+     }
+ }
+ 
+@@ -109,6 +123,11 @@ pub mod ffi_arkweb {
+         /// Deliver a JS dialog result from ACE back to the parked `SimpleDialog` (see
+         /// `show_js_dialog`). `value` carries the entered text for a confirmed prompt.
+         fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString);
++        /// Deliver a `<select>` choice from ACE back to the parked `SelectElement`: `indices` are
++        /// the picked option indices (flat DOM order).
++        fn select_popup_continue(select_id: u64, indices: &CxxVector<i32>);
++        /// The `<select>` popup was dismissed without a choice.
++        fn select_popup_cancel(select_id: u64);
+     }
+ 
+     unsafe extern "C++" {
+@@ -222,3 +241,9 @@ fn init_logging(min_level: i32) {
+ fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString) {
+     crate::runtime::resolve_js_dialog(dialog_id, confirmed, value)
+ }
++fn select_popup_continue(select_id: u64, indices: &CxxVector<i32>) {
++    crate::runtime::select_popup_continue(select_id, indices)
++}
++fn select_popup_cancel(select_id: u64) {
++    crate::runtime::select_popup_cancel(select_id)
++}
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index c05ce8975cc..da48ccdc9cf 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -22,7 +22,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+ use std::thread;
+ 
+ use cookie::Cookie;
+-use cxx::{CxxString, SharedPtr};
++use cxx::{CxxString, CxxVector, SharedPtr};
+ use dpi::PhysicalSize;
+ use log::{LevelFilter, error, info};
+ use ohos_ime::{AttachOptions, Ime, ImeProxy, RawTextEditorProxy};
+@@ -36,9 +36,9 @@ use servo::{
+     CompositionEvent, CompositionState, ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D,
+     EmbedderControl, EmbedderControlId, EventLoopWaker, ImeEvent, InputEvent, InputMethodControl,
+     InputMethodType, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts,
+-    Preferences, RefreshDriver, RenderingContext, Scroll, Servo, ServoBuilder, SimpleDialog,
+-    TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
+-    WebViewDelegate, WindowRenderingContext,
++    Preferences, RefreshDriver, RenderingContext, Scroll, SelectElement,
++    SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog, TouchEvent, TouchEventType,
++    TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
+ };
+ use url::Url;
+ 
+@@ -156,6 +156,12 @@ enum Action {
+         confirmed: bool,
+         value: String,
+     },
++    /// The user picked (or dismissed) a `<select>` popup (from the ACE popup callback thread).
++    ResolveSelectPopup {
++        select_id: u64,
++        indices: Vec<usize>,
++        cancelled: bool,
++    },
+     GetCookie {
+         url: String,
+         include_http_only: bool,
+@@ -238,6 +244,28 @@ thread_local! {
+     static JS_DIALOGS: RefCell<HashMap<u64, SimpleDialog>> = RefCell::new(HashMap::new());
+ }
+ 
++static NEXT_SELECT_ID: AtomicU64 = AtomicU64::new(1);
++
++thread_local! {
++    /// `<select>` popups awaiting a choice. Like [`JS_DIALOGS`], the `!Send` `SelectElement` is
++    /// parked on the servo thread; ACE renders the dropdown itself and reports the picked option
++    /// indices through the popup callback, routed back as an `Action`.
++    static SELECT_POPUPS: RefCell<HashMap<u64, SelectElement>> = RefCell::new(HashMap::new());
++}
++
++/// Resolve a parked `<select>` popup. On a pick, apply the chosen option indices and submit; on
++/// cancel, drop the parked element (its `Drop` resubmits the current, unchanged selection).
++fn resolve_select_popup(select_id: u64, indices: Vec<usize>, cancelled: bool) {
++    SELECT_POPUPS.with(|popups| {
++        if let Some(mut select) = popups.borrow_mut().remove(&select_id) {
++            if !cancelled {
++                select.select(indices);
++                select.submit();
++            }
++        }
++    });
++}
++
+ /// Resolve a parked JS dialog with the user's response and unblock the page's script. A prompt
+ /// carries the entered text on confirm; everything else confirms or cancels.
+ fn resolve_parked_dialog(dialog_id: u64, confirmed: bool, value: String) {
+@@ -666,6 +694,11 @@ impl ServoThread {
+                 confirmed,
+                 value,
+             } => resolve_parked_dialog(dialog_id, confirmed, value),
++            Action::ResolveSelectPopup {
++                select_id,
++                indices,
++                cancelled,
++            } => resolve_select_popup(select_id, indices, cancelled),
+             Action::GetCookie {
+                 url,
+                 include_http_only,
+@@ -1107,6 +1140,47 @@ impl WebViewDelegate for ArkWebViewDelegate {
+                     resolve_parked_dialog(dialog_id, kind == 0, String::new());
+                 }
+             },
++            // A `<select>` dropdown. ACE renders the option menu itself; we hand it the flattened
++            // option labels + the select's on-screen rect, park the (`!Send`) element, and let the
++            // popup callback resolve it. Option indices are the flat DOM order, matching servo's ids.
++            EmbedderControl::SelectElement(select) => {
++                let select_id = NEXT_SELECT_ID.fetch_add(1, Ordering::Relaxed);
++                let mut labels: Vec<String> = Vec::new();
++                for entry in select.options() {
++                    match entry {
++                        SelectElementOptionOrOptgroup::Option(option) => {
++                            labels.push(option.label.replace('\n', " "));
++                        },
++                        SelectElementOptionOrOptgroup::Optgroup { options, .. } => {
++                            for option in options {
++                                labels.push(option.label.replace('\n', " "));
++                            }
++                        },
++                    }
++                }
++                let selected = select
++                    .selected_options()
++                    .first()
++                    .map(|&index| index as i32)
++                    .unwrap_or(-1);
++                let multiple = select.allow_select_multiple();
++                let rect = select.position();
++                let (x, y) = (rect.min.x, rect.min.y);
++                let (width, height) = (rect.width(), rect.height());
++                SELECT_POPUPS.with(|popups| popups.borrow_mut().insert(select_id, select));
++                let handled = match self.client.as_ref() {
++                    Some(client) => {
++                        cxx::let_cxx_string!(labels = labels.join("\n"));
++                        client.show_select_popup(
++                            select_id, &labels, selected, multiple, x, y, width, height,
++                        )
++                    },
++                    None => false,
++                };
++                if !handled {
++                    resolve_select_popup(select_id, Vec::new(), true);
++                }
++            },
+             _ => {},
+         }
+     }
+@@ -1442,6 +1516,26 @@ pub fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString) {
+     })
+ }
+ 
++pub fn select_popup_continue(select_id: u64, indices: &CxxVector<i32>) {
++    guard("select_popup_continue", || {
++        send(Action::ResolveSelectPopup {
++            select_id,
++            indices: indices.iter().map(|&index| index.max(0) as usize).collect(),
++            cancelled: false,
++        })
++    })
++}
++
++pub fn select_popup_cancel(select_id: u64) {
++    guard("select_popup_cancel", || {
++        send(Action::ResolveSelectPopup {
++            select_id,
++            indices: Vec::new(),
++            cancelled: true,
++        })
++    })
++}
++
+ /// Translate an OHOS key event into a servo `KeyboardEvent`. `action`: 0 = down, 1 = up (ArkUI
+ /// `KeyAction`). `unicode` is the character value if any (0 otherwise). Returns whether the key was
+ /// mapped and dispatched, so ACE can fall back to its own handling for keys we do not consume.
+diff --git a/ports/arkweb/tools/conftest.py b/ports/arkweb/tools/conftest.py
+index 77c32dad0d7..364b17d7e41 100644
+--- a/ports/arkweb/tools/conftest.py
++++ b/ports/arkweb/tools/conftest.py
+@@ -27,6 +27,7 @@ import os
+ import re
+ import shlex
+ import time
++from collections.abc import Callable
+ from pathlib import Path
+ 
+ import pytest
+@@ -47,9 +48,17 @@ WEB_TOP_Y = 160
+ 
+ # --- hdc helpers -----------------------------------------------------------------------
+ 
++# Bound every device command. `hdc_py.cmd` forwards kwargs to `subprocess.run`, which has no
++# timeout by default, so without this a wedged device -- e.g. a servo bug that hangs the
++# ArkUI thread, which blocks `uitest dumpLayout` -- would hang a test *inside* a command and
++# never reach the wall-clock deadline in the poll helpers above it. On expiry `subprocess`
++# raises TimeoutExpired, failing the test instead of hanging the run. Generous vs. real
++# command times (snapshot/dumpLayout ~1-2s); no test command legitimately runs this long.
++CMD_TIMEOUT = 30.0
+ 
+-def sh(device: HarmonyDevice, command: str, check: bool = True) -> str:
+-    return device.cmd(command, capture_output=True, text=True, check=check).stdout
++
++def sh(device: HarmonyDevice, command: str, check: bool = True, timeout: float = CMD_TIMEOUT) -> str:
++    return device.cmd(command, capture_output=True, text=True, check=check, timeout=timeout).stdout
+ 
+ 
+ def tap(device: HarmonyDevice, xy: tuple[int, int]) -> None:
+@@ -146,6 +155,57 @@ def screencap(device: HarmonyDevice, dest_dir: Path) -> Image.Image:
+     return Image.open(local).convert("RGB")
+ 
+ 
++# --- settle-aware capture --------------------------------------------------------------
++#
++# A discrete repaint (a tap toggling a colour, an embedder control resolving) presents a
++# frame or two *after* the interaction, so a single sleep-then-cap can race the present and
++# read the pre-change frame. That premature-capture race -- not any engine latency -- is what
++# made the dialog/select frames read blank (see the servo-arkweb memory). Poll instead.
++
++
++def wait_for_pixel(
++    cap: Callable[[], Image.Image],
++    xy: tuple[int, int],
++    predicate: Callable[[tuple[int, int, int]], bool],
++    timeout: float = 8.0,
++    interval: float = 0.3,
++) -> Image.Image:
++    """Capture until ``sample(img, xy)`` satisfies ``predicate``, or ``timeout`` elapses.
++
++    Returns the matching frame; on timeout returns the last frame so the caller's assertion
++    fails against a real colour rather than a stale one. Use instead of ``sleep(); cap()``
++    around any interaction whose result appears via a repaint.
++    """
++    deadline = time.time() + timeout
++    while True:
++        img = cap()
++        if predicate(sample(img, xy)) or time.time() >= deadline:
++            return img
++        time.sleep(interval)
++
++
++def wait_until_stable(
++    cap: Callable[[], Image.Image],
++    box: tuple[int, int, int, int],
++    interval: float = 0.4,
++    timeout: float = 6.0,
++) -> Image.Image:
++    """Capture until ``box`` stops changing between consecutive frames (the present settled).
++
++    Useful when the expected colour is not known ahead of time (e.g. waiting for an ACE
++    overlay to finish animating in) -- returns the first frame that matches its predecessor.
++    """
++    deadline = time.time() + timeout
++    prev = cap()
++    while time.time() < deadline:
++        time.sleep(interval)
++        cur = cap()
++        if not region_changed(prev, cur, box):
++            return cur
++        prev = cur
++    return prev
++
++
+ # --- pixel helpers (JPEG-tolerant; vote over a small neighbourhood) ---------------------
+ 
+ 
+diff --git a/ports/arkweb/tools/test_dialogs.py b/ports/arkweb/tools/test_dialogs.py
+index 74258ab51ea..36d3fb7aaf4 100644
+--- a/ports/arkweb/tools/test_dialogs.py
++++ b/ports/arkweb/tools/test_dialogs.py
+@@ -28,7 +28,7 @@ import time
+ 
+ import pytest
+ 
+-from conftest import data_url, find_center, is_green, is_red, sample, tap
++from conftest import data_url, find_center, is_green, is_red, sample, tap, wait_for_pixel
+ 
+ 
+ def _page(script: str) -> str:
+@@ -51,20 +51,20 @@ PROBE = (360, 600)
+ 
+ def test_alert_resolves_and_continues(launch, cap):
+     launch(url=data_url(ALERT))
+-    time.sleep(3.0)
+-    assert is_green(sample(cap(), PROBE)), "alert() did not resolve -- the page's script stayed blocked"
++    img = wait_for_pixel(cap, PROBE, is_green)
++    assert is_green(sample(img, PROBE)), "alert() did not resolve -- the page's script stayed blocked"
+ 
+ 
+ def test_confirm_returns_result(launch, cap):
+     launch(url=data_url(CONFIRM))
+-    time.sleep(3.0)
+-    assert is_red(sample(cap(), PROBE)), "confirm() (no handler) did not return false"
++    img = wait_for_pixel(cap, PROBE, is_red)
++    assert is_red(sample(img, PROBE)), "confirm() (no handler) did not return false"
+ 
+ 
+ def test_prompt_returns_result(launch, cap):
+     launch(url=data_url(PROMPT))
+-    time.sleep(3.0)
+-    assert is_green(sample(cap(), PROBE)), "prompt() (no handler) did not return null"
++    img = wait_for_pixel(cap, PROBE, is_green)
++    assert is_green(sample(img, PROBE)), "prompt() (no handler) did not return null"
+ 
+ 
+ # --- handled path: DialogPage shows a real dialog and returns the user's choice -----------
+@@ -101,8 +101,8 @@ def test_confirm_ok_returns_true(launch, cap, dump):
+     ok = _wait_for_button(dump, "OK")
+     _skip_if_no_dialog(ok)
+     tap(device, ok)
+-    time.sleep(2.5)
+-    assert is_green(sample(cap(), DIALOG_PROBE)), "confirm() did not return true after OK"
++    img = wait_for_pixel(cap, DIALOG_PROBE, is_green)
++    assert is_green(sample(img, DIALOG_PROBE)), "confirm() did not return true after OK"
+ 
+ 
+ def test_confirm_cancel_returns_false(launch, cap, dump):
+@@ -110,8 +110,8 @@ def test_confirm_cancel_returns_false(launch, cap, dump):
+     cancel = _wait_for_button(dump, "Cancel")
+     _skip_if_no_dialog(cancel)
+     tap(device, cancel)
+-    time.sleep(2.5)
+-    assert is_red(sample(cap(), DIALOG_PROBE)), "confirm() did not return false after Cancel"
++    img = wait_for_pixel(cap, DIALOG_PROBE, is_red)
++    assert is_red(sample(img, DIALOG_PROBE)), "confirm() did not return false after Cancel"
+ 
+ 
+ def test_prompt_ok_returns_value(launch, cap, dump):
+@@ -119,8 +119,8 @@ def test_prompt_ok_returns_value(launch, cap, dump):
+     ok = _wait_for_button(dump, "OK")
+     _skip_if_no_dialog(ok)
+     tap(device, ok)
+-    time.sleep(2.5)
+-    assert is_green(sample(cap(), DIALOG_PROBE)), "prompt() did not return the default value after OK"
++    img = wait_for_pixel(cap, DIALOG_PROBE, is_green)
++    assert is_green(sample(img, DIALOG_PROBE)), "prompt() did not return the default value after OK"
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/ports/arkweb/tools/test_navigation.py b/ports/arkweb/tools/test_navigation.py
+index 1e575d7c2f5..80a98b28c72 100644
+--- a/ports/arkweb/tools/test_navigation.py
++++ b/ports/arkweb/tools/test_navigation.py
+@@ -11,11 +11,11 @@ independent of the known URL-bar-stale-on-history-back gap (that is the ArkTS UR
+ the web content). See conftest.py for the harness/provisioning notes.
+ """
+ 
+-import time
+-
+ import pytest
+ 
+-from conftest import BACK_BUTTON_XY, data_url, is_green, is_red, sample, tap
++from conftest import BACK_BUTTON_XY, data_url, is_green, is_red, sample, tap, wait_for_pixel
++
++PROBE = (360, 600)
+ 
+ PAGE_B = data_url("<html><body style='margin:0;background:#cc0000'></body></html>")
+ PAGE_A = (
+@@ -28,16 +28,13 @@ PAGE_A = (
+ 
+ def test_link_navigation_and_back(launch, cap):
+     device = launch(url=data_url(PAGE_A))
+-    time.sleep(2.0)
+-    assert is_green(sample(cap(), (360, 600))), "page A did not render"
++    assert is_green(sample(wait_for_pixel(cap, PROBE, is_green), PROBE)), "page A did not render"
+ 
+     tap(device, (360, 500))  # tap the viewport-filling link
+-    time.sleep(2.5)
+-    assert is_red(sample(cap(), (360, 600))), "link tap did not navigate to page B"
++    assert is_red(sample(wait_for_pixel(cap, PROBE, is_red), PROBE)), "link tap did not navigate to page B"
+ 
+     tap(device, BACK_BUTTON_XY)  # app history back button
+-    time.sleep(2.5)
+-    assert is_green(sample(cap(), (360, 600))), "back did not return to page A"
++    assert is_green(sample(wait_for_pixel(cap, PROBE, is_green), PROBE)), "back did not return to page A"
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/ports/arkweb/tools/test_select.py b/ports/arkweb/tools/test_select.py
+new file mode 100644
+index 00000000000..d47200587eb
+--- /dev/null
++++ b/ports/arkweb/tools/test_select.py
+@@ -0,0 +1,80 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""`<select>` dropdowns for the Servo ArkWeb backend.
++
++Servo surfaces a `<select>` via `show_embedder_control(EmbedderControl::SelectElement)`;
++the shim hands ACE the option labels + the select's rect and ACE renders the dropdown
++itself (`OnSelectPopupMenu`), returning the picked index through the popup callback, which
++the shim applies with `select() + submit()`. Unlike JS dialogs this needs no app handler --
++ACE's overlay menu works on any page.
++
++The menu rows are real ArkUI overlay nodes, so `uitest dumpLayout` sees them (find the
++`Banana` row's bounds instead of guessing coordinates). The page's `onchange` encodes the
++chosen value as its background colour, turning the round-trip into a pixel check.
++
++Capture uses `wait_for_pixel`: the body only turns green a repaint *after* the pick
++resolves, so a single sleep-then-cap would race the present (this is the premature-capture
++artifact that earlier masqueraded as render latency -- see conftest). See conftest.py for
++the harness/provisioning notes.
++"""
++
++import time
++
++import pytest
++
++from conftest import data_url, find_center, is_green, sample, tap, wait_for_pixel
++
++# Big select near the top so its tap coordinate is unambiguous; onchange paints the body a
++# per-value colour (Banana -> green). Body background propagates to the viewport, so a probe
++# well below the select/menu still reflects the choice.
++SELECT_PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
++<body style="margin:0;background:#dddddd">
++<select id=s style="font-size:28px;margin:20px;width:80%;height:60px" onchange="
++  document.body.style.background = this.value=='Banana' ? '#00c000'
++    : this.value=='Cherry' ? '#0000c0' : '#c00000';">
++<option>Apple</option><option>Banana</option><option>Cherry</option>
++</select></body>"""
++
++# Inside the select on screen: web area starts ~WEB_TOP_Y, select is margin 20 + height 60
++# CSS px (density 1.5 -> ~30..135 device px below the web top).
++SELECT_XY = (300, 210)
++# Below the select and its open menu (which spans down to ~y=464): plain body background.
++BODY_PROBE = (360, 900)
++
++
++def _wait_for_option(dump, label: str, timeout: float = 10.0):
++    """Poll the ArkUI tree until the named menu option appears (the overlay renders a beat
++    after the open tap), returning its on-screen centre or None."""
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        center = find_center(dump(), label)
++        if center is not None:
++            return center
++        time.sleep(0.4)
++    return None
++
++
++def test_select_pick_fires_change(launch, cap, dump):
++    device = launch(url=data_url(SELECT_PAGE))
++    time.sleep(1.5)
++
++    tap(device, SELECT_XY)
++    banana = _wait_for_option(dump, "Banana")
++    if banana is None:
++        # The open tap can miss if it lands before the page's first layout; try once more.
++        tap(device, SELECT_XY)
++        banana = _wait_for_option(dump, "Banana")
++    if banana is None:
++        pytest.skip("ACE <select> menu never appeared -- could not open the dropdown")
++
++    tap(device, banana)
++    img = wait_for_pixel(cap, BODY_PROBE, is_green)
++    assert is_green(sample(img, BODY_PROBE)), "picking 'Banana' did not fire the change event (body never turned green)"
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))
