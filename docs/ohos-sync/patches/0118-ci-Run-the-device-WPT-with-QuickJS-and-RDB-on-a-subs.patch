@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 28 Oct 2026 14:35:36 +0000
+Subject: [PATCH] ci: Run the device WPT with QuickJS and RDB, on a subset for
+ GenUI
+
+The nightly DAYU200 run now tests the configuration of GenUI: QuickJS and
+the RDB storage backend instead of SpiderMonkey and SQLite, with the
+default features otherwise, as `just genui-min` leaves out the WebDriver
+server that WPT needs. It stores the results as ohos-dayu200-quickjs,
+compared with linux-quickjs. The subset grows from about 9,000 to about
+17,500 tests, chosen by what generated UI uses: text decoration, colors,
+images, masking, compositing, filters, transforms, animations and
+transitions, positioning and media queries, intersection and resize
+observers, 2D canvas for charts, img, forms, pointer, touch and UI
+events, and all of fetch, XHR, EventSource, IndexedDB and web storage.
+The QuickJS build changes Cargo.lock, so it isn't `--locked`, like the
+QuickJS workflow's.
+
+Validation: the build command builds a checked-release headless servoshell with QuickJS and RDB (libnative_rdb_ndk.z.so linked); on a DAYU200, /IndexedDB, /webstorage, /css/css-animations, /intersection-observer and /touch-events (1250 tests) took 17.7 min with 2 processes, RDB wrote its stores under the config directory, and the scores match linux-quickjs within 2 points per directory (IndexedDB 56.4% vs 57.5%; the differences are timeouts on the board, dates in subtest names in the board's time zone, and file_support and idbversionchangeevent); actionlint passes, apart from its warnings about the local actions' metadata and the runner label.
+AI-assisted: Yes (agent session; written by the agent, which also ran the device tests)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/ohos-device-wpt.yml | 36 +++++++++++++++++----------
+ 1 file changed, 23 insertions(+), 13 deletions(-)
+
+diff --git a/.github/workflows/ohos-device-wpt.yml b/.github/workflows/ohos-device-wpt.yml
+index 2d39bce2fe7..984de81b7c5 100644
+--- a/.github/workflows/ohos-device-wpt.yml
++++ b/.github/workflows/ohos-device-wpt.yml
+@@ -1,12 +1,12 @@
+ # Runs WPT on the DAYU200 board of the self-hosted runner labelled servo-ohos-dayu200, with the
+-# headless servoshell of `./mach build --ohos --headless-binary`. There are no expectations for
+-# OpenHarmony yet, so the tests never fail the run.
++# headless servoshell of `./mach build --ohos --headless-binary`. It tests the configuration of
++# GenUI: QuickJS and the RDB storage backend, like `just genui-min`, but with the WebDriver server
++# that WPT needs. There are no expectations for OpenHarmony yet, so the tests never fail the run.
+ #
+ # Every night, unless servo-ohos-wpt has a run of the ohos-main commit already, it runs the
+ # nightly subset of WPT and stores the results in openharmony-rs/servo-ohos-wpt as
+-# `ohos-dayu200-spidermonkey`. All of
+-# WPT would take the board about a day. Otherwise it runs on request only: pull requests must not
+-# reach the board.
++# `ohos-dayu200-quickjs`. All of WPT would take the board about 14 hours. Otherwise it runs on
++# request only: pull requests must not reach the board.
+ name: OpenHarmony device WPT
+ on:
+   schedule:
+@@ -36,13 +36,19 @@ env:
+   RUST_BACKTRACE: 1
+   SHELL: /bin/bash
+   CARGO_INCREMENTAL: 0
+-  # About 9,000 tests, which take the board about three hours. The stored runs have to keep to
+-  # one subset for their scores to be comparable.
+   # The configuration of the stored runs, as in the results job.
+-  RESULTS_CONFIG: ohos-dayu200-spidermonkey
++  RESULTS_CONFIG: ohos-dayu200-quickjs
++  # About 17,500 tests of what generated UI uses: layout, text and fonts, rendering, canvas (for
++  # charts), animations, images, forms, touch input, storage and the network. They take the board
++  # about four hours. The stored runs have to keep to one subset for their scores to be comparable.
+   NIGHTLY_TESTS: >-
+-    /infrastructure /dom /url /fetch/api /css/css-flexbox /css/css-grid /css/css-text
+-    /css/css-backgrounds /css/css-fonts
++    /infrastructure /dom /url /fetch /xhr /eventsource /IndexedDB /webstorage
++    /css/css-flexbox /css/css-grid /css/css-text /css/css-text-decor /css/css-fonts
++    /css/css-backgrounds /css/css-color /css/css-images /css/css-masking /css/compositing
++    /css/filter-effects /css/css-transforms /css/css-animations /css/css-transitions
++    /css/css-position /css/mediaqueries /intersection-observer /resize-observer
++    /html/canvas/element /html/semantics/embedded-content/the-img-element /html/semantics/forms
++    /pointerevents /touch-events /uievents
+ 
+ jobs:
+   setup:
+@@ -133,10 +139,14 @@ jobs:
+         run: |
+           echo "OHOS_SDK_NATIVE=$OHOS_SDK_NATIVE" >> "$GITHUB_ENV"
+           echo "OHOS_BASE_SDK_HOME=$OHOS_BASE_SDK_HOME" >> "$GITHUB_ENV"
++      # The default features with the RDB storage backend instead of SQLite. `--js-engine quickjs`
++      # changes Cargo.lock, so the build is not `--locked`.
+       - name: Build
+         env:
+           PROFILE: ${{ needs.setup.outputs.profile }}
+-        run: ./mach build --locked --ohos --headless-binary --profile "$PROFILE"
++        run: |
++          ./mach build --ohos --headless-binary --profile "$PROFILE" --js-engine quickjs \
++            --no-default-features --features "base ohos-rdb-backend"
+       - name: Upload the headless servoshell
+         uses: actions/upload-artifact@v7
+         with:
+@@ -168,7 +178,7 @@ jobs:
+         run: |
+           mkdir -p wpt-full-logs/linux/wptreport
+           # shellcheck disable=SC2086 # TESTS holds several paths.
+-          ./mach test-wpt --ohos --profile "$PROFILE" --processes 2 --always-succeed \
++          ./mach test-wpt --ohos --profile "$PROFILE" --js-engine quickjs --processes 2 --always-succeed \
+             --log-raw wpt-full-logs/raw.log --log-wptreport wpt-full-logs/linux/wptreport/1.json \
+             $TESTS
+       # wptrunner gives up on the remaining tests when it can't start Servo again, e.g. after the
+@@ -213,7 +223,7 @@ jobs:
+       SERVO_OHOS_WPT_TOKEN: ${{ secrets.SERVO_OHOS_WPT_TOKEN }}
+     with:
+       # RESULTS_CONFIG; `with` can't read env.
+-      artifacts: '{"ohos-dayu200-spidermonkey": "wpt-full-logs-ohos-dayu200"}'
++      artifacts: '{"ohos-dayu200-quickjs": "wpt-full-logs-ohos-dayu200"}'
+       chunks: 1
+       upstream: false
+     permissions: {}

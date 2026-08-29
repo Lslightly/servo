@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 28 Oct 2026 07:47:09 +0000
+Subject: [PATCH] quickjs: Bump servo-quickjs for three QuickJS-only memory
+ leaks
+
+servo-quickjs c38af5c brings three fixes for memory that QuickJS kept
+and SpiderMonkey frees:
+- Q41: the contents of an Rc shared by several DOM objects were never
+  traced, so the cycle collector could not see through them. A
+  CustomElementDefinition is shared by the registry and every element
+  created from it, so a window that created one custom element was
+  never freed: every same-site navigation and iframe of such a page
+  stayed alive. Shared Rcs are now traced once per collector pass,
+  when all their owners are reachable from the GC graph.
+- Q42: FinalizationRegistry cleanup jobs went to QuickJS's own job
+  list, which nothing runs while Servo's job queue is installed, and
+  each held its realm forever. They are dropped instead: cleanup
+  callbacks still never run, as with SpiderMonkey, where Servo sets no
+  host cleanup callback.
+- Q43: AddAssociatedMemory and RemoveAssociatedMemory have a GC
+  trigger of their own, like SpiderMonkey's malloc threshold. Garbage
+  canvases, whose bitmaps Servo reports that way, reached 10-27 GB and
+  thousands of canvas threads before a collection.
+
+The new Request(...).clone() subtest of
+fetch-body-does-not-leak-document.https.html passes with QuickJS now.
+WebGL framebuffer-to-texture.html tests #8 and #9 become intermittent
+with QuickJS. Servo rejects the test's blits from a renderbuffer to a
+texture with INVALID_OPERATION, since get_attachment_formats() knows
+only renderbuffer formats (#6, #7 and #10 fail on every build), and
+does not zero-initialize texStorage2D textures. So #8 and #9 read
+whatever memory the GL driver hands to the texture: zeros on llvmpipe,
+and on a GPU sometimes buffers that WebGL objects of earlier tests
+freed when the garbage collector finalized them. The fixes change when
+collections run: the tests failed in 1 of 11 parallel runs with the
+old shim and in about half with the new one.
+
+Validation: QuickJS release builds of aecb1d2a597 (this commit's parent before patches 128 and 129, which change only CI and docs) with servo-quickjs 2de9592 and with c38af5c's tree. 20 same-site navigations of a page with a custom element or a FinalizationRegistry: live realms 22 against 2, QuickJS heap 75 MiB against 4 MiB. 48 iframe page states, 20 frames each: 47 free every frame (listenerOnParent retains its frames by design, on both engines). 15 s of garbage 512x512 canvases without a forced GC: 10-27 GB against a 770 MiB peak, as on SpiderMonkey. Full WPT with --js-engine quickjs on both builds (58,638 tests), then the 29 tests that differed 3 more times on each, and builds with Q41 alone and Q41 and Q42 bisecting the WebGL tests: the only consistent difference is the Request clone subtest above (Q41 alone fixes it); the WebGL tests and two sanitizer-inert-document.html subtests are intermittent on both builds. The custom-elements, shadow-dom, streams, dom and FileAPI directories under QJS_VERIFY_TRACING=1: 1,837 tests as expected. GenUI, the three React apps, mossel and Wikipedia, 5 loads each: CPU and peak memory unchanged within noise. DOM churn of 30,000 custom elements per task pays +34% in batches that follow an explicit collection, which resets the new trigger, and nothing in the first batch. This commit's own build, from the git rev: both tests with changed expectations as expected 3 of 3 times, and the custom element and FinalizationRegistry navigation pages keep 2 realms.
+AI-assisted: Yes (agent session; the agent wrote the servo-quickjs changes, bumped the pin, updated the two expectations and ran the checks above)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ support/quickjs/cargo-config.toml                         | 2 +-
+ .../fetch-body-does-not-leak-document.https.html.ini      | 4 ----
+ .../rendering/framebuffer-to-texture.html.ini             | 8 ++++++++
+ 3 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/support/quickjs/cargo-config.toml b/support/quickjs/cargo-config.toml
+index cb7fc2eb69f..d3808421ee8 100644
+--- a/support/quickjs/cargo-config.toml
++++ b/support/quickjs/cargo-config.toml
+@@ -5,4 +5,4 @@
+ # were tested with. The shim's version must match the mozjs version that Cargo.toml requires, or
+ # Cargo leaves the patch unused.
+ [patch.crates-io]
+-mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "2de95922804e5ec0876f3106097b46d0f62bd0c9" }
++mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "c38af5cbaf6ac252a65a81ff42b27b0097c19f7f" }
+diff --git a/tests/wpt/mozilla/meta/memory/fetch-body-does-not-leak-document.https.html.ini b/tests/wpt/mozilla/meta/memory/fetch-body-does-not-leak-document.https.html.ini
+index 5af81b3bfe5..67c5e048cbd 100644
+--- a/tests/wpt/mozilla/meta/memory/fetch-body-does-not-leak-document.https.html.ini
++++ b/tests/wpt/mozilla/meta/memory/fetch-body-does-not-leak-document.https.html.ini
+@@ -4,7 +4,3 @@
+ 
+   ['<script>fetch("/common/slow.py?delay=60000", {method: "POST", duplex: "half", body: new ReadableStream({start(c) { c.enqueue(new Uint8Array([1\])); }})});</script>' does not leak the document]
+     expected: FAIL
+-
+-  ['<script>new Request("/common/slow.py?delay=60000", {method: "POST", body: "data"}).clone();</script>' does not leak the document]
+-    expected:
+-      if js_engine == "quickjs": FAIL
+diff --git a/tests/wpt/webgl/meta/conformance2/rendering/framebuffer-to-texture.html.ini b/tests/wpt/webgl/meta/conformance2/rendering/framebuffer-to-texture.html.ini
+index c789b921fe3..5355f59e948 100644
+--- a/tests/wpt/webgl/meta/conformance2/rendering/framebuffer-to-texture.html.ini
++++ b/tests/wpt/webgl/meta/conformance2/rendering/framebuffer-to-texture.html.ini
+@@ -7,3 +7,11 @@
+ 
+   [WebGL test #7]
+     expected: FAIL
++
++  [WebGL test #8]
++    expected:
++      if js_engine == "quickjs": [PASS, FAIL]
++
++  [WebGL test #9]
++    expected:
++      if js_engine == "quickjs": [PASS, FAIL]

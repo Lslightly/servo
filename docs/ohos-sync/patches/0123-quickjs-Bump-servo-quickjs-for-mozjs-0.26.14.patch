@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 9 Nov 2026 10:59:07 +0000
+Subject: [PATCH] quickjs: Bump servo-quickjs for mozjs 0.26.14
+
+With mozjs at 0.26.14, the pinned servo-quickjs 544db84, which is mozjs
+0.26.9, would leave `--js-engine quickjs`'s patch unused. servo-quickjs
+ae9eb96 is mozjs 0.26.14. It implements the stencil functions of
+upstream's off-thread compilation of classic scripts (07ebaae, with
+QuickJS patches Q50 and Q51), which Servo 0.8.0 calls only with its
+`dom_script_asynch` pref, off by default, and it
+compiles event handlers as standalone functions, whose name is not
+bound in their own scope, as SpiderMonkey does (ae9eb96, patch Q52):
+`<body onload="onload()">` called the handler itself instead of the
+page's global `onload` function, until the stack overflowed.
+
+Validation: servo-quickjs's `just test`, `just test-asan --no-fail-fast`, `just lint`, `cargo fmt --check` and `just test262` pass on the tree of ae9eb96, with a negative control for each fix. A full QuickJS WPT run of this commit and the previous one on ohos-main 1ea6baf2d37 (release, 60,788 tests) had 55 tests with unexpected results; in three reruns of those with each engine, none recurs with QuickJS only. The 33 that recur with both engines give the same results on this host with plain upstream 0bf4c02a050 (26) or with ohos-main 1ea6baf2d37 (6, see the previous commit), or as in ohos-main's stored CI run (1). 2026-11-09 sync: with Servo 0.8.0, `--js-engine quickjs` leaves no unused patch, and a full QuickJS WPT run of the stack (release, 61,175 tests, `dom_script_asynch` off, so not of the stencil functions) had 80 tests with unexpected results; in three reruns of those with each engine, one recurs with QuickJS only, window-open-multi-global.html, which times out on plain 0.8.0 with SpiderMonkey as well.
+AI-assisted: Yes (agent session; shim port, patches and validation by the agent during the dropped 2026-11-08 sync attempt)
+AI-assisted: Yes (agent session; 2026-11-09 sync -- Servo 0.8.0 has the off-thread compilation behind the `dom_script_asynch` pref, off by default; the message says so)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ support/quickjs/cargo-config.toml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/support/quickjs/cargo-config.toml b/support/quickjs/cargo-config.toml
+index 9af11c534c7..2e4a987cb79 100644
+--- a/support/quickjs/cargo-config.toml
++++ b/support/quickjs/cargo-config.toml
+@@ -5,4 +5,4 @@
+ # were tested with. The shim's version must match the mozjs version that Cargo.toml requires, or
+ # Cargo leaves the patch unused.
+ [patch.crates-io]
+-mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "544db84d9210b332e98baa8bb39a51c4c769001d" }
++mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "ae9eb96c65821a35d51e20c6e1e24e7479fc2fb1" }

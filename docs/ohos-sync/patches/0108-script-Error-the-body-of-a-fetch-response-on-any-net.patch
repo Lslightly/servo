@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 17:46:39 +0000
+Subject: [PATCH] script: Error the body of a fetch() response on any network
+ error
+
+`fetch()` errored the body stream of its response only when the body
+failed to decode, and closed it for every other network error that ended
+the body, so a reader saw a body that ended early as complete. A
+`WebAssembly.compileStreaming()` consumer was ended normally even when
+the body failed to decode.
+
+Error the body stream with a TypeError whenever the body ends with a
+network error, as the fetch response handover does when the stream
+errors, and end the WebAssembly consumer with `streamError`. SpiderMonkey
+rejects the compilation with the exception the stream error callback leaves
+pending, and leaves the promise unsettled without one, so the callback now
+throws the TypeError instead of only logging. A stream that is no longer
+readable, because it was cancelled, errored by an aborted `fetch()` call,
+or already errored with the network error of the response, is left as it
+is instead of hitting the assertion in `ReadableStream::error`.
+
+A consumer that refuses a chunk has been ended by SpiderMonkey, which
+then deletes it, so it is dropped instead of being fed or ended again.
+
+Net still ends a body cut short by the connection as complete; that
+changes in a later patch, so the cut-short case of the new test is
+expected to fail until then.
+
+Validation: `./mach check` passes. New test `tests/wpt/mozilla/tests/mozilla/wasm-streaming-network-error.any.js` (window and dedicated worker): its decode error cases pass; its cut-short cases are expected to fail until `net: End a body cut short by the connection with a network error`, and pass with it. A focused WPT run of `fetch/api`, `fetch/content-*`, `wasm/webapi`, `xhr`, `eventsource`, `navigation-timing` and the `link`/`style` element tests with this and the next four patches has no unexpected results in the upstream tests except `wasm/webapi/historical.any.js`, which times out in whichever variant runs after another and does the same on the previous patch.
+AI-assisted: Yes (agent session; the agent wrote this patch and its test following docs/fetch-p4a-truncated-body-audit-2026-10-22.md in the workspace, and applied an independent review's findings)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/fetch/response.rs       | 20 +++++++++--
+ components/script/fetch/fetch.rs              |  5 +--
+ components/script/runtime/script_runtime.rs   | 36 ++++++++++++++-----
+ tests/wpt/mozilla/meta/MANIFEST.json          | 29 +++++++++++++++
+ .../wasm-streaming-network-error.any.js.ini   | 11 ++++++
+ .../mozilla/resources/wasm-network-error.py   | 22 ++++++++++++
+ .../wasm-streaming-network-error.any.js       | 11 ++++++
+ 7 files changed, 120 insertions(+), 14 deletions(-)
+ create mode 100644 tests/wpt/mozilla/meta/mozilla/wasm-streaming-network-error.any.js.ini
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/resources/wasm-network-error.py
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/wasm-streaming-network-error.any.js
+
+diff --git a/components/script/dom/fetch/response.rs b/components/script/dom/fetch/response.rs
+index efe729ce87c..4e25ef46822 100644
+--- a/components/script/dom/fetch/response.rs
++++ b/components/script/dom/fetch/response.rs
+@@ -114,9 +114,15 @@ impl Response {
+     }
+ 
+     pub(crate) fn error_stream(&self, cx: &mut js::context::JSContext, error: Error) {
+-        if let Some(body) = self.fetch_body_stream.get() {
++        if let Some(body) = self.fetch_body_stream.get() &&
++            body.is_readable()
++        {
+             body.error_native(cx, error);
+         }
++        let stream_consumer = self.stream_consumer.borrow_mut().take();
++        if let Some(stream_consumer) = stream_consumer {
++            stream_consumer.stream_error();
++        }
+     }
+ 
+     pub(crate) fn is_disturbed(&self) -> bool {
+@@ -551,8 +557,16 @@ impl Response {
+ 
+     pub(crate) fn stream_chunk(&self, cx: &mut js::context::JSContext, chunk: Bytes) {
+         // Note, are these two actually mutually exclusive?
+-        if let Some(stream_consumer) = self.stream_consumer.borrow().as_ref() {
+-            stream_consumer.consume_chunk(&chunk);
++        let consumed = self
++            .stream_consumer
++            .borrow()
++            .as_ref()
++            .map(|stream_consumer| stream_consumer.consume_chunk(&chunk));
++        if let Some(consumed) = consumed {
++            // SpiderMonkey has ended a consumer that refuses a chunk, which must not be used again.
++            if !consumed {
++                self.stream_consumer.borrow_mut().take();
++            }
+         } else if let Some(body) = self.fetch_body_stream.get() {
+             body.enqueue_native(cx, chunk.to_vec());
+         }
+diff --git a/components/script/fetch/fetch.rs b/components/script/fetch/fetch.rs
+index 2b714cb6cdd..c3706f56bd9 100644
+--- a/components/script/fetch/fetch.rs
++++ b/components/script/fetch/fetch.rs
+@@ -695,11 +695,12 @@ impl FetchCallState {
+     ) {
+         let mut realm = enter_auto_realm(cx, &*self.response);
+         let cx = &mut realm.current_realm();
+-        if let Err(NetworkError::DecompressionError) = response {
++        if response.is_err() {
+             self.response
+                 .error_stream(cx, Error::Type(c"Network error occurred".to_owned()));
++        } else {
++            self.response.finish(cx);
+         }
+-        self.response.finish(cx);
+         // TODO
+         // ... trailerObject is not supported in Servo yet.
+     }
+diff --git a/components/script/runtime/script_runtime.rs b/components/script/runtime/script_runtime.rs
+index 179485c4a96..4f0c1460483 100644
+--- a/components/script/runtime/script_runtime.rs
++++ b/components/script/runtime/script_runtime.rs
+@@ -24,9 +24,9 @@ use js::context::JSContext;
+ use js::conversions::jsstr_to_string;
+ use js::gc::StackGCVector;
+ use js::glue::{
+-    DispatchablePointer, RUST_js_GetErrorMessage, RegisterScriptEnvironmentPreparer,
+-    RunScriptEnvironmentPreparerClosure, SetBuildId, StreamConsumerConsumeChunk,
+-    StreamConsumerNoteResponseURLs, StreamConsumerStreamEnd, StreamConsumerStreamError,
++    DispatchablePointer, RegisterScriptEnvironmentPreparer, RunScriptEnvironmentPreparerClosure,
++    SetBuildId, StreamConsumerConsumeChunk, StreamConsumerNoteResponseURLs,
++    StreamConsumerStreamEnd, StreamConsumerStreamError,
+ };
+ use js::jsapi::{
+     AsmJSOption, BuildIdCharVector, CompilationType, Dispatchable_MaybeShuttingDown, GCDescription,
+@@ -1233,9 +1233,11 @@ impl StreamConsumer {
+         }
+     }
+ 
+-    pub(crate) fn stream_error(&self, error_code: usize) {
++    /// Ends the stream because the body ended with a network error, which rejects the
++    /// compilation with the TypeError thrown by `report_stream_error`.
++    pub(crate) fn stream_error(&self) {
+         unsafe {
+-            StreamConsumerStreamError(self.0, error_code);
++            StreamConsumerStreamError(self.0, STREAM_NETWORK_ERROR);
+         }
+     }
+ 
+@@ -1351,11 +1353,27 @@ unsafe extern "C" fn consume_stream(
+     true
+ }
+ 
++/// The error code `StreamConsumer::stream_error` passes to SpiderMonkey, which hands it back to
++/// `report_stream_error`. SpiderMonkey reserves 0 for out of memory.
++const STREAM_NETWORK_ERROR: usize = 1;
++
++/// SpiderMonkey rejects the compilation with the exception this leaves pending, and leaves the
++/// promise unsettled if there is none.
+ #[expect(unsafe_code)]
+-unsafe extern "C" fn report_stream_error(_cx: *mut RawJSContext, error_code: usize) {
+-    error!("Error initializing StreamConsumer: {:?}", unsafe {
+-        RUST_js_GetErrorMessage(ptr::null_mut(), error_code as u32)
+-    });
++unsafe extern "C" fn report_stream_error(cx: *mut RawJSContext, error_code: usize) {
++    debug_assert_eq!(error_code, STREAM_NETWORK_ERROR);
++    let mut cx = unsafe {
++        // SAFETY: We are in SM hook
++        JSContext::from_ptr(NonNull::new(cx).expect("JSContext should not be null in SM hook"))
++    };
++    let cx = &mut cx;
++    let mut realm = CurrentRealm::assert(cx);
++    let global = GlobalScope::from_current_realm(&mut realm);
++    throw_dom_exception(
++        cx,
++        &global,
++        Error::Type(c"Network error occurred".to_owned()),
++    );
+ }
+ 
+ #[expect(unsafe_code)]
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 35844744d11..e2dae44f4ee 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11323,6 +11323,10 @@
+       "fb5dbca23808bee44003692cb0e139dd6a22e874",
+       []
+      ],
++     "wasm-network-error.py": [
++      "c473aaf7fe592f7170d203afb2dee1850903f004",
++      []
++     ],
+      "worker-success.js": [
+       "327986f34b9b20476b6a7b1189c732a9ea8b9f68",
+       []
+@@ -15537,6 +15541,31 @@
+       {}
+      ]
+     ],
++    "wasm-streaming-network-error.any.js": [
++     "202926bbd070f579152276ef35d35431566ef999",
++     [
++      "mozilla/wasm-streaming-network-error.any.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,dedicatedworker"
++        ]
++       ]
++      }
++     ],
++     [
++      "mozilla/wasm-streaming-network-error.any.worker.html",
++      {
++       "script_metadata": [
++        [
++         "global",
++         "window,dedicatedworker"
++        ]
++       ]
++      }
++     ]
++    ],
+     "weakref.html": [
+      "091ff3e67e2999c54fc6e9ee95f7fd331f94501a",
+      [
+diff --git a/tests/wpt/mozilla/meta/mozilla/wasm-streaming-network-error.any.js.ini b/tests/wpt/mozilla/meta/mozilla/wasm-streaming-network-error.any.js.ini
+new file mode 100644
+index 00000000000..f09987b5330
+--- /dev/null
++++ b/tests/wpt/mozilla/meta/mozilla/wasm-streaming-network-error.any.js.ini
+@@ -0,0 +1,11 @@
++[wasm-streaming-network-error.any.html]
++  disabled:
++    if js_engine == "quickjs": QuickJS has no WebAssembly
++  [compileStreaming rejects with a TypeError when the body is cut short]
++    expected: FAIL
++
++[wasm-streaming-network-error.any.worker.html]
++  disabled:
++    if js_engine == "quickjs": QuickJS has no WebAssembly
++  [compileStreaming rejects with a TypeError when the body is cut short]
++    expected: FAIL
+diff --git a/tests/wpt/mozilla/tests/mozilla/resources/wasm-network-error.py b/tests/wpt/mozilla/tests/mozilla/resources/wasm-network-error.py
+new file mode 100644
+index 00000000000..c473aaf7fe5
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/resources/wasm-network-error.py
+@@ -0,0 +1,22 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++# An empty module, which compiles if a consumer takes a body that ends early as complete.
++module = b"\0asm\x01\0\0\0"
++
++
++def main(request, response):
++    response.add_required_headers = False
++    output = b"HTTP/1.1 200 OK\r\n"
++    output += b"Content-Type: application/wasm\r\n"
++    output += b"Connection: close\r\n"
++    if request.GET.first(b"error") == b"decode":
++        output += b"Content-Encoding: gzip\r\n"
++        output += b"Content-Length: %d\r\n" % len(module)
++    else:
++        output += b"Content-Length: %d\r\n" % (len(module) + 8)
++    output += b"\r\n"
++    output += module
++    response.writer.write(output)
++    response.close_connection = True
+diff --git a/tests/wpt/mozilla/tests/mozilla/wasm-streaming-network-error.any.js b/tests/wpt/mozilla/tests/mozilla/wasm-streaming-network-error.any.js
+new file mode 100644
+index 00000000000..202926bbd07
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/wasm-streaming-network-error.any.js
+@@ -0,0 +1,11 @@
++// META: global=window,dedicatedworker
++
++for (const [error, description] of [
++  ["decode", "fails to decode"],
++  ["cut-short", "is cut short"],
++]) {
++  promise_test(async t => {
++    const response = fetch(`resources/wasm-network-error.py?error=${error}`);
++    await promise_rejects_js(t, TypeError, WebAssembly.compileStreaming(response));
++  }, `compileStreaming rejects with a TypeError when the body ${description}`);
++}

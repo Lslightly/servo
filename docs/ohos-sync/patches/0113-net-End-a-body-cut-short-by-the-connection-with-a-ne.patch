@@ -1,0 +1,336 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 18:11:49 +0000
+Subject: [PATCH] net: End a body cut short by the connection with a network
+ error
+
+A body that the connection ended early, before its Content-Length or its
+last chunk, by an HTTP/2 stream reset with an error code, or by a TLS
+connection closed inside a framed body, was handed over as complete and
+the response marked aborted, like a body whose fetch was cancelled.
+Consumers took the truncated body for the whole one: `fetch()` resolved
+`text()` with it, XMLHttpRequest fired `load`, scripts ran it, style
+sheets applied it, and a WebAssembly module cut at a section boundary
+compiled.
+
+When the stream errors in HTTP-network fetch, the fetch is a network
+error, not aborted as a cancelled one is. End such a body with
+`NetworkError::ConnectionFailure`, as one suspended for too long, and keep
+ending a cancelled one, or one nobody can resume, as aborted. Devtools
+gets a failed body as far as it got, as it does for an aborted one.
+
+The previous patches prepare the consumers in script: `fetch()` errors
+its body stream, EventSource reconnects, style sheets fail, XMLHttpRequest
+drops what it received, and documents keep their fetch timing. Scripts,
+workers and fonts already fail on a network error, and media restarts with
+a range request. A truncated image is now broken instead of decoded as far
+as the decoder accepts it, as in Chrome and WebKit.
+
+Validation: `./mach test-unit -p servo-net`: 499 tests pass. New tests `test_body_cut_short_by_the_connection_is_a_network_error` (a short Content-Length and a chunk cut off, with the bytes received before the error handed over) and `test_body_cut_short_by_the_connection_is_sent_to_devtools`; `test_truncated_body_that_ends_with_its_tls_connection_is_a_network_error`, `test_fetch_whose_connection_closes_while_suspended_ends_when_resumed` and `test_truncated_response_is_not_served_from_cache` now expect `ConnectionFailure` instead of a delivered body, `test_body_cut_short_is_not_delivered_for_an_integrity_check` pins it, and the cancellation tests check that a cancelled body is not a network error. Against the previous patch, the six tests that expect `ConnectionFailure` or the devtools body fail. A focused WPT run (1132 tests: `fetch/api`, `fetch/content-*`, `fetch/http-cache`, `fetch/stale-while-revalidate`, `subresource-integrity`, `wasm/webapi`, `xhr`, `eventsource`, `navigation-timing`, the `link` and `style` element tests and the new tests) makes `fetch/api/basic/error-after-response.any.js` (6 subtests), `fetch/content-length/too-long.window.js`, `xhr/response-body-errors.any.js` (4) and `xhr/event-error.sub.any.js` (2) pass, as do the cut-short cases of the new tests; `fetch/stale-while-revalidate/stale-script.html` fails, as it does in 8 of 8 runs here on patch 115, because the revalidated response arrives after the test loads the script again.
+AI-assisted: Yes (agent session; the agent wrote this patch and its tests following docs/fetch-p4a-truncated-body-audit-2026-10-22.md in the workspace, and applied an independent review's findings)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/net/fetch/methods.rs               |  1 +
+ components/net/http_loader.rs                 | 12 +--
+ components/net/tests/http_loader.rs           | 77 +++++++++++++++++--
+ .../api/basic/error-after-response.any.js.ini | 24 ------
+ .../content-length/too-long.window.js.ini     |  4 -
+ tests/wpt/meta/xhr/event-error.sub.any.js.ini |  8 --
+ .../meta/xhr/response-body-errors.any.js.ini  | 15 ----
+ .../mozilla/stylesheet-network-error.html.ini |  6 --
+ .../wasm-streaming-network-error.any.js.ini   |  4 -
+ 9 files changed, 80 insertions(+), 71 deletions(-)
+ delete mode 100644 tests/wpt/meta/fetch/content-length/too-long.window.js.ini
+ delete mode 100644 tests/wpt/meta/xhr/event-error.sub.any.js.ini
+ delete mode 100644 tests/wpt/meta/xhr/response-body-errors.any.js.ini
+ delete mode 100644 tests/wpt/mozilla/meta/mozilla/stylesheet-network-error.html.ini
+
+diff --git a/components/net/fetch/methods.rs b/components/net/fetch/methods.rs
+index 96e7dcd2ad6..4d9091d71f2 100644
+--- a/components/net/fetch/methods.rs
++++ b/components/net/fetch/methods.rs
+@@ -1130,6 +1130,7 @@ async fn wait_for_response(
+                 break;
+             },
+             BodyEvent::End(BodyEnd::Failed(network_error)) => {
++                send_response_to_devtools(request, context, response, devtools_body);
+                 set_body_failure(response, network_error);
+                 break;
+             },
+diff --git a/components/net/http_loader.rs b/components/net/http_loader.rs
+index b1d0cf1335a..93f82dfc08d 100644
+--- a/components/net/http_loader.rs
++++ b/components/net/http_loader.rs
+@@ -2270,11 +2270,12 @@ async fn http_network_fetch(
+         let mut flow_state = cancellation_listener.subscribe();
+         let mut suspended_until = None;
+         let mut suspended_too_long = false;
++        let mut cancelled = false;
+         let result = loop {
+             // While suspended, do not poll the body: what is not read is held back
+             // by TCP or HTTP/2 flow control, and the body continues with the next byte.
+             let state = *flow_state.borrow_and_update();
+-            let cancelled = match state {
++            cancelled = match state {
+                 FetchFlowState::Cancelled => true,
+                 FetchFlowState::Suspended => {
+                     let deadline = *suspended_until
+@@ -2339,16 +2340,17 @@ async fn http_network_fetch(
+                 body_sender.finish(BodyEnd::Complete);
+             },
+             Err(error) => {
+-                let end = if let std::io::ErrorKind::InvalidData = error.kind() {
++                let end = if cancelled {
++                    BodyEnd::Aborted
++                } else if let std::io::ErrorKind::InvalidData = error.kind() {
+                     debug!("Content decompression error for {:?}", request_url);
+                     BodyEnd::Failed(NetworkError::DecompressionError)
+                 } else if suspended_too_long {
+                     debug!("Fetch suspended for too long: {:?}", request_url);
+                     BodyEnd::Failed(NetworkError::ConnectionFailure)
+                 } else {
+-                    // A body cut short by the connection is handed over as far as it got,
+-                    // like one whose fetch was cancelled.
+-                    BodyEnd::Aborted
++                    debug!("Body of {:?} cut short: {error}", request_url);
++                    BodyEnd::Failed(NetworkError::ConnectionFailure)
+                 };
+                 debug!("finished response for {:?}", request_url);
+                 timing.set_attribute(ResourceAttribute::ResponseEnd);
+diff --git a/components/net/tests/http_loader.rs b/components/net/tests/http_loader.rs
+index a10095180d7..aa4a1962b03 100644
+--- a/components/net/tests/http_loader.rs
++++ b/components/net/tests/http_loader.rs
+@@ -2028,7 +2028,7 @@ fn test_body_that_ends_with_its_tls_connection_without_close_notify_is_complete(
+ }
+ 
+ #[test]
+-fn test_truncated_body_that_ends_with_its_tls_connection_is_aborted() {
++fn test_truncated_body_that_ends_with_its_tls_connection_is_a_network_error() {
+     for response in [
+         &b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort"[..],
+         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n",
+@@ -2048,7 +2048,10 @@ fn test_truncated_body_that_ends_with_its_tls_connection_is_aborted() {
+ 
+         let response = fetch_with_context(request, &mut context);
+         server.close();
+-        assert!(is_aborted(&response));
++        assert_eq!(
++            response.get_network_error(),
++            Some(&NetworkError::ConnectionFailure)
++        );
+     }
+ }
+ 
+@@ -2376,7 +2379,10 @@ fn test_truncated_response_is_not_served_from_cache() {
+     let mut context = new_fetch_context(None, None);
+ 
+     let response = fetch_with_context(build_cacheable_request(&url), &mut context);
+-    assert_eq!(body_of(&response), b"truncated");
++    assert_eq!(
++        response.get_network_error(),
++        Some(&NetworkError::ConnectionFailure)
++    );
+     assert_eq!(
+         stored_response_count(&context, &build_cacheable_request(&url)),
+         0
+@@ -3180,6 +3186,7 @@ fn test_cancelling_a_suspended_fetch_ends_it() {
+     let (response, body) = fetch.wait_for_end();
+     assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+     assert!(response.aborted);
++    assert!(!response.is_network_error());
+     assert_eq!(body.received, STREAM_CHUNK_SIZE);
+ 
+     let _ = server.server.close();
+@@ -3197,6 +3204,7 @@ fn test_cancelling_a_fetch_that_waits_for_the_network_ends_it() {
+     let (response, body) = fetch.wait_for_end();
+     assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+     assert!(response.aborted);
++    assert!(!response.is_network_error());
+     assert_eq!(body.received, STREAM_CHUNK_SIZE);
+ 
+     let _ = server.server.close();
+@@ -3216,7 +3224,10 @@ fn test_fetch_whose_connection_closes_while_suspended_ends_when_resumed() {
+ 
+     fetch.listener.resume();
+     let (response, body) = fetch.wait_for_end();
+-    assert!(response.aborted);
++    assert_eq!(
++        response.get_network_error(),
++        Some(&NetworkError::ConnectionFailure)
++    );
+     assert!(!body.mismatch);
+     assert_eq!(body.received, chunks * STREAM_CHUNK_SIZE);
+ }
+@@ -3866,10 +3877,66 @@ fn test_body_cut_short_is_not_delivered_for_an_integrity_check() {
+     let _ = release.send(());
+     let (response, events, _) =
+         fetch_events(build_request_with_integrity(&url, INTEGRITY_OF_SCRIPT));
+-    assert!(response.is_network_error());
++    assert_eq!(
++        response.get_network_error(),
++        Some(&NetworkError::ConnectionFailure)
++    );
+     assert_eq!(events, ["response", "end"]);
+ }
+ 
++#[test]
++fn test_body_cut_short_by_the_connection_is_a_network_error() {
++    for (raw_response, received) in [
++        (
++            &b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort"[..],
++            &b"short"[..],
++        ),
++        (
++            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n100\r\ncut",
++            b"shortcut",
++        ),
++    ] {
++        let (url, release, _) = make_raw_held_server(raw_response);
++        let _ = release.send(());
++        let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
++            .origin(url.origin())
++            .pipeline_id(Some(TEST_PIPELINE_ID))
++            .policy_container(Default::default())
++            .build();
++        let (response, events, body) = fetch_events(request);
++        assert_eq!(
++            response.get_network_error(),
++            Some(&NetworkError::ConnectionFailure)
++        );
++        assert_eq!(events.first(), Some(&"response"));
++        assert_eq!(events.last(), Some(&"end"));
++        assert_eq!(body, received);
++    }
++}
++
++#[test]
++fn test_body_cut_short_by_the_connection_is_sent_to_devtools() {
++    let (url, release, _) =
++        make_raw_held_server(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort");
++    let _ = release.send(());
++    let (devtools_sender, devtools_receiver) = unbounded();
++    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
++        .origin(url.origin())
++        .pipeline_id(Some(TEST_PIPELINE_ID))
++        .policy_container(Default::default())
++        .build();
++    let response = fetch_with_context(request, &mut new_fetch_context(Some(devtools_sender), None));
++    assert!(response.is_network_error());
++    let bodies: Vec<_> = collect_all_network_events(&devtools_receiver)
++        .into_iter()
++        .filter_map(|event| match event {
++            NetworkEvent::HttpResponse(response) => Some(response.body),
++            _ => None,
++        })
++        .collect();
++    assert_eq!(bodies.last(), Some(&Some(Bytes::from_static(b"short"))));
++}
++
+ #[test]
+ fn test_null_body_fails_its_integrity_check() {
+     let handler =
+diff --git a/tests/wpt/meta/fetch/api/basic/error-after-response.any.js.ini b/tests/wpt/meta/fetch/api/basic/error-after-response.any.js.ini
+index 436ca4a8de7..42b68e0b6c7 100644
+--- a/tests/wpt/meta/fetch/api/basic/error-after-response.any.js.ini
++++ b/tests/wpt/meta/fetch/api/basic/error-after-response.any.js.ini
+@@ -1,26 +1,2 @@
+-[error-after-response.any.sharedworker.html]
+-  [Response reader read() promise should reject after a network error happening after resolving fetch promise]
+-    expected: FAIL
+-
+-  [Response reader closed promise should reject after a network error happening after resolving fetch promise]
+-    expected: FAIL
+-
+-
+-[error-after-response.any.worker.html]
+-  [Response reader closed promise should reject after a network error happening after resolving fetch promise]
+-    expected: FAIL
+-
+-  [Response reader read() promise should reject after a network error happening after resolving fetch promise]
+-    expected: FAIL
+-
+-
+-[error-after-response.any.html]
+-  [Response reader closed promise should reject after a network error happening after resolving fetch promise]
+-    expected: FAIL
+-
+-  [Response reader read() promise should reject after a network error happening after resolving fetch promise]
+-    expected: FAIL
+-
+-
+ [error-after-response.any.serviceworker.html]
+   expected: ERROR
+diff --git a/tests/wpt/meta/fetch/content-length/too-long.window.js.ini b/tests/wpt/meta/fetch/content-length/too-long.window.js.ini
+deleted file mode 100644
+index 0a78a1a8ea0..00000000000
+--- a/tests/wpt/meta/fetch/content-length/too-long.window.js.ini
++++ /dev/null
+@@ -1,4 +0,0 @@
+-[too-long.window.html]
+-  [Content-Length header value of network response exceeds response body]
+-    expected: FAIL
+-
+diff --git a/tests/wpt/meta/xhr/event-error.sub.any.js.ini b/tests/wpt/meta/xhr/event-error.sub.any.js.ini
+deleted file mode 100644
+index 5375d9954e4..00000000000
+--- a/tests/wpt/meta/xhr/event-error.sub.any.js.ini
++++ /dev/null
+@@ -1,8 +0,0 @@
+-[event-error.sub.any.worker.html]
+-  [error while reading body should report zeros for loaded and total]
+-    expected: FAIL
+-
+-
+-[event-error.sub.any.html]
+-  [error while reading body should report zeros for loaded and total]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/xhr/response-body-errors.any.js.ini b/tests/wpt/meta/xhr/response-body-errors.any.js.ini
+deleted file mode 100644
+index 88688e7724d..00000000000
+--- a/tests/wpt/meta/xhr/response-body-errors.any.js.ini
++++ /dev/null
+@@ -1,15 +0,0 @@
+-[response-body-errors.any.html]
+-  [Synchronous XMLHttpRequest should throw on bad chunk]
+-    expected: FAIL
+-
+-  [Asynchronous XMLHttpRequest should clear response on bad chunk]
+-    expected: FAIL
+-
+-
+-[response-body-errors.any.worker.html]
+-  [Synchronous XMLHttpRequest should throw on bad chunk]
+-    expected: FAIL
+-
+-  [Asynchronous XMLHttpRequest should clear response on bad chunk]
+-    expected: FAIL
+-
+diff --git a/tests/wpt/mozilla/meta/mozilla/stylesheet-network-error.html.ini b/tests/wpt/mozilla/meta/mozilla/stylesheet-network-error.html.ini
+deleted file mode 100644
+index c17cd8f49fd..00000000000
+--- a/tests/wpt/mozilla/meta/mozilla/stylesheet-network-error.html.ini
++++ /dev/null
+@@ -1,6 +0,0 @@
+-[stylesheet-network-error.html]
+-  [A link fires error and applies no style when the body of its style sheet is cut short]
+-    expected: FAIL
+-
+-  [A style element fires error and applies no style when the body of an imported style sheet is cut short]
+-    expected: FAIL
+diff --git a/tests/wpt/mozilla/meta/mozilla/wasm-streaming-network-error.any.js.ini b/tests/wpt/mozilla/meta/mozilla/wasm-streaming-network-error.any.js.ini
+index f09987b5330..16cf7da2179 100644
+--- a/tests/wpt/mozilla/meta/mozilla/wasm-streaming-network-error.any.js.ini
++++ b/tests/wpt/mozilla/meta/mozilla/wasm-streaming-network-error.any.js.ini
+@@ -1,11 +1,7 @@
+ [wasm-streaming-network-error.any.html]
+   disabled:
+     if js_engine == "quickjs": QuickJS has no WebAssembly
+-  [compileStreaming rejects with a TypeError when the body is cut short]
+-    expected: FAIL
+ 
+ [wasm-streaming-network-error.any.worker.html]
+   disabled:
+     if js_engine == "quickjs": QuickJS has no WebAssembly
+-  [compileStreaming rejects with a TypeError when the body is cut short]
+-    expected: FAIL

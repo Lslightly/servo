@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 16 Oct 2026 21:10:26 +0000
+Subject: [PATCH] gstreamer: Keep the offset of the source when it declines a
+ seek
+
+When appsrc asks the source to seek to the offset that it is already
+at, the source declines, since its stream continues there. The player
+still marked the seek as done, which set the offset of the source to
+the one of the last requested seek, that is 0, as a requested offset of
+0 also stood for no request. The buffers that followed carried offsets
+from 0, and later seeks compared against the wrong offset: a seek to
+where the stream really was restarted the fetch for nothing, and a seek
+to the offset that the source wrongly assumed was declined while the
+stream was elsewhere, so that the demuxer got the wrong bytes.
+
+Only finish a seek that the source accepted, so that a seek that it
+declines because another one waits does not finish the waiting one
+either, and keep the offset of a requested seek as an Option, so that a
+seek to offset 0 is not taken for no seek.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: a unit test of the source, which declines a seek to its
+offset, and one while another waits, and checks the offsets.
+
+Validation: `cargo nextest run -p servo-media-gstreamer`: the new test fails without this patch, at the check after the declined seek, and passes with it. In traces of the scenario of the first patch of the series, the only declined seek is the one to offset 0 at startup, where the reset does no harm, so this patch does not change those runs: with range support, 3 requests at byte offsets, 166.5 MB, no seeking event; without range support, 2 requests, 264.8 MB. `./mach test-wpt --release --processes 6 --timeout-multiplier 2` of html/semantics/embedded-content/media-elements, the-video-element, and html/canvas/element/manual/drawing-images-to-the-canvas and imagebitmap (475 tests) with the series up to the last patch: no new failure; the unexpected results (media_fragment_seek, autoplay-default-permissions-policy, load-removes-queued-error-event) also occur on ohos-main. Re-run with the whole series after the second review: the range case takes 3 requests and 163.2 MB with no seeking event, and the paused case 2 requests, 266.5 MB and a peak of 426 MiB; `./mach test-wpt --release --processes 6 --timeout-multiplier 2` of media-elements, the-video-element and drawing-images-to-the-canvas (449 tests): no new failure; track-cues-seeking timed out in 1 of 13 isolated runs both with the series and on ohos-main, and video_loop_base passed 3 of 3 isolated runs either way. `cargo nextest run -p servo-media-gstreamer` passes. `./mach check --ohos` passes.
+AI-assisted: Yes (agent session; written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/media/backends/gstreamer/player.rs | 30 +++++------
+ components/media/backends/gstreamer/source.rs | 51 +++++++++++++++----
+ 2 files changed, 53 insertions(+), 28 deletions(-)
+
+diff --git a/components/media/backends/gstreamer/player.rs b/components/media/backends/gstreamer/player.rs
+index e95d32a09ee..09850901de9 100644
+--- a/components/media/backends/gstreamer/player.rs
++++ b/components/media/backends/gstreamer/player.rs
+@@ -901,25 +901,21 @@ impl GStreamerPlayer {
+                                     let _ = notify!(observer__, PlayerEvent::EnoughData);
+                                 })
+                                 .seek_data(move |_, offset| {
+-                                    let (ret, ack_channel) = if servosrc_.set_seek_offset(offset) {
+-                                        let _ = notify!(
+-                                            observer___,
+-                                            PlayerEvent::SeekData(
+-                                                offset,
+-                                                seek_channel.lock().unwrap().sender()
+-                                            )
+-                                        );
+-                                        let (ret, ack_channel) =
+-                                            seek_channel.lock().unwrap()._await();
+-                                        (ret, Some(ack_channel))
+-                                    } else {
+-                                        (true, None)
+-                                    };
++                                    if !servosrc_.set_seek_offset(offset) {
++                                        return true;
++                                    }
++
++                                    let _ = notify!(
++                                        observer___,
++                                        PlayerEvent::SeekData(
++                                            offset,
++                                            seek_channel.lock().unwrap().sender()
++                                        )
++                                    );
++                                    let (ret, ack_channel) = seek_channel.lock().unwrap()._await();
+ 
+                                     servosrc_.set_seek_done();
+-                                    if let Some(ack_channel) = ack_channel {
+-                                        ack_channel.send(()).unwrap();
+-                                    }
++                                    ack_channel.send(()).unwrap();
+                                     ret
+                                 })
+                                 .build(),
+diff --git a/components/media/backends/gstreamer/source.rs b/components/media/backends/gstreamer/source.rs
+index e019c4b8ee3..063485209b1 100644
+--- a/components/media/backends/gstreamer/source.rs
++++ b/components/media/backends/gstreamer/source.rs
+@@ -36,7 +36,8 @@ mod imp {
+     #[derive(Debug, Default)]
+     struct Position {
+         offset: u64,
+-        requested_offset: u64,
++        /// The offset of a seek that waits for the media element to restart its fetch.
++        requested_offset: Option<u64>,
+     }
+ 
+     // The actual data structure that stores our values. This is not accessible
+@@ -73,17 +74,12 @@ mod imp {
+         pub fn set_seek_offset<O: IsA<gstreamer::Object>>(&self, parent: &O, offset: u64) -> bool {
+             let mut pos = self.position.lock().unwrap();
+ 
+-            if pos.offset == offset || pos.requested_offset != 0 {
++            if pos.offset == offset || pos.requested_offset.is_some() {
+                 false
+             } else {
+                 self.seeking.store(true, Ordering::Relaxed);
+-                pos.requested_offset = offset;
+-                gstreamer::debug!(
+-                    self.cat,
+-                    obj = parent,
+-                    "seeking to offset: {}",
+-                    pos.requested_offset
+-                );
++                pos.requested_offset = Some(offset);
++                gstreamer::debug!(self.cat, obj = parent, "seeking to offset: {}", offset);
+ 
+                 true
+             }
+@@ -99,8 +95,9 @@ mod imp {
+             }
+ 
+             let mut pos = self.position.lock().unwrap();
+-            pos.offset = pos.requested_offset;
+-            pos.requested_offset = 0;
++            if let Some(offset) = pos.requested_offset.take() {
++                pos.offset = offset;
++            }
+         }
+ 
+         pub fn push_buffer<O: IsA<gstreamer::Object>>(
+@@ -439,3 +436,35 @@ pub fn register_servo_src() -> Result<(), glib::BoolError> {
+         ServoSrc::static_type(),
+     )
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn declined_seek_keeps_the_offset() {
++        gstreamer::init().unwrap();
++        register_servo_src().unwrap();
++        let src = gstreamer::ElementFactory::make("servosrc")
++            .build()
++            .unwrap()
++            .downcast::<ServoSrc>()
++            .unwrap();
++
++        // The source is not started, so the buffer is flushed, but it moves the offset all the same.
++        let _ = src.push_buffer(vec![0; 100]);
++        assert!(!src.set_seek_offset(100));
++        src.set_seek_done();
++        assert!(!src.set_seek_offset(100));
++
++        assert!(src.set_seek_offset(0));
++        src.set_seek_done();
++        assert!(!src.set_seek_offset(0));
++
++        // A seek that is declined because another one waits leaves the waiting one alone.
++        assert!(src.set_seek_offset(200));
++        assert!(!src.set_seek_offset(300));
++        src.set_seek_done();
++        assert!(!src.set_seek_offset(200));
++    }
++}

@@ -1,0 +1,341 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 14:44:29 +0000
+Subject: [PATCH] net: Add an owned stream type for response bodies
+
+A response body is today held twice: as a state in a shared
+`Arc<Mutex<ResponseBody>>` and as a `done_chan` that every fetch function
+passes along by `&mut`. The consumer's half of that channel keeps a sender
+clone, so a producer that exits without sending `Done` hangs its consumer.
+
+Add `net_traits::body_stream`: a single-producer stream of chunks that ends
+in exactly one `BodyEnd` (complete, aborted, or failed with a network
+error). The producer owns the only `BodySender`, so if it returns, panics
+or is dropped without finishing, the receiver ends the body as failed
+instead of waiting. `BodyReceiver::read_all` implements "fully read".
+
+Nothing uses it yet; the next patch replaces `done_chan` with it.
+
+Validation: `./mach test-unit -p servo-net-traits`: 104 tests pass, among them the 8 new ones in tests/body_stream.rs. Negative control: with a closed channel ending the body as complete, `test_body_without_finish_fails` and `test_body_of_a_panicking_producer_fails` fail.
+AI-assisted: Yes (agent session; the agent wrote the type and its tests following docs/fetch-body-stream-plan-2026-10-22.md in the workspace)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/shared/net/Cargo.toml           |   3 +-
+ components/shared/net/body_stream.rs       | 122 +++++++++++++++++
+ components/shared/net/lib.rs               |   1 +
+ components/shared/net/tests/body_stream.rs | 145 +++++++++++++++++++++
+ 4 files changed, 270 insertions(+), 1 deletion(-)
+ create mode 100644 components/shared/net/body_stream.rs
+ create mode 100644 components/shared/net/tests/body_stream.rs
+
+diff --git a/components/shared/net/Cargo.toml b/components/shared/net/Cargo.toml
+index 22dab3fe4f4..5e291c6ca9a 100644
+--- a/components/shared/net/Cargo.toml
++++ b/components/shared/net/Cargo.toml
+@@ -53,13 +53,14 @@ servo-url = { workspace = true }
+ servo_arc = { workspace = true }
+ sys-locale = { workspace = true }
+ rustls = { workspace = true }
+-tokio = { workspace = true }
++tokio = { workspace = true, features = ["sync"] }
+ url = { workspace = true }
+ uuid = { workspace = true }
+ webrender_api = { workspace = true }
+ 
+ [dev-dependencies]
+ servo-default-resources = { workspace = true }
++tokio = { workspace = true, features = ["rt"] }
+ 
+ [lints]
+ workspace = true
+diff --git a/components/shared/net/body_stream.rs b/components/shared/net/body_stream.rs
+new file mode 100644
+index 00000000000..46fda5f1601
+--- /dev/null
++++ b/components/shared/net/body_stream.rs
+@@ -0,0 +1,122 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! The [stream](https://fetch.spec.whatwg.org/#concept-body-stream) of a response body, from
++//! the task that receives the body to the fetch that hands it over to its consumer.
++
++use bytes::{Bytes, BytesMut};
++use log::warn;
++use servo_config::pref;
++use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
++
++use crate::NetworkError;
++
++/// How a response body ended.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum BodyEnd {
++    /// The whole body was received.
++    Complete,
++    /// The fetch was aborted before the end of the body.
++    ///
++    /// <https://fetch.spec.whatwg.org/#concept-response-aborted>
++    Aborted,
++    /// The body could not be received or decoded to its end.
++    Failed(NetworkError),
++}
++
++/// What a [`BodyReceiver`] yields: chunks, then how the body ended.
++#[derive(Debug)]
++pub enum BodyEvent {
++    Chunk(Bytes),
++    End(BodyEnd),
++}
++
++/// Create both ends of a response body stream. `length_hint` is how many bytes to preallocate
++/// for the body, if a size can be guessed; it is capped at the `network_max_content_length`
++/// preference and is never checked against the body.
++pub fn body_channel(length_hint: Option<usize>) -> (BodySender, BodyReceiver) {
++    let (sender, receiver) = unbounded_channel();
++    let max_hint = pref!(network_max_content_length) as usize;
++    (
++        BodySender { sender },
++        BodyReceiver {
++            receiver,
++            length_hint: length_hint.map(|hint| hint.min(max_hint)),
++            end: None,
++        },
++    )
++}
++
++/// The producing end of a response body stream. A body has a single producer, so this is not
++/// `Clone`, and the body ends when the producer is gone.
++#[derive(Debug)]
++pub struct BodySender {
++    sender: UnboundedSender<BodyEvent>,
++}
++
++impl BodySender {
++    /// Send the next chunk of the body. Returns `false` if nobody reads the body any more.
++    #[must_use]
++    pub fn send(&self, chunk: Bytes) -> bool {
++        self.sender.send(BodyEvent::Chunk(chunk)).is_ok()
++    }
++
++    /// Whether the receiving end was dropped.
++    pub fn is_closed(&self) -> bool {
++        self.sender.is_closed()
++    }
++
++    /// End the body.
++    pub fn finish(self, end: BodyEnd) {
++        let _ = self.sender.send(BodyEvent::End(end));
++    }
++}
++
++/// The consuming end of a response body stream. If the producer goes away without calling
++/// [`BodySender::finish`], for example because it panicked, the body ends with
++/// [`BodyEnd::Failed`].
++#[derive(Debug)]
++pub struct BodyReceiver {
++    receiver: UnboundedReceiver<BodyEvent>,
++    length_hint: Option<usize>,
++    end: Option<BodyEnd>,
++}
++
++impl BodyReceiver {
++    pub fn length_hint(&self) -> Option<usize> {
++        self.length_hint
++    }
++
++    /// The next chunk, or how the body ended. Once the body has ended, this keeps returning
++    /// that end.
++    pub async fn next(&mut self) -> BodyEvent {
++        if let Some(end) = &self.end {
++            return BodyEvent::End(end.clone());
++        }
++        let event = self.receiver.recv().await.unwrap_or_else(|| {
++            warn!("A response body ended without being finished by its producer");
++            BodyEvent::End(BodyEnd::Failed(NetworkError::ResourceLoadError(
++                "The response body ended without being finished".into(),
++            )))
++        });
++        if let BodyEvent::End(end) = &event {
++            self.end = Some(end.clone());
++        }
++        event
++    }
++
++    /// Read the whole body.
++    ///
++    /// <https://fetch.spec.whatwg.org/#body-fully-read>
++    pub async fn read_all(mut self) -> Result<Bytes, BodyEnd> {
++        let mut bytes = BytesMut::with_capacity(self.length_hint.unwrap_or(0));
++        loop {
++            match self.next().await {
++                BodyEvent::Chunk(chunk) => bytes.extend_from_slice(&chunk),
++                BodyEvent::End(BodyEnd::Complete) => return Ok(bytes.freeze()),
++                BodyEvent::End(end) => return Err(end),
++            }
++        }
++    }
++}
+diff --git a/components/shared/net/lib.rs b/components/shared/net/lib.rs
+index 0cfc6e7ef84..443c9a8b53d 100644
+--- a/components/shared/net/lib.rs
++++ b/components/shared/net/lib.rs
+@@ -53,6 +53,7 @@ use crate::request::{Request, RequestBuilder};
+ use crate::response::{Response, ResponseInit};
+ 
+ pub mod blob_url_store;
++pub mod body_stream;
+ pub mod fetch;
+ pub mod filemanager_thread;
+ pub mod http_status;
+diff --git a/components/shared/net/tests/body_stream.rs b/components/shared/net/tests/body_stream.rs
+new file mode 100644
+index 00000000000..fdf08713c09
+--- /dev/null
++++ b/components/shared/net/tests/body_stream.rs
+@@ -0,0 +1,145 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use bytes::Bytes;
++use net_traits::NetworkError;
++use net_traits::body_stream::{BodyEnd, BodyEvent, BodyReceiver, BodySender, body_channel};
++
++fn block_on<F: Future>(future: F) -> F::Output {
++    tokio::runtime::Builder::new_current_thread()
++        .build()
++        .unwrap()
++        .block_on(future)
++}
++
++fn next_chunk(receiver: &mut BodyReceiver) -> Bytes {
++    match block_on(receiver.next()) {
++        BodyEvent::Chunk(chunk) => chunk,
++        BodyEvent::End(end) => panic!("expected a chunk, got the end {end:?}"),
++    }
++}
++
++fn next_end(receiver: &mut BodyReceiver) -> BodyEnd {
++    match block_on(receiver.next()) {
++        BodyEvent::Chunk(chunk) => panic!("expected the end, got a chunk {chunk:?}"),
++        BodyEvent::End(end) => end,
++    }
++}
++
++#[test]
++fn test_body_delivers_chunks_then_its_end() {
++    let (sender, mut receiver) = body_channel(Some(6));
++    assert_eq!(receiver.length_hint(), Some(6));
++    assert!(sender.send(Bytes::from_static(b"abc")));
++    assert!(sender.send(Bytes::from_static(b"def")));
++    sender.finish(BodyEnd::Complete);
++
++    assert_eq!(next_chunk(&mut receiver), &b"abc"[..]);
++    assert_eq!(next_chunk(&mut receiver), &b"def"[..]);
++    assert_eq!(next_end(&mut receiver), BodyEnd::Complete);
++    assert_eq!(next_end(&mut receiver), BodyEnd::Complete);
++}
++
++#[test]
++fn test_body_without_finish_fails() {
++    let (sender, mut receiver) = body_channel(None);
++    assert!(sender.send(Bytes::from_static(b"abc")));
++    drop(sender);
++
++    assert_eq!(next_chunk(&mut receiver), &b"abc"[..]);
++    let end = next_end(&mut receiver);
++    assert!(matches!(end, BodyEnd::Failed(_)));
++    assert_eq!(next_end(&mut receiver), end);
++}
++
++#[test]
++fn test_body_of_a_panicking_producer_fails() {
++    let (sender, receiver) = body_channel(None);
++    let producer = std::thread::spawn(move || {
++        assert!(sender.send(Bytes::from_static(b"abc")));
++        panic!("the producer failed");
++    });
++    assert!(producer.join().is_err());
++
++    assert!(matches!(
++        block_on(receiver.read_all()),
++        Err(BodyEnd::Failed(_))
++    ));
++}
++
++#[test]
++fn test_send_reports_a_dropped_receiver() {
++    let (sender, receiver) = body_channel(None);
++    assert!(!sender.is_closed());
++    drop(receiver);
++
++    assert!(sender.is_closed());
++    assert!(!sender.send(Bytes::from_static(b"abc")));
++}
++
++#[test]
++fn test_body_of_a_panicking_producer_task_fails() {
++    block_on(async {
++        let (sender, receiver) = body_channel(None);
++        let producer = tokio::spawn(async move {
++            assert!(sender.send(Bytes::from_static(b"abc")));
++            panic!("the producer failed");
++        });
++        assert!(producer.await.is_err());
++        assert!(matches!(receiver.read_all().await, Err(BodyEnd::Failed(_))));
++    });
++}
++
++#[test]
++fn test_length_hint_is_capped() {
++    let (_sender, receiver) = body_channel(Some(usize::MAX));
++    assert!(receiver.length_hint().unwrap() < usize::MAX);
++}
++
++#[test]
++fn test_body_ends_can_be_held_across_awaits() {
++    fn assert_send_and_sync<T: Send + Sync>() {}
++    assert_send_and_sync::<BodySender>();
++    assert_send_and_sync::<BodyReceiver>();
++}
++
++#[test]
++fn test_read_all_concatenates_a_complete_body() {
++    let (sender, receiver) = body_channel(Some(1));
++    assert!(sender.send(Bytes::from_static(b"abc")));
++    assert!(sender.send(Bytes::new()));
++    assert!(sender.send(Bytes::from_static(b"def")));
++    sender.finish(BodyEnd::Complete);
++
++    assert_eq!(block_on(receiver.read_all()).unwrap(), &b"abcdef"[..]);
++}
++
++#[test]
++fn test_read_all_reports_how_an_incomplete_body_ended() {
++    let (sender, receiver) = body_channel(None);
++    assert!(sender.send(Bytes::from_static(b"abc")));
++    sender.finish(BodyEnd::Failed(NetworkError::DecompressionError));
++    assert_eq!(
++        block_on(receiver.read_all()),
++        Err(BodyEnd::Failed(NetworkError::DecompressionError))
++    );
++
++    let (sender, receiver) = body_channel(None);
++    sender.finish(BodyEnd::Aborted);
++    assert_eq!(block_on(receiver.read_all()), Err(BodyEnd::Aborted));
++}
++
++#[test]
++fn test_body_is_read_from_another_thread() {
++    let (sender, receiver) = body_channel(None);
++    let producer = std::thread::spawn(move || {
++        for _ in 0..100 {
++            assert!(sender.send(Bytes::from_static(b"x")));
++        }
++        sender.finish(BodyEnd::Complete);
++    });
++
++    assert_eq!(block_on(receiver.read_all()).unwrap().len(), 100);
++    producer.join().unwrap();
++}

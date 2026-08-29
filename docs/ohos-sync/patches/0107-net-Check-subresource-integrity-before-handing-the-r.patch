@@ -1,0 +1,367 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 15:23:37 +0000
+Subject: [PATCH] net: Check subresource integrity before handing the response
+ over
+
+Main fetch handed the body of a request with integrity metadata over to
+the consumer while reading it for the integrity check, before
+`process_response`, and only then replaced the response with a network
+error if the body did not match. So the consumer got the bytes of a body
+that failed its check, and got them before the response.
+
+Step 23 of main fetch fully reads the body first, and hands the response
+over with those bytes only if they match the metadata; a null body fails
+the check. Do that: read the whole body, check it, and hand over either the
+response with the verified bytes, as one chunk, or a network error, through
+the same handover as every other response. This also changes:
+
+- An opaque or opaque-redirect response, whose body is null, now fails any
+  integrity check without being read, even when the metadata does not
+  parse; so does a null body status.
+- A body that fails while it is read keeps its own network error and the
+  response's timing, as without integrity metadata, instead of becoming an
+  integrity failure.
+- Devtools gets the body of a checked response after the response, and
+  never gets the body of one that fails the check.
+
+Validation: `./mach test-unit -p servo-net`: 497 tests pass. Against the previous patch, these new tests fail: `test_body_that_fails_its_integrity_check_is_not_delivered`, `test_body_cut_short_is_not_delivered_for_an_integrity_check` and `test_body_that_passes_its_integrity_check_is_delivered_after_the_response` (the target sees the body before the response), `test_synchronous_fetch_delivers_a_checked_body_after_the_response` (likewise for a synchronous fetch) and `test_opaque_response_fails_any_integrity_check` (an opaque response with metadata that does not parse is delivered); `test_null_body_fails_its_integrity_check` and `test_body_that_fails_to_decode_is_not_delivered_for_an_integrity_check` pass on both.
+AI-assisted: Yes (agent session; the agent wrote this patch and its tests following docs/fetch-body-stream-plan-2026-10-22.md in the workspace, and applied an independent review's findings)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/net/fetch/methods.rs         |  77 ++++++----
+ components/net/subresource_integrity.rs |   5 +-
+ components/net/tests/http_loader.rs     | 188 ++++++++++++++++++++++++
+ 3 files changed, 237 insertions(+), 33 deletions(-)
+
+diff --git a/components/net/fetch/methods.rs b/components/net/fetch/methods.rs
+index 99d6c17bc1d..96e7dcd2ad6 100644
+--- a/components/net/fetch/methods.rs
++++ b/components/net/fetch/methods.rs
+@@ -981,35 +981,21 @@ pub async fn main_fetch(
+         response.actual_response_mut().body = ResponseBody::Null;
+     }
+ 
+-    // Step 19. If response is not a network error and any of the following returns blocked
+-    let mut response_loaded = false;
+     let mut response = if !response.is_network_error() && !request.integrity_metadata.is_empty() {
+-        // Step 19.1.
+-        wait_for_response(request, &mut response, target, true, context).await;
+-        response_loaded = true;
+-
+-        // Step 19.2.
+-        let integrity_metadata = &request.integrity_metadata;
+-        if response.termination_reason.is_none() &&
+-            !is_response_integrity_valid(integrity_metadata, &response)
+-        {
+-            Response::network_error(NetworkError::SubresourceIntegrity)
+-        } else {
+-            response
+-        }
++        check_integrity(request, response).await
+     } else {
+         response
+     };
+ 
++    // A preloaded response is kept whole for the fetch that consumes it.
++    let retain = request.preload_id.is_some();
++
+     // Step 20.
+     if request.synchronous {
+         // process_response is not supposed to be used
+         // by sync fetch, but we overload it here for simplicity
+         target.process_response(request, &response);
+-        if !response_loaded {
+-            let retain = request.preload_id.is_some();
+-            wait_for_response(request, &mut response, target, retain, context).await;
+-        }
++        wait_for_response(request, &mut response, target, retain, context).await;
+         // overloaded similarly to process_response
+         target.process_response_eof(request, &response);
+         return response;
+@@ -1031,11 +1017,7 @@ pub async fn main_fetch(
+     send_security_info_to_devtools(request, context, &response);
+ 
+     // Step 23.
+-    if !response_loaded {
+-        // A preloaded response is kept whole for the fetch that consumes it.
+-        let retain = request.preload_id.is_some();
+-        wait_for_response(request, &mut response, target, retain, context).await;
+-    }
++    wait_for_response(request, &mut response, target, retain, context).await;
+ 
+     // Step 24.
+     target.process_response_eof(request, &response);
+@@ -1049,6 +1031,46 @@ pub async fn main_fetch(
+     response
+ }
+ 
++/// Steps 23.1 to 23.4 of <https://fetch.spec.whatwg.org/#concept-main-fetch>: read the whole body
++/// of `response`, and return the response with that body if it matches the request’s integrity
++/// metadata, or a network error otherwise.
++async fn check_integrity(request: &Request, mut response: Response) -> Response {
++    // The body of an opaque filtered response is null.
++    if matches!(
++        response.response_type,
++        ResponseType::Opaque | ResponseType::OpaqueRedirect
++    ) {
++        return Response::network_error(NetworkError::SubresourceIntegrity);
++    }
++    let bytes = match response.actual_response_mut().body.take() {
++        ResponseBody::Null => return Response::network_error(NetworkError::SubresourceIntegrity),
++        ResponseBody::Bytes(bytes) => bytes,
++        ResponseBody::Stream(receiver) => match receiver.read_all().await {
++            Ok(bytes) => bytes,
++            Err(BodyEnd::Failed(network_error)) => {
++                set_body_failure(&mut response, network_error);
++                return response;
++            },
++            Err(_) => return Response::network_error(NetworkError::SubresourceIntegrity),
++        },
++    };
++    response.actual_response_mut().body = ResponseBody::Bytes(bytes);
++    if !is_response_integrity_valid(&request.integrity_metadata, &response) {
++        return Response::network_error(NetworkError::SubresourceIntegrity);
++    }
++    response
++}
++
++/// Make `response` a network error, because its body failed with `network_error`.
++fn set_body_failure(response: &mut Response, network_error: NetworkError) {
++    response.aborted = true;
++    response.actual_response_mut().aborted = true;
++    if network_error == NetworkError::DecompressionError {
++        response.termination_reason = Some(TerminationReason::Fatal);
++    }
++    response.set_network_error(network_error);
++}
++
+ /// Hand the body of `response` over to `target`, and set how it ended on `response`.
+ /// With `retain`, the body is also kept in `response` as a whole once it is complete.
+ async fn wait_for_response(
+@@ -1108,12 +1130,7 @@ async fn wait_for_response(
+                 break;
+             },
+             BodyEvent::End(BodyEnd::Failed(network_error)) => {
+-                response.aborted = true;
+-                response.actual_response_mut().aborted = true;
+-                if network_error == NetworkError::DecompressionError {
+-                    response.termination_reason = Some(TerminationReason::Fatal);
+-                }
+-                response.set_network_error(network_error);
++                set_body_failure(response, network_error);
+                 break;
+             },
+         }
+diff --git a/components/net/subresource_integrity.rs b/components/net/subresource_integrity.rs
+index 0b1577cab8c..dde56b85fb4 100644
+--- a/components/net/subresource_integrity.rs
++++ b/components/net/subresource_integrity.rs
+@@ -147,9 +147,8 @@ fn apply_algorithm_to_response(
+         let response_digest = digest::digest(algorithm, bytes);
+         base64::engine::general_purpose::STANDARD.encode(response_digest)
+     } else {
+-        // There is nothing to digest: a null body status leaves the body null, and a body
+-        // that is still being received is not known as a whole. Return a digest that
+-        // cannot match, so the integrity check fails rather than the process.
++        // There is nothing to digest. Return a digest that cannot match, so the integrity
++        // check fails rather than the process.
+         log::debug!("integrity check on a response with no retained body");
+         String::new()
+     }
+diff --git a/components/net/tests/http_loader.rs b/components/net/tests/http_loader.rs
+index 0632e85c33d..a10095180d7 100644
+--- a/components/net/tests/http_loader.rs
++++ b/components/net/tests/http_loader.rs
+@@ -3762,3 +3762,191 @@ fn test_fetch_of_a_preload_keeps_its_body() {
+     assert_eq!(body_of(&response), b"preloaded");
+     let _ = server.close();
+ }
++
++/// The integrity metadata of `alert('Hello, world.');`.
++const INTEGRITY_OF_SCRIPT: &str =
++    "sha384-H8BRh8j48O9oYatfu5AZzq6A9RINhZO5H16dQZngK7T62em8MUt1FLm52t+eX6xO";
++
++/// Records what a fetch hands over to its target, in order, and the body it delivers.
++struct EventCollector {
++    sender: Option<tokio::sync::oneshot::Sender<(Response, Vec<&'static str>, Vec<u8>)>>,
++    events: Vec<&'static str>,
++    body: Vec<u8>,
++}
++
++impl FetchTaskTarget for EventCollector {
++    fn process_request_body(&mut self, _: &Request) {}
++    fn process_response(&mut self, _: &Request, _: &Response) {
++        self.events.push("response");
++    }
++    fn process_response_chunk(&mut self, _: &Request, chunk: Bytes) {
++        self.events.push("chunk");
++        self.body.extend_from_slice(&chunk);
++    }
++    fn process_response_eof(&mut self, _: &Request, response: &Response) {
++        self.events.push("end");
++        let _ = self.sender.take().unwrap().send((
++            response.try_clone().unwrap(),
++            std::mem::take(&mut self.events),
++            std::mem::take(&mut self.body),
++        ));
++    }
++    fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
++    fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
++}
++
++/// A request for `url` with `integrity`.
++fn build_request_with_integrity(url: &UrlWithBlobClaim, integrity: &str) -> Request {
++    let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
++        .origin(url.origin())
++        .pipeline_id(Some(TEST_PIPELINE_ID))
++        .policy_container(Default::default())
++        .build();
++    request.integrity_metadata = integrity.to_owned();
++    request
++}
++
++/// Fetch `request`, and return the response, what reached the target and the body it got.
++fn fetch_events(request: Request) -> (Response, Vec<&'static str>, Vec<u8>) {
++    let context = new_fetch_context(None, None);
++    let (sender, receiver) = tokio::sync::oneshot::channel();
++    let mut target = EventCollector {
++        sender: Some(sender),
++        events: Vec::new(),
++        body: Vec::new(),
++    };
++    spawn_task(async move {
++        methods::fetch(request, &mut target, &context).await;
++    });
++    wait_for_fetch(receiver)
++}
++
++/// Fetch a server's `body` with `integrity`, and return the response, what reached the target and
++/// the body it got.
++fn fetch_with_integrity(
++    body: &'static [u8],
++    integrity: &str,
++) -> (Response, Vec<&'static str>, Vec<u8>) {
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            *response.body_mut() = make_body(body.to_vec());
++        };
++    let (server, url) = make_server(handler);
++    let result = fetch_events(build_request_with_integrity(&url, integrity));
++    let _ = server.close();
++    result
++}
++
++#[test]
++fn test_body_that_fails_its_integrity_check_is_not_delivered() {
++    let (response, events, _) =
++        fetch_with_integrity(b"alert('Hello, Network Error');", INTEGRITY_OF_SCRIPT);
++    assert_eq!(
++        response.get_network_error(),
++        Some(&NetworkError::SubresourceIntegrity)
++    );
++    assert_eq!(events, ["response", "end"]);
++}
++
++#[test]
++fn test_body_that_passes_its_integrity_check_is_delivered_after_the_response() {
++    let (response, events, body) =
++        fetch_with_integrity(b"alert('Hello, world.');", INTEGRITY_OF_SCRIPT);
++    assert!(!response.is_network_error());
++    assert_eq!(events, ["response", "chunk", "end"]);
++    assert_eq!(body, b"alert('Hello, world.');");
++}
++
++#[test]
++fn test_body_cut_short_is_not_delivered_for_an_integrity_check() {
++    let (url, release, _) = make_raw_held_server(
++        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nalert('Hello, world.');",
++    );
++    let _ = release.send(());
++    let (response, events, _) =
++        fetch_events(build_request_with_integrity(&url, INTEGRITY_OF_SCRIPT));
++    assert!(response.is_network_error());
++    assert_eq!(events, ["response", "end"]);
++}
++
++#[test]
++fn test_null_body_fails_its_integrity_check() {
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            *response.status_mut() = StatusCode::NO_CONTENT;
++        };
++    let (server, url) = make_server(handler);
++    let (response, events, _) =
++        fetch_events(build_request_with_integrity(&url, INTEGRITY_OF_SCRIPT));
++    let _ = server.close();
++    assert_eq!(
++        response.get_network_error(),
++        Some(&NetworkError::SubresourceIntegrity)
++    );
++    assert_eq!(events, ["response", "end"]);
++}
++
++#[test]
++fn test_body_that_fails_to_decode_is_not_delivered_for_an_integrity_check() {
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            response
++                .headers_mut()
++                .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
++            *response.body_mut() = make_body(b"not gzip".to_vec());
++        };
++    let (server, url) = make_server(handler);
++    let (response, events, _) =
++        fetch_events(build_request_with_integrity(&url, INTEGRITY_OF_SCRIPT));
++    let _ = server.close();
++    assert_eq!(
++        response.get_network_error(),
++        Some(&NetworkError::DecompressionError)
++    );
++    assert_eq!(events, ["response", "end"]);
++}
++
++#[test]
++fn test_synchronous_fetch_delivers_a_checked_body_after_the_response() {
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            *response.body_mut() = make_body(b"alert('Hello, world.');".to_vec());
++        };
++    let (server, url) = make_server(handler);
++    let mut request = build_request_with_integrity(&url, INTEGRITY_OF_SCRIPT);
++    request.synchronous = true;
++    let (response, events, _) = fetch_events(request);
++    let _ = server.close();
++    assert!(!response.is_network_error());
++    assert_eq!(events, ["response", "chunk", "end"]);
++}
++
++#[test]
++fn test_opaque_response_fails_any_integrity_check() {
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            *response.body_mut() = make_body(b"alert('Hello, world.');".to_vec());
++        };
++    let (server, url) = make_server(handler);
++    for integrity in [INTEGRITY_OF_SCRIPT, "unknown-metadata"] {
++        let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
++            .mode(RequestMode::NoCors)
++            .origin(mock_origin())
++            .pipeline_id(Some(TEST_PIPELINE_ID))
++            .policy_container(Default::default())
++            .build();
++        request.integrity_metadata = integrity.to_owned();
++        let (response, events, _) = fetch_events(request);
++        assert_eq!(
++            response.get_network_error(),
++            Some(&NetworkError::SubresourceIntegrity)
++        );
++        assert_eq!(events, ["response", "end"]);
++    }
++    let _ = server.close();
++}

@@ -1,0 +1,429 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 15:55:11 +0000
+Subject: [PATCH] net: Take a TLS close without close_notify as the end of a
+ close-delimited body
+
+An HTTP/1 response with neither a `Content-Length` nor a chunked
+`Transfer-Encoding` ends when its connection does. Over TLS, rustls reports a close without
+close_notify as an `UnexpectedEof` error, which the decoder only let through
+once a `Content-Length` worth of bytes had been read. A close-delimited body
+that the server closed without close_notify, as wptserve does, so ended with
+an error although all of it had arrived.
+
+Fetch treated that error like a body cut short, which marked the response
+as aborted but still delivered the whole body with a successful end of
+file. Take such a close as the end of the body instead, as Chromium and
+Firefox do, although RFC 9112 section 9.8 calls the response incomplete. A
+body with a `Content-Length` or a chunked coding still fails when the
+connection closes early. The framing follows hyper, which reads the body:
+a `Transfer-Encoding` takes precedence over a `Content-Length`, and one
+whose last coding is not chunked is read until the connection closes. The HTTP cache, which reads the body below the
+decoder, still does not store these responses.
+
+The only other change is that devtools now gets the response, which it got
+only for bodies that ended cleanly. The next patch stops keeping the bytes
+of a body that is cut short, which would otherwise fail subresource
+integrity for these responses.
+
+Validation: `./mach test-unit -p servo-net`: 483 tests pass. `test_body_that_ends_with_its_tls_connection_without_close_notify_is_complete` fails without the change to the decoder: the response is marked as aborted. It also covers a `Transfer-Encoding` that does not end with chunked, with and without a `Content-Length`, which fails when any transfer coding counts as framing. `test_truncated_body_that_ends_with_its_tls_connection_is_aborted` covers a short `Content-Length` and chunked bodies without their last chunk, written `Chunked` or as the last coding of a second `Transfer-Encoding` line; a case-sensitive or first-line check for chunked fails it. WPT `subresource-integrity/integrity-policy/script.https.html`, where wptserve sends `common/dispatcher/dispatcher.js` this way, logs "finished response for" (the error path) for it without this patch.
+AI-assisted: Yes (agent session; the agent found the cause while checking WPT results of the next patch, wrote this patch and its tests, and applied the findings of independent reviews of this patch and of a later one)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/net/decoder.rs           | 109 +++++++++++++++++++---------
+ components/net/test_util.rs         |  79 +++++++++++++++++---
+ components/net/tests/http_loader.rs |  60 ++++++++++++++-
+ components/net/tests/main.rs        |   5 ++
+ 4 files changed, 206 insertions(+), 47 deletions(-)
+
+diff --git a/components/net/decoder.rs b/components/net/decoder.rs
+index 742ec9d93fc..e676d16f13b 100644
+--- a/components/net/decoder.rs
++++ b/components/net/decoder.rs
+@@ -29,9 +29,9 @@ use futures::{Future, Stream};
+ use futures_util::StreamExt;
+ use headers::{ContentLength, HeaderMapExt};
+ use http_body_util::BodyExt;
+-use hyper::Response;
+ use hyper::body::Body;
+ use hyper::header::{CONTENT_ENCODING, HeaderValue, TRANSFER_ENCODING};
++use hyper::{Response, Version};
+ use malloc_size_of_derive::MallocSizeOf;
+ use serde::{Deserialize, Serialize};
+ use tokio_util::codec::{BytesCodec, FramedRead};
+@@ -151,13 +151,9 @@ impl Decoder {
+     ///
+     /// This decoder will emit the underlying bytes as-is.
+     #[inline]
+-    fn plain_text(
+-        body: BodySource,
+-        is_secure_scheme: bool,
+-        content_length: Option<ContentLength>,
+-    ) -> Decoder {
++    fn plain_text(body: BodySource, is_secure_scheme: bool, length: BodyLength) -> Decoder {
+         Decoder {
+-            inner: Inner::PlainText(BodyStream::new(body, is_secure_scheme, content_length)),
++            inner: Inner::PlainText(BodyStream::new(body, is_secure_scheme, length)),
+         }
+     }
+ 
+@@ -169,11 +165,11 @@ impl Decoder {
+         body: BodySource,
+         type_: DecoderType,
+         is_secure_scheme: bool,
+-        content_length: Option<ContentLength>,
++        length: BodyLength,
+     ) -> Decoder {
+         Decoder {
+             inner: Inner::Pending(Pending {
+-                body: BodyStream::new(body, is_secure_scheme, content_length).peekable(),
++                body: BodyStream::new(body, is_secure_scheme, length).peekable(),
+                 type_,
+             }),
+         }
+@@ -192,19 +188,12 @@ impl Decoder {
+     /// Uses the correct variant by inspecting the Content-Encoding header.
+     pub fn detect(response: Response<BoxedBody>, is_secure_scheme: bool) -> Response<Decoder> {
+         let decoder = DecoderType::detect(response.headers());
+-        let content_length = response.headers().typed_get::<ContentLength>();
++        let length = BodyLength::of(&response);
+         match decoder {
+-            Some(type_) => response.map(|r| {
+-                Decoder::pending(
+-                    BodySource::Hyper(r),
+-                    type_,
+-                    is_secure_scheme,
+-                    content_length,
+-                )
+-            }),
+-            None => response.map(|r| {
+-                Decoder::plain_text(BodySource::Hyper(r), is_secure_scheme, content_length)
+-            }),
++            Some(type_) => response
++                .map(|r| Decoder::pending(BodySource::Hyper(r), type_, is_secure_scheme, length)),
++            None => response
++                .map(|r| Decoder::plain_text(BodySource::Hyper(r), is_secure_scheme, length)),
+         }
+     }
+ 
+@@ -216,8 +205,8 @@ impl Decoder {
+     ) -> Decoder {
+         let source = BodySource::Stream(stream);
+         match type_ {
+-            Some(type_) => Decoder::pending(source, type_, false, None),
+-            None => Decoder::plain_text(source, false, None),
++            Some(type_) => Decoder::pending(source, type_, false, BodyLength::Unknown),
++            None => Decoder::plain_text(source, false, BodyLength::Unknown),
+         }
+     }
+ }
+@@ -322,10 +311,57 @@ enum BodySource {
+     Stream(BoxStream<'static, io::Result<Bytes>>),
+ }
+ 
++/// How the end of a network body is delimited.
++#[derive(Clone, Copy)]
++enum BodyLength {
++    /// By a `Content-Length`.
++    Known(u64),
++    /// By the end of the connection: an HTTP/1 body with a `Transfer-Encoding` that does not end
++    /// with chunked, or with neither a `Transfer-Encoding` nor a `Content-Length`.
++    UntilClose,
++    /// By the framing of the protocol: a chunked transfer coding, HTTP/2 or HTTP/3, or a body
++    /// that did not come from the network.
++    Unknown,
++}
++
++impl BodyLength {
++    /// The framing hyper reads the body with: in HTTP/1, a `Transfer-Encoding` takes precedence
++    /// over a `Content-Length`, and only its last coding decides whether the body is chunked.
++    fn of<B>(response: &Response<B>) -> BodyLength {
++        let http1 = response.version() <= Version::HTTP_11;
++        if http1 &&
++            let Some(codings) = response
++                .headers()
++                .get_all(TRANSFER_ENCODING)
++                .iter()
++                .next_back()
++        {
++            let chunked = codings
++                .to_str()
++                .ok()
++                .and_then(|codings| codings.rsplit(',').next())
++                .is_some_and(|coding| coding.trim().eq_ignore_ascii_case("chunked"));
++            return if chunked {
++                BodyLength::Unknown
++            } else {
++                BodyLength::UntilClose
++            };
++        }
++        if let Some(content_length) = response.headers().typed_get::<ContentLength>() {
++            return BodyLength::Known(content_length.0);
++        }
++        if http1 {
++            BodyLength::UntilClose
++        } else {
++            BodyLength::Unknown
++        }
++    }
++}
++
+ struct BodyStream {
+     body: BodySource,
+     is_secure_scheme: bool,
+-    content_length: Option<ContentLength>,
++    length: BodyLength,
+     total_read: u64,
+ }
+ 
+@@ -338,20 +374,16 @@ impl BodyStream {
+                     .boxed(),
+             ),
+             is_secure_scheme: false,
+-            content_length: None,
++            length: BodyLength::Unknown,
+             total_read: 0,
+         }
+     }
+ 
+-    fn new(
+-        body: BodySource,
+-        is_secure_scheme: bool,
+-        content_length: Option<ContentLength>,
+-    ) -> Self {
++    fn new(body: BodySource, is_secure_scheme: bool, length: BodyLength) -> Self {
+         BodyStream {
+             body,
+             is_secure_scheme,
+-            content_length,
++            length,
+             total_read: 0,
+         }
+     }
+@@ -378,10 +410,17 @@ impl Stream for BodyStream {
+                 // an error of type std::io::Error with ErrorKind::UnexpectedEof.
+                 // https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof
+                 //
+-                // The error can be safely ignored if we known that all content was received or is explicitly
+-                // set in preferences.
+-                let all_content_read = self.content_length.is_some_and(|c| c.0 == self.total_read);
+-                if self.is_secure_scheme && all_content_read {
++                // The error can be safely ignored if we know that all content was received.
++                //
++                // A body that ends with its connection is only complete with a close_notify
++                // (RFC 9112, section 9.8), but many servers close without one. Like Chromium and
++                // Firefox, take such a close as the end of the body.
++                let close_ends_body = match self.length {
++                    BodyLength::Known(length) => length == self.total_read,
++                    BodyLength::UntilClose => true,
++                    BodyLength::Unknown => false,
++                };
++                if self.is_secure_scheme && close_ends_body {
+                     let source = err.source();
+                     let is_unexpected_eof = source
+                         .and_then(|e| e.downcast_ref::<io::Error>())
+diff --git a/components/net/test_util.rs b/components/net/test_util.rs
+index d2d4aa90eb2..1c606e5e87c 100644
+--- a/components/net/test_util.rs
++++ b/components/net/test_util.rs
+@@ -23,6 +23,7 @@ use rustls_pki_types::pem::PemObject;
+ use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+ use servo_default_resources as _;
+ use servo_url::ServoUrl;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio::net::{TcpListener, TcpStream};
+ use tokio_rustls::{self, TlsAcceptor};
+ 
+@@ -213,16 +214,7 @@ where
+     let url_string = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+     let url = UrlWithBlobClaim::new(ServoUrl::parse(&url_string).unwrap(), None);
+ 
+-    let certificates = load_certificates_from_pem().expect("Invalid certificate");
+-    let key = load_private_key_from_file().expect("Invalid key");
+-
+-    let mut config = rustls::ServerConfig::builder()
+-        .with_no_client_auth()
+-        .with_single_cert(certificates.clone(), key)
+-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
+-        .expect("Could not create rustls ServerConfig");
+-    config.alpn_protocols = alpn_protocols;
+-    let acceptor = TlsAcceptor::from(Arc::new(config));
++    let (acceptor, certificates) = tls_acceptor(alpn_protocols);
+ 
+     let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+     let server = async move {
+@@ -281,6 +273,73 @@ where
+     )
+ }
+ 
++/// The acceptor of the test TLS servers, offering `alpn_protocols`, and their certificates.
++fn tls_acceptor(alpn_protocols: Vec<Vec<u8>>) -> (TlsAcceptor, Vec<CertificateDer<'static>>) {
++    let certificates = load_certificates_from_pem().expect("Invalid certificate");
++    let key = load_private_key_from_file().expect("Invalid key");
++
++    let mut config = rustls::ServerConfig::builder()
++        .with_no_client_auth()
++        .with_single_cert(certificates.clone(), key)
++        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
++        .expect("Could not create rustls ServerConfig");
++    config.alpn_protocols = alpn_protocols;
++    (TlsAcceptor::from(Arc::new(config)), certificates)
++}
++
++/// A TLS server that answers each request with `response`, written as is, and then closes the
++/// connection without a TLS close_notify. Returns an `https` URL.
++pub fn make_tls_server_without_close_notify(response: &'static [u8]) -> (Server, UrlWithBlobClaim) {
++    if !async_runtime_initialized() {
++        let _ = &*ASYNC_RUNTIME;
++    }
++    let listener = StdTcpListener::bind("[::0]:0").unwrap();
++    listener.set_nonblocking(true).unwrap();
++    let listener = spawn_blocking_task(async move { TcpListener::from_std(listener).unwrap() });
++    let url_string = format!(
++        "https://localhost:{}",
++        listener.local_addr().unwrap().port()
++    );
++    let url = UrlWithBlobClaim::new(ServoUrl::parse(&url_string).unwrap(), None);
++    let (acceptor, certificates) = tls_acceptor(vec![]);
++
++    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
++    let server = async move {
++        loop {
++            let stream = tokio::select! {
++                stream = listener.accept() => stream.unwrap().0,
++                _ = &mut rx => break
++            };
++            let acceptor = acceptor.clone();
++            spawn_task(async move {
++                let Ok(mut stream) = acceptor.accept(stream).await else {
++                    return;
++                };
++                let mut request = Vec::new();
++                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
++                    let mut buffer = [0; 1024];
++                    match stream.read(&mut buffer).await {
++                        Ok(0) | Err(_) => return,
++                        Ok(length) => request.extend_from_slice(&buffer[..length]),
++                    }
++                }
++                let _ = stream.write_all(response).await;
++                let _ = stream.flush().await;
++                // Dropping the stream closes the connection without a close_notify.
++            });
++        }
++    };
++    spawn_task(server);
++
++    (
++        Server {
++            close_channel: tx,
++            certificates: Some(certificates),
++        },
++        url,
++    )
++}
++
+ pub fn make_body(bytes: Vec<u8>) -> BoxBody<Bytes, hyper::Error> {
+     Full::new(Bytes::from(bytes))
+         .map_err(|_| unreachable!())
+diff --git a/components/net/tests/http_loader.rs b/components/net/tests/http_loader.rs
+index 024ee6850a6..a73b4fb2b54 100644
+--- a/components/net/tests/http_loader.rs
++++ b/components/net/tests/http_loader.rs
+@@ -40,7 +40,7 @@ use net::http_loader::{determine_requests_referrer, serialize_origin};
+ use net::protocols::ProtocolRegistry;
+ use net::resource_thread::{AuthCacheEntry, new_core_resource_thread};
+ use net::test::DECODER_BUFFER_SIZE;
+-use net::test_util::make_h2_ssl_server;
++use net::test_util::{make_h2_ssl_server, make_tls_server_without_close_notify};
+ use net_traits::blob_url_store::UrlWithBlobClaim;
+ use net_traits::fetch::fetch_controller::FetchController;
+ use net_traits::http_status::HttpStatus;
+@@ -63,7 +63,7 @@ use url::Url;
+ 
+ use crate::{
+     create_generic_embedder_proxy, create_generic_embedder_proxy_and_receiver, create_http_state,
+-    fetch, fetch_with_context, make_body, make_server, make_ssl_server, mock_origin,
++    fetch, fetch_with_context, is_aborted, make_body, make_server, make_ssl_server, mock_origin,
+     new_fetch_context, receive_credential_prompt_msgs, replace_host_table, spawn_blocking_task,
+ };
+ 
+@@ -2014,6 +2014,62 @@ fn collect_all_network_events(devtools_port: &Receiver<DevtoolsControlMsg>) -> V
+     events
+ }
+ 
++#[test]
++fn test_body_that_ends_with_its_tls_connection_without_close_notify_is_complete() {
++    for response in [
++        &b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nuntil close"[..],
++        // A transfer coding that does not end with chunked is read until the connection closes,
++        // whatever the `Content-Length`.
++        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\nConnection: close\r\n\r\nuntil close",
++        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, identity\r\nContent-Length: 100\r\n\r\nuntil close",
++    ] {
++        let (server, url) = make_tls_server_without_close_notify(response);
++        let mut context = new_fetch_context(None, None);
++        for certificate in server.certificates.as_ref().unwrap().iter() {
++            context.state.override_manager.add_override(certificate);
++        }
++        let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
++            .origin(url.origin())
++            .pipeline_id(Some(TEST_PIPELINE_ID))
++            .policy_container(Default::default())
++            .build();
++
++        let response = fetch_with_context(request, &mut context);
++        server.close();
++        assert!(!response.is_network_error());
++        assert!(!is_aborted(&response));
++        assert_eq!(
++            *response.actual_response().body.lock(),
++            ResponseBody::Done(b"until close".to_vec())
++        );
++    }
++}
++
++#[test]
++fn test_truncated_body_that_ends_with_its_tls_connection_is_aborted() {
++    for response in [
++        &b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort"[..],
++        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n",
++        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\n5\r\nshort\r\n",
++        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\nTransfer-Encoding: gzip, CHUNKED\r\n\r\n5\r\nshort\r\n",
++    ] {
++        let (server, url) = make_tls_server_without_close_notify(response);
++        let mut context = new_fetch_context(None, None);
++        for certificate in server.certificates.as_ref().unwrap().iter() {
++            context.state.override_manager.add_override(certificate);
++        }
++        let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
++            .origin(url.origin())
++            .pipeline_id(Some(TEST_PIPELINE_ID))
++            .policy_container(Default::default())
++            .build();
++
++        let response = fetch_with_context(request, &mut context);
++        server.close();
++        assert!(is_aborted(&response));
++    }
++}
++
+ #[test]
+ fn test_security_info_for_https_connection() {
+     let handler =
+diff --git a/components/net/tests/main.rs b/components/net/tests/main.rs
+index 14013b16fc1..13338436a8f 100644
+--- a/components/net/tests/main.rs
++++ b/components/net/tests/main.rs
+@@ -207,6 +207,11 @@ fn fetch_with_cors_cache(request: Request, cache: &mut CorsCache) -> Response {
+     response
+ }
+ 
++/// Whether the body of a response from `fetch_with_context` ended before it was complete.
++pub(crate) fn is_aborted(response: &Response) -> bool {
++    response.aborted.load(std::sync::atomic::Ordering::SeqCst)
++}
++
+ pub(crate) fn mock_origin() -> ImmutableOrigin {
+     ServoUrl::parse("http://servo.org").unwrap().origin()
+ }

@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 23 Oct 2026 17:09:57 +0000
+Subject: [PATCH] quickjs: Bump servo-quickjs for interrupts and terminations
+ in built-ins
+
+servo-quickjs 2de9592 brings five QuickJS changes:
+- Q36: QuickJS polls for interrupts on every call, built-ins included,
+  so the interrupt requested when a script thread shuts down or a worker
+  is terminated could be handled inside NewPromiseObject or
+  CallOriginalPromiseResolve/Reject. They returned null, and the asserts
+  in Promise::new_in_realm and Promise::new_resolved panicked (servo-fuzz
+  finding 0d530f8a5ec4: document.fonts during shutdown). These
+  operations now leave the interrupt pending while they run only
+  built-ins, as SpiderMonkey checks only in script.
+- Q37: QuickJS's built-ins caught the uncatchable termination like any
+  exception: promise executors and jobs, async functions and generators
+  and module evaluation turned it into a rejection, and the terminated
+  script kept running. They now propagate it. Module evaluation follows
+  SpiderMonkey, so ModuleEvaluate still succeeds: a module terminated
+  while it runs is rejected with undefined.
+- Q38 to Q40: undefined behavior that UBSan reports with QuickJS's
+  -fwrapv (a DynBuf realloc function called through an incompatible
+  type, a memcpy from NULL in TypedArray.prototype.slice), and
+  ArrayBuffer's maxByteLength converted with ToIndex instead of wrapping
+  modulo 2^64.
+
+"Worker is terminated during top-level await" passes with QuickJS now:
+the evaluation of a module terminated during top-level await stays
+pending, and no error event fires. SpiderMonkey also leaves it pending,
+but its ThrowModuleErrorsSync reports a pending evaluation as an error,
+undefined.
+
+Validation: servo-quickjs CI passes on 2de9592 (tests, also under ASan, LSan and UBSan; test262 under the sanitizers; fuzzing). QuickJS checked-release builds of c5a6c8ef59d (a5ebf1f) and of this commit: the finding's 6 testcases, 10 runs each, panic at the promise.rs:259 assert 12/60 against 0/60; the crashtest of the next patch, `--repeat 10`, CRASH 10/10 against PASS 10/10; Worker-terminate-forever-during-evaluation.html, `--repeat 10`, fails the top-level await subtest 10/10 against passing it 10/10. Full WPT with `--js-engine quickjs` on both builds, then the 89 tests unexpected in either run 3 more times on each: the only consistent differences are those two tests. Three others that differed 3/3 gave the same results on both builds 5/5 when run alone.
+AI-assisted: Yes (agent session; the agent wrote the servo-quickjs changes, bumped the pin and ran the checks above)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ support/quickjs/cargo-config.toml                             | 2 +-
+ .../Worker-terminate-forever-during-evaluation.html.ini       | 4 +++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/support/quickjs/cargo-config.toml b/support/quickjs/cargo-config.toml
+index 21f3d6acaa3..cb7fc2eb69f 100644
+--- a/support/quickjs/cargo-config.toml
++++ b/support/quickjs/cargo-config.toml
+@@ -5,4 +5,4 @@
+ # were tested with. The shim's version must match the mozjs version that Cargo.toml requires, or
+ # Cargo leaves the patch unused.
+ [patch.crates-io]
+-mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "a5ebf1f04a1b6097e79714d2b77cec3436bbc3c5" }
++mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "2de95922804e5ec0876f3106097b46d0f62bd0c9" }
+diff --git a/tests/wpt/meta/workers/Worker-terminate-forever-during-evaluation.html.ini b/tests/wpt/meta/workers/Worker-terminate-forever-during-evaluation.html.ini
+index 1f05c20de41..a9c645a17e6 100644
+--- a/tests/wpt/meta/workers/Worker-terminate-forever-during-evaluation.html.ini
++++ b/tests/wpt/meta/workers/Worker-terminate-forever-during-evaluation.html.ini
+@@ -1,6 +1,8 @@
+ [Worker-terminate-forever-during-evaluation.html]
+   [Worker is terminated during top-level await]
+-    expected: FAIL
++    expected:
++      if js_engine == "quickjs": PASS
++      FAIL
+ 
+   [Worker is terminated during top-level script evaluation (module)]
+     expected: FAIL

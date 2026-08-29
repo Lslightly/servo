@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 08:24:23 +0000
+Subject: [PATCH] ci: Run WPT on every ohos-main push and store the results in
+ servo-ohos-wpt
+
+Pushes to ohos-main ran no WPT, and the QuickJS WPT ran every night, also
+when ohos-main had not changed, while servo-ohos-wpt built and tested
+ohos-main a second time for its dashboard. The ohos-main WPT workflow runs
+the whole suite with SpiderMonkey and with QuickJS on each push instead,
+on the checked-release builds of the self-hosted runners. Its results job
+calls store.yml of servo-ohos-wpt, which stores the results together with
+those of servo/servo's CI for the upstream base, so servo-ohos-wpt no
+longer runs tests itself. The QuickJS schedule goes, as the push runs
+replace it.
+
+Runs go one at a time, so that the results job, which names and pushes
+the runs, never races with itself: a push waits for the running run, and
+of several waiting pushes GitHub only keeps the latest.
+
+linux-wpt.yml passes the whole `github` context to the WPT steps, which
+on push events includes every pushed commit. After a rebase onto upstream
+that is several hundred kilobytes (about 340 KB for the 2026-10-13 sync),
+more than the 128 KiB that Linux allows for one environment variable, so
+the steps could not start. Push events pass an empty context instead,
+which the scripts already handle; those runs report no check run.
+
+The results job needs the `servo-ohos-wpt` environment, limited to
+ohos-main, with a SERVO_OHOS_WPT_TOKEN secret: a fine-grained token with
+read and write access to the contents of openharmony-rs/servo-ohos-wpt.
+It passes that secret, and no other, to store.yml, without any token
+permissions.
+
+The upstream base line needs a complete WPT run of the base in servo/servo's
+merge queue, so the sync runbook checks that the merge-queue run of the new
+base succeeded before tagging it.
+
+Validation: actionlint reports nothing for ohos-main-wpt.yml and only the existing findings for quickjs.yml and linux-wpt.yml; an independent agent review found the missing secret and the context size, both checked against GitHub's documentation and the commits of past syncs; the runbook's `gh api` check prints `success` for the bases of the last two syncs, 5979b83191a and ab7e8fb1358; `./mach test-tidy` reports only the existing cargo-deny advisories of ohos-main. The store step of store.yml ran locally against a scratch copy of servo-ohos-wpt, with 20 wptreport chunks of ohos-main 8eaee63c99b and the servo/servo artifacts of its base 5979b83191a; the workflow itself runs on the next push.
+AI-assisted: Yes (agent session; written by the agent, which also ran the checks above)
+AI-assisted: Yes (agent session; 2026-11-09 sync -- runbook: no reference to a development container)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/linux-wpt.yml     |  7 +++--
+ .github/workflows/ohos-main-wpt.yml | 46 +++++++++++++++++++++++++++++
+ .github/workflows/quickjs.yml       |  9 +++---
+ docs/ohos-sync.md                   | 11 +++++--
+ python/servo/pr_jobs.py             |  4 +--
+ 5 files changed, 66 insertions(+), 11 deletions(-)
+ create mode 100644 .github/workflows/ohos-main-wpt.yml
+
+diff --git a/.github/workflows/linux-wpt.yml b/.github/workflows/linux-wpt.yml
+index 803f8839099..7cf16c66990 100644
+--- a/.github/workflows/linux-wpt.yml
++++ b/.github/workflows/linux-wpt.yml
+@@ -124,7 +124,9 @@ jobs:
+             --filter-intermittents wpt-filtered-logs/linux/${{ matrix.chunk_id }}.json \
+             ${{ inputs.wpt-args }}
+         env:
+-          GITHUB_CONTEXT: ${{ toJson(github) }}
++          # A push event lists every pushed commit; after a rebase that exceeds the 128 KiB that
++          # Linux allows for one environment variable, and the step cannot start.
++          GITHUB_CONTEXT: ${{ github.event_name == 'push' && '{}' || toJson(github) }}
+       - name: Archive results (filtered)
+         uses: actions/upload-artifact@v7
+         if: ${{ always() }}
+@@ -185,6 +187,7 @@ jobs:
+             --tag="${{ inputs.name }}-wpt" \
+             results/linux/*.json
+         env:
+-          GITHUB_CONTEXT: ${{ toJson(github) }}
++          # See "Run tests".
++          GITHUB_CONTEXT: ${{ github.event_name == 'push' && '{}' || toJson(github) }}
+           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+           RESULTS: ${{ toJson(needs.*.result) }}
+diff --git a/.github/workflows/ohos-main-wpt.yml b/.github/workflows/ohos-main-wpt.yml
+new file mode 100644
+index 00000000000..6a4d49a393d
+--- /dev/null
++++ b/.github/workflows/ohos-main-wpt.yml
+@@ -0,0 +1,46 @@
++# Runs the whole WPT suite with SpiderMonkey and with QuickJS on every ohos-main commit, and stores
++# the results in openharmony-rs/servo-ohos-wpt, which shows them with the results of the upstream
++# commit that ohos-main is based on: https://openharmony-rs.github.io/servo-ohos-wpt/
++#
++# The results job takes its token from the `servo-ohos-wpt` environment, which only ohos-main can
++# use.
++name: ohos-main WPT
++on:
++  push:
++    branches: ["ohos-main"]
++  workflow_dispatch:
++
++# One run at a time, so that the results job stores the runs in order. A push waits for the running
++# run; of several waiting pushes, GitHub only keeps the latest.
++concurrency:
++  group: ${{ github.workflow }}-${{ github.ref }}
++  cancel-in-progress: false
++
++jobs:
++  linux:
++    name: Linux
++    uses: ./.github/workflows/linux.yml
++    secrets: inherit
++    with:
++      profile: checked-release
++      wpt: true
++
++  quickjs:
++    name: QuickJS
++    uses: ./.github/workflows/quickjs.yml
++    secrets: inherit
++    with:
++      profile: checked-release
++      wpt: true
++
++  # Stores the configurations whose WPT jobs uploaded the results of all chunks, also if some
++  # tests had unexpected results.
++  results:
++    name: Results
++    needs: [linux, quickjs]
++    if: ${{ !cancelled() }}
++    uses: openharmony-rs/servo-ohos-wpt/.github/workflows/store.yml@main
++    # The called workflow reads the secret from its job's environment, but only if it is passed.
++    secrets:
++      SERVO_OHOS_WPT_TOKEN: ${{ secrets.SERVO_OHOS_WPT_TOKEN }}
++    permissions: {}
+diff --git a/.github/workflows/quickjs.yml b/.github/workflows/quickjs.yml
+index 286c5f7bfe8..a4fc8eb474a 100644
+--- a/.github/workflows/quickjs.yml
++++ b/.github/workflows/quickjs.yml
+@@ -1,11 +1,10 @@
+ # Builds servoshell on the QuickJS mozjs shim (openharmony-rs/servo-quickjs) and runs WPT with it,
+ # against the expectations with their `js_engine == "quickjs"` conditions. Pull requests run WPT
+ # on the directories of the Linux WPT job, and the whole suite when they change the shim pin
+-# (python/servo/pr_jobs.py); the merge queue runs the build and smoketest only.
++# (python/servo/pr_jobs.py); the merge queue runs the build and smoketest only, and ohos-main-wpt.yml
++# the whole suite on every ohos-main push.
+ name: QuickJS
+ on:
+-  schedule:
+-    - cron: "30 1 * * *"
+   workflow_call:
+     inputs:
+       profile:
+@@ -48,7 +47,7 @@ env:
+   # Replaces the servo-quickjs commit pinned in support/quickjs/cargo-config.toml, if set.
+   SERVO_QUICKJS_REF: ${{ inputs.servo-quickjs-ref }}
+   PROFILE: ${{ inputs.profile || 'release' }}
+-  RUN_WPT: ${{ github.event_name == 'schedule' || inputs.wpt }}
++  RUN_WPT: ${{ inputs.wpt }}
+ 
+ jobs:
+   build:
+@@ -139,7 +138,7 @@ jobs:
+   # comments on the pull request.
+   wpt:
+     needs: build
+-    if: ${{ github.event_name == 'schedule' || inputs.wpt }}
++    if: ${{ inputs.wpt }}
+     uses: ./.github/workflows/linux-wpt.yml
+     with:
+       profile: ${{ inputs.profile || 'release' }}
+diff --git a/docs/ohos-sync.md b/docs/ohos-sync.md
+index 520f72b70b6..f8ab3618e78 100644
+--- a/docs/ohos-sync.md
++++ b/docs/ohos-sync.md
+@@ -77,13 +77,20 @@ A rebase can go wrong in three ways, and each needs its own evidence:
+ 
+ ```sh
+ git fetch upstream main
++gh api "repos/servo/servo/actions/runs?head_sha=$(git rev-parse upstream/main)&event=merge_group" \
++  --jq '.workflow_runs[] | select(.name == "Main") | .conclusion'
+ git tag pre-sync/<date> ohos-main
+ git tag base/<date> upstream/main
+ git worktree add -b ohos-sync-<date> <worktree-dir> ohos-main
+ ```
+ 
+-Use a private cargo target dir for the worktree (see the workspace
+-`AGENTS.md` if working in the servo-workspace container).
++The base needs a complete WPT run in servo/servo's merge queue, whose results
++[servo-ohos-wpt](https://github.com/openharmony-rs/servo-ohos-wpt) shows as the
++upstream base line: the `gh api` command must print `success`, which means that
++all WPT chunks ran. Otherwise, tag the newest earlier upstream commit for which
++it does as `base/<date>` instead of `upstream/main`.
++
++Use a private cargo target dir for the worktree.
+ 
+ Predict the conflicts before starting, and list the upstream commits that
+ touch files the stack touches — this is the briefing for conflict
+diff --git a/python/servo/pr_jobs.py b/python/servo/pr_jobs.py
+index f09f62e911e..da52ef4f6d6 100644
+--- a/python/servo/pr_jobs.py
++++ b/python/servo/pr_jobs.py
+@@ -16,8 +16,8 @@ Every pull request runs the Linux unit tests and lint. On top of that:
+ - WPT tests or expectations: a Linux WPT run of the directories of those tests, with SpiderMonkey
+   and QuickJS, or of the whole suites for more than `MAX_DIRECTORIES` directories.
+ - Files that no build or test reads, such as documentation: nothing.
+-- Anything else: the OHOS and QuickJS builds and the whole Linux WPT suite. The nightly QuickJS
+-  workflow runs the whole QuickJS WPT suite.
++- Anything else: the OHOS and QuickJS builds and the whole Linux WPT suite. The whole QuickJS WPT
++  suite runs on every ohos-main push (ohos-main-wpt.yml).
+ 
+ The selections of the changed files add up, so other files that need a full run keep the QuickJS
+ WPT run of changed tests or of a changed QuickJS build.

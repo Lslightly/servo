@@ -1,0 +1,361 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 22 Sep 2026 13:58:30 +0000
+Subject: [PATCH] third_party: vendor Stylo with the eager pseudo-element
+ cascade skip
+
+Build the Stylo crates from third_party/stylo through a `[patch]` table
+instead of the crates.io packages that Servo's releases take. The `stylo`
+dependency keeps upstream's version requirement exactly as upstream Servo
+writes it, and third_party/patches/stylo/update.sh reads it: it fetches
+servo/stylo at the release tag of that version (or at the commit of a
+git pin, as on upstream's main branch), applies the patches next to it and copies the tracked files (minus upstream's CI and
+git configuration) into third_party/stylo, so an upstream bump of the pin
+only needs a re-run of the script. `update.sh --export-patches`
+regenerates the patches from a Stylo checkout and `update.sh --check`
+verifies the committed copy. Cargo applies the table only if the
+vendored crates have the versions the dependencies require, which
+vendoring the release tag ensures. The whole of third_party is now excluded
+from the workspace; the nested Stylo workspace manifest is needed for its
+crates' `workspace = true` fields.
+
+The one patch, also proposed upstream, skips cascading the style of a
+::before/::after whose matched rules declare no `content`. Such a
+pseudo-element cannot generate a box, so Stylo threw the cascaded style
+away; universal rules like Tailwind's `*, ::before, ::after { --tw-...: ... }`
+made that half of all style traversal work on the GenUI pages. On a
+HarmonyOS phone with `--pref=layout_threads=1` (two A/B rounds, 20 loads each)
+`layout_proper` drops by 16% (chuxing), 17% (biyadi), 26% (shibashiji)
+and 16% (keai), and `traverse_dom` by 41-47%; the default three layout
+threads confirm it. Rendering is unchanged: the same pseudo-elements were
+already discarded after the cascade.
+
+Validation: `third_party/patches/stylo/update.sh --check` reproduces the committed copy. `./mach check --ohos`, `./mach fmt` and `./mach test-tidy` pass. With the same Stylo patch as a path dependency, `./mach test-wpt --release css/css-pseudo css/css-content css/cssom css/css-transitions css/css-animations css/css-nesting css/css-lists css/selectors css/css-cascade css/css-variables` runs with no unexpected results. 2026-11-09 sync: `update.sh --check` reproduces the copy vendored from Stylo v0.23.0, whose crates.io package names that tag's commit (2dca34592ce) in .cargo_vcs_info.json, and which is the git pin 890aa121c6 of the release's branch point with the crate versions bumped; `cargo metadata --locked` passes, and Cargo.lock takes all 11 Stylo crates from third_party/stylo, with no unused patch.
+AI-assisted: Yes (agent session; written and tested by the agent)
+AI-assisted: Yes (agent session; 2026-10-08 sync -- upstream moved the Stylo pin from b3e6425 to 7b2f078: rebased the patch (context changes only), re-exported it and re-vendored third_party/stylo; Cargo.lock regenerated from upstream's so that `cargo metadata --locked` passes at this commit)
+AI-assisted: Yes (agent session; 2026-10-13 sync -- upstream moved the Stylo pin from 7b2f078 to c81cd9c: the patch applied unchanged, re-exported it and re-vendored third_party/stylo; dropped the deny.toml hunk and its paragraph, since upstream #46281 allows unused allowed organizations; Cargo.lock regenerated from upstream's)
+AI-assisted: Yes (agent session; 2026-10-22 sync -- upstream moved the Stylo pin from c81cd9c to 633f43a: the patch applied unchanged, re-exported it and re-vendored third_party/stylo; Cargo.lock regenerated from upstream's)
+AI-assisted: Yes (agent session; 2026-10-29 sync -- upstream moved the Stylo pin from 633f43a to da29a2a: the patch applied unchanged and re-vendored third_party/stylo; Cargo.lock regenerated from upstream's)
+AI-assisted: Yes (agent session; 2026-11-09 sync -- Servo 0.8.0 takes Stylo from crates.io (0.23.0, Stylo tag v0.23.0, which is upstream's last git pin before the release, 890aa121c6, with the versions bumped; this stack's previous pin was da29a2a): the patch table moved into [patch.crates-io], update.sh reads a version and vendors its release tag (or a git pin, as before), the patch applied unchanged and third_party/stylo was re-vendored; Cargo.lock regenerated from upstream's)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock                                    | 22 -----
+ Cargo.toml                                    | 12 ++-
+ ...efore-after-styles-that-cannot-gener.patch | 81 +++++++++++++++++
+ third_party/patches/stylo/update.sh           | 86 +++++++++++++++++++
+ 4 files changed, 178 insertions(+), 23 deletions(-)
+ create mode 100644 third_party/patches/stylo/0001-Skip-cascading-before-after-styles-that-cannot-gener.patch
+ create mode 100755 third_party/patches/stylo/update.sh
+
+diff --git a/Cargo.lock b/Cargo.lock
+index f8ead670650..ebdb2b644bc 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -8110,8 +8110,6 @@ dependencies = [
+ [[package]]
+ name = "selectors"
+ version = "0.42.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "284ac2879477575f13b22201f7e98aa33aacc765b790536808cf580fd79339f1"
+ dependencies = [
+  "bitflags 2.13.2",
+  "cssparser",
+@@ -10013,8 +10011,6 @@ dependencies = [
+ [[package]]
+ name = "servo_arc"
+ version = "0.6.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9f121f129345b5201873a0e253f630413d750b9d799613e2873fb768e592c2a7"
+ dependencies = [
+  "serde",
+  "stable_deref_trait",
+@@ -10514,8 +10510,6 @@ dependencies = [
+ [[package]]
+ name = "stylo"
+ version = "0.23.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "84fe6be1e185e318b93be8f1e025667c196584a9bc9d5b7aca34bba4a07fb488"
+ dependencies = [
+  "app_units",
+  "arrayvec",
+@@ -10573,8 +10567,6 @@ dependencies = [
+ [[package]]
+ name = "stylo_atoms"
+ version = "0.23.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "cf5f78e379ca000ebacf94d1eaa3ce4c72a1b14b0fd8c5547a6fb3fe0d767c62"
+ dependencies = [
+  "string_cache",
+  "string_cache_codegen",
+@@ -10583,8 +10575,6 @@ dependencies = [
+ [[package]]
+ name = "stylo_derive"
+ version = "0.23.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d7fdb4416be784fd22b2bc3d1c7be82f6bb55e58af99b0e1e7e975b5575be8bb"
+ dependencies = [
+  "darling 0.20.11",
+  "proc-macro2",
+@@ -10596,8 +10586,6 @@ dependencies = [
+ [[package]]
+ name = "stylo_dom"
+ version = "0.23.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "137701caa61df2cbba072468a322b92729bb9e4838b5d6e3890360ea3e74a9e9"
+ dependencies = [
+  "bitflags 2.13.2",
+  "stylo_malloc_size_of",
+@@ -10606,8 +10594,6 @@ dependencies = [
+ [[package]]
+ name = "stylo_malloc_size_of"
+ version = "0.23.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e1f70f5473f53bfd468197313daa6fc944cdef0fe39e03e5179c54e7b5d7f72a"
+ dependencies = [
+  "app_units",
+  "cssparser",
+@@ -10626,8 +10612,6 @@ dependencies = [
+ [[package]]
+ name = "stylo_static_prefs"
+ version = "0.23.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "8e06c605a1d428d159798ebfed3f81f3a145f1838872360ebb24ec6d85993fe1"
+ dependencies = [
+  "toml 1.1.8+spec-1.1.0",
+ ]
+@@ -10635,8 +10619,6 @@ dependencies = [
+ [[package]]
+ name = "stylo_traits"
+ version = "0.23.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3bfa703936a384ea36c9257e9263021a37963e3f9aee51bc515fb331ee4dbfb1"
+ dependencies = [
+  "app_units",
+  "bitflags 2.13.2",
+@@ -11048,8 +11030,6 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+ [[package]]
+ name = "to_shmem"
+ version = "0.7.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "2124b7c691cfffe4c3607ba502b898076f4c281eb80c1aa633c40b1711a319c1"
+ dependencies = [
+  "cssparser",
+  "hashbrown 0.17.1",
+@@ -11063,8 +11043,6 @@ dependencies = [
+ [[package]]
+ name = "to_shmem_derive"
+ version = "0.3.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "41fef02c6bedb48041c2d9c9883cfd677afb3bc026435bf6828b74e9db30068d"
+ dependencies = [
+  "darling 0.20.11",
+  "proc-macro2",
+diff --git a/Cargo.toml b/Cargo.toml
+index 555eab98277..ef29885a74c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -11,7 +11,7 @@ members = [
+     "tests/unit/*",
+ ]
+ default-members = ["ports/servoshell"]
+-exclude = [".cargo", "support/crown", "third_party/freetype-sys"]
++exclude = [".cargo", "support/crown", "third_party"]
+ 
+ [workspace.package]
+ version = "0.8.0"
+@@ -466,6 +466,16 @@ codegen-units = 1
+ # OpenHarmony fork with FreeType 2.14.3, mmap-backed streams and ABI fixes; see
+ # third_party/patches/freetype-sys/update.sh.
+ freetype-sys = { path = "third_party/freetype-sys" }
++# Stylo at the version required above with the OpenHarmony patches applied; see
++# third_party/patches/stylo/update.sh.
++selectors = { path = "third_party/stylo/selectors" }
++servo_arc = { path = "third_party/stylo/servo_arc" }
++stylo = { path = "third_party/stylo/style" }
++stylo_atoms = { path = "third_party/stylo/stylo_atoms" }
++stylo_dom = { path = "third_party/stylo/stylo_dom" }
++stylo_malloc_size_of = { path = "third_party/stylo/malloc_size_of" }
++stylo_static_prefs = { path = "third_party/stylo/stylo_static_prefs" }
++stylo_traits = { path = "third_party/stylo/style_traits" }
+ 
+ # If you need to temporarily test Servo with a local fork of some upstream
+ # crate, add that here. Use the form:
+diff --git a/third_party/patches/stylo/0001-Skip-cascading-before-after-styles-that-cannot-gener.patch b/third_party/patches/stylo/0001-Skip-cascading-before-after-styles-that-cannot-gener.patch
+new file mode 100644
+index 00000000000..381903f73ee
+--- /dev/null
++++ b/third_party/patches/stylo/0001-Skip-cascading-before-after-styles-that-cannot-gener.patch
+@@ -0,0 +1,81 @@
++From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From: Jonathan Schwender <schwenderjonathan@gmail.com>
++Date: Tue, 22 Sep 2026 07:52:44 +0000
++Subject: [PATCH] Skip cascading ::before/::after styles that cannot generate a
++ box
++
++After matching an eager ::before/::after, check whether any matched rule
++declares `content` before cascading. Without such a declaration the
++property computes to `none` on these pseudo-elements, so the cascaded
++style would only be thrown away by
++`eager_pseudo_is_definitely_not_generated`.
++
++Universal rules like Tailwind's `*, ::before, ::after { --tw-...: ... }`
++match both pseudo-elements on every element and previously caused a
++full cascade of ~40 custom properties per pseudo-element. Blink has
++skipped this case since 2014 (crbug 412558).
++
++Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
++---
++ style/style_resolver.rs | 32 +++++++++++++++++++++++++++++++-
++ 1 file changed, 31 insertions(+), 1 deletion(-)
++
++diff --git a/style/style_resolver.rs b/style/style_resolver.rs
++index ce1985a89..df523e0fc 100644
++--- a/style/style_resolver.rs
+++++ b/style/style_resolver.rs
++@@ -11,9 +11,10 @@ use crate::data::{EagerPseudoStyles, ElementStyles};
++ use crate::dom::{TElement, TNode};
++ use crate::matching::MatchMethods;
++ use crate::properties::longhands::display::computed_value::T as Display;
++-use crate::properties::{ComputedValues, FirstLineReparenting};
+++use crate::properties::{ComputedValues, FirstLineReparenting, LonghandId, PropertyDeclarationId};
++ use crate::rule_tree::{RuleCascadeFlags, RuleTree, StrongRuleNode};
++ use crate::selector_parser::{PseudoElement, SelectorImpl};
+++use crate::shared_lock::StylesheetGuards;
++ use crate::stylist::RuleInclusion;
++ use log::Level::Trace;
++ use selectors::matching::{
++@@ -160,6 +161,24 @@ fn eager_pseudo_is_definitely_not_generated(
++     *style.get_box().get_display() == Display::None || style.ineffective_content_property()
++ }
++ 
+++/// Whether any of the matched rules declares `content`. If none does, the
+++/// property computes to `normal` (which is `none` for `::before` and `::after`,
+++/// see <https://drafts.csswg.org/css-content-3/#valdef-content-none>), so no
+++/// box gets generated and the cascade would be thrown away anyway.
+++///
+++/// This is intentionally conservative: any `content` declaration, including
+++/// `inherit`, `revert`, `var()` and the like, is enough to keep the style,
+++/// which leaves the final decision to `eager_pseudo_is_definitely_not_generated`.
+++fn rules_may_generate_content(rules: &StrongRuleNode, guards: &StylesheetGuards) -> bool {
+++    rules.self_and_ancestors().any(|node| {
+++        node.style_source().is_some_and(|source| {
+++            source
+++                .read(node.cascade_level().guard(guards))
+++                .contains(PropertyDeclarationId::Longhand(LonghandId::Content))
+++        })
+++    })
+++}
+++
++ impl<'a, 'ctx, 'le, E> StyleResolverForElement<'a, 'ctx, 'le, E>
++ where
++     'ctx: 'a,
++@@ -470,6 +489,17 @@ where
++             VisitedHandlingMode::AllLinksUnvisited,
++         )?;
++ 
+++        // Skip the cascade when it cannot generate a box, which is the common
+++        // case for universal `::before` / `::after` rules such as
+++        // `*, ::before, ::after { box-sizing: border-box }`. Only the unvisited
+++        // rules matter, since the visited cascade only applies colors.
+++        if pseudo.is_before_or_after()
+++            && !matches!(self.pseudo_resolution, PseudoElementResolution::Force)
+++            && !rules_may_generate_content(&rule_node, &self.context.shared.guards)
+++        {
+++            return None;
+++        }
+++
++         let mut visited_rules = None;
++         if originating_element_style.style().visited_style().is_some() {
++             visited_rules = self
+diff --git a/third_party/patches/stylo/update.sh b/third_party/patches/stylo/update.sh
+new file mode 100755
+index 00000000000..c9c9350c134
+--- /dev/null
++++ b/third_party/patches/stylo/update.sh
+@@ -0,0 +1,86 @@
++#!/usr/bin/env bash
++# Vendors Stylo into third_party/stylo/: upstream servo/stylo at the release tag of the version
++# Cargo.toml requires (`v<version>` of the `stylo` dependency), or at the `rev` of a `stylo` git
++# dependency, with the patches in this directory applied.
++#
++#   ./update.sh                                Replace third_party/stylo/ and stage it.
++#   ./update.sh --check                        Compare third_party/stylo/ with a fresh
++#                                              vendoring; exit non-zero if they differ.
++#   ./update.sh --export-patches <repo> <rev>  Replace the patches here with the commits from
++#                                              the upstream commit to <rev> in the Stylo
++#                                              checkout <repo>.
++#
++# Cargo.toml keeps the upstream `stylo` dependency exactly as upstream Servo writes it and
++# redirects the crates to third_party/stylo/ with a `[patch]` table: `[patch.crates-io]` for a
++# version, as Servo's releases take Stylo from crates.io, or `[patch."https://github.com/servo/stylo"]`
++# for a git pin, as Servo's main branch does. An upstream bump only needs a re-run of this script.
++set -euo pipefail
++
++UPSTREAM=https://github.com/servo/stylo.git
++
++cd "$(dirname "$0")"
++repo_root=$(git rev-parse --show-toplevel)
++vendored_dir=$repo_root/third_party/stylo
++
++usage() {
++    sed -n '2,12s/^# \{0,1\}//p' "$0" >&2
++    exit 2
++}
++
++upstream_commit=$(sed -n 's/^stylo = { git = "https:\/\/github.com\/servo\/stylo", rev = "\([0-9a-f]\{40\}\)" }$/\1/p' "$repo_root/Cargo.toml")
++if [ -z "$upstream_commit" ]; then
++    version=$(sed -n 's/^stylo = { version = "\([0-9][0-9.]*\)" }$/\1/p' "$repo_root/Cargo.toml")
++    [ -z "$version" ] || upstream_commit=refs/tags/v$version
++fi
++if [ -z "$upstream_commit" ]; then
++    echo "Could not find the stylo version or git pin in $repo_root/Cargo.toml" >&2
++    exit 1
++fi
++
++if [ "${1-}" = --export-patches ]; then
++    [ $# -eq 3 ] || usage
++    repo=$2
++    rev=$3
++    rm -f ./*.patch
++    git -C "$repo" format-patch --quiet --zero-commit --no-signature -o "$PWD" "$upstream_commit..$rev"
++    echo "Exported $(ls ./*.patch 2>/dev/null | wc -l) patches to $PWD."
++    exit 0
++fi
++
++check=false
++if [ "${1-}" = --check ]; then
++    check=true
++    shift
++fi
++[ $# -eq 0 ] || usage
++
++work=$(mktemp -d)
++trap 'rm -rf "${work:?}"' EXIT
++
++crate="$work/stylo"
++git init -q "$crate"
++git -C "$crate" fetch -q --depth 1 "$UPSTREAM" "$upstream_commit"
++git -C "$crate" checkout -q FETCH_HEAD
++if ls ./*.patch > /dev/null 2>&1; then
++    git -C "$crate" -c user.name=update.sh -c user.email=update.sh@invalid am -q --whitespace=nowarn "$PWD"/*.patch
++fi
++
++# Everything upstream tracks except its CI and git configuration.
++vendored="$work/vendored"
++git -C "$crate" ls-files -z | grep -zv '^\.github/\|^\.gitignore$' |
++    (cd "$crate" && cpio --quiet -0 -pdm "$vendored")
++
++if $check; then
++    if git diff --no-index --quiet "$vendored_dir" "$vendored"; then
++        echo "third_party/stylo/ is up to date."
++        exit 0
++    fi
++    { git diff --no-index --stat "$vendored_dir" "$vendored" || true; } | sed "s#$vendored#(fresh)#"
++    echo "third_party/stylo/ differs from a fresh vendoring."
++    exit 1
++fi
++
++rm -rf "$vendored_dir"
++mv "$vendored" "$vendored_dir"
++git -C "$repo_root" add --all --force third_party/stylo
++echo "Vendored and staged Stylo in third_party/stylo/."

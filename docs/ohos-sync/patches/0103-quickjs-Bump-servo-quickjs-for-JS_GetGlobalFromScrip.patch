@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 12:49:56 +0000
+Subject: [PATCH] quickjs: Bump servo-quickjs for JS_GetGlobalFromScript
+
+Since upstream fb11f484542 (#48952), HostLoadImportedModule takes the
+settings object of a module load's referrer from the global of the
+referrer's code (`JS_GetGlobalFromScript`), which servo-quickjs did not
+implement, so every static or dynamic import from a module panicked on
+QuickJS. servo-quickjs a5ebf1f implements it (QuickJS patch Q35: the
+realm of a script's code). The bump also brings the six servo-quickjs
+commits since cbf02ee (the re-entrancy rules and shared hand-outs of
+runtime state, and an explicit icu-uc link).
+
+Validation: in servo-quickjs, `just test` (108 tests) and `just lint` pass, and the new `global_from_script` test fails when the function returns the current realm's global instead. A release build with `--js-engine quickjs` and this shim commit ran the whole WPT (58,632 tests, on non-default wptserve ports): 4 tests crashed, against 747 with cbf02ee, where 469 crash logs named `JS_GetGlobalFromScript`; the module tests of scripting-1's module/dynamic-import, workers/modules and import-maps/acquiring (84 tests) run as expected. The 120 tests with unexpected results, rerun on the default ports once and then three times with each engine: 2 recur in every QuickJS run and never with SpiderMonkey, and are now QuickJS expectations in `wpt: Add the QuickJS expectations`.
+AI-assisted: Yes (agent session; 2026-10-22 sync -- the agent found the panic in the sync's QuickJS WPT run, implemented the shim function and ran the checks above)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ support/quickjs/cargo-config.toml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/support/quickjs/cargo-config.toml b/support/quickjs/cargo-config.toml
+index 3431cd22256..21f3d6acaa3 100644
+--- a/support/quickjs/cargo-config.toml
++++ b/support/quickjs/cargo-config.toml
+@@ -5,4 +5,4 @@
+ # were tested with. The shim's version must match the mozjs version that Cargo.toml requires, or
+ # Cargo leaves the patch unused.
+ [patch.crates-io]
+-mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "cbf02ee851f7f60b39c3b0ed99a81c99f759bd98" }
++mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "a5ebf1f04a1b6097e79714d2b77cec3436bbc3c5" }

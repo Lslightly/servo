@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 8 Oct 2026 22:30:51 +0000
+Subject: [PATCH] constellation: Abort superseded iframe navigations
+
+Dropped in favour of upstream eb511d5c499 (#49426), which aborts the
+older pending changes of a navigable when it is navigated again, and
+which Servo 0.8.0 includes. The code differs, so equivalence is checked
+with this commit's previous Validation (below) on plain upstream
+(runbook decision 3). Upstream differs in one respect: it also aborts a
+pending change that reloads an entry (from a traversal to a discarded
+entry, or from a crash page's replacement), which this commit left
+alone. No run of this Validation exercises that case. The specification
+sides with neither: while a navigable traverses, its ongoing navigation
+is "traversal", and a new navigation of it is ignored
+(https://html.spec.whatwg.org/multipage/#navigate), where upstream lets
+the new navigation win and this commit let both continue. The sync
+accepted upstream's behaviour. This commit's test,
+cross-document-nav-cross-document-nav-slow-first-response.html, goes
+with it; it passes on plain upstream.
+
+Its Validation before this sync: Release build of ohos-main plus this
+patch. `./mach test-wpt --release --processes 1 --repeat 10
+html/browsers/browsing-the-web/overlapping-navigations-and-traversals/cross-document-nav-cross-document-nav-slow-first-response.html`:
+10/10 PASS; `--repeat 25
+html/semantics/forms/form-submission-0/form-submit-iframe-then-location-navigate.html`:
+25/25 as expected, no hang; `--processes 2 --repeat 10` of
+assign-replace-from-iframe.html, security_location_0.htm,
+replace-with-nested-iframe.html,
+sandbox-initial-empty-document-toward-same-origin.html,
+iframe-loading-lazy-nav-location-assign.html,
+iframe-loading-lazy-nav-location-replace.html,
+iframe-loading-lazy-reload-location-reload.html and
+navigating-across-documents/005.html: 80/80 as expected. `./mach
+test-wpt --release --processes 2 html/semantics/forms/form-submission-0
+html/semantics/embedded-content/the-iframe-element
+html/browsers/browsing-the-web/navigating-across-documents
+html/browsers/history
+html/browsers/browsing-the-web/overlapping-navigations-and-traversals`
+(506 tests): 500 as expected. Of the 6 others,
+replace-before-load/form-submit-cross-frame.html FAIL and
+location_replace_session_history.html CRASH happen as often on plain
+ohos-main (A/B: 10 repeats each and 3 runs of replace-before-load/), and
+cross-origin-top-navigation-with-user-activation-in-parent.window.html
+TIMEOUT, navigation-unload-same-origin-fragment.html FAIL,
+refresh/same-document-refresh.html PASS and
+jsurl-form-submit.tentative.html PASS were unexpected or flaky without
+the patch in the upstream A/B. Upstream (8de25a1ab6b) before and after:
+the form test hung in 5/25 and 6/25 runs, then 0/75; the new test 5/5
+TIMEOUT, then 35/35 PASS. `./mach fmt` and `./mach test-tidy` are clean.
+
+This empty placeholder is removed in the next sync's fold step.
+
+Superseded-by: eb511d5c499
+Validation: release build of Servo 0.8.0 (4e136d8ef31) with this commit's test added: `./mach test-wpt --release --processes 1 --repeat 10` of cross-document-nav-cross-document-nav-slow-first-response.html: 10/10 OK; `--repeat 25` of form-submit-iframe-then-location-navigate.html: 25/25 as expected, no hang; `--processes 2 --repeat 10` of the eight navigation tests of its previous Validation: 80/80 as expected; `--processes 2` of its five directories (512 tests): 8 unexpected results. Four are the ones its previous Validation found unexpected or flaky without it: location_replace_session_history.html CRASH, the TIMEOUT of cross-origin-top-navigation-with-user-activation-in-parent.window.html, and the subtests of navigation-unload-same-origin-fragment.html and jsurl-form-submit.tentative.html. history/001.html's subtest is flaky on this host (it flips in the sync's QuickJS reruns too). The other three, the TIMEOUTs of replace-before-load's form-requestsubmit.html, form-submit-button-click.html and form-submit.html, are the same with this commit's code applied to 0.8.0: in three repeats of replace-before-load with and without it, each times out two or three times.
+AI-assisted: Yes (agent session; root-caused, written and tested by the agent)
+AI-assisted: Yes (agent session; 2026-11-09 sync -- dropped in favour of upstream's abort of superseded navigations, kept as an empty placeholder)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>

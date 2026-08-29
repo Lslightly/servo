@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 17:46:44 +0000
+Subject: [PATCH] script: Fail a style sheet whose body ends with a network
+ error
+
+The style sheet loader parsed and applied whatever part of a body it had
+received when the body ended with a network error, and fired `load`. When
+the body is fully read with a failure, the linked resource is processed
+with success set to false, so no style sheet applies and `error` fires.
+Do that for a `link` and for an `@import`: as for a status that is not ok,
+Servo gives the link, or the import rule, an empty style sheet.
+
+Net reports a body cut short by the connection as complete today, so the
+cut-short cases of the new test are expected to fail until it reports it
+as a network error.
+
+Validation: New test `tests/wpt/mozilla/tests/mozilla/stylesheet-network-error.html`: its decode error cases pass; its cut-short cases are expected to fail until `net: End a body cut short by the connection with a network error`, and pass with it.
+AI-assisted: Yes (agent session; the agent wrote this patch and its test following docs/fetch-p4a-truncated-body-audit-2026-10-22.md in the workspace, and applied an independent review's findings)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/css/stylesheet_loader.rs    |  5 ++-
+ tests/wpt/mozilla/meta/MANIFEST.json          | 11 ++++++
+ .../mozilla/stylesheet-network-error.html.ini |  6 +++
+ .../resources/stylesheet-network-error.py     | 21 ++++++++++
+ .../mozilla/stylesheet-network-error.html     | 39 +++++++++++++++++++
+ 5 files changed, 81 insertions(+), 1 deletion(-)
+ create mode 100644 tests/wpt/mozilla/meta/mozilla/stylesheet-network-error.html.ini
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/resources/stylesheet-network-error.py
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/stylesheet-network-error.html
+
+diff --git a/components/script/css/stylesheet_loader.rs b/components/script/css/stylesheet_loader.rs
+index dfa498d55c5..58bd897f8f1 100644
+--- a/components/script/css/stylesheet_loader.rs
++++ b/components/script/css/stylesheet_loader.rs
+@@ -418,7 +418,10 @@ impl FetchResponseListener for StylesheetContext {
+             }
+         }
+ 
+-        if metadata.status != http::StatusCode::OK {
++        // https://html.spec.whatwg.org/multipage/#fetch-and-process-the-linked-resource
++        // > If bodyBytes is null or failure, or response's status is not an ok status, set
++        // > success to false.
++        if status.is_err() || metadata.status != http::StatusCode::OK {
+             let empty_stylesheet = self.empty_stylesheet(&document);
+             self.do_post_parse_tasks(false, empty_stylesheet, cx);
+             return;
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index cf97efa57ab..1c9f9d9d62d 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11323,6 +11323,10 @@
+       "8faa57c0c47c4fdf27c052d059b28ee1088235e9",
+       []
+      ],
++     "stylesheet-network-error.py": [
++      "1d025bac32fb5e5a51eb982027f8690c7ccfa55d",
++      []
++     ],
+      "video.mp4": [
+       "fb5dbca23808bee44003692cb0e139dd6a22e874",
+       []
+@@ -15438,6 +15442,13 @@
+       {}
+      ]
+     ],
++    "stylesheet-network-error.html": [
++     "264085b73ad8b1f7b0a3de6d9f8a1a3de9adf3ce",
++     [
++      null,
++      {}
++     ]
++    ],
+     "svg-content-event-handler.html": [
+      "651dd8563e059da447fab9aebb8c257c812afaf0",
+      [
+diff --git a/tests/wpt/mozilla/meta/mozilla/stylesheet-network-error.html.ini b/tests/wpt/mozilla/meta/mozilla/stylesheet-network-error.html.ini
+new file mode 100644
+index 00000000000..c17cd8f49fd
+--- /dev/null
++++ b/tests/wpt/mozilla/meta/mozilla/stylesheet-network-error.html.ini
+@@ -0,0 +1,6 @@
++[stylesheet-network-error.html]
++  [A link fires error and applies no style when the body of its style sheet is cut short]
++    expected: FAIL
++
++  [A style element fires error and applies no style when the body of an imported style sheet is cut short]
++    expected: FAIL
+diff --git a/tests/wpt/mozilla/tests/mozilla/resources/stylesheet-network-error.py b/tests/wpt/mozilla/tests/mozilla/resources/stylesheet-network-error.py
+new file mode 100644
+index 00000000000..1d025bac32f
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/resources/stylesheet-network-error.py
+@@ -0,0 +1,21 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++stylesheet = b"#target { color: rgb(0, 128, 0); }\n"
++
++
++def main(request, response):
++    response.add_required_headers = False
++    output = b"HTTP/1.1 200 OK\r\n"
++    output += b"Content-Type: text/css\r\n"
++    output += b"Connection: close\r\n"
++    if request.GET.first(b"error") == b"decode":
++        output += b"Content-Encoding: gzip\r\n"
++        output += b"Content-Length: %d\r\n" % len(stylesheet)
++    else:
++        output += b"Content-Length: %d\r\n" % (len(stylesheet) + 8)
++    output += b"\r\n"
++    output += stylesheet
++    response.writer.write(output)
++    response.close_connection = True
+diff --git a/tests/wpt/mozilla/tests/mozilla/stylesheet-network-error.html b/tests/wpt/mozilla/tests/mozilla/stylesheet-network-error.html
+new file mode 100644
+index 00000000000..264085b73ad
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/stylesheet-network-error.html
+@@ -0,0 +1,39 @@
++<!doctype html>
++<meta charset="utf-8">
++<title>A style sheet whose body ends with a network error is a failure</title>
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<div id="target"></div>
++<script>
++function load(t, element) {
++  const event = new Promise(resolve => {
++    element.onload = element.onerror = e => resolve(e.type);
++  });
++  document.head.append(element);
++  t.add_cleanup(() => element.remove());
++  return event;
++}
++
++for (const [error, description] of [
++  ["decode", "fails to decode"],
++  ["cut-short", "is cut short"],
++]) {
++  promise_test(async t => {
++    const link = document.createElement("link");
++    link.rel = "stylesheet";
++    link.href = `resources/stylesheet-network-error.py?error=${error}&from=link`;
++    assert_equals(await load(t, link), "error", "event");
++    assert_equals(getComputedStyle(document.getElementById("target")).color, "rgb(0, 0, 0)",
++                  "color");
++  }, `A link fires error and applies no style when the body of its style sheet ${description}`);
++
++  promise_test(async t => {
++    const style = document.createElement("style");
++    style.textContent =
++      `@import url("resources/stylesheet-network-error.py?error=${error}&from=import");`;
++    assert_equals(await load(t, style), "error", "event");
++    assert_equals(getComputedStyle(document.getElementById("target")).color, "rgb(0, 0, 0)",
++                  "color");
++  }, `A style element fires error and applies no style when the body of an imported style sheet ${description}`);
++}
++</script>

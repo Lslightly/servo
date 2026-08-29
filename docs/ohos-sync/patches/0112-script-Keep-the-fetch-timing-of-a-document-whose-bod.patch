@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 17:46:48 +0000
+Subject: [PATCH] script: Keep the fetch timing of a document whose body ends
+ with a network error
+
+The parser recorded the fetch timing of a document only when its body
+ended without a network error. That condition dates from when the timing
+came with a successful end only; it now comes with every end. A document
+whose body ends with a network error is still parsed and shown as far as
+it got, but its navigation timing entry kept the zeros it was queued with
+when the response arrived. Error pages return before this point, so record
+the timing whenever the document gets this far.
+
+Net reports a body cut short by the connection as complete today; it will
+report it as a network error.
+
+Validation: New test `tests/wpt/mozilla/tests/mozilla/navigation-timing-network-error.html` passes with `net: End a body cut short by the connection with a network error`; with it but without this patch, `fetchStart` is 0.
+AI-assisted: Yes (agent session; the agent wrote this patch and its test following docs/fetch-p4a-truncated-body-audit-2026-10-22.md in the workspace, and applied an independent review's findings)
+AI-assisted: Yes (agent session; 2026-11-09 sync -- the status check wrapped upstream's steps 15.1 to 15.4 of initialising the document object; dropped around them, so the fetch timing with its redirect count is recorded whenever the document gets this far)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/servoparser/mod.rs      | 47 +++++++++----------
+ tests/wpt/mozilla/meta/MANIFEST.json          | 11 +++++
+ .../navigation-timing-network-error.html      | 21 +++++++++
+ .../resources/document-network-error.py       | 17 +++++++
+ 4 files changed, 71 insertions(+), 25 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/navigation-timing-network-error.html
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/resources/document-network-error.py
+
+diff --git a/components/script/dom/servoparser/mod.rs b/components/script/dom/servoparser/mod.rs
+index 978d9dad14f..8dcb2d461fc 100644
+--- a/components/script/dom/servoparser/mod.rs
++++ b/components/script/dom/servoparser/mod.rs
+@@ -1675,33 +1675,30 @@ impl ParserContext {
+         let mut realm = enter_auto_realm(cx, &*document);
+         let cx = &mut realm;
+ 
+-        if status.is_ok() {
+-            // Step 15 of https://html.spec.whatwg.org/multipage/#initialise-the-document-object
++        // Step 15 of https://html.spec.whatwg.org/multipage/#initialise-the-document-object
+ 
+-            // Step 15.1. Let fullTimingInfo be the result of extracting the full timing info
+-            // from navigationParams's fetch controller.
+-            let mut full_timing_info = timing;
++        // Step 15.1. Let fullTimingInfo be the result of extracting the full timing info
++        // from navigationParams's fetch controller.
++        let mut full_timing_info = timing;
+ 
+-            // Step 15.3. If navigationParams's response's redirect taint is "same-origin", or all of the following are true:
+-            //   * navigationParams's request's client is null, or navigationParams's request's referrer is not "no-referrer", and
+-            //   * navigation TAO check given navigationParams's response and navigationParams's origin returns success,
+-            // then set redirectCount to navigationParams's request's redirect count.
+-            //
+-            // TODO: Implement the two other bullet points
+-            let redirect_count =
+-                if self.navigation_params.redirect_taint == RedirectTaint::SameOrigin {
+-                    full_timing_info.redirect_count
+-                } else {
+-                    // Step 15.2. Let redirectCount be 0.
+-                    0
+-                };
+-
+-            // Step 15.4. Create the navigation timing entry for document, given fullTimingInfo, redirectCount,
+-            // navigationTimingType, navigationParams's response's service worker timing info,
+-            // and navigationParams's response's body info.
+-            full_timing_info.redirect_count = redirect_count;
+-            document.set_resource_fetch_timing(full_timing_info);
+-        }
++        // Step 15.3. If navigationParams's response's redirect taint is "same-origin", or all of the following are true:
++        //   * navigationParams's request's client is null, or navigationParams's request's referrer is not "no-referrer", and
++        //   * navigation TAO check given navigationParams's response and navigationParams's origin returns success,
++        // then set redirectCount to navigationParams's request's redirect count.
++        //
++        // TODO: Implement the two other bullet points
++        let redirect_count = if self.navigation_params.redirect_taint == RedirectTaint::SameOrigin {
++            full_timing_info.redirect_count
++        } else {
++            // Step 15.2. Let redirectCount be 0.
++            0
++        };
++
++        // Step 15.4. Create the navigation timing entry for document, given fullTimingInfo, redirectCount,
++        // navigationTimingType, navigationParams's response's service worker timing info,
++        // and navigationParams's response's body info.
++        full_timing_info.redirect_count = redirect_count;
++        document.set_resource_fetch_timing(full_timing_info);
+ 
+         if let Some(parser) = parser {
+             parser.last_chunk_received.set(true);
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 1c9f9d9d62d..7701a74afb5 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11267,6 +11267,10 @@
+       "cb0d6c8b0447959e6bc0b757444e9a80bfd57390",
+       []
+      ],
++     "document-network-error.py": [
++      "b2432174a29fe1e8f374446808dc0fd835a503dc",
++      []
++     ],
+      "eventsource-network-error.py": [
+       "8a5953ab3c8a5e875dd65e89ca8c7c49d67799c5",
+       []
+@@ -15040,6 +15044,13 @@
+       {}
+      ]
+     ],
++    "navigation-timing-network-error.html": [
++     "fc4e9df1d63759d9d001999bb41c097975224056",
++     [
++      null,
++      {}
++     ]
++    ],
+     "navigator.html": [
+      "cb245d9d660dd40af03cf6f430bc4a535662cddd",
+      [
+diff --git a/tests/wpt/mozilla/tests/mozilla/navigation-timing-network-error.html b/tests/wpt/mozilla/tests/mozilla/navigation-timing-network-error.html
+new file mode 100644
+index 00000000000..fc4e9df1d63
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/navigation-timing-network-error.html
+@@ -0,0 +1,21 @@
++<!doctype html>
++<meta charset="utf-8">
++<title>Navigation timing of a document whose body ends with a network error</title>
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<body>
++<script>
++promise_test(async t => {
++  const iframe = document.createElement("iframe");
++  const loaded = new Promise(resolve => iframe.onload = resolve);
++  iframe.src = "resources/document-network-error.py";
++  document.body.append(iframe);
++  t.add_cleanup(() => iframe.remove());
++  await loaded;
++  assert_equals(iframe.contentDocument.body.textContent, "cut short", "content");
++  const [entry] = iframe.contentWindow.performance.getEntriesByType("navigation");
++  assert_greater_than(entry.fetchStart, 0, "fetchStart");
++  assert_greater_than_equal(entry.requestStart, entry.fetchStart, "requestStart");
++  assert_greater_than(entry.responseEnd, entry.requestStart, "responseEnd");
++}, "A document whose body is cut short keeps the timing of its fetch");
++</script>
+diff --git a/tests/wpt/mozilla/tests/mozilla/resources/document-network-error.py b/tests/wpt/mozilla/tests/mozilla/resources/document-network-error.py
+new file mode 100644
+index 00000000000..b2432174a29
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/resources/document-network-error.py
+@@ -0,0 +1,17 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++document = b"<!doctype html><p>cut short"
++
++
++def main(request, response):
++    response.add_required_headers = False
++    output = b"HTTP/1.1 200 OK\r\n"
++    output += b"Content-Type: text/html\r\n"
++    output += b"Connection: close\r\n"
++    output += b"Content-Length: %d\r\n" % (len(document) + 8)
++    output += b"\r\n"
++    output += document
++    response.writer.write(output)
++    response.close_connection = True

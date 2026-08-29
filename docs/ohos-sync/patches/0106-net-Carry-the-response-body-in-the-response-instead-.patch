@@ -1,0 +1,2822 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 14:58:55 +0000
+Subject: [PATCH] net: Carry the response body in the response instead of a
+ done channel
+
+A response body was held twice: as a state in a shared
+`Arc<Mutex<ResponseBody>>`, and as a `done_chan` that every fetch function
+passed along and had to reset whenever it replaced the response. Keeping
+the two paired by convention went wrong in several ways:
+
+- A fetch cancelled right after its headers returned a network error while
+  `done_chan` still held a sender, so `wait_for_response` waited forever
+  and the fetch never ended.
+- A response replaced by a network error, after a failed CORS check or a
+  CORP, CSP, nosniff, MIME type or mixed content block, kept its channel,
+  so its body was still delivered to the consumer.
+- Step 22 of main fetch (null body status, HEAD) blanked the state, but not
+  the chunks already queued in the channel.
+- A navigation through a `web+` protocol handler returned a response whose
+  body an inner fetch had already handed to `DiscardFetch`.
+- Producers had to know whether a consumer inside net (subresource
+  integrity, preloads) needed the whole body, and `file:` and `blob:`
+  bodies were kept whole in net in any case. An in-memory `blob:` body was
+  never kept, so its integrity check always failed.
+
+`ResponseBody` is now `Null`, `Bytes`, or a `Stream` of the body stream
+type added in the previous patch, and the response owns it.
+`wait_for_response` is the one place that hands a body over, and it keeps
+the body as `Bytes` for preloads and for subresource integrity. A body whose
+producer goes away without finishing ends as failed instead of hanging. The
+body of a redirect, or of a response replaced after a 401 or 407, is
+discarded instead of being queued while the next request runs; readers of
+files and of the cache stop when nobody reads their body.
+`ProtocolHandler::load` loses its `done_chan` parameter, and
+`servo::protocol_handler` exports the body stream. `Response` is no longer
+`Clone`: `try_clone` copies a response whose body is not a stream. The page
+content protocol handler runs main fetch recursively, so the outer fetch
+hands the handler URL's body over.
+
+Otherwise behaviour does not change: a body cut short by the connection
+still ends as aborted with a successful end of file, a discarded network
+body is still read to its end so that its connection can be reused and the
+cache can store it, and subresource integrity still forwards the body
+before checking it. One exception: a preload whose body is cut short is
+now kept without a body instead of with the bytes that arrived; both are
+wrong, and a later patch makes it a network error.
+
+Validation: `./mach test-unit -p servo-net`: 490 tests pass, 7 of them new. On ohos-main 67173a4bf2b, `test_fetch_cancelled_while_its_headers_are_held_ends` fails with "the fetch did not end", `test_body_of_a_response_that_fails_the_cors_check_is_not_delivered` with all 19 body bytes delivered, `test_body_of_a_response_blocked_by_nosniff_is_not_delivered` with all 12, and `test_navigation_through_a_page_content_protocol_handler_delivers_the_body` with none. Negative controls on this patch: without applying step 22's null body, `test_body_of_a_null_body_status_is_not_delivered` gets 7 bytes; with a test producer that keeps its sender alive, `test_body_whose_producer_stops_without_finishing_ends_the_fetch` does not end; without keeping preloaded bodies, `test_fetch_of_a_preload_keeps_its_body` finds no body. `./mach check`, `./mach clippy --locked -- -- --deny warnings` and `./mach test-tidy` pass. 2026-10-29 sync (CORS cache now in the fetch context): `./mach test-unit --profile checked-release -p servo-net` at this commit, 490 tests pass.
+AI-assisted: Yes (agent session; the agent wrote this patch and its tests following docs/fetch-body-stream-plan-2026-10-22.md in the workspace, found the cancellation hang, the delivery of blocked bodies and the protocol handler regression, and applied an independent review's findings)
+AI-assisted: Yes (agent session; 2026-10-29 sync -- conflict resolution, no semantic change: upstream moved the CORS preflight cache into the fetch context (#49055, #49252), so `main_fetch`, `scheme_fetch`, `http_fetch` and `http_redirect_fetch` lose both the cache and `done_chan`, and the page content protocol handler's inner main fetch no longer passes a fresh cache; the preflight fetch keeps upstream's devtools reporting (#49151); `to_filtered` takes the headers out of the internal response before its body-less copy, as upstream now does (#49313))
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/net/fetch/fetch_params.rs          |   5 +-
+ components/net/fetch/methods.rs               | 193 +++++------
+ components/net/filemanager_thread.rs          | 115 +++----
+ components/net/http_cache/mod.rs              | 111 ++----
+ components/net/http_loader.rs                 | 139 ++------
+ components/net/local_directory_listing.rs     |   2 +-
+ components/net/protocols/blob.rs              |  12 +-
+ components/net/protocols/data.rs              |   5 +-
+ components/net/protocols/file.rs              |  17 +-
+ components/net/protocols/mod.rs               |  39 ++-
+ components/net/request_interceptor.rs         |  11 +-
+ components/net/resource_thread.rs             |   1 -
+ components/net/subresource_integrity.rs       |  16 +-
+ components/net/tests/data_loader.rs           |  11 +-
+ components/net/tests/fetch.rs                 | 121 ++-----
+ components/net/tests/http_loader.rs           | 325 +++++++++++++++---
+ components/net/tests/main.rs                  |  23 +-
+ components/net/tests/subresource_integrity.rs |   8 +-
+ components/servo/lib.rs                       |   3 +-
+ components/shared/net/response.rs             | 121 +++++--
+ .../servoshell/desktop/protocols/resource.rs  |  21 +-
+ ports/servoshell/desktop/protocols/servo.rs   |  43 +--
+ ports/servoshell/desktop/protocols/urlinfo.rs |   6 +-
+ 23 files changed, 681 insertions(+), 667 deletions(-)
+
+diff --git a/components/net/fetch/fetch_params.rs b/components/net/fetch/fetch_params.rs
+index 93819daae5d..81404384964 100644
+--- a/components/net/fetch/fetch_params.rs
++++ b/components/net/fetch/fetch_params.rs
+@@ -27,7 +27,7 @@ impl PreloadResponseCandidate {
+             PreloadResponseCandidate::None => None,
+             // Step 2. Assert: fetchParams’s preloaded response candidate is a response.
+             PreloadResponseCandidate::Response(response, preload_id) => {
+-                Some((*response.clone(), preload_id.clone()))
++                Some((response.try_clone()?, preload_id.clone()))
+             },
+             // Step 1. Wait until fetchParams’s preloaded response candidate is not "pending".
+             PreloadResponseCandidate::Pending(receiver, preload_id) => receiver
+@@ -139,8 +139,9 @@ impl ConsumePreloadedResources for RequestClient {
+ 
+         // Step 10. Otherwise, call onResponseAvailable with entry's response.
+         if let Some(response) = preload_entry.response.as_ref() {
++            // A preloaded response holds its whole body, so this copy always succeeds.
+             Some(PreloadResponseCandidate::Response(
+-                Box::new(response.clone()),
++                Box::new(response.try_clone()?),
+                 preload_id.clone(),
+             ))
+         } else {
+diff --git a/components/net/fetch/methods.rs b/components/net/fetch/methods.rs
+index d47984e7a7d..99d6c17bc1d 100644
+--- a/components/net/fetch/methods.rs
++++ b/components/net/fetch/methods.rs
+@@ -3,13 +3,12 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ use std::sync::Arc;
+-use std::sync::atomic::Ordering;
+ use std::time::Duration;
+ use std::{io, mem, str};
+ 
+ use base64::Engine as _;
+ use base64::engine::general_purpose;
+-use bytes::Bytes;
++use bytes::BytesMut;
+ use content_security_policy as csp;
+ use embedder_traits::resources::{self, Resource};
+ use headers::{AccessControlExposeHeaders, ContentType, HeaderMapExt};
+@@ -19,6 +18,7 @@ use ipc_channel::ipc;
+ use log::{debug, trace, warn};
+ use malloc_size_of_derive::MallocSizeOf;
+ use mime::{self, Mime};
++use net_traits::body_stream::{BodyEnd, BodyEvent};
+ use net_traits::fetch::headers::{determine_nosniff, extract_mime_type_as_mime};
+ use net_traits::filemanager_thread::{FileTokenCheck, RelativePos};
+ use net_traits::http_status::HttpStatus;
+@@ -44,7 +44,6 @@ use servo_base::generic_channel::CallbackSetter;
+ use servo_base::id::PipelineId;
+ use servo_config::pref;
+ use servo_url::{Host, ImmutableOrigin, ServoUrl};
+-use tokio::sync::mpsc::{UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender};
+ use tokio::sync::{Mutex as TokioMutex, watch};
+ 
+ use crate::connector::CACertificates;
+@@ -62,15 +61,6 @@ use crate::subresource_integrity::is_response_integrity_valid;
+ 
+ pub type Target<'a> = &'a mut (dyn FetchTaskTarget + Send);
+ 
+-#[derive(Clone, Deserialize, Serialize)]
+-pub enum Data {
+-    Payload(bytes::Bytes),
+-    ContentLength(usize),
+-    Done,
+-    Cancelled,
+-    Error(NetworkError),
+-}
+-
+ pub struct WebSocketChannel {
+     pub sender: ProfileGenericCallback<WebSocketNetworkEvent>,
+     pub receiver: Option<CallbackSetter<WebSocketDomAction>>,
+@@ -342,17 +332,6 @@ pub(crate) fn transfers_request_body_stream_to_later_manual_redirect(
+             .is_some_and(|status| status.is_redirection())
+ }
+ 
+-pub type DoneChannel = Option<(TokioSender<Data>, TokioReceiver<Data>)>;
+-
+-/// Whether the whole decoded body has to be kept in the net process rather than
+-/// only streamed to the consumer.
+-///
+-/// Subresource integrity has to digest the body before the response is handed on,
+-/// and a preloaded response may later be consumed by a fetch that does.
+-pub(crate) fn retains_whole_body(request: &Request) -> bool {
+-    !request.integrity_metadata.is_empty() || request.preload_id.is_some()
+-}
+-
+ /// [Fetch](https://fetch.spec.whatwg.org#concept-fetch)
+ pub async fn fetch(request: Request, target: Target<'_>, context: &FetchContext) -> Response {
+     // Step 7. Let timingInfo be a new fetch timing info whose start time
+@@ -460,7 +439,7 @@ pub async fn fetch(request: Request, target: Target<'_>, context: &FetchContext)
+     let request_id = request.id;
+ 
+     // Step 17: Run main fetch given fetchParams.
+-    let response = main_fetch(&mut fetch_params, false, target, &mut None, context).await;
++    let response = main_fetch(&mut fetch_params, false, target, context).await;
+ 
+     if transfers_request_body_stream_to_later_manual_redirect(&fetch_params.request, &response) {
+         request_body_stream_closer.disarm();
+@@ -582,7 +561,6 @@ pub async fn main_fetch(
+     fetch_params: &mut FetchParams,
+     recursive_flag: bool,
+     target: Target<'_>,
+-    done_chan: &mut DoneChannel,
+     context: &FetchContext,
+ ) -> Response {
+     // Step 1: Let request be fetchParam's request.
+@@ -776,7 +754,7 @@ pub async fn main_fetch(
+                 request.response_tainting = ResponseTainting::Basic;
+ 
+                 // Substep 2. Return the result of running scheme fetch given fetchParams.
+-                scheme_fetch(fetch_params, target, done_chan, context).await
++                scheme_fetch(fetch_params, target, context).await
+             } else if request.mode == RequestMode::SameOrigin {
+                 Response::network_error(NetworkError::CrossOriginResponse)
+             } else if request.mode == RequestMode::NoCors {
+@@ -788,7 +766,7 @@ pub async fn main_fetch(
+                     request.response_tainting = ResponseTainting::Opaque;
+ 
+                     // Substep 3. Return the result of running scheme fetch given fetchParams.
+-                    scheme_fetch(fetch_params, target, done_chan, context).await
++                    scheme_fetch(fetch_params, target, context).await
+                 }
+             } else if !matches!(current_scheme, "http" | "https") {
+                 Response::network_error(NetworkError::UnsupportedScheme)
+@@ -808,7 +786,7 @@ pub async fn main_fetch(
+                 // Substep 2. Let corsWithPreflightResponse be the result of running override fetch
+                 // given "http-fetch", fetchParams, and true.
+                 let cors_with_preflight_response =
+-                    http_fetch(fetch_params, true, true, false, target, done_chan, context).await;
++                    http_fetch(fetch_params, true, true, false, target, context).await;
+                 // Substep 3. If corsWithPreflightResponse is a network error, then clear cache entries using request.
+                 if cors_with_preflight_response.is_network_error() {
+                     context
+@@ -824,7 +802,7 @@ pub async fn main_fetch(
+                 request.response_tainting = ResponseTainting::CorsTainting;
+ 
+                 // Substep 2. Return the result of running override fetch given "http-fetch" and fetchParams.
+-                http_fetch(fetch_params, true, false, false, target, done_chan, context).await
++                http_fetch(fetch_params, true, false, false, target, context).await
+             }
+         },
+     };
+@@ -879,7 +857,7 @@ pub async fn main_fetch(
+         response = response.to_filtered(response_type);
+     }
+ 
+-    let internal_error = {
++    let (internal_error, has_null_body) = {
+         // Tests for steps 17 and 18, before step 15 for borrowing concerns.
+         let response_is_network_error = response.is_network_error();
+         let should_replace_with_nosniff_error = !response_is_network_error &&
+@@ -986,29 +964,28 @@ pub async fn main_fetch(
+         // disregard any enqueuing toward it (if any).
+         // NOTE: We check `internal_response` since we did not mutate `response` in the previous steps.
+         let not_network_error = !response_is_network_error && !internal_response.is_network_error();
+-        if not_network_error &&
++        let has_null_body = not_network_error &&
+             (is_null_body_status(&internal_response.status) ||
+-                matches!(request.method, Method::HEAD | Method::CONNECT))
+-        {
+-            // when Fetch is used only asynchronously, we will need to make sure
+-            // that nothing tries to write to the body at this point
+-            let mut body = internal_response.body.lock();
+-            *body = ResponseBody::Empty;
+-        }
++                matches!(request.method, Method::HEAD | Method::CONNECT));
+ 
+-        internal_response.get_network_error().cloned()
++        (
++            internal_response.get_network_error().cloned(),
++            has_null_body,
++        )
+     };
+ 
+     // Execute deferred rebinding of response.
+     if let Some(error) = internal_error {
+         response = Response::network_error(error);
++    } else if has_null_body {
++        response.actual_response_mut().body = ResponseBody::Null;
+     }
+ 
+     // Step 19. If response is not a network error and any of the following returns blocked
+     let mut response_loaded = false;
+     let mut response = if !response.is_network_error() && !request.integrity_metadata.is_empty() {
+         // Step 19.1.
+-        wait_for_response(request, &mut response, target, done_chan, context).await;
++        wait_for_response(request, &mut response, target, true, context).await;
+         response_loaded = true;
+ 
+         // Step 19.2.
+@@ -1030,7 +1007,8 @@ pub async fn main_fetch(
+         // by sync fetch, but we overload it here for simplicity
+         target.process_response(request, &response);
+         if !response_loaded {
+-            wait_for_response(request, &mut response, target, done_chan, context).await;
++            let retain = request.preload_id.is_some();
++            wait_for_response(request, &mut response, target, retain, context).await;
+         }
+         // overloaded similarly to process_response
+         target.process_response_eof(request, &response);
+@@ -1054,7 +1032,9 @@ pub async fn main_fetch(
+ 
+     // Step 23.
+     if !response_loaded {
+-        wait_for_response(request, &mut response, target, done_chan, context).await;
++        // A preloaded response is kept whole for the fetch that consumes it.
++        let retain = request.preload_id.is_some();
++        wait_for_response(request, &mut response, target, retain, context).await;
+     }
+ 
+     // Step 24.
+@@ -1069,68 +1049,73 @@ pub async fn main_fetch(
+     response
+ }
+ 
++/// Hand the body of `response` over to `target`, and set how it ended on `response`.
++/// With `retain`, the body is also kept in `response` as a whole once it is complete.
+ async fn wait_for_response(
+     request: &Request,
+     response: &mut Response,
+     target: Target<'_>,
+-    done_chan: &mut DoneChannel,
++    retain: bool,
+     context: &FetchContext,
+ ) {
+-    if let Some(ref mut ch) = *done_chan {
+-        #[cfg(feature = "devtools")]
+-        let mut devtools_body = context.devtools_chan.as_ref().map(|_| Vec::new());
+-        #[cfg(not(feature = "devtools"))]
+-        let devtools_body = None;
+-        loop {
+-            match ch.1.recv().await {
+-                Some(Data::ContentLength(length)) => {
+-                    target.process_response_length_hint(request, length);
+-                },
+-                Some(Data::Payload(bytes)) => {
+-                    #[cfg(feature = "devtools")]
+-                    if let Some(body) = devtools_body.as_mut() {
+-                        body.extend(&bytes);
+-                    }
+-                    target.process_response_chunk(request, bytes);
+-                },
+-                Some(Data::Error(network_error)) => {
+-                    if network_error == NetworkError::DecompressionError {
+-                        response.termination_reason = Some(TerminationReason::Fatal);
+-                    }
+-                    response.set_network_error(network_error);
+-
+-                    break;
+-                },
+-                Some(Data::Done) => {
+-                    send_response_to_devtools(request, context, response, devtools_body);
+-                    break;
+-                },
+-                Some(Data::Cancelled) => {
+-                    response.aborted.store(true, Ordering::Release);
+-                    break;
+-                },
+-
+-                None => {
+-                    panic!("fetch worker should always send Done before terminating");
+-                },
+-            }
+-        }
+-    } else {
+-        match *response.actual_response().body.lock() {
+-            ResponseBody::Done(ref vec) if !vec.is_empty() => {
+-                // in case there was no channel to wait for, the body was
+-                // obtained synchronously via scheme_fetch for data/file/about/etc
+-                // We should still send the body across as a chunk
+-                target.process_response_chunk(request, Bytes::copy_from_slice(vec));
++    let mut receiver = match response.actual_response_mut().body.take() {
++        ResponseBody::Null => return,
++        ResponseBody::Bytes(bytes) => {
++            if !bytes.is_empty() {
++                target.process_response_chunk(request, bytes.clone());
+                 #[cfg(feature = "devtools")]
+                 if context.devtools_chan.is_some() {
+-                    // Now that we've replayed the entire cached body,
+-                    // notify the DevTools server with the full Response.
+-                    send_response_to_devtools(request, context, response, Some(vec.clone()));
++                    send_response_to_devtools(request, context, response, Some(bytes.to_vec()));
+                 }
++            }
++            response.actual_response_mut().body = ResponseBody::Bytes(bytes);
++            return;
++        },
++        ResponseBody::Stream(receiver) => receiver,
++    };
++
++    if let Some(length) = receiver.length_hint() {
++        target.process_response_length_hint(request, length);
++    }
++    let mut retained = retain.then(|| BytesMut::with_capacity(receiver.length_hint().unwrap_or(0)));
++    #[cfg(feature = "devtools")]
++    let mut devtools_body = context.devtools_chan.as_ref().map(|_| Vec::new());
++    #[cfg(not(feature = "devtools"))]
++    let devtools_body = None;
++    loop {
++        match receiver.next().await {
++            BodyEvent::Chunk(bytes) => {
++                #[cfg(feature = "devtools")]
++                if let Some(body) = devtools_body.as_mut() {
++                    body.extend(&bytes);
++                }
++                if let Some(retained) = retained.as_mut() {
++                    retained.extend_from_slice(&bytes);
++                }
++                target.process_response_chunk(request, bytes);
++            },
++            BodyEvent::End(BodyEnd::Complete) => {
++                send_response_to_devtools(request, context, response, devtools_body);
++                if let Some(retained) = retained {
++                    response.actual_response_mut().body = ResponseBody::Bytes(retained.freeze());
++                }
++                break;
++            },
++            BodyEvent::End(BodyEnd::Aborted) => {
++                send_response_to_devtools(request, context, response, devtools_body);
++                response.aborted = true;
++                response.actual_response_mut().aborted = true;
++                break;
++            },
++            BodyEvent::End(BodyEnd::Failed(network_error)) => {
++                response.aborted = true;
++                response.actual_response_mut().aborted = true;
++                if network_error == NetworkError::DecompressionError {
++                    response.termination_reason = Some(TerminationReason::Fatal);
++                }
++                response.set_network_error(network_error);
++                break;
+             },
+-            ResponseBody::Done(_) | ResponseBody::Empty | ResponseBody::Streamed => {},
+-            _ => unreachable!(),
+         }
+     }
+ }
+@@ -1172,7 +1157,7 @@ fn create_blank_reply(url: ServoUrl, timing_type: ResourceTimingType) -> Respons
+     response
+         .headers
+         .typed_insert(ContentType::from(mime::TEXT_HTML_UTF_8));
+-    *response.body.lock() = ResponseBody::Done(vec![]);
++    response.body = ResponseBody::Bytes(Default::default());
+     response.status = HttpStatus::default();
+     response
+ }
+@@ -1182,7 +1167,7 @@ fn create_about_memory(url: ServoUrl, timing_type: ResourceTimingType) -> Respon
+     response
+         .headers
+         .typed_insert(ContentType::from(mime::TEXT_HTML_UTF_8));
+-    *response.body.lock() = ResponseBody::Done(resources::read_bytes(Resource::AboutMemoryHTML));
++    response.body = ResponseBody::Bytes(resources::read_bytes(Resource::AboutMemoryHTML).into());
+     response.status = HttpStatus::default();
+     response
+ }
+@@ -1253,7 +1238,6 @@ fn handle_allowcert_request(request: &mut Request, context: &FetchContext) -> io
+ async fn scheme_fetch(
+     fetch_params: &mut FetchParams,
+     target: Target<'_>,
+-    done_chan: &mut DoneChannel,
+     context: &FetchContext,
+ ) -> Response {
+     // Step 1: If fetchParams is canceled, then return the appropriate network error for fetchParams.
+@@ -1278,21 +1262,10 @@ async fn scheme_fetch(
+             create_blank_reply(url_and_blob_lock.url(), request.timing_type())
+         },
+ 
+-        "http" | "https" => {
+-            http_fetch(
+-                fetch_params,
+-                false,
+-                false,
+-                false,
+-                target,
+-                done_chan,
+-                context,
+-            )
+-            .await
+-        },
++        "http" | "https" => http_fetch(fetch_params, false, false, false, target, context).await,
+ 
+         _ => match context.protocols.get(scheme) {
+-            Some(handler) => handler.load(request, done_chan, context).await,
++            Some(handler) => handler.load(request, context).await,
+             None => Response::network_error(NetworkError::UnsupportedScheme),
+         },
+     }
+diff --git a/components/net/filemanager_thread.rs b/components/net/filemanager_thread.rs
+index 5a86784f0c5..2956b203638 100644
+--- a/components/net/filemanager_thread.rs
++++ b/components/net/filemanager_thread.rs
+@@ -17,7 +17,9 @@ use embedder_traits::{
+ use headers::{ContentLength, ContentRange, ContentType, HeaderMap, HeaderMapExt, Range};
+ use log::warn;
+ use mime::Mime;
++use net_traits::NetworkError;
+ use net_traits::blob_url_store::{BlobBuf, BlobTokenCommunicator, BlobURLStoreError};
++use net_traits::body_stream::{BodyEnd, BodySender, body_channel};
+ use net_traits::filemanager_thread::{
+     FileManagerResult, FileManagerThreadError, FileManagerThreadMsg, FileTokenCheck,
+     GetTokenForFileReply, ReadFileProgress, RelativePos,
+@@ -26,17 +28,15 @@ use net_traits::response::{Response, ResponseBody};
+ use parking_lot::{Mutex, RwLock};
+ use profile_traits::generic_callback::GenericCallback;
+ use rustc_hash::{FxHashMap, FxHashSet};
+-use servo_arc::Arc as ServoArc;
+ use servo_base::generic_channel::GenericSender;
+ use servo_url::ImmutableOrigin;
+ use tokio::io::{AsyncReadExt, AsyncSeekExt};
+-use tokio::sync::mpsc::UnboundedSender as TokioSender;
+ use tokio::task::yield_now;
+ use uuid::Uuid;
+ 
+ use crate::async_runtime::spawn_task;
+ use crate::embedder::NetToEmbedderMsg;
+-use crate::fetch::methods::{CancellationListener, Data, RangeRequestBounds};
++use crate::fetch::methods::{CancellationListener, RangeRequestBounds};
+ use crate::protocols::get_range_request_bounds;
+ 
+ pub const FILE_CHUNK_SIZE: usize = 32768; // 32 KB
+@@ -123,10 +123,8 @@ impl FileManager {
+     /// Read a file for the Fetch implementation.
+     /// It gets the required headers synchronously and reads the actual content
+     /// in a separate thread.
+-    #[expect(clippy::too_many_arguments)]
+     pub(crate) fn fetch_file(
+         &self,
+-        done_sender: &mut TokioSender<Data>,
+         cancellation_listener: Arc<CancellationListener>,
+         id: Uuid,
+         file_token: &FileTokenCheck,
+@@ -135,7 +133,6 @@ impl FileManager {
+         range: Option<Range>,
+     ) -> Result<(), BlobURLStoreError> {
+         self.fetch_blob_buf(
+-            done_sender,
+             cancellation_listener,
+             &id,
+             file_token,
+@@ -207,72 +204,65 @@ impl FileManager {
+ 
+     pub fn fetch_file_in_chunks(
+         &self,
+-        done_sender: &mut TokioSender<Data>,
++        sender: BodySender,
+         mut reader: BufReader<File>,
+-        res_body: ServoArc<Mutex<ResponseBody>>,
+         cancellation_listener: Arc<CancellationListener>,
+         range: RelativePos,
+     ) {
+-        let done_sender = done_sender.clone();
+         spawn_task(async move {
++            let mut sent = 0;
+             loop {
+                 if cancellation_listener.cancelled() {
+-                    *res_body.lock() = ResponseBody::Done(vec![]);
+-                    let _ = done_sender.send(Data::Cancelled);
++                    sender.finish(BodyEnd::Aborted);
+                     return;
+                 }
+-                let length = {
+-                    let buffer = reader.fill_buf().unwrap();
+-                    let mut buffer_len = buffer.len();
+-                    if let ResponseBody::Receiving(ref mut body) = *res_body.lock() {
+-                        let offset = usize::min(
+-                            {
+-                                if let Some(end) = range.end {
+-                                    // HTTP Range requests are specified with closed ranges,
+-                                    // while Rust uses half-open ranges. We add +1 here so
+-                                    // we don't skip the last requested byte.
+-                                    let remaining_bytes =
+-                                        end as usize - range.start as usize - body.len() + 1;
+-                                    if remaining_bytes <= FILE_CHUNK_SIZE {
+-                                        // This is the last chunk so we set buffer
+-                                        // len to 0 to break the reading loop.
+-                                        buffer_len = 0;
+-                                        remaining_bytes
+-                                    } else {
+-                                        FILE_CHUNK_SIZE
+-                                    }
+-                                } else {
+-                                    FILE_CHUNK_SIZE
+-                                }
+-                            },
+-                            buffer.len(),
+-                        );
+-                        let chunk = &buffer[0..offset];
+-                        body.extend_from_slice(chunk);
+-                        let _ = done_sender.send(Data::Payload(Bytes::copy_from_slice(chunk)));
+-                    }
+-                    buffer_len
++                let buffer = match reader.fill_buf() {
++                    Ok(buffer) => buffer,
++                    Err(error) => {
++                        sender.finish(BodyEnd::Failed(NetworkError::ResourceLoadError(
++                            error.to_string(),
++                        )));
++                        return;
++                    },
+                 };
+-                if length == 0 {
+-                    let mut body = res_body.lock();
+-                    let completed_body = match *body {
+-                        ResponseBody::Receiving(ref mut body) => std::mem::take(body),
+-                        _ => vec![],
+-                    };
+-                    *body = ResponseBody::Done(completed_body);
+-                    let _ = done_sender.send(Data::Done);
+-                    break;
++                let mut buffer_len = buffer.len();
++                let offset = usize::min(
++                    {
++                        if let Some(end) = range.end {
++                            // HTTP Range requests are specified with closed ranges,
++                            // while Rust uses half-open ranges. We add +1 here so
++                            // we don't skip the last requested byte.
++                            let remaining_bytes = end as usize - range.start as usize - sent + 1;
++                            if remaining_bytes <= FILE_CHUNK_SIZE {
++                                // This is the last chunk so we set buffer
++                                // len to 0 to break the reading loop.
++                                buffer_len = 0;
++                                remaining_bytes
++                            } else {
++                                FILE_CHUNK_SIZE
++                            }
++                        } else {
++                            FILE_CHUNK_SIZE
++                        }
++                    },
++                    buffer.len(),
++                );
++                if !sender.send(Bytes::copy_from_slice(&buffer[0..offset])) {
++                    return;
++                }
++                sent += offset;
++                if buffer_len == 0 {
++                    sender.finish(BodyEnd::Complete);
++                    return;
+                 }
+-                reader.consume(length);
++                reader.consume(buffer_len);
+                 yield_now().await
+             }
+         });
+     }
+ 
+-    #[expect(clippy::too_many_arguments)]
+     fn fetch_blob_buf(
+         &self,
+-        done_sender: &mut TokioSender<Data>,
+         cancellation_listener: Arc<CancellationListener>,
+         id: &Uuid,
+         file_token: &FileTokenCheck,
+@@ -315,11 +305,7 @@ impl FileManager {
+                     content_range,
+                 );
+ 
+-                let mut bytes = vec![];
+-                bytes.extend_from_slice(buf.bytes.index(range));
+-
+-                let _ = done_sender.send(Data::Payload(Bytes::copy_from_slice(&bytes)));
+-                let _ = done_sender.send(Data::Done);
++                response.body = ResponseBody::Bytes(Bytes::copy_from_slice(buf.bytes.index(range)));
+ 
+                 Ok(())
+             },
+@@ -369,13 +355,9 @@ impl FileManager {
+                     content_range,
+                 );
+ 
+-                self.fetch_file_in_chunks(
+-                    &mut done_sender.clone(),
+-                    reader,
+-                    response.body.clone(),
+-                    cancellation_listener,
+-                    range,
+-                );
++                let (sender, body) = body_channel(None);
++                response.body = ResponseBody::Stream(body);
++                self.fetch_file_in_chunks(sender, reader, cancellation_listener, range);
+ 
+                 Ok(())
+             },
+@@ -386,7 +368,6 @@ impl FileManager {
+                     RelativePos::full_range().slice_inner(&inner_rel_pos),
+                 );
+                 self.fetch_blob_buf(
+-                    done_sender,
+                     cancellation_listener,
+                     &parent_id,
+                     file_token,
+diff --git a/components/net/http_cache/mod.rs b/components/net/http_cache/mod.rs
+index fdfb7ffe0d5..5d29f144d7c 100644
+--- a/components/net/http_cache/mod.rs
++++ b/components/net/http_cache/mod.rs
+@@ -29,19 +29,17 @@ use http_cache_rules::{
+ use log::debug;
+ use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+ use malloc_size_of_derive::MallocSizeOf as MallocSizeOfDerive;
++use net_traits::body_stream::{BodyEnd, BodySender, body_channel};
+ use net_traits::http_status::HttpStatus;
+ use net_traits::request::{CacheMode, Request, RequestMode};
+ use net_traits::response::{CacheState, Response, ResponseBody};
+ use net_traits::{CacheEntryDescriptor, NetworkError, ResourceFetchTiming};
+-use parking_lot::Mutex;
+-use servo_arc::Arc as ServoArc;
+ use servo_config::pref;
+-use tokio::sync::mpsc::{UnboundedSender as TokioSender, unbounded_channel as unbounded};
+ use tokio::sync::watch;
+ 
+ use crate::connector::BoxedBody;
+ use crate::decoder::{Decoder, DecoderType};
+-use crate::fetch::methods::{Data, DoneChannel, FetchFlowState, retains_whole_body};
++use crate::fetch::methods::FetchFlowState;
+ use crate::http_cache::inflight::{InFlight, InFlightState, InFlightWriter, RevalidationGuards};
+ use crate::http_cache::key::EntryId;
+ use crate::http_cache::memory_store::MemoryStore;
+@@ -171,12 +169,10 @@ impl HttpCache {
+         &self,
+         request: &mut Request,
+         producer: watch::Receiver<FetchFlowState>,
+-        done_chan: &mut DoneChannel,
+         revalidating_flag: &mut bool,
+     ) -> (CacheTransaction, CacheLookup) {
+         let mut transaction = self.new_transaction(request, producer);
+         let key = transaction.key.clone();
+-        *done_chan = None;
+         let mut lookup = CacheLookup::default();
+ 
+         if !transaction.storable || request.cache_mode == CacheMode::NoStore {
+@@ -218,7 +214,7 @@ impl HttpCache {
+                         .policy
+                         .presented_fields(&meta.headers, SystemTime::now());
+                     match self
+-                        .serve(request, id, &meta, headers, done_chan, CacheState::Local)
++                        .serve(request, id, &meta, headers, CacheState::Local)
+                         .await
+                     {
+                         Ok(response) => {
+@@ -233,11 +229,9 @@ impl HttpCache {
+                             // The entry vanished between the lookup and the open, which
+                             // the store is allowed to do. Fall back to the network.
+                             self.store.remove(id, meta.stamp).await;
+-                            *done_chan = None;
+                         },
+                         Err(ServeError::RangeNotSatisfiable) => {
+                             // Keep the entry: this request just cannot be answered from it.
+-                            *done_chan = None;
+                         },
+                     }
+                 },
+@@ -337,7 +331,6 @@ impl HttpCache {
+         id: EntryId,
+         meta: &EntryMeta,
+         mut headers: HeaderMap,
+-        done_chan: &mut DoneChannel,
+         cache_state: CacheState,
+     ) -> Result<Response, ServeError> {
+         let mut status = meta.status.clone();
+@@ -370,15 +363,13 @@ impl HttpCache {
+         response.referrer_policy = request.referrer_policy;
+         response.cache_state = cache_state;
+ 
+-        let (sender, receiver) = unbounded();
+-        *done_chan = Some((sender.clone(), receiver));
+-        let accumulate = retains_whole_body(request);
+-        *response.body.lock() = if accumulate {
+-            ResponseBody::Receiving(Vec::new())
+-        } else {
+-            ResponseBody::Streamed
+-        };
+-        spawn_entry_stream(reader, sender, response.body.clone(), accumulate);
++        let length_hint = reader
++            .content_encoding()
++            .is_none()
++            .then(|| reader.len() as usize);
++        let (sender, body) = body_channel(length_hint);
++        response.body = ResponseBody::Stream(body);
++        spawn_entry_stream(reader, sender);
+         Ok(response)
+     }
+ 
+@@ -392,7 +383,6 @@ impl HttpCache {
+         transaction: &mut CacheTransaction,
+         request: &Request,
+         forward_response: &Response,
+-        done_chan: &mut DoneChannel,
+     ) -> Option<Response> {
+         let (id, meta) = transaction.revalidating.take()?;
+         let request_headers = transaction.presented_request_headers(request);
+@@ -418,14 +408,7 @@ impl HttpCache {
+             // The 304 forbids storing the response, with `no-store` for example: it
+             // answers this request, and the entry goes.
+             let response = self
+-                .serve(
+-                    request,
+-                    id,
+-                    &meta,
+-                    freshened.headers,
+-                    done_chan,
+-                    CacheState::Validated,
+-                )
++                .serve(request, id, &meta, freshened.headers, CacheState::Validated)
+                 .await
+                 .ok();
+             self.store.remove(id, meta.stamp).await;
+@@ -442,16 +425,9 @@ impl HttpCache {
+         let headers = refreshed
+             .policy
+             .presented_fields(&refreshed.headers, SystemTime::now());
+-        self.serve(
+-            request,
+-            id,
+-            &refreshed,
+-            headers,
+-            done_chan,
+-            CacheState::Validated,
+-        )
+-        .await
+-        .ok()
++        self.serve(request, id, &refreshed, headers, CacheState::Validated)
++            .await
++            .ok()
+     }
+ 
+     /// Copy a network body into the cache as it is delivered, when the response may
+@@ -738,29 +714,15 @@ impl HttpCache {
+         let headers = meta
+             .policy
+             .presented_fields(&meta.headers, SystemTime::now());
+-        let mut done_chan = None;
+-        let response = self
+-            .serve(
+-                request,
+-                id,
+-                &meta,
+-                headers,
+-                &mut done_chan,
+-                CacheState::Local,
+-            )
++        let mut response = self
++            .serve(request, id, &meta, headers, CacheState::Local)
+             .await
+             .ok()?;
+-        let (_, mut receiver) = done_chan?;
+-        let mut body = Vec::new();
+-        while let Some(data) = receiver.recv().await {
+-            match data {
+-                Data::Payload(chunk) => body.extend_from_slice(&chunk),
+-                Data::Done => break,
+-                Data::Error(_) | Data::Cancelled => return None,
+-                Data::ContentLength(_) => {},
+-            }
+-        }
+-        Some((response, body))
++        let ResponseBody::Stream(body) = response.body.take() else {
++            return None;
++        };
++        let body = body.read_all().await.ok()?;
++        Some((response, body.to_vec()))
+     }
+ 
+     /// Invalidate what an unsafe `request` that `response` answered invalidates.
+@@ -862,43 +824,24 @@ fn is_cacheable_request(request: &Request) -> bool {
+ }
+ 
+ /// Stream a stored entry to the fetch consumer, decoding it on the way.
+-fn spawn_entry_stream(
+-    reader: BodyReader,
+-    sender: TokioSender<Data>,
+-    body: ServoArc<Mutex<ResponseBody>>,
+-    accumulate: bool,
+-) {
++fn spawn_entry_stream(reader: BodyReader, sender: BodySender) {
+     let encoding = reader.content_encoding();
+-    let stored_len = reader.len();
+     tokio::spawn(async move {
+-        if encoding.is_none() {
+-            let _ = sender.send(Data::ContentLength(stored_len as usize));
+-        }
+         let mut decoder = Box::pin(Decoder::for_stream(reader.into_stream(), encoding));
+         while let Some(item) = decoder.next().await {
+             match item {
+                 Ok(chunk) => {
+-                    if accumulate && let ResponseBody::Receiving(bytes) = &mut *body.lock() {
+-                        bytes.extend_from_slice(&chunk);
+-                    }
+-                    if sender.send(Data::Payload(chunk)).is_err() {
+-                        break;
++                    if !sender.send(chunk) {
++                        return;
+                     }
+                 },
+                 Err(error) => {
+                     debug!("error reading a cached body: {error}");
+-                    let _ = sender.send(Data::Error(NetworkError::DecompressionError));
+-                    break;
++                    sender.finish(BodyEnd::Failed(NetworkError::DecompressionError));
++                    return;
+                 },
+             }
+         }
+-        {
+-            let mut body = body.lock();
+-            if let ResponseBody::Receiving(bytes) = &mut *body {
+-                let bytes = std::mem::take(bytes);
+-                *body = ResponseBody::Done(bytes);
+-            }
+-        }
+-        let _ = sender.send(Data::Done);
++        sender.finish(BodyEnd::Complete);
+     });
+ }
+diff --git a/components/net/http_loader.rs b/components/net/http_loader.rs
+index deb6874406d..b1d0cf1335a 100644
+--- a/components/net/http_loader.rs
++++ b/components/net/http_loader.rs
+@@ -5,7 +5,6 @@
+ use std::collections::HashSet;
+ use std::iter::FromIterator;
+ use std::sync::Arc as StdArc;
+-use std::sync::atomic::Ordering;
+ use std::time::Duration;
+ 
+ use async_recursion::async_recursion;
+@@ -36,6 +35,7 @@ use ipc_channel::router::ROUTER;
+ use log::{debug, error, info, log_enabled, warn};
+ use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+ use net_traits::blob_url_store::UrlWithBlobClaim;
++use net_traits::body_stream::{BodyEnd, body_channel};
+ use net_traits::fetch::headers::get_value_from_header_list;
+ use net_traits::http_status::HttpStatus;
+ use net_traits::policy_container::{EmbedderPolicyValue, RequestPolicyContainer};
+@@ -95,8 +95,7 @@ use crate::fetch::cors_cache::CorsCache;
+ use crate::fetch::fetch_params::FetchParams;
+ use crate::fetch::headers::{SecFetchDest, SecFetchMode, SecFetchSite, SecFetchUser};
+ use crate::fetch::methods::{
+-    Data, DoneChannel, FetchContext, FetchFlowState, SuspendedFetches, Target, fetch, main_fetch,
+-    retains_whole_body,
++    FetchContext, FetchFlowState, SuspendedFetches, Target, fetch, main_fetch,
+ };
+ use crate::hsts::HstsList;
+ use crate::http_cache::{CacheTransaction, HttpCache, RevalidationGuard};
+@@ -894,11 +893,8 @@ pub(crate) async fn http_fetch(
+     cors_preflight_flag: bool,
+     authentication_fetch_flag: bool,
+     target: Target<'async_recursion>,
+-    done_chan: &mut DoneChannel,
+     context: &FetchContext,
+ ) -> Response {
+-    // This is a new async fetch, reset the channel we are waiting on
+-    *done_chan = None;
+     // Step 1. Let request be fetchParams’s request.
+     let request = &mut fetch_params.request;
+ 
+@@ -980,7 +976,6 @@ pub(crate) async fn http_fetch(
+             fetch_params,
+             authentication_fetch_flag,
+             cors_flag,
+-            done_chan,
+             context,
+         )
+         .await;
+@@ -1068,15 +1063,7 @@ pub(crate) async fn http_fetch(
+ 
+                 // Step 6.3."follow".2. Set response to the result of running HTTP-redirect fetch
+                 // given fetchParams and response.
+-                http_redirect_fetch(
+-                    fetch_params,
+-                    response,
+-                    cors_flag,
+-                    target,
+-                    done_chan,
+-                    context,
+-                )
+-                .await
++                http_redirect_fetch(fetch_params, response, cors_flag, target, context).await
+             },
+         };
+     }
+@@ -1214,7 +1201,6 @@ pub async fn http_redirect_fetch(
+     mut response: Response,
+     cors_flag: bool,
+     target: Target<'async_recursion>,
+-    done_chan: &mut DoneChannel,
+     context: &FetchContext,
+ ) -> Response {
+     let mut redirect_end_timer = RedirectEndTimer(Some(fetch_params.timing_info.clone()));
+@@ -1348,8 +1334,11 @@ pub async fn http_redirect_fetch(
+     // Step 21: If request’s redirect mode is "manual", then...
+     let recursive_flag = request.redirect_mode != RedirectMode::Manual;
+ 
++    // Discard the body of the redirect rather than queue it while the next request runs.
++    drop(response);
++
+     // Step 22: Return the result of running main fetch given fetchParams and recursive.
+-    let fetch_response = main_fetch(fetch_params, recursive_flag, target, done_chan, context).await;
++    let fetch_response = main_fetch(fetch_params, recursive_flag, target, context).await;
+ 
+     // TODO: timing allow check
+     fetch_params
+@@ -1369,7 +1358,6 @@ async fn http_network_or_cache_fetch(
+     fetch_params: &mut FetchParams,
+     authentication_fetch_flag: bool,
+     cors_flag: bool,
+-    done_chan: &mut DoneChannel,
+     context: &FetchContext,
+ ) -> Response {
+     // Step 2. Let httpFetchParams be null.
+@@ -1613,7 +1601,6 @@ async fn http_network_or_cache_fetch(
+         .read(
+             http_request,
+             context.cancellation_listener.subscribe(),
+-            done_chan,
+             &mut revalidating_flag,
+         )
+         .await;
+@@ -1642,7 +1629,6 @@ async fn http_network_or_cache_fetch(
+             http_fetch_params,
+             include_credentials,
+             &mut cache_transaction,
+-            done_chan,
+             context,
+         )
+         .await;
+@@ -1661,9 +1647,6 @@ async fn http_network_or_cache_fetch(
+ 
+         // Step 10.4 If the revalidatingFlag is set and forwardResponse’s status is 304, then:
+         if revalidating_flag && forward_response.status == StatusCode::NOT_MODIFIED {
+-            // Ensure done_chan is None, since the network response will be replaced by the
+-            // revalidated stored one.
+-            *done_chan = None;
+             response = context
+                 .state
+                 .http_cache
+@@ -1671,7 +1654,6 @@ async fn http_network_or_cache_fetch(
+                     &mut cache_transaction,
+                     &http_fetch_params.request,
+                     &forward_response,
+-                    done_chan,
+                 )
+                 .await;
+ 
+@@ -1684,13 +1666,11 @@ async fn http_network_or_cache_fetch(
+                 let http_request = &mut http_fetch_params.request;
+                 http_request.headers.remove(header::IF_NONE_MATCH);
+                 http_request.headers.remove(header::IF_MODIFIED_SINCE);
+-                *done_chan = None;
+                 response = Some(
+                     http_network_fetch(
+                         http_fetch_params,
+                         include_credentials,
+                         &mut cache_transaction,
+-                        done_chan,
+                         context,
+                     )
+                     .await,
+@@ -1774,16 +1754,14 @@ async fn http_network_or_cache_fetch(
+             };
+         }
+ 
+-        // Make sure this is set to None,
+-        // since we're about to start a new `http_network_or_cache_fetch`.
+-        *done_chan = None;
++        // Discard the body of the response being replaced rather than queue it.
++        response.body = ResponseBody::Null;
+ 
+         // Step 14.4 Set response to the result of running HTTP-network-or-cache fetch given fetchParams and true.
+         response = http_network_or_cache_fetch(
+             fetch_params,
+             true, /* authentication flag */
+             cors_flag,
+-            done_chan,
+             context,
+         )
+         .await;
+@@ -1830,16 +1808,14 @@ async fn http_network_or_cache_fetch(
+             auth_cache.entries.insert(key, entry);
+         }
+ 
+-        // Make sure this is set to None,
+-        // since we're about to start a new `http_network_or_cache_fetch`.
+-        *done_chan = None;
++        // Discard the body of the response being replaced rather than queue it.
++        response.body = ResponseBody::Null;
+ 
+         // Step 15.5 Set response to the result of running HTTP-network-or-cache fetch given fetchParams.
+         response = http_network_or_cache_fetch(
+             fetch_params,
+             false, /* authentication flag */
+             cors_flag,
+-            done_chan,
+             context,
+         )
+         .await;
+@@ -2040,31 +2016,12 @@ impl Drop for ResponseEndTimer {
+     }
+ }
+ 
+-/// Mark a body that will not receive any more data as complete. Bodies that are
+-/// accumulated for a consumer inside net keep their bytes; streamed bodies are
+-/// left alone, since nothing retained them.
+-fn complete_response_body_in_place(body: &mut ResponseBody) {
+-    if let ResponseBody::Receiving(bytes) = body {
+-        let mut bytes = std::mem::take(bytes);
+-        bytes.shrink_to_fit();
+-        *body = ResponseBody::Done(bytes);
+-    }
+-}
+-
+-/// Drop what has been accumulated so far for a body whose fetch failed or was cancelled.
+-fn discard_response_body(body: &mut ResponseBody) {
+-    if matches!(body, ResponseBody::Receiving(_)) {
+-        *body = ResponseBody::Done(Vec::new());
+-    }
+-}
+-
+ /// [HTTP network fetch](https://fetch.spec.whatwg.org/#http-network-fetch)
+ #[servo_tracing::instrument(skip_all,fields(url=fetch_params.request.url().as_str()))]
+ async fn http_network_fetch(
+     fetch_params: &mut FetchParams,
+     credentials_flag: bool,
+     cache_transaction: &mut CacheTransaction,
+-    done_chan: &mut DoneChannel,
+     context: &FetchContext,
+ ) -> Response {
+     let mut response_end_timer = ResponseEndTimer(Some(fetch_params.timing_info.clone()));
+@@ -2258,12 +2215,6 @@ async fn http_network_fetch(
+         url.is_secure_scheme(),
+     );
+ 
+-    let response_body = response.body.clone();
+-
+-    // We're about to spawn a future to be waited on here
+-    let (done_sender, done_receiver) = unbounded_channel();
+-    *done_chan = Some((done_sender.clone(), done_receiver));
+-
+     let cancellation_listener = context.cancellation_listener.clone();
+     if cancellation_listener.cancelled() {
+         return Response::network_error(NetworkError::LoadCancelled);
+@@ -2307,18 +2258,9 @@ async fn http_network_fetch(
+         4096
+     }
+     .min(pref!(network_max_content_length) as usize);
+-    let _ = done_sender.send(Data::ContentLength(prealloc_size));
+-
+-    // The decoded body is only accumulated when a consumer inside the net process
+-    // needs it as one piece. Subresource integrity and preloads are the only such
+-    // consumers; every other body is streamed to the caller and never retained here,
+-    // and the cache keeps its own copy on the encoded side.
+-    *response_body.lock() = if retains_whole_body(request) {
+-        ResponseBody::Receiving(Vec::with_capacity(prealloc_size))
+-    } else {
+-        ResponseBody::Streamed
+-    };
+-    let aborted = response.aborted.clone();
++
++    let (body_sender, body) = body_channel(Some(prealloc_size));
++    response.body = ResponseBody::Stream(body);
+     let suspend_timeout = context.state.suspended_fetches.timeout();
+     let network_body = cancellation_listener
+         .start_network_body(context.state.suspended_fetches.clone(), url.origin());
+@@ -2353,11 +2295,6 @@ async fn http_network_fetch(
+                 },
+             };
+             if cancelled {
+-                let mut body = response_body.lock();
+-                aborted.store(true, Ordering::Release);
+-                discard_response_body(&mut body);
+-                drop(body);
+-                let _ = done_sender.send(Data::Cancelled);
+                 break Err(std::io::Error::new(
+                     std::io::ErrorKind::Interrupted,
+                     "Fetch aborted",
+@@ -2370,10 +2307,9 @@ async fn http_network_fetch(
+             };
+             match chunk {
+                 Some(Ok(chunk)) => {
+-                    if let ResponseBody::Receiving(ref mut body) = *response_body.lock() {
+-                        body.extend_from_slice(&chunk);
+-                    }
+-                    let _ = done_sender.send(Data::Payload(chunk));
++                    // When nobody reads the body any more, it is still read to its end, so
++                    // that the connection can be reused and the cache can store it.
++                    let _ = body_sender.send(chunk);
+                 },
+                 Some(Err(error)) => break Err(error),
+                 None => break Ok(()),
+@@ -2388,43 +2324,35 @@ async fn http_network_fetch(
+                 if let Some(cache_commit) = cache_commit {
+                     cache_commit.commit();
+                 }
+-                let mut body = response_body.lock();
+-                complete_response_body_in_place(&mut body);
+-                // A streamed body is not retained here; devtools accumulates its own
+-                // copy from the chunks in `wait_for_response`.
+-                #[cfg(feature = "devtools")]
+-                let devtools_response_body = match &*body {
+-                    ResponseBody::Done(bytes) if devtools_chan.is_some() => Some(bytes.clone()),
+-                    _ => None,
+-                };
++                // The body is not retained here; devtools accumulates its own copy from the
++                // chunks in `wait_for_response`.
+                 #[cfg(feature = "devtools")]
+                 send_response_values_to_devtools(
+                     Some(headers),
+                     status,
+-                    devtools_response_body,
++                    None,
+                     CacheState::None,
+                     &devtools_request,
+                     devtools_chan,
+                 );
+                 timing.set_attribute(ResourceAttribute::ResponseEnd);
+-                let _ = done_sender.send(Data::Done);
++                body_sender.finish(BodyEnd::Complete);
+             },
+             Err(error) => {
+-                // The body is incomplete, so keep the HTTP cache from using it.
+-                aborted.store(true, Ordering::Release);
+-                if let std::io::ErrorKind::InvalidData = error.kind() {
++                let end = if let std::io::ErrorKind::InvalidData = error.kind() {
+                     debug!("Content decompression error for {:?}", request_url);
+-                    let _ = done_sender.send(Data::Error(NetworkError::DecompressionError));
+-                    discard_response_body(&mut response_body.lock());
+-                }
+-                if suspended_too_long {
++                    BodyEnd::Failed(NetworkError::DecompressionError)
++                } else if suspended_too_long {
+                     debug!("Fetch suspended for too long: {:?}", request_url);
+-                    let _ = done_sender.send(Data::Error(NetworkError::ConnectionFailure));
+-                }
++                    BodyEnd::Failed(NetworkError::ConnectionFailure)
++                } else {
++                    // A body cut short by the connection is handed over as far as it got,
++                    // like one whose fetch was cancelled.
++                    BodyEnd::Aborted
++                };
+                 debug!("finished response for {:?}", request_url);
+-                complete_response_body_in_place(&mut response_body.lock());
+                 timing.set_attribute(ResourceAttribute::ResponseEnd);
+-                let _ = done_sender.send(Data::Done);
++                body_sender.finish(end);
+             },
+         }
+     });
+@@ -2442,7 +2370,7 @@ async fn http_network_fetch(
+     // Step 13
+     // TODO this step isn't possible yet (CSP)
+ 
+-    // Step 14, update the cached response, done via the shared response body.
++    // Step 14, update the cached response, done by the copy that `HttpCache::tee` takes of the body.
+ 
+     // TODO this step isn't possible yet
+     // Step 15
+@@ -2540,8 +2468,7 @@ async fn cors_preflight_fetch(request: &Request, context: &FetchContext) -> Resp
+ 
+     send_early_httprequest_to_devtools(&preflight, context);
+ 
+-    let response =
+-        http_network_or_cache_fetch(&mut fetch_params, false, false, &mut None, context).await;
++    let response = http_network_or_cache_fetch(&mut fetch_params, false, false, context).await;
+ 
+     send_response_to_devtools(&preflight, context, &response, None);
+     send_security_info_to_devtools(&preflight, context, &response);
+diff --git a/components/net/local_directory_listing.rs b/components/net/local_directory_listing.rs
+index 124f5ebecca..0cae9915c16 100644
+--- a/components/net/local_directory_listing.rs
++++ b/components/net/local_directory_listing.rs
+@@ -43,7 +43,7 @@ pub(crate) async fn fetch(request: &mut Request, url: ServoUrl, path_buf: PathBu
+ 
+     let mut response = Response::new(url, ResourceFetchTiming::new(request.timing_type()));
+     response.headers.typed_insert(ContentType::html());
+-    *response.body.lock() = ResponseBody::Done(output.into_bytes());
++    response.body = ResponseBody::Bytes(output.into_bytes().into());
+ 
+     response
+ }
+diff --git a/components/net/protocols/blob.rs b/components/net/protocols/blob.rs
+index e572df33614..53c4a25352c 100644
+--- a/components/net/protocols/blob.rs
++++ b/components/net/protocols/blob.rs
+@@ -11,11 +11,10 @@ use log::debug;
+ use net_traits::blob_url_store::{BlobURLStoreError, parse_blob_url};
+ use net_traits::http_status::HttpStatus;
+ use net_traits::request::Request;
+-use net_traits::response::{Response, ResponseBody};
++use net_traits::response::Response;
+ use net_traits::{NetworkError, ResourceFetchTiming};
+-use tokio::sync::mpsc::unbounded_channel;
+ 
+-use crate::fetch::methods::{Data, DoneChannel, FetchContext};
++use crate::fetch::methods::FetchContext;
+ use crate::protocols::{ProtocolHandler, partial_content, range_not_satisfiable_error};
+ 
+ #[derive(Default)]
+@@ -25,7 +24,6 @@ impl ProtocolHandler for BlobProtocolHander {
+     fn load(
+         &self,
+         request: &mut Request,
+-        done_chan: &mut DoneChannel,
+         context: &FetchContext,
+     ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+         let url_and_blob_claim = request.current_url_with_blob_claim();
+@@ -62,12 +60,7 @@ impl ProtocolHandler for BlobProtocolHander {
+             partial_content(&mut response);
+         }
+ 
+-        let (mut done_sender, done_receiver) = unbounded_channel();
+-        *done_chan = Some((done_sender.clone(), done_receiver));
+-        *response.body.lock() = ResponseBody::Receiving(vec![]);
+-
+         if let Err(err) = context.filemanager.fetch_file(
+-            &mut done_sender,
+             context.cancellation_listener.clone(),
+             file_id,
+             &context.file_token,
+@@ -75,7 +68,6 @@ impl ProtocolHandler for BlobProtocolHander {
+             &mut response,
+             range_header,
+         ) {
+-            let _ = done_sender.send(Data::Done);
+             let err = match err {
+                 BlobURLStoreError::InvalidRange => {
+                     range_not_satisfiable_error(&mut response);
+diff --git a/components/net/protocols/data.rs b/components/net/protocols/data.rs
+index ef45527e768..6c551c32c9a 100644
+--- a/components/net/protocols/data.rs
++++ b/components/net/protocols/data.rs
+@@ -12,7 +12,7 @@ use net_traits::request::Request;
+ use net_traits::response::{Response, ResponseBody};
+ use net_traits::{NetworkError, ResourceFetchTiming};
+ 
+-use crate::fetch::methods::{DoneChannel, FetchContext};
++use crate::fetch::methods::FetchContext;
+ use crate::protocols::ProtocolHandler;
+ 
+ #[derive(Default)]
+@@ -22,7 +22,6 @@ impl ProtocolHandler for DataProtocolHander {
+     fn load(
+         &self,
+         request: &mut Request,
+-        _done_chan: &mut DoneChannel,
+         _context: &FetchContext,
+     ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+         let url = request.current_url();
+@@ -35,7 +34,7 @@ impl ProtocolHandler for DataProtocolHander {
+                     let content_type = data_url.mime_type().to_string();
+                     let mut response =
+                         Response::new(url, ResourceFetchTiming::new(request.timing_type()));
+-                    *response.body.lock() = ResponseBody::Done(bytes);
++                    response.body = ResponseBody::Bytes(bytes.into());
+ 
+                     if let Ok(content_type_header_value) = HeaderValue::from_str(&content_type) {
+                         response
+diff --git a/components/net/protocols/file.rs b/components/net/protocols/file.rs
+index e6f3fccaeb7..31f940df357 100644
+--- a/components/net/protocols/file.rs
++++ b/components/net/protocols/file.rs
+@@ -9,12 +9,12 @@ use std::pin::Pin;
+ 
+ use headers::{ContentLength, ContentRange, ContentType, HeaderMapExt, Range};
+ use http::Method;
++use net_traits::body_stream::body_channel;
+ use net_traits::request::Request;
+ use net_traits::response::{Response, ResponseBody};
+ use net_traits::{NetworkError, ResourceFetchTiming};
+-use tokio::sync::mpsc::unbounded_channel;
+ 
+-use crate::fetch::methods::{DoneChannel, FetchContext};
++use crate::fetch::methods::FetchContext;
+ use crate::filemanager_thread::FILE_CHUNK_SIZE;
+ use crate::local_directory_listing;
+ use crate::protocols::{
+@@ -28,7 +28,6 @@ impl ProtocolHandler for FileProtocolHander {
+     fn load<'a>(
+         &'a self,
+         request: &'a mut Request,
+-        done_chan: &mut DoneChannel,
+         context: &FetchContext,
+     ) -> Pin<Box<dyn Future<Output = Response> + Send + 'a>> {
+         let url = request.current_url();
+@@ -93,17 +92,11 @@ impl ProtocolHandler for FileProtocolHander {
+                 let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
+                 response.headers.typed_insert(ContentType::from(mime));
+ 
+-                // Setup channel to receive cross-thread messages about the file fetch
+-                // operation.
+-                let (mut done_sender, done_receiver) = unbounded_channel();
+-                *done_chan = Some((done_sender.clone(), done_receiver));
+-
+-                *response.body.lock() = ResponseBody::Receiving(vec![]);
+-
++                let (sender, body) = body_channel(None);
++                response.body = ResponseBody::Stream(body);
+                 context.filemanager.fetch_file_in_chunks(
+-                    &mut done_sender,
++                    sender,
+                     reader,
+-                    response.body.clone(),
+                     context.cancellation_listener.clone(),
+                     range,
+                 );
+diff --git a/components/net/protocols/mod.rs b/components/net/protocols/mod.rs
+index fbc2d68fa54..94621758bd3 100644
+--- a/components/net/protocols/mod.rs
++++ b/components/net/protocols/mod.rs
+@@ -15,12 +15,16 @@ use net_traits::blob_url_store::UrlWithBlobClaim;
+ use net_traits::filemanager_thread::RelativePos;
+ use net_traits::request::Request;
+ use net_traits::response::Response;
+-use net_traits::{DiscardFetch, NetworkError};
++use net_traits::{
++    DiscardFetch, NetworkError, ResourceAttribute, ResourceFetchTiming,
++    ResourceFetchTimingContainer, ResourceTimeValue,
++};
+ use rustc_hash::FxHashMap;
+ use servo_url::ServoUrl;
+ use url::Position;
+ 
+-use crate::fetch::methods::{DoneChannel, FetchContext, RangeRequestBounds, fetch};
++use crate::fetch::fetch_params::FetchParams;
++use crate::fetch::methods::{FetchContext, RangeRequestBounds, main_fetch};
+ 
+ mod blob;
+ mod data;
+@@ -48,12 +52,10 @@ pub trait ProtocolHandler: Send + Sync {
+     /// http endpoint, it is recommended to a least provide:
+     /// - A relevant status code.
+     /// - A Content Type.
+-    fn load<'a>(
+-        &'a self,
+-        request: &'a mut Request,
+-        done_chan: &mut DoneChannel,
+-        context: &FetchContext,
+-    ) -> FutureResponse<'a>;
++    ///
++    /// The body is either a `ResponseBody::Bytes`, or a `ResponseBody::Stream` from
++    /// `body_channel`, whose sender then sends the chunks and finishes the body.
++    fn load<'a>(&'a self, request: &'a mut Request, context: &FetchContext) -> FutureResponse<'a>;
+ 
+     /// Specify if resources served by that protocol can be retrieved
+     /// with `fetch()` without no-cors mode to allow the caller direct
+@@ -178,12 +180,7 @@ struct WebPageContentProtocolHandler {
+ 
+ impl ProtocolHandler for WebPageContentProtocolHandler {
+     /// <https://html.spec.whatwg.org/multipage/#protocol-handler-invocation>
+-    fn load<'a>(
+-        &'a self,
+-        request: &'a mut Request,
+-        _done_chan: &mut DoneChannel,
+-        context: &FetchContext,
+-    ) -> FutureResponse<'a> {
++    fn load<'a>(&'a self, request: &'a mut Request, context: &FetchContext) -> FutureResponse<'a> {
+         let mut url = request.current_url();
+         // Step 1. Assert: inputURL's scheme is normalizedScheme.
+         assert!(url.scheme() == self.scheme);
+@@ -223,9 +220,21 @@ impl ProtocolHandler for WebPageContentProtocolHandler {
+         request
+             .url_list
+             .push(UrlWithBlobClaim::new(result_url, None));
++
++        // The handler's response is returned without handing its body over, so that the
++        // fetch of the original URL hands it over to its consumer.
+         let request2 = request.clone();
+         let context2 = context.clone();
+-        Box::pin(async move { fetch(request2, &mut DiscardFetch, &context2).await })
++        Box::pin(async move {
++            let timing: ResourceFetchTimingContainer =
++                ResourceFetchTiming::new(request2.timing_type()).into();
++            timing.set_attributes(&[
++                ResourceAttribute::FetchStart,
++                ResourceAttribute::StartTime(ResourceTimeValue::FetchStart),
++            ]);
++            let mut fetch_params = FetchParams::new(request2, timing);
++            main_fetch(&mut fetch_params, true, &mut DiscardFetch, &context2).await
++        })
+     }
+ }
+ 
+diff --git a/components/net/request_interceptor.rs b/components/net/request_interceptor.rs
+index 200720227fd..6b5d21940d3 100644
+--- a/components/net/request_interceptor.rs
++++ b/components/net/request_interceptor.rs
+@@ -47,7 +47,7 @@ impl RequestInterceptor {
+                 sender,
+             ));
+ 
+-        // TODO: use done_chan and run in CoreResourceThreadPool.
++        // TODO: stream the body and run in CoreResourceThreadPool.
+         let mut accumulated_body = Vec::new();
+         while let Some(message) = receiver.recv().await {
+             match message {
+@@ -73,8 +73,13 @@ impl RequestInterceptor {
+                         error!("Received unexpected FinishLoad message");
+                         break;
+                     };
+-                    *response.body.lock() =
+-                        ResponseBody::Done(accumulated_body.into_iter().flatten().collect());
++                    response.body = ResponseBody::Bytes(
++                        accumulated_body
++                            .into_iter()
++                            .flatten()
++                            .collect::<Vec<u8>>()
++                            .into(),
++                    );
+                     break;
+                 },
+                 WebResourceResponseMsg::CancelLoad => {
+diff --git a/components/net/resource_thread.rs b/components/net/resource_thread.rs
+index 60f8a8bcd67..a79f5c1dc38 100644
+--- a/components/net/resource_thread.rs
++++ b/components/net/resource_thread.rs
+@@ -899,7 +899,6 @@ impl CoreResourceManager {
+                         response,
+                         true,
+                         &mut sender,
+-                        &mut None,
+                         &context,
+                     )
+                     .await;
+diff --git a/components/net/subresource_integrity.rs b/components/net/subresource_integrity.rs
+index 1364918197d..0b1577cab8c 100644
+--- a/components/net/subresource_integrity.rs
++++ b/components/net/subresource_integrity.rs
+@@ -9,7 +9,6 @@ use std::sync::LazyLock;
+ use aws_lc_rs::digest::{self};
+ use base64::Engine;
+ use net_traits::response::{Response, ResponseBody, ResponseType};
+-use parking_lot::MutexGuard;
+ use regex::Regex;
+ 
+ type StaticCharVec = &'static [char];
+@@ -141,17 +140,16 @@ pub fn get_strongest_metadata<'a>(integrity_metadata_list: Vec<SriEntry<'a>>) ->
+ 
+ /// <https://w3c.github.io/webappsec-subresource-integrity/#apply-algorithm-to-response>
+ fn apply_algorithm_to_response(
+-    body: MutexGuard<ResponseBody>,
++    body: &ResponseBody,
+     algorithm: &'static digest::Algorithm,
+ ) -> String {
+-    if let ResponseBody::Done(ref vec) = *body {
+-        let response_digest = digest::digest(algorithm, vec);
++    if let Some(bytes) = body.bytes() {
++        let response_digest = digest::digest(algorithm, bytes);
+         base64::engine::general_purpose::STANDARD.encode(response_digest)
+     } else {
+-        // There is nothing to digest: a null body status leaves the body empty, and
+-        // a streamed body is delivered to the consumer rather than retained. Return
+-        // a digest that cannot match, so the integrity check fails rather than the
+-        // process.
++        // There is nothing to digest: a null body status leaves the body null, and a body
++        // that is still being received is not known as a whole. Return a digest that
++        // cannot match, so the integrity check fails rather than the process.
+         log::debug!("integrity check on a response with no retained body");
+         String::new()
+     }
+@@ -182,7 +180,7 @@ pub fn is_response_integrity_valid(integrity_metadata: &str, response: &Response
+     // Step 5
+     let metadata: Vec<SriEntry> = get_strongest_metadata(parsed_metadata_list);
+     for item in metadata {
+-        let body = response.body.lock();
++        let body = &response.actual_response().body;
+         let digest = item.val;
+ 
+         let hashed = match item.algorithm {
+diff --git a/components/net/tests/data_loader.rs b/components/net/tests/data_loader.rs
+index 8dc732be95f..72307e6dfb5 100644
+--- a/components/net/tests/data_loader.rs
++++ b/components/net/tests/data_loader.rs
+@@ -9,12 +9,11 @@ use hyper_serde::Serde;
+ use mime::{self, Mime};
+ use net_traits::blob_url_store::UrlWithBlobClaim;
+ use net_traits::request::Referrer;
+-use net_traits::response::ResponseBody;
+ use net_traits::{FetchMetadata, FilteredMetadata, NetworkError};
+ use servo_base::id::TEST_WEBVIEW_ID;
+ use servo_url::ServoUrl;
+ 
+-use crate::fetch;
++use crate::{body_of, fetch};
+ 
+ #[cfg(test)]
+ fn assert_parse(
+@@ -53,13 +52,7 @@ fn assert_parse(
+             assert_eq!(metadata.content_type.map(Serde::into_inner), content_type);
+             assert_eq!(metadata.charset.as_ref().map(String::deref), charset);
+ 
+-            let resp_body = response.body.lock();
+-            match *resp_body {
+-                ResponseBody::Done(ref val) => {
+-                    assert_eq!(val, &data);
+-                },
+-                _ => panic!(),
+-            }
++            assert_eq!(body_of(&response), data);
+         },
+         None => {
+             assert!(response.is_network_error());
+diff --git a/components/net/tests/fetch.rs b/components/net/tests/fetch.rs
+index 975d47001ad..bb72fdcfddc 100644
+--- a/components/net/tests/fetch.rs
++++ b/components/net/tests/fetch.rs
+@@ -38,7 +38,7 @@ use net_traits::http_status::HttpStatus;
+ use net_traits::request::{
+     Destination, RedirectMode, Referrer, Request, RequestBuilder, RequestMode,
+ };
+-use net_traits::response::{CacheState, Response, ResponseBody, ResponseType};
++use net_traits::response::{CacheState, Response, ResponseType};
+ use net_traits::{
+     FetchTaskTarget, IncludeSubdomains, NetworkError, ReferrerPolicy, get_current_locale,
+ };
+@@ -49,9 +49,9 @@ use uuid::Uuid;
+ 
+ use crate::http_loader::{devtools_response_with_body, expect_devtools_http_request};
+ use crate::{
+-    DEFAULT_USER_AGENT, create_generic_embedder_proxy, create_generic_embedder_proxy_and_receiver,
+-    create_http_state, fetch, fetch_with_context, fetch_with_cors_cache, make_body, make_server,
+-    make_ssl_server, mock_origin, new_fetch_context,
++    DEFAULT_USER_AGENT, body_of, create_generic_embedder_proxy,
++    create_generic_embedder_proxy_and_receiver, create_http_state, fetch, fetch_with_context,
++    fetch_with_cors_cache, make_body, make_server, make_ssl_server, mock_origin, new_fetch_context,
+ };
+ 
+ // TODO write a struct that impls Handler for storing test values
+@@ -115,12 +115,7 @@ fn test_fetch_response_body_matches_const_message() {
+     assert!(!fetch_response.is_network_error());
+     assert_eq!(fetch_response.response_type, ResponseType::Basic);
+ 
+-    match *fetch_response.body.lock() {
+-        ResponseBody::Done(ref body) => {
+-            assert_eq!(&**body, MESSAGE);
+-        },
+-        _ => panic!(),
+-    };
++    assert_eq!(body_of(&fetch_response), MESSAGE);
+ }
+ 
+ #[test]
+@@ -140,15 +135,13 @@ fn test_fetch_aboutblank() {
+     assert_eq!(fetch_response.response_type, ResponseType::Opaque);
+     assert!(!fetch_response.is_network_error());
+     assert_eq!(fetch_response.headers.len(), 0);
+-    let resp_body = fetch_response.body.lock();
+-    assert_eq!(*resp_body, ResponseBody::Empty);
++    assert!(fetch_response.body.is_null());
+ 
+     // The underlying response behind the filter should
+     // have a 0-byte body.
+     let actual_response = fetch_response.actual_response();
+     assert!(!actual_response.is_network_error());
+-    let resp_body = actual_response.body.lock();
+-    assert_eq!(*resp_body, ResponseBody::Done(vec![]));
++    assert_eq!(body_of(&fetch_response), b"");
+ }
+ 
+ #[test]
+@@ -170,7 +163,7 @@ fn test_fetch_blob() {
+         /// Fired when the response is fully fetched
+         fn process_response_eof(&mut self, _: &Request, response: &Response) {
+             assert_eq!(self.buffer, self.expected);
+-            let _ = self.sender.send(response.clone());
++            let _ = self.sender.send(response.try_clone().unwrap());
+         }
+         fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
+ 
+@@ -229,7 +222,7 @@ fn test_fetch_blob() {
+     let content_length: ContentLength = fetch_response.headers.typed_get().unwrap();
+     assert_eq!(content_length.0, bytes.len() as u64);
+ 
+-    assert_eq!(*fetch_response.body.lock(), ResponseBody::Receiving(vec![]));
++    assert_eq!(body_of(&fetch_response), bytes);
+ }
+ 
+ #[test]
+@@ -256,8 +249,7 @@ fn test_file() {
+ 
+     assert!(!fetch_response.is_network_error());
+     assert_eq!(fetch_response.headers.len(), 0);
+-    let resp_body = fetch_response.body.lock();
+-    assert_eq!(*resp_body, ResponseBody::Empty);
++    assert!(fetch_response.body.is_null());
+ 
+     // The underlying response behind the filter should
+     // have the file's MIME type and contents.
+@@ -280,14 +272,7 @@ fn test_file() {
+         .0;
+     assert_eq!(content_size, file.len() as u64);
+ 
+-    let resp_body = actual_response.body.lock();
+-
+-    match *resp_body {
+-        ResponseBody::Done(ref val) => {
+-            assert_eq!(val, &file);
+-        },
+-        _ => panic!(),
+-    }
++    assert_eq!(body_of(&fetch_response), file);
+ }
+ 
+ #[test]
+@@ -384,10 +369,7 @@ fn test_cors_preflight_fetch() {
+     let _ = server.close();
+ 
+     assert!(!fetch_response.is_network_error());
+-    match *fetch_response.body.lock() {
+-        ResponseBody::Done(ref body) => assert_eq!(&**body, ACK),
+-        _ => panic!(),
+-    };
++    assert_eq!(body_of(&fetch_response), ACK);
+ }
+ 
+ #[test]
+@@ -457,14 +439,8 @@ fn test_cors_preflight_cache_fetch() {
+     assert_eq!(true, cache.match_method(&wrapped_request2, &Method::GET));
+     assert_eq!(true, cache.match_method(&wrapped_request3, &Method::GET));
+ 
+-    match *fetch_response0.body.lock() {
+-        ResponseBody::Done(ref body) => assert_eq!(&**body, ACK),
+-        _ => panic!(),
+-    };
+-    match *fetch_response1.body.lock() {
+-        ResponseBody::Done(ref body) => assert_eq!(&**body, ACK),
+-        _ => panic!(),
+-    };
++    assert_eq!(body_of(&fetch_response0), ACK);
++    assert_eq!(body_of(&fetch_response1), ACK);
+ }
+ 
+ #[test]
+@@ -659,10 +635,7 @@ fn test_fetch_response_is_opaque_filtered() {
+     // this also asserts that status message is "the empty byte sequence"
+     assert!(fetch_response.status.is_error());
+     assert_eq!(fetch_response.headers, HeaderMap::new());
+-    match *fetch_response.body.lock() {
+-        ResponseBody::Empty => {},
+-        _ => panic!(),
+-    }
++    assert!(fetch_response.body.is_null());
+     match fetch_response.cache_state {
+         CacheState::None => {},
+         _ => panic!(),
+@@ -709,10 +682,7 @@ fn test_fetch_response_is_opaque_redirect_filtered() {
+     // this also asserts that status message is "the empty byte sequence"
+     assert!(fetch_response.status.is_error());
+     assert_eq!(fetch_response.headers, HeaderMap::new());
+-    match *fetch_response.body.lock() {
+-        ResponseBody::Empty => {},
+-        _ => panic!(),
+-    }
++    assert!(fetch_response.body.is_null());
+     match fetch_response.cache_state {
+         CacheState::None => {},
+         _ => panic!(),
+@@ -1012,7 +982,8 @@ fn test_fetch_with_sri_sucess() {
+     let response = fetch(request, None);
+ 
+     let _ = server.close();
+-    assert_eq!(response_is_done(&response), true);
++    assert!(!response.is_network_error());
++    assert_eq!(body_of(&response), MESSAGE);
+ }
+ 
+ /// `fetch` should return a network error if there is a header `X-Content-Type-Options: nosniff`
+@@ -1111,12 +1082,7 @@ fn test_fetch_redirect_count_ceiling() {
+     assert!(!fetch_response.is_network_error());
+     assert_eq!(fetch_response.response_type, ResponseType::Basic);
+ 
+-    match *fetch_response.body.lock() {
+-        ResponseBody::Done(ref body) => {
+-            assert_eq!(&**body, MESSAGE);
+-        },
+-        _ => panic!(),
+-    };
++    assert_eq!(body_of(&fetch_response), MESSAGE);
+ }
+ 
+ #[test]
+@@ -1129,10 +1095,7 @@ fn test_fetch_redirect_count_failure() {
+ 
+     assert!(fetch_response.is_network_error());
+ 
+-    match *fetch_response.body.lock() {
+-        ResponseBody::Done(_) | ResponseBody::Receiving(_) => panic!(),
+-        _ => {},
+-    };
++    assert!(fetch_response.body.is_null());
+ }
+ 
+ fn test_fetch_redirect_updates_method_runner(
+@@ -1240,24 +1203,6 @@ fn test_fetch_redirect_updates_method() {
+     assert_eq!(rx.try_recv().is_err(), true);
+ }
+ 
+-fn response_is_done(response: &Response) -> bool {
+-    let response_complete = match response.response_type {
+-        ResponseType::Default | ResponseType::Basic | ResponseType::Cors => {
+-            (*response.body.lock()).is_done()
+-        },
+-        // if the internal response cannot have a body, it shouldn't block the "done" state
+-        ResponseType::Opaque | ResponseType::OpaqueRedirect | ResponseType::Error(..) => true,
+-    };
+-
+-    let internal_complete = if let Some(ref res) = response.internal_response {
+-        res.body.lock().is_done()
+-    } else {
+-        true
+-    };
+-
+-    response_complete && internal_complete
+-}
+-
+ #[test]
+ fn test_fetch_async_returns_complete_response() {
+     static MESSAGE: &'static [u8] = b"this message should be retrieved in full";
+@@ -1275,7 +1220,7 @@ fn test_fetch_async_returns_complete_response() {
+     let fetch_response = fetch(request, None);
+ 
+     let _ = server.close();
+-    assert_eq!(response_is_done(&fetch_response), true);
++    assert_eq!(body_of(&fetch_response), MESSAGE);
+ }
+ 
+ #[test]
+@@ -1355,14 +1300,6 @@ fn test_response_cache_status_is_validated() {
+     let _ = server.close();
+ }
+ 
+-/// The body of a response from `fetch_with_context`.
+-fn body_of(response: &Response) -> Vec<u8> {
+-    match &*response.actual_response().body.lock() {
+-        ResponseBody::Done(body) => body.clone(),
+-        _ => panic!("the body is not complete"),
+-    }
+-}
+-
+ #[test]
+ fn test_a_304_for_another_response_makes_the_request_again_without_preconditions() {
+     let preconditions = Arc::new(std::sync::Mutex::new(Vec::new()));
+@@ -1552,7 +1489,7 @@ fn test_opaque_filtered_fetch_async_returns_complete_response() {
+     let _ = server.close();
+ 
+     assert_eq!(fetch_response.response_type, ResponseType::Opaque);
+-    assert_eq!(response_is_done(&fetch_response), true);
++    assert_eq!(body_of(&fetch_response), MESSAGE);
+ }
+ 
+ #[test]
+@@ -1591,7 +1528,7 @@ fn test_opaque_redirect_filtered_fetch_async_returns_complete_response() {
+     let _ = server.close();
+ 
+     assert_eq!(fetch_response.response_type, ResponseType::OpaqueRedirect);
+-    assert_eq!(response_is_done(&fetch_response), true);
++    assert_eq!(body_of(&fetch_response), MESSAGE);
+ }
+ 
+ #[test]
+@@ -1767,13 +1704,11 @@ fn test_fetch_request_intercepted() {
+         "The custom header does not exist or has an incorrect value!"
+     );
+ 
+-    let body = response.body.lock();
+-    match &*body {
+-        ResponseBody::Done(data) => {
+-            assert_eq!(data, &EXPECTED_BODY, "Body content does not match");
+-        },
+-        _ => panic!("Expected ResponseBody::Done, but got {:?}", *body),
+-    }
++    assert_eq!(
++        body_of(&response),
++        EXPECTED_BODY,
++        "Body content does not match"
++    );
+ 
+     assert_eq!(
+         response.status.code(),
+diff --git a/components/net/tests/http_loader.rs b/components/net/tests/http_loader.rs
+index a73b4fb2b54..0632e85c33d 100644
+--- a/components/net/tests/http_loader.rs
++++ b/components/net/tests/http_loader.rs
+@@ -37,21 +37,23 @@ use net::cookie::ServoCookie;
+ use net::cookie_storage::CookieStorage;
+ use net::fetch::methods::{self, CancellationListener, FetchContext, SuspendedFetches};
+ use net::http_loader::{determine_requests_referrer, serialize_origin};
+-use net::protocols::ProtocolRegistry;
++use net::protocols::{ProtocolHandler, ProtocolRegistry};
+ use net::resource_thread::{AuthCacheEntry, new_core_resource_thread};
+ use net::test::DECODER_BUFFER_SIZE;
+ use net::test_util::{make_h2_ssl_server, make_tls_server_without_close_notify};
+ use net_traits::blob_url_store::UrlWithBlobClaim;
++use net_traits::body_stream::{BodyEnd, body_channel};
+ use net_traits::fetch::fetch_controller::FetchController;
+ use net_traits::http_status::HttpStatus;
+ use net_traits::request::{
+-    CredentialsMode, Destination, Referrer, Request, RequestBuilder, RequestMode,
++    CredentialsMode, Destination, PreloadId, Referrer, Request, RequestBuilder, RequestMode,
+     TraversableForUserPrompts, create_request_body_with_content,
+ };
+ use net_traits::response::{CacheState, Response, ResponseBody};
+ use net_traits::{
+-    CookieSource, CoreResourceMsg, CoreResourceThread, FetchResponseMsg, FetchTaskTarget,
+-    NetworkError, ReferrerPolicy, fetch_async, get_current_locale,
++    CookieSource, CoreResourceMsg, CoreResourceThread, DiscardFetch, FetchResponseMsg,
++    FetchTaskTarget, NetworkError, ReferrerPolicy, ResourceFetchTiming, fetch_async,
++    get_current_locale,
+ };
+ use parking_lot::{Mutex, RwLock};
+ use profile_traits::mem::ProfilerChan as MemProfilerChan;
+@@ -62,9 +64,10 @@ use servo_url::{ImmutableOrigin, ServoUrl};
+ use url::Url;
+ 
+ use crate::{
+-    create_generic_embedder_proxy, create_generic_embedder_proxy_and_receiver, create_http_state,
+-    fetch, fetch_with_context, is_aborted, make_body, make_server, make_ssl_server, mock_origin,
+-    new_fetch_context, receive_credential_prompt_msgs, replace_host_table, spawn_blocking_task,
++    body_of, create_generic_embedder_proxy, create_generic_embedder_proxy_and_receiver,
++    create_http_state, fetch, fetch_with_context, is_aborted, make_body, make_server,
++    make_ssl_server, mock_origin, new_fetch_context, receive_credential_prompt_msgs,
++    replace_host_table, spawn_blocking_task,
+ };
+ 
+ fn assert_cookie_for_domain(
+@@ -615,10 +618,7 @@ fn test_load_should_decode_the_response_as_deflate_when_response_headers_have_co
+ 
+     let internal_response = response.internal_response.unwrap();
+     assert!(internal_response.status.clone().code().is_success());
+-    assert_eq!(
+-        *internal_response.body.lock(),
+-        ResponseBody::Done(b"Yay!".to_vec())
+-    );
++    assert_eq!(body_of(&internal_response), b"Yay!");
+ }
+ 
+ #[test]
+@@ -651,10 +651,7 @@ fn test_load_should_decode_the_response_as_gzip_when_response_headers_have_conte
+ 
+     let internal_response = response.internal_response.unwrap();
+     assert!(internal_response.status.clone().code().is_success());
+-    assert_eq!(
+-        *internal_response.body.lock(),
+-        ResponseBody::Done(b"Yay!".to_vec())
+-    );
++    assert_eq!(body_of(&internal_response), b"Yay!");
+ }
+ 
+ #[test]
+@@ -1289,10 +1286,7 @@ fn test_load_succeeds_with_a_redirect_loop() {
+ 
+     let response = response.to_actual();
+     assert_eq!(response.url_list, [url_a.url(), url_b.url(), url_a.url()]);
+-    assert_eq!(
+-        *response.body.lock(),
+-        ResponseBody::Done(b"Success".to_vec())
+-    );
++    assert_eq!(body_of(&response), b"Success");
+ }
+ 
+ #[test]
+@@ -1333,10 +1327,7 @@ fn test_load_follows_a_redirect() {
+ 
+     let internal_response = response.internal_response.unwrap();
+     assert!(internal_response.status.clone().code().is_success());
+-    assert_eq!(
+-        *internal_response.body.lock(),
+-        ResponseBody::Done(b"Yay!".to_vec())
+-    );
++    assert_eq!(body_of(&internal_response), b"Yay!");
+ }
+ 
+ #[test]
+@@ -1423,10 +1414,7 @@ fn test_redirect_from_x_to_y_provides_y_cookies_from_y() {
+ 
+     let internal_response = response.internal_response.unwrap();
+     assert!(internal_response.status.clone().code().is_success());
+-    assert_eq!(
+-        *internal_response.body.lock(),
+-        ResponseBody::Done(b"Yay!".to_vec())
+-    );
++    assert_eq!(body_of(&internal_response), b"Yay!");
+ }
+ 
+ #[test]
+@@ -1479,10 +1467,7 @@ fn test_redirect_from_x_to_x_provides_x_with_cookie_from_first_response() {
+ 
+     let internal_response = response.internal_response.unwrap();
+     assert!(internal_response.status.clone().code().is_success());
+-    assert_eq!(
+-        *internal_response.body.lock(),
+-        ResponseBody::Done(b"Yay!".to_vec())
+-    );
++    assert_eq!(body_of(&internal_response), b"Yay!");
+ }
+ 
+ #[test]
+@@ -2038,10 +2023,7 @@ fn test_body_that_ends_with_its_tls_connection_without_close_notify_is_complete(
+         server.close();
+         assert!(!response.is_network_error());
+         assert!(!is_aborted(&response));
+-        assert_eq!(
+-            *response.actual_response().body.lock(),
+-            ResponseBody::Done(b"until close".to_vec())
+-        );
++        assert_eq!(body_of(&response), b"until close");
+     }
+ }
+ 
+@@ -2259,7 +2241,7 @@ impl FetchTaskTarget for BodyLengthCollector {
+             .sender
+             .take()
+             .unwrap()
+-            .send((response.clone(), self.length));
++            .send((response.try_clone().unwrap(), self.length));
+     }
+     fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
+     fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
+@@ -2309,10 +2291,7 @@ fn test_large_media_response_is_neither_kept_nor_stored() {
+     for expected_request_count in 1..=2 {
+         let (response, body_length) = fetch_video(&url, &mut context);
+         assert_eq!(body_length, LENGTH);
+-        assert!(matches!(
+-            &*response.actual_response().body.lock(),
+-            ResponseBody::Streamed
+-        ));
++        assert!(response.actual_response().body.is_null());
+         assert_eq!(request_count.load(Ordering::SeqCst), expected_request_count);
+     }
+ 
+@@ -2397,10 +2376,7 @@ fn test_truncated_response_is_not_served_from_cache() {
+     let mut context = new_fetch_context(None, None);
+ 
+     let response = fetch_with_context(build_cacheable_request(&url), &mut context);
+-    assert_eq!(
+-        *response.actual_response().body.lock(),
+-        ResponseBody::Done(b"truncated".to_vec())
+-    );
++    assert_eq!(body_of(&response), b"truncated");
+     assert_eq!(
+         stored_response_count(&context, &build_cacheable_request(&url)),
+         0
+@@ -2451,10 +2427,7 @@ fn test_compressed_response_is_answered_from_cache() {
+             matches!(response.cache_state, CacheState::Local),
+             from_cache
+         );
+-        assert_eq!(
+-            *response.actual_response().body.lock(),
+-            ResponseBody::Done(b"compressed content".to_vec())
+-        );
++        assert_eq!(body_of(&response), b"compressed content");
+     }
+     assert_eq!(request_count.load(Ordering::SeqCst), 1);
+ 
+@@ -3078,7 +3051,7 @@ impl FetchTaskTarget for StreamCollector {
+             .sender
+             .take()
+             .unwrap()
+-            .send((response.clone(), self.verifier.take().unwrap()));
++            .send((response.try_clone().unwrap(), self.verifier.take().unwrap()));
+     }
+     fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
+     fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
+@@ -3173,7 +3146,7 @@ fn check_suspended_fetch_holds_back_the_server(http2: bool) {
+     let listener = fetch.listener.clone();
+     let (response, body) = fetch.wait_for_end();
+     assert!(!response.is_network_error());
+-    assert!(!response.aborted.load(Ordering::SeqCst));
++    assert!(!response.aborted);
+     assert!(body.is_intact(STREAM_LENGTH));
+     assert_eq!(server.sent(0), STREAM_LENGTH);
+     assert_eq!(server.used_http2.load(Ordering::SeqCst), http2);
+@@ -3206,7 +3179,7 @@ fn test_cancelling_a_suspended_fetch_ends_it() {
+     fetch.listener.cancel();
+     let (response, body) = fetch.wait_for_end();
+     assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+-    assert!(response.aborted.load(Ordering::SeqCst));
++    assert!(response.aborted);
+     assert_eq!(body.received, STREAM_CHUNK_SIZE);
+ 
+     let _ = server.server.close();
+@@ -3223,7 +3196,7 @@ fn test_cancelling_a_fetch_that_waits_for_the_network_ends_it() {
+     fetch.listener.cancel();
+     let (response, body) = fetch.wait_for_end();
+     assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+-    assert!(response.aborted.load(Ordering::SeqCst));
++    assert!(response.aborted);
+     assert_eq!(body.received, STREAM_CHUNK_SIZE);
+ 
+     let _ = server.server.close();
+@@ -3243,7 +3216,7 @@ fn test_fetch_whose_connection_closes_while_suspended_ends_when_resumed() {
+ 
+     fetch.listener.resume();
+     let (response, body) = fetch.wait_for_end();
+-    assert!(response.aborted.load(Ordering::SeqCst));
++    assert!(response.aborted);
+     assert!(!body.mismatch);
+     assert_eq!(body.received, chunks * STREAM_CHUNK_SIZE);
+ }
+@@ -3323,7 +3296,7 @@ fn test_at_most_two_fetches_per_origin_are_suspended() {
+     assert!(fifth.listener.suspend());
+ 
+     let (response, _) = first.wait_for_end();
+-    assert!(response.aborted.load(Ordering::SeqCst));
++    assert!(response.aborted);
+     let (_, body) = second.wait_for_end();
+     assert!(body.is_intact(STREAM_LENGTH));
+     for fetch in [fourth, fifth] {
+@@ -3545,3 +3518,247 @@ fn test_fetch_controller_suspends_and_resumes_a_fetch() {
+         .unwrap();
+     exit_receiver.recv().unwrap();
+ }
++
++/// A raw server that reads one request and answers it with `response` once the returned sender
++/// fires. The returned counter counts the requests it has read.
++fn make_raw_held_server(
++    response: &'static [u8],
++) -> (
++    UrlWithBlobClaim,
++    std::sync::mpsc::Sender<()>,
++    Arc<AtomicUsize>,
++) {
++    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++    let url = UrlWithBlobClaim::new(
++        ServoUrl::parse(&format!(
++            "http://127.0.0.1:{}",
++            listener.local_addr().unwrap().port()
++        ))
++        .unwrap(),
++        None,
++    );
++    let (release_sender, release) = std::sync::mpsc::channel::<()>();
++    let request_count = Arc::new(AtomicUsize::new(0));
++    let request_count_clone = request_count.clone();
++    std::thread::spawn(move || {
++        let (mut stream, _) = listener.accept().unwrap();
++        let mut request = Vec::new();
++        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
++            let mut buffer = [0; 1024];
++            let length = stream.read(&mut buffer).unwrap();
++            assert!(length > 0);
++            request.extend_from_slice(&buffer[..length]);
++        }
++        request_count_clone.fetch_add(1, Ordering::SeqCst);
++        let _ = release.recv();
++        let _ = stream.write_all(response);
++    });
++    (url, release_sender, request_count)
++}
++
++#[test]
++fn test_fetch_cancelled_while_its_headers_are_held_ends() {
++    let (url, release, request_count) =
++        make_raw_held_server(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ncomplete");
++    let context = new_fetch_context(None, None);
++    let listener = context.cancellation_listener.clone();
++
++    let fetch = start_fetch(build_cacheable_request(&url), context);
++    wait_until(|| request_count.load(Ordering::SeqCst) == 1);
++    listener.cancel();
++    let _ = release.send(());
++    let (response, body_length) = wait_for_fetch(fetch);
++    assert!(response.is_network_error());
++    assert_eq!(body_length, 0);
++}
++
++#[test]
++fn test_body_of_a_response_that_fails_the_cors_check_is_not_delivered() {
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            *response.body_mut() = make_body(b"cross-origin secret".to_vec());
++        };
++    let (server, url) = make_server(handler);
++    let request = RequestBuilder::new(None, url, Referrer::NoReferrer)
++        .mode(RequestMode::CorsMode)
++        .origin(mock_origin())
++        .pipeline_id(Some(TEST_PIPELINE_ID))
++        .policy_container(Default::default())
++        .build();
++
++    let (response, body_length) =
++        wait_for_fetch(start_fetch(request, new_fetch_context(None, None)));
++    assert!(response.is_network_error());
++    assert_eq!(body_length, 0);
++    let _ = server.close();
++}
++
++#[test]
++fn test_body_of_a_response_blocked_by_nosniff_is_not_delivered() {
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            response
++                .headers_mut()
++                .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
++            response.headers_mut().insert(
++                HeaderName::from_static("x-content-type-options"),
++                HeaderValue::from_static("nosniff"),
++            );
++            *response.body_mut() = make_body(b"not a script".to_vec());
++        };
++    let (server, url) = make_server(handler);
++    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
++        .destination(Destination::Script)
++        .origin(url.origin())
++        .pipeline_id(Some(TEST_PIPELINE_ID))
++        .policy_container(Default::default())
++        .build();
++
++    let (response, body_length) =
++        wait_for_fetch(start_fetch(request, new_fetch_context(None, None)));
++    assert!(response.is_network_error());
++    assert_eq!(body_length, 0);
++    let _ = server.close();
++}
++
++/// A protocol handler whose responses have the status `status` and a streamed body, which it
++/// leaves unfinished unless `finish` is set.
++struct StreamingProtocolHandler {
++    status: StatusCode,
++    finish: bool,
++}
++
++impl ProtocolHandler for StreamingProtocolHandler {
++    fn load<'a>(
++        &'a self,
++        request: &'a mut Request,
++        _: &FetchContext,
++    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + 'a>> {
++        let mut response = Response::new(
++            request.current_url(),
++            ResourceFetchTiming::new(request.timing_type()),
++        );
++        response.status = self.status.into();
++        let (sender, body) = body_channel(None);
++        assert!(sender.send(Bytes::from_static(b"content")));
++        if self.finish {
++            sender.finish(BodyEnd::Complete);
++        }
++        response.body = ResponseBody::Stream(body);
++        Box::pin(std::future::ready(response))
++    }
++
++    fn is_fetchable(&self) -> bool {
++        true
++    }
++}
++
++/// Fetch `scheme:test` from `handler`, and return the response and the number of body bytes
++/// delivered.
++fn fetch_from_protocol_handler(
++    scheme: &str,
++    handler: StreamingProtocolHandler,
++) -> (Response, usize) {
++    let mut registry = ProtocolRegistry::with_internal_protocols();
++    registry.register(scheme, handler).unwrap();
++    let mut context = new_fetch_context(None, None);
++    context.protocols = Arc::new(registry);
++    let url = UrlWithBlobClaim::new(ServoUrl::parse(&format!("{scheme}:test")).unwrap(), None);
++    let request = RequestBuilder::new(None, url, Referrer::NoReferrer)
++        .origin(mock_origin())
++        .pipeline_id(Some(TEST_PIPELINE_ID))
++        .policy_container(Default::default())
++        .build();
++    wait_for_fetch(start_fetch(request, context))
++}
++
++#[test]
++fn test_body_of_a_null_body_status_is_not_delivered() {
++    let (response, body_length) = fetch_from_protocol_handler(
++        "nocontent",
++        StreamingProtocolHandler {
++            status: StatusCode::NO_CONTENT,
++            finish: true,
++        },
++    );
++    assert!(!response.is_network_error());
++    assert_eq!(body_length, 0);
++
++    let (response, body_length) = fetch_from_protocol_handler(
++        "content",
++        StreamingProtocolHandler {
++            status: StatusCode::OK,
++            finish: true,
++        },
++    );
++    assert!(!response.is_network_error());
++    assert_eq!(body_length, b"content".len());
++}
++
++#[test]
++fn test_body_whose_producer_stops_without_finishing_ends_the_fetch() {
++    let (response, body_length) = fetch_from_protocol_handler(
++        "unfinished",
++        StreamingProtocolHandler {
++            status: StatusCode::OK,
++            finish: false,
++        },
++    );
++    assert!(response.is_network_error());
++    assert_eq!(body_length, b"content".len());
++}
++
++#[test]
++fn test_navigation_through_a_page_content_protocol_handler_delivers_the_body() {
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            *response.body_mut() = make_body(b"handled".to_vec());
++        };
++    let (server, url) = make_server(handler);
++    let mut registry = ProtocolRegistry::with_internal_protocols();
++    registry
++        .register_page_content_handler("web+test".into(), format!("{}?url=%s", url.as_str()))
++        .unwrap();
++    let mut context = new_fetch_context(None, None);
++    context.protocols = Arc::new(registry);
++    let handler_url = UrlWithBlobClaim::new(ServoUrl::parse("web+test:resource").unwrap(), None);
++    let request = RequestBuilder::new(None, handler_url, Referrer::NoReferrer)
++        .destination(Destination::Document)
++        .mode(RequestMode::Navigate)
++        .origin(mock_origin())
++        .pipeline_id(Some(TEST_PIPELINE_ID))
++        .policy_container(Default::default())
++        .build();
++
++    let (response, body_length) = wait_for_fetch(start_fetch(request, context));
++    assert!(!response.is_network_error());
++    assert_eq!(body_length, b"handled".len());
++    let _ = server.close();
++}
++
++#[test]
++fn test_fetch_of_a_preload_keeps_its_body() {
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            *response.body_mut() = make_body(b"preloaded".to_vec());
++        };
++    let (server, url) = make_server(handler);
++    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
++        .origin(url.origin())
++        .preload_id(PreloadId::default())
++        .pipeline_id(Some(TEST_PIPELINE_ID))
++        .policy_container(Default::default())
++        .build();
++    let context = new_fetch_context(None, None);
++
++    let response =
++        spawn_blocking_task(
++            async move { methods::fetch(request, &mut DiscardFetch, &context).await },
++        );
++    assert_eq!(body_of(&response), b"preloaded");
++    let _ = server.close();
++}
+diff --git a/components/net/tests/main.rs b/components/net/tests/main.rs
+index 13338436a8f..1c598dff05f 100644
+--- a/components/net/tests/main.rs
++++ b/components/net/tests/main.rs
+@@ -163,10 +163,14 @@ impl FetchTaskTarget for FetchResponseCollector {
+     }
+     /// Fired when the response is fully fetched
+     fn process_response_eof(&mut self, _: &Request, response: &Response) {
+-        let response = response.clone();
+-        let body = &response.actual_response().body;
+-        if matches!(&*body.lock(), ResponseBody::Streamed) {
+-            *body.lock() = ResponseBody::Done(std::mem::take(&mut self.body));
++        let mut response = response
++            .try_clone()
++            .expect("a body is handed over before the end of the response");
++        if !response.is_network_error() {
++            let body = &mut response.actual_response_mut().body;
++            if body.bytes().is_none() {
++                *body = ResponseBody::Bytes(std::mem::take(&mut self.body).into());
++            }
+         }
+         let _ = self.sender.take().unwrap().send(response);
+     }
+@@ -209,7 +213,16 @@ fn fetch_with_cors_cache(request: Request, cache: &mut CorsCache) -> Response {
+ 
+ /// Whether the body of a response from `fetch_with_context` ended before it was complete.
+ pub(crate) fn is_aborted(response: &Response) -> bool {
+-    response.aborted.load(std::sync::atomic::Ordering::SeqCst)
++    response.aborted
++}
++
++/// The body of a response from `fetch_with_context`.
++pub(crate) fn body_of(response: &Response) -> &[u8] {
++    response
++        .actual_response()
++        .body
++        .bytes()
++        .expect("the body is not complete")
+ }
+ 
+ pub(crate) fn mock_origin() -> ImmutableOrigin {
+diff --git a/components/net/tests/subresource_integrity.rs b/components/net/tests/subresource_integrity.rs
+index d36243efe1b..7a2133bf338 100644
+--- a/components/net/tests/subresource_integrity.rs
++++ b/components/net/tests/subresource_integrity.rs
+@@ -60,7 +60,7 @@ fn test_get_strongest_metadata_different_algorithm() {
+ #[test]
+ fn test_response_integrity_valid() {
+     let url: ServoUrl = ServoUrl::parse("http://servo.org").unwrap();
+-    let response: Response = Response::new(
++    let mut response: Response = Response::new(
+         url,
+         ResourceFetchTiming::new(ResourceTimingType::Navigation),
+     );
+@@ -69,14 +69,14 @@ fn test_response_integrity_valid() {
+         "sha384-H8BRh8j48O9oYatfu5AZzq6A9RINhZO5H16dQZngK7T62em8MUt1FLm52t+eX6xO";
+     let response_body = "alert('Hello, world.');".to_owned().into_bytes();
+ 
+-    *response.body.lock() = ResponseBody::Done(response_body);
++    response.body = ResponseBody::Bytes(response_body.into());
+     assert!(is_response_integrity_valid(integrity_metadata, &response));
+ }
+ 
+ #[test]
+ fn test_response_integrity_invalid() {
+     let url: ServoUrl = ServoUrl::parse("http://servo.org").unwrap();
+-    let response: Response = Response::new(
++    let mut response: Response = Response::new(
+         url,
+         ResourceFetchTiming::new(ResourceTimingType::Navigation),
+     );
+@@ -85,6 +85,6 @@ fn test_response_integrity_invalid() {
+         "sha256-H8BRh8j48O9oYatfu5AZzq6A9RINhZO5H16dQZngK7T62em8MUt1FLm52t+eX6xO";
+     let response_body = "alert('Hello, world.');".to_owned().into_bytes();
+ 
+-    *response.body.lock() = ResponseBody::Done(response_body);
++    response.body = ResponseBody::Bytes(response_body.into());
+     assert!(!is_response_integrity_valid(integrity_metadata, &response));
+ }
+diff --git a/components/servo/lib.rs b/components/servo/lib.rs
+index 02a9d4cc5e7..97a7487e026 100644
+--- a/components/servo/lib.rs
++++ b/components/servo/lib.rs
+@@ -140,9 +140,10 @@ pub mod webxr {
+ 
+ // TODO: The protocol handler interface needs to be cleaned and simplified.
+ pub mod protocol_handler {
+-    pub use net::fetch::methods::{DoneChannel, FetchContext};
++    pub use net::fetch::methods::FetchContext;
+     pub use net::filemanager_thread::FILE_CHUNK_SIZE;
+     pub use net::protocols::{ProtocolHandler, ProtocolRegistry};
++    pub use net_traits::body_stream::{BodyEnd, BodySender, body_channel};
+     pub use net_traits::filemanager_thread::RelativePos;
+     pub use net_traits::http_status::HttpStatus;
+     pub use net_traits::request::Request;
+diff --git a/components/shared/net/response.rs b/components/shared/net/response.rs
+index 7e4b764061a..b56b847be0f 100644
+--- a/components/shared/net/response.rs
++++ b/components/shared/net/response.rs
+@@ -4,16 +4,15 @@
+ 
+ //! The [Response](https://fetch.spec.whatwg.org/#responses) object
+ //! resulting from a [fetch operation](https://fetch.spec.whatwg.org/#concept-fetch)
+-use std::sync::atomic::AtomicBool;
+-
++use bytes::Bytes;
+ use http::HeaderMap;
+ use hyper_serde::Serde;
++use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+ use malloc_size_of_derive::MallocSizeOf;
+-use parking_lot::Mutex;
+ use serde::{Deserialize, Serialize};
+-use servo_arc::Arc;
+ use servo_url::ServoUrl;
+ 
++use crate::body_stream::BodyReceiver;
+ use crate::fetch::headers::extract_mime_type_as_mime;
+ use crate::http_status::HttpStatus;
+ use crate::resource_fetch_timing::{ResourceFetchTimingContainer, ResourceTimingType};
+@@ -41,25 +40,49 @@ pub enum TerminationReason {
+     Timeout,
+ }
+ 
+-/// The response body can still be pushed to after fetch
+-/// This provides a way to store unfinished response bodies
+-#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
++/// [Body](https://fetch.spec.whatwg.org/#concept-body) of a response.
++#[derive(Debug, Default)]
+ pub enum ResponseBody {
+-    Empty, // XXXManishearth is this necessary, or is Done(vec![]) enough?
+-    #[serde(with = "serde_bytes")]
+-    Receiving(Vec<u8>),
+-    #[serde(with = "serde_bytes")]
+-    Done(Vec<u8>),
+-    /// The body is delivered to the consumer chunk by chunk and is not retained
+-    /// anywhere in the net process.
+-    Streamed,
++    /// A null body.
++    #[default]
++    Null,
++    /// A body whose bytes are all known.
++    Bytes(Bytes),
++    /// A body that is still being received. Dropping it discards the rest of the body.
++    Stream(BodyReceiver),
+ }
+ 
+ impl ResponseBody {
+-    pub fn is_done(&self) -> bool {
+-        match *self {
+-            ResponseBody::Done(..) | ResponseBody::Streamed => true,
+-            ResponseBody::Empty | ResponseBody::Receiving(..) => false,
++    pub fn is_null(&self) -> bool {
++        matches!(self, ResponseBody::Null)
++    }
++
++    /// The bytes of a body that is known as a whole.
++    pub fn bytes(&self) -> Option<&Bytes> {
++        match self {
++            ResponseBody::Bytes(bytes) => Some(bytes),
++            ResponseBody::Null | ResponseBody::Stream(_) => None,
++        }
++    }
++
++    pub fn take(&mut self) -> ResponseBody {
++        std::mem::take(self)
++    }
++
++    fn try_clone(&self) -> Option<ResponseBody> {
++        match self {
++            ResponseBody::Null => Some(ResponseBody::Null),
++            ResponseBody::Bytes(bytes) => Some(ResponseBody::Bytes(bytes.clone())),
++            ResponseBody::Stream(_) => None,
++        }
++    }
++}
++
++impl MallocSizeOf for ResponseBody {
++    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
++        match self {
++            ResponseBody::Bytes(bytes) => bytes.size_of(ops),
++            ResponseBody::Null | ResponseBody::Stream(_) => 0,
+         }
+     }
+ }
+@@ -96,7 +119,7 @@ pub struct ResponseInit {
+ }
+ 
+ /// A [Response](https://fetch.spec.whatwg.org/#concept-response) as defined by the Fetch spec
+-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
++#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+ pub struct Response {
+     pub response_type: ResponseType,
+     pub termination_reason: Option<TerminationReason>,
+@@ -108,8 +131,8 @@ pub struct Response {
+         serialize_with = "::hyper_serde::serialize"
+     )]
+     pub headers: HeaderMap,
+-    #[conditional_malloc_size_of]
+-    pub body: Arc<Mutex<ResponseBody>>,
++    #[serde(skip)]
++    pub body: ResponseBody,
+     pub cache_state: CacheState,
+     pub tls_security_info: Option<TlsSecurityInfo>,
+     pub referrer: Option<ServoUrl>,
+@@ -128,8 +151,7 @@ pub struct Response {
+     /// <https://fetch.spec.whatwg.org/#concept-response-aborted>
+     ///
+     /// Also set when the body failed before its end.
+-    #[conditional_malloc_size_of]
+-    pub aborted: Arc<AtomicBool>,
++    pub aborted: bool,
+     /// track network metrics
+     pub resource_timing: ResourceFetchTimingContainer,
+ 
+@@ -150,7 +172,7 @@ impl Response {
+             url_list: vec![],
+             status: HttpStatus::default(),
+             headers: HeaderMap::new(),
+-            body: Arc::new(Mutex::new(ResponseBody::Empty)),
++            body: ResponseBody::Null,
+             cache_state: CacheState::None,
+             tls_security_info: None,
+             referrer: None,
+@@ -159,7 +181,7 @@ impl Response {
+             location_url: None,
+             internal_response: None,
+             return_internal: true,
+-            aborted: Arc::new(AtomicBool::new(false)),
++            aborted: false,
+             resource_timing: resource_timing.into(),
+             range_requested: false,
+             request_includes_credentials: true,
+@@ -184,7 +206,7 @@ impl Response {
+             url_list: vec![],
+             status: HttpStatus::new_error(),
+             headers: HeaderMap::new(),
+-            body: Arc::new(Mutex::new(ResponseBody::Empty)),
++            body: ResponseBody::Null,
+             cache_state: CacheState::None,
+             tls_security_info: None,
+             referrer: None,
+@@ -193,7 +215,7 @@ impl Response {
+             location_url: None,
+             internal_response: None,
+             return_internal: true,
+-            aborted: Arc::new(AtomicBool::new(false)),
++            aborted: false,
+             resource_timing: ResourceFetchTiming::new(ResourceTimingType::Error).into(),
+             range_requested: false,
+             request_includes_credentials: true,
+@@ -250,6 +272,44 @@ impl Response {
+         &self.resource_timing
+     }
+ 
++    /// A copy of this response, unless it or its internal response has a body that is still
++    /// being received, which cannot be copied.
++    pub fn try_clone(&self) -> Option<Response> {
++        let mut response = self.clone_without_body();
++        response.body = self.body.try_clone()?;
++        response.internal_response = match &self.internal_response {
++            Some(internal_response) => Some(Box::new(internal_response.try_clone()?)),
++            None => None,
++        };
++        Some(response)
++    }
++
++    /// A copy of this response with a null body and no internal response.
++    fn clone_without_body(&self) -> Response {
++        Response {
++            response_type: self.response_type.clone(),
++            termination_reason: self.termination_reason,
++            url: self.url.clone(),
++            url_list: self.url_list.clone(),
++            status: self.status.clone(),
++            headers: self.headers.clone(),
++            body: ResponseBody::Null,
++            cache_state: self.cache_state,
++            tls_security_info: self.tls_security_info.clone(),
++            referrer: self.referrer.clone(),
++            redirect_taint: self.redirect_taint,
++            referrer_policy: self.referrer_policy,
++            cors_exposed_header_name_list: self.cors_exposed_header_name_list.clone(),
++            location_url: self.location_url.clone(),
++            internal_response: None,
++            return_internal: self.return_internal,
++            aborted: self.aborted,
++            resource_timing: self.resource_timing.clone(),
++            range_requested: self.range_requested,
++            request_includes_credentials: self.request_includes_credentials,
++        }
++    }
++
+     /// Convert to a filtered response, of type `filter_type`.
+     /// Do not use with type Error or Default
+     pub fn to_filtered(self, filter_type: ResponseType) -> Response {
+@@ -266,7 +326,8 @@ impl Response {
+ 
+         // This is ok as we always set the `response.headers` in all branches in the following.
+         let old_headers = std::mem::take(&mut old_response.headers);
+-        let mut response = old_response.clone();
++        // The body stays with the internal response.
++        let mut response = old_response.clone_without_body();
+         response.response_type = filter_type;
+ 
+         match response.response_type {
+@@ -320,14 +381,12 @@ impl Response {
+                 response.url = None;
+                 response.headers = HeaderMap::new();
+                 response.status = HttpStatus::new_error();
+-                response.body = Arc::new(Mutex::new(ResponseBody::Empty));
+                 response.cache_state = CacheState::None;
+             },
+ 
+             ResponseType::OpaqueRedirect => {
+                 response.headers = HeaderMap::new();
+                 response.status = HttpStatus::new_error();
+-                response.body = Arc::new(Mutex::new(ResponseBody::Empty));
+                 response.cache_state = CacheState::None;
+             },
+         }
+diff --git a/ports/servoshell/desktop/protocols/resource.rs b/ports/servoshell/desktop/protocols/resource.rs
+index 0ff4f52b3a1..3267cf9062c 100644
+--- a/ports/servoshell/desktop/protocols/resource.rs
++++ b/ports/servoshell/desktop/protocols/resource.rs
+@@ -14,10 +14,9 @@ use std::pin::Pin;
+ 
+ use headers::{ContentType, HeaderMapExt};
+ use servo::protocol_handler::{
+-    DoneChannel, FILE_CHUNK_SIZE, FetchContext, NetworkError, ProtocolHandler, RelativePos,
+-    Request, ResourceFetchTiming, Response, ResponseBody,
++    FILE_CHUNK_SIZE, FetchContext, NetworkError, ProtocolHandler, RelativePos, Request,
++    ResourceFetchTiming, Response, ResponseBody, body_channel,
+ };
+-use tokio::sync::mpsc::unbounded_channel;
+ 
+ #[derive(Default)]
+ pub struct ResourceProtocolHandler {}
+@@ -25,7 +24,6 @@ pub struct ResourceProtocolHandler {}
+ impl ResourceProtocolHandler {
+     pub fn response_for_path(
+         request: &mut Request,
+-        done_chan: &mut DoneChannel,
+         context: &FetchContext,
+         path: &str,
+     ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+@@ -62,17 +60,11 @@ impl ResourceProtocolHandler {
+             let mime = mime_guess::from_path(file_path).first_or_octet_stream();
+             response.headers.typed_insert(ContentType::from(mime));
+ 
+-            // Setup channel to receive cross-thread messages about the file fetch
+-            // operation.
+-            let (mut done_sender, done_receiver) = unbounded_channel();
+-            *done_chan = Some((done_sender.clone(), done_receiver));
+-
+-            *response.body.lock() = ResponseBody::Receiving(vec![]);
+-
++            let (sender, body) = body_channel(None);
++            response.body = ResponseBody::Stream(body);
+             context.filemanager.fetch_file_in_chunks(
+-                &mut done_sender,
++                sender,
+                 reader,
+-                response.body.clone(),
+                 context.cancellation_listener.clone(),
+                 RelativePos::full_range(),
+             );
+@@ -92,7 +84,6 @@ impl ProtocolHandler for ResourceProtocolHandler {
+     fn load(
+         &self,
+         request: &mut Request,
+-        done_chan: &mut DoneChannel,
+         context: &FetchContext,
+     ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+         let url = request.current_url();
+@@ -100,6 +91,6 @@ impl ProtocolHandler for ResourceProtocolHandler {
+         // TODO: Check referrer.
+         //       We unexpectedly get `NoReferrer` for all requests from the newtab page.
+ 
+-        Self::response_for_path(request, done_chan, context, url.path())
++        Self::response_for_path(request, context, url.path())
+     }
+ }
+diff --git a/ports/servoshell/desktop/protocols/servo.rs b/ports/servoshell/desktop/protocols/servo.rs
+index 7fc4d01e497..1177542ee55 100644
+--- a/ports/servoshell/desktop/protocols/servo.rs
++++ b/ports/servoshell/desktop/protocols/servo.rs
+@@ -16,8 +16,8 @@ use std::pin::Pin;
+ use headers::{ContentType, HeaderMapExt};
+ use servo::UserAgentPlatform;
+ use servo::protocol_handler::{
+-    DoneChannel, FetchContext, NetworkError, ProtocolHandler, Request, ResourceFetchTiming,
+-    Response, ResponseBody,
++    FetchContext, NetworkError, ProtocolHandler, Request, ResourceFetchTiming, Response,
++    ResponseBody,
+ };
+ 
+ use crate::desktop::protocols::resource::ResourceProtocolHandler;
+@@ -38,38 +38,25 @@ impl ProtocolHandler for ServoProtocolHandler {
+     fn load(
+         &self,
+         request: &mut Request,
+-        done_chan: &mut DoneChannel,
+         context: &FetchContext,
+     ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+         let url = request.current_url();
+ 
+         match url.path() {
+-            "config" => ResourceProtocolHandler::response_for_path(
+-                request,
+-                done_chan,
+-                context,
+-                "/config.html",
+-            ),
+-            "newtab" => ResourceProtocolHandler::response_for_path(
+-                request,
+-                done_chan,
+-                context,
+-                "/newtab.html",
+-            ),
++            "config" => {
++                ResourceProtocolHandler::response_for_path(request, context, "/config.html")
++            },
++            "newtab" => {
++                ResourceProtocolHandler::response_for_path(request, context, "/newtab.html")
++            },
+ 
+-            "preferences" => ResourceProtocolHandler::response_for_path(
+-                request,
+-                done_chan,
+-                context,
+-                "/preferences.html",
+-            ),
++            "preferences" => {
++                ResourceProtocolHandler::response_for_path(request, context, "/preferences.html")
++            },
+ 
+-            "license" => ResourceProtocolHandler::response_for_path(
+-                request,
+-                done_chan,
+-                context,
+-                "/license.html",
+-            ),
++            "license" => {
++                ResourceProtocolHandler::response_for_path(request, context, "/license.html")
++            },
+ 
+             "experimental-preferences" => {
+                 let pref_list = EXPERIMENTAL_PREFS
+@@ -101,6 +88,6 @@ fn json_response(
+         ResourceFetchTiming::new(request.timing_type()),
+     );
+     response.headers.typed_insert(ContentType::json());
+-    *response.body.lock() = ResponseBody::Done(body.into_bytes());
++    response.body = ResponseBody::Bytes(body.into_bytes().into());
+     Box::pin(std::future::ready(response))
+ }
+diff --git a/ports/servoshell/desktop/protocols/urlinfo.rs b/ports/servoshell/desktop/protocols/urlinfo.rs
+index 127b085f611..05714d188ca 100644
+--- a/ports/servoshell/desktop/protocols/urlinfo.rs
++++ b/ports/servoshell/desktop/protocols/urlinfo.rs
+@@ -7,8 +7,7 @@ use std::pin::Pin;
+ 
+ use headers::{ContentType, HeaderMapExt};
+ use servo::protocol_handler::{
+-    DoneChannel, FetchContext, HttpStatus, ProtocolHandler, Request, ResourceFetchTiming, Response,
+-    ResponseBody,
++    FetchContext, HttpStatus, ProtocolHandler, Request, ResourceFetchTiming, Response, ResponseBody,
+ };
+ 
+ #[derive(Default)]
+@@ -19,7 +18,6 @@ impl ProtocolHandler for UrlInfoProtocolHander {
+     fn load(
+         &self,
+         request: &mut Request,
+-        _done_chan: &mut DoneChannel,
+         _context: &FetchContext,
+     ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+         let url = request.current_url();
+@@ -34,7 +32,7 @@ impl ProtocolHandler for UrlInfoProtocolHander {
+             url.query()
+         );
+         let mut response = Response::new(url, ResourceFetchTiming::new(request.timing_type()));
+-        *response.body.lock() = ResponseBody::Done(content.as_bytes().to_vec());
++        response.body = ResponseBody::Bytes(content.into_bytes().into());
+         response.headers.typed_insert(ContentType::text());
+         response.status = HttpStatus::default();
+ 

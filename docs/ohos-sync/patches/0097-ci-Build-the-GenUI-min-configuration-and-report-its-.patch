@@ -1,0 +1,323 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 18 Oct 2026 17:47:08 +0000
+Subject: [PATCH] ci: Build the GenUI-min configuration and report its size
+
+GenUI-min is the smallest servoshell configuration for generated pages
+on OpenHarmony that the size measurements of 2026-10-12 settled on
+(stack G2 plus RELR and ICF there). A justfile at the top level keeps
+its flags in one place: `just genui-min` builds it and its HAP with
+`./mach build`, and `just genui-min-size` prints the size of the
+stripped library and of the HAP.
+
+- QuickJS, the OpenHarmony RDB storage backend, and
+  `--no-default-features` with only bundled, max_log_level and
+  servo/clipboard: no WebGPU, WebGL, WebXR, SubtleCrypto (`crypto` keeps only
+  its own methods), gamepad, brotli in CompressionStream, multiprocess, devtools
+  or jemalloc. RDB instead of SQLite saves only 16 KB for now, because
+  components/net links rusqlite for its disk cache in any case, but it
+  makes this the build in CI that covers the RDB backend.
+- A `genui-min` Cargo profile, defined with `--config`: `production` at
+  opt-level "z" and with panic=abort. It has its own output directory,
+  so a production build in the same target directory stays intact.
+- RELR relocations and `--icf=all` through RUSTFLAGS, which mach
+  appends to. Cargo ignores `target.<triple>.rustflags` whenever
+  RUSTFLAGS is set, and mach always sets it.
+
+The new GenUI-min workflow runs the recipes, writes the sizes to the job
+summary and uploads the HAP and the unstripped library. A second job
+sends both sizes to the servo-ohos project on Bencher, with a project
+key in the BENCHER_API_KEY secret of the bencher environment, which only
+that job uses: pushes to ohos-main to its ohos-main branch, and pull
+requests from this repository to a `<number>/PR` branch that starts at
+the base commit and takes over its thresholds, with a comment on the
+pull request. Main passes the secret on, because a reusable workflow
+only gets the environment secrets that its caller passes. The Bencher
+jobs inherited from Servo use BENCHER_API_TOKEN and stay off. The Main
+workflow calls it for pull requests that need the OpenHarmony or
+QuickJS build; it also runs on pushes to ohos-main and on demand. It
+doesn't decide the result of Main.
+
+The build runs on the self-hosted runners labelled servo-ohos-linux,
+whose image needs the OpenHarmony SDK, hvigor, just and a prebuilt
+target directory of this build for that. Pull requests from forks and
+runs while NO_SELF_HOSTED_RUNNERS is set build on a GitHub-hosted
+runner, set up as for the OpenHarmony build, with an unsigned HAP.
+
+pr_jobs counts the justfile and the workflow as OpenHarmony-only files,
+so that a pull request changing them runs GenUI-min.
+
+The justfile is force-added: upstream's .gitignore lists `justfile` so
+that developers can keep a personal one at the top level, and such a
+file now blocks checking out this branch until it is renamed.
+
+Left out for now: static libc++ (HAP -0.83 MiB, needs a packaging
+change), the exported-symbols list (about 0 for QuickJS), and the
+source changes measured with this stack (servoshell without testbinding
+and bluetooth, capitalize without the CJ dictionary).
+
+Set the Bencher threshold for the GenUI-min sizes from the ohos-main
+runs: an alert when a size grows by more than 0.1% over the previous
+push, with the percentage test on one sample. The sizes are
+deterministic, so the tests that estimate noise from the spread of the
+samples have none to work with, and an average of several samples would
+keep alerting for a few pushes after each jump. Pull requests already
+take the thresholds over from their base, and `--thresholds-reset`
+keeps the workflow the only place that sets them.
+
+Validation: `just genui-min` on ohos-main 013edabb25d, in a fresh target directory on 32 cores, built in 4 min 7 s with the OpenHarmony 6.1 SDK as cargo-ohos installs it (`cargo ohos init sdk --version 6.1`, what the runner image will use); a change to storage's features rebuilt storage, servo and servoshell in 2 min 17 s. The library is 29,387,176 bytes after llvm-strip (28.03 MiB), with `.relr.dyn` and a 3.6 KB `.rela.dyn` (RELR on), a 13.8 KB `.gcc_except_table` (panic=abort) and NEEDED libnative_rdb_ndk.z.so; the same build with sqlite-backend was 16,128 B larger and both link 290 sqlite3_ symbols. That fits the 2026-10-12 stack: its 26.14 MiB included static libc++ (+0.44 on the library) and the two source changes (-1.02 and -1.92), which this patch leaves out, so about 28.6 MiB here, less devtools (about -0.5, not yet a feature on that base) and plus the code merged since. hvigor 5 from npm packaged the default-flavor HAP against that SDK (34,205,612 B unsigned, the library in it byte-for-byte the llvm-strip size), and `just genui-min-size` printed both sizes. `bencher run --dry-run` (CLI 0.6.13), run outside a checkout with the Bencher job's script and this build's sizes, reports both as file-size benchmarks: for a push on ohos-main at GITHUB_SHA, for a pull request on 42/PR at the head commit with the start point ohos-main at the base commit (reset, thresholds cloned). On GitHub, a run on pull request 38 built GenUI-min and reached the Bencher job, which got an empty key before Main passed the secret on; the upload itself has not run there yet. pr_jobs tests pass (12), `./mach test-tidy` passes, and actionlint 1.7 reports nothing new (the missing action-metadata descriptions and the decision step's SC2086 exist on ohos-main). Not run: the workflow on GitHub, and a self-hosted runner image with the OpenHarmony toolchain (prepared separately in ohos-ci-runners); this build was not run on a device. Bencher threshold: `bencher run --dry-run` (CLI 0.6.13) with the job's script: the push report carries the file-size threshold (percentage, max_sample_size 1, upper_boundary 0.001, which Bencher's documentation defines as 0.1%), and the pull request report is unchanged. actionlint reports nothing new.
+AI-assisted: Yes (agent session; written by the agent, which also built and packaged the configuration locally)
+AI-assisted: Yes (agent session; written by the agent)
+AI-assisted: Yes (agent session; 2026-10-22 sync -- folded in "squash! ci: Build the GenUI-min configuration and report its size" (the Bencher threshold for the GenUI-min sizes))
+AI-assisted: Yes (agent session; 2026-11-09 sync -- upstream always builds the `Crypto` interface since #48860; only SubtleCrypto is a feature now, so the justfile's rationale says so; found by the drift review)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/main.yml           |  15 +++
+ .github/workflows/ohos-genui-min.yml | 147 +++++++++++++++++++++++++++
+ justfile                             |  36 +++++++
+ python/servo/pr_jobs.py              |   2 +
+ 4 files changed, 200 insertions(+)
+ create mode 100644 .github/workflows/ohos-genui-min.yml
+ create mode 100644 justfile
+
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index ae1a88f16be..b6ebc510566 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -83,6 +83,21 @@ jobs:
+       coverage: ${{ matrix.coverage }}
+       capi: ${{ matrix.capi }}
+ 
++  # Pull requests that need the OpenHarmony or QuickJS build also build GenUI-min, which doesn't
++  # decide the result.
++  genui-min:
++    name: GenUI-min
++    needs: ["decision"]
++    if: ${{ github.event_name == 'pull_request' && (contains(fromJson(needs.decision.outputs.configuration).matrix.*.workflow, 'ohos') || contains(fromJson(needs.decision.outputs.configuration).matrix.*.workflow, 'quickjs')) }}
++    permissions:
++      checks: write
++      contents: read
++      pull-requests: write
++    uses: ./.github/workflows/ohos-genui-min.yml
++    # Reusable workflows only get the environment secrets that the caller passes.
++    secrets:
++      BENCHER_API_KEY: ${{ secrets.BENCHER_API_KEY }}
++
+   build-result:
+     name: Result
+     runs-on: ubuntu-latest
+diff --git a/.github/workflows/ohos-genui-min.yml b/.github/workflows/ohos-genui-min.yml
+new file mode 100644
+index 00000000000..5b106e38d50
+--- /dev/null
++++ b/.github/workflows/ohos-genui-min.yml
+@@ -0,0 +1,147 @@
++# Builds GenUI-min, the smallest servoshell configuration for OpenHarmony (`just genui-min`), and
++# reports the size of its library and HAP. The Main workflow calls it for pull requests that need
++# the OpenHarmony or QuickJS build.
++name: GenUI-min
++on:
++  push:
++    branches: ["ohos-main"]
++  workflow_call:
++    secrets:
++      BENCHER_API_KEY:
++        required: false
++  workflow_dispatch:
++
++env:
++  RUST_BACKTRACE: 1
++  SHELL: /bin/bash
++  CARGO_INCREMENTAL: 0
++
++jobs:
++  build:
++    name: OpenHarmony Build (GenUI-min)
++    timeout-minutes: 90
++    # The self-hosted runners labelled servo-ohos-linux have the OpenHarmony SDK, hvigor, just and
++    # a target directory with this build of a recent ohos-main. Pull requests from forks and runs
++    # while the repository variable NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners.
++    runs-on: ${{ (vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || 'servo-ohos-linux' }}
++    permissions:
++      contents: read
++    outputs:
++      library-size: ${{ steps.size.outputs.library }}
++      hap-size: ${{ steps.size.outputs.hap }}
++    steps:
++      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
++      - name: Setup Python
++        if: ${{ runner.environment != 'self-hosted' }}
++        uses: ./.github/actions/setup-python
++      - name: Change Mirror Priorities
++        if: ${{ runner.environment != 'self-hosted' }}
++        uses: ./.github/actions/apt-mirrors
++      - name: Bootstrap dependencies
++        if: ${{ runner.environment != 'self-hosted' }}
++        timeout-minutes: 30
++        run: |
++          sudo apt update
++          sudo apt install -y just
++          ./mach bootstrap --yes --skip-lints --skip-nextest --ohos
++      - name: Install LLVM and Clang
++        if: ${{ runner.environment != 'self-hosted' }}
++        uses: KyleMayes/install-llvm-action@v2
++        with:
++          version: "20.1"
++          directory: ${{ runner.temp }}/llvm
++      - name: Setup OpenHarmony SDK
++        if: ${{ runner.environment != 'self-hosted' }}
++        id: setup_sdk
++        uses: openharmony-rs/setup-ohos-sdk@v1.0.0
++        with:
++          version: "6.1" # api 23 in openharmony
++          fixup-path: true
++      # The self-hosted runners set these in their environment.
++      - name: Set the OpenHarmony SDK env
++        if: ${{ runner.environment != 'self-hosted' }}
++        env:
++          OHOS_SDK_NATIVE: ${{ steps.setup_sdk.outputs.ohos_sdk_native }}
++          OHOS_BASE_SDK_HOME: ${{ steps.setup_sdk.outputs.ohos-base-sdk-home }}
++        run: |
++          echo "OHOS_SDK_NATIVE=$OHOS_SDK_NATIVE" >> "$GITHUB_ENV"
++          echo "OHOS_BASE_SDK_HOME=$OHOS_BASE_SDK_HOME" >> "$GITHUB_ENV"
++      - name: Install node for hvigor
++        if: ${{ runner.environment != 'self-hosted' }}
++        uses: actions/setup-node@v7
++        with:
++          node-version: 24
++      - name: Install hvigor modules
++        if: ${{ runner.environment != 'self-hosted' }}
++        run: |
++          mkdir ~/hvigor-installation
++          cd ~/hvigor-installation
++          echo "@ohos:registry=https://repo.harmonyos.com/npm/" > .npmrc
++          npm install "@ohos/hvigor@5" "@ohos/hvigor-ohos-plugin@5"
++          echo "HVIGOR_PATH=$PWD" >> "$GITHUB_ENV"
++      - name: Build
++        env:
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: just genui-min
++      - name: Report the size
++        id: size
++        run: |
++          LLVM_STRIP="$OHOS_SDK_NATIVE/llvm/bin/llvm-strip" just genui-min-size | tee size.txt
++          {
++            echo "### GenUI-min"
++            echo '```'
++            cat size.txt
++            echo '```'
++          } >> "$GITHUB_STEP_SUMMARY"
++          {
++            echo "library=$(stat -c %s target/aarch64-unknown-linux-ohos/genui-min/libservoshell.stripped.so)"
++            echo "hap=$(stat -c %s target/openharmony/aarch64-unknown-linux-ohos/genui-min/entry/build/default/outputs/default/servoshell-default-unsigned.hap)"
++          } >> "$GITHUB_OUTPUT"
++      - name: Upload the HAP and the library
++        uses: actions/upload-artifact@v7
++        with:
++          name: genui-min-ohos-aarch64-unknown-linux-ohos
++          path: |
++            target/openharmony/aarch64-unknown-linux-ohos/genui-min/entry/build/default/outputs/default/*.hap
++            target/aarch64-unknown-linux-ohos/genui-min/libservoshell.so
++          if-no-files-found: error
++
++  # The project key in the bencher environment's BENCHER_API_KEY can only write to the servo-ohos
++  # project. The Bencher jobs inherited from Servo use BENCHER_API_TOKEN and stay off. Pull requests
++  # from forks don't get the key.
++  bencher:
++    name: Send the GenUI-min size to Bencher
++    needs: build
++    if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
++    runs-on: ubuntu-24.04
++    environment:
++      name: bencher
++      deployment: false
++    permissions:
++      checks: write
++      pull-requests: write
++    steps:
++      - uses: bencherdev/bencher@main
++      - name: Send the size
++        env:
++          BENCHER_API_KEY: ${{ secrets.BENCHER_API_KEY }}
++          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++          LIBRARY_SIZE: ${{ needs.build.outputs.library-size }}
++          HAP_SIZE: ${{ needs.build.outputs.hap-size }}
++          PR_NUMBER: ${{ github.event.number }}
++          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
++          BASE_SHA: ${{ github.event.pull_request.base.sha }}
++        run: |
++          jq -n --argjson library "$LIBRARY_SIZE" --argjson hap "$HAP_SIZE" \
++            '{"libservoshell.stripped.so": {"file-size": {"value": $library}}, "servoshell-default-unsigned.hap": {"file-size": {"value": $hap}}}' > size.json
++          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
++            options=(--branch "$PR_NUMBER/PR" --hash "$HEAD_SHA" --start-point "$GITHUB_BASE_REF" \
++              --start-point-hash "$BASE_SHA" --start-point-reset --start-point-clone-thresholds)
++          else
++            # The sizes are deterministic, so each push is compared with the previous one.
++            options=(--branch ohos-main --hash "$GITHUB_SHA" --threshold-measure file-size \
++              --threshold-test percentage --threshold-max-sample-size 1 --threshold-upper-boundary 0.001 \
++              --thresholds-reset)
++          fi
++          bencher run --project servo-ohos "${options[@]}" --testbed aarch64-unknown-linux-ohos \
++            --adapter json --file size.json --github-actions "$GITHUB_TOKEN"
+diff --git a/justfile b/justfile
+new file mode 100644
+index 00000000000..809f6427c6a
+--- /dev/null
++++ b/justfile
+@@ -0,0 +1,36 @@
++# Builds that take more than a plain `./mach` command. `just --list` lists the recipes.
++
++set shell := ["bash", "-euo", "pipefail", "-c"]
++
++genui_min_target := "aarch64-unknown-linux-ohos"
++
++# GenUI-min is the smallest servoshell for generated pages on OpenHarmony. It runs on QuickJS,
++# stores site data with the OpenHarmony RDB backend, and `--no-default-features` leaves out
++# WebGPU, WebGL, WebXR, SubtleCrypto (`crypto` keeps only its own methods), gamepad, brotli in
++# CompressionStream, multiprocess, devtools and jemalloc. The
++# `genui-min` Cargo profile is `production` at opt-level "z" and with panic=abort, so a panic ends
++# the app instead of showing a crash page. The linker packs the relative relocations (RELR) and
++# folds identical code.
++#
++# Build the GenUI-min servoshell and its HAP; arguments go to `./mach build`
++genui-min *args:
++    RUSTFLAGS="${RUSTFLAGS:-} -Clink-arg=-Wl,-z,pack-relative-relocs -Clink-arg=-Wl,--icf=all" \
++    ./mach build --target {{genui_min_target}} --js-engine quickjs --profile genui-min \
++        --no-default-features --features "bundled max_log_level ohos-rdb-backend servo/clipboard" \
++        {{args}} \
++        --config 'profile.genui-min.inherits="production"' \
++        --config 'profile.genui-min.opt-level="z"' \
++        --config 'profile.genui-min.panic="abort"'
++
++# Print the size of the GenUI-min library after stripping, and of its HAP
++genui-min-size:
++    #!/usr/bin/env bash
++    set -euo pipefail
++    shopt -s nullglob
++    size() { stat -c %s "$1" | awk -v name="$2" '{ printf "%s: %d bytes (%.2f MiB)\n", name, $1, $1 / 1048576 }'; }
++    lib="${CARGO_TARGET_DIR:-target}/{{genui_min_target}}/genui-min/libservoshell.so"
++    "${LLVM_STRIP:-llvm-strip}" -o "${lib%.so}.stripped.so" "$lib"
++    size "${lib%.so}.stripped.so" "libservoshell.so, stripped"
++    for hap in target/openharmony/{{genui_min_target}}/genui-min/entry/build/*/outputs/default/*.hap; do
++        size "$hap" "$(basename "$hap")"
++    done
+diff --git a/python/servo/pr_jobs.py b/python/servo/pr_jobs.py
+index 8717293cd33..f09f62e911e 100644
+--- a/python/servo/pr_jobs.py
++++ b/python/servo/pr_jobs.py
+@@ -52,6 +52,7 @@ NOT_BUILT = (
+ # Code that is only built for OpenHarmony.
+ OHOS_ONLY = (
+     ".github/workflows/ohos-emulator.yml",
++    ".github/workflows/ohos-genui-min.yml",
+     ".github/workflows/ohos.yml",
+     "components/fonts/platform/freetype/ohos/",
+     "components/media/backends/ohos/",
+@@ -60,6 +61,7 @@ OHOS_ONLY = (
+     "components/storage/ohos_rdb/",
+     "components/storage/webstorage/engines/ohos_rdb.rs",
+     "etc/ci/ohos_emulator_smoke_test.py",
++    "justfile",
+     "ports/arkweb/",
+     "ports/servoshell/egl/ohos/",
+     "ports/servoshell/platform/openharmony/",

@@ -1,0 +1,909 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 9 Jul 2026 18:10:33 +0000
+Subject: [PATCH] ports/arkweb: add on-device regression tests (scroll, nav,
+ render, multi-webview, vsync)
+
+Extend the smoke-test harness with feature tests, sharing helpers/fixtures
+via a new conftest.py (device connection, uinput/hilog/screenshot helpers,
+JPEG-tolerant pixel classifiers). Each test relaunches the app on a
+self-describing data: page and asserts via hilog markers + screenshot pixel
+checks:
+
+- render: solid colour bands paint correctly (WebRender/surfman pipeline)
+- scroll: touch-drag moves content (guards the batched-OnTouchMove fix)
+- navigation: link tap navigates, history back returns
+- multi-webview: SplitPage's two concurrent surfaces both render
+- vsync: a CSS animation advances, and hilog shows the OHOS Vsync framework
+  servicing our named "ServoArkWeb-<id>" connection -- proving frames are
+  vsync-driven with no engine instrumentation
+
+Refactor test_ime.py onto the shared conftest. Exempt the pytest files from
+ruff ANN (type-annotation) rules, matching Servo's existing per-file ignores
+for test code.
+
+Validated on rk3568: 12 tests green (uv run per file, or
+`python -m pytest ports/arkweb/tools`).
+
+Validation: Test by running uv run --with pytest --with hdc-py --with pillow python -m pytest ports/arkweb/tools on a device.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+
+Clear hilog before the vsync assertion rather than relying on the launch-time clear.
+
+The premise the check was written on -- that the OHOS Vsync framework logs the
+serviced connection once -- is wrong: it re-logs periodically, roughly every 10s
+while the connection is serviced. What actually breaks the check is the 256K
+hilog buffer, which holds only ~4400 lines on a busy device and wraps within
+seconds, so a line emitted during launch is evicted long before the assertion
+reads it. The test therefore failed whenever it ran last in the full suite (after
+~5 minutes of log traffic) and passed standalone against a quiet buffer.
+
+Clear the buffer at the start of the check so the next servicing lands in an empty
+one, and widen the window to 40s to cover the measured re-log interval.
+
+Validation: Test by running the full suite (uv run --with pytest --with hdc-py --with pillow python -m pytest ports/arkweb/tools) so test_frames_are_vsync_driven runs last, after the buffer has been churned by every preceding test.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/tools/conftest.py          | 211 ++++++++++++++++++
+ ports/arkweb/tools/test_ime.py          | 283 ++++++------------------
+ ports/arkweb/tools/test_multiwebview.py |  35 +++
+ ports/arkweb/tools/test_navigation.py   |  46 ++++
+ ports/arkweb/tools/test_render.py       |  40 ++++
+ ports/arkweb/tools/test_scroll.py       |  44 ++++
+ ports/arkweb/tools/test_vsync.py        |  66 ++++++
+ pyproject.toml                          |   4 +
+ 8 files changed, 508 insertions(+), 221 deletions(-)
+ create mode 100644 ports/arkweb/tools/conftest.py
+ create mode 100644 ports/arkweb/tools/test_multiwebview.py
+ create mode 100644 ports/arkweb/tools/test_navigation.py
+ create mode 100644 ports/arkweb/tools/test_render.py
+ create mode 100644 ports/arkweb/tools/test_scroll.py
+ create mode 100644 ports/arkweb/tools/test_vsync.py
+
+diff --git a/ports/arkweb/tools/conftest.py b/ports/arkweb/tools/conftest.py
+new file mode 100644
+index 00000000000..c498f29e401
+--- /dev/null
++++ b/ports/arkweb/tools/conftest.py
+@@ -0,0 +1,211 @@
++"""Shared fixtures and helpers for the ArkWeb on-device smoke tests.
++
++See ``test_ime.py`` for the harness rationale: because Servo renders web content to a
++GPU surface that the ArkUI component tree / UiTest cannot see, tests observe state two
++ways -- **hilog markers** for engine/ACE plumbing, and **screenshot pixel checks** for
++paint. The recurring trick is to make a test page encode a JS-observable value as its
++``<body>`` background colour, turning an assertion into an OCR-free pixel check.
++
++Provisioning (device-lab, not stock CI): a rooted device with ``deploy.py`` already run,
++``web.engine.enforce=100`` for the boot session (this fixture sets it if unset), and a
++default input method installed. The ``device`` fixture skips the suite if the shim is
++absent.
++
++Run one file:   ``uv run ports/arkweb/tools/test_scroll.py``
++Run all:        ``uv run --with pytest --with hdc-py --with pillow \\
++                     python -m pytest ports/arkweb/tools``
++
++TODO(test-infra): shared with test_ime.py -- investigate migrating to host-side hypium /
++xDevice, or the on-device @ohos/hypium module, once that tooling is validated here.
++"""
++
++from __future__ import annotations
++
++import base64
++import os
++import re
++import shlex
++import time
++from pathlib import Path
++
++import pytest
++from hdc_py import Hdc, HarmonyDevice
++from PIL import Image
++
++BUNDLE = "org.openharmonyrs.arkwebtest"
++ABILITY = "EntryAbility"
++SHIM_PATH = "/system/lib64/libservo_arkweb.so"
++ENGINE_ENFORCE_SERVO = "100"
++KEYCODE_BACK = 2
++
++# App chrome (see arkweb-test Index.ets): the history back-button, and where the web area
++# starts on screen (below the URL bar). Device: rk3568, 720x1280.
++BACK_BUTTON_XY = (40, 113)
++WEB_TOP_Y = 160
++
++
++# --- hdc helpers -----------------------------------------------------------------------
++
++
++def sh(device: HarmonyDevice, command: str, check: bool = True) -> str:
++    return device.cmd(command, capture_output=True, text=True, check=check).stdout
++
++
++def tap(device: HarmonyDevice, xy: tuple[int, int]) -> None:
++    sh(device, f"uinput -T -c {xy[0]} {xy[1]}", check=False)
++
++
++def swipe(device: HarmonyDevice, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 400) -> None:
++    sh(device, f"uinput -T -m {x1} {y1} {x2} {y2} {duration_ms}", check=False)
++
++
++def key(device: HarmonyDevice, code: int) -> None:
++    sh(device, f"uinput -K -d {code} -u {code}", check=False)
++
++
++def back(device: HarmonyDevice) -> None:
++    key(device, KEYCODE_BACK)
++
++
++def clear_log(device: HarmonyDevice) -> None:
++    sh(device, "hilog -r", check=False)
++
++
++def read_log(device: HarmonyDevice) -> str:
++    # `hilog -x` prints the current buffer and exits (bare `hilog` streams).
++    return sh(device, "hilog -x", check=False)
++
++
++def wait_log(device: HarmonyDevice, needle: str, timeout: float = 12.0) -> bool:
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        if needle in read_log(device):
++            return True
++        time.sleep(0.5)
++    return False
++
++
++def force_stop(device: HarmonyDevice) -> None:
++    sh(device, f"aa force-stop {BUNDLE}", check=False)
++
++
++def data_url(html: str) -> str:
++    return "data:text/html;base64," + base64.b64encode(html.encode()).decode()
++
++
++def launch_page(device: HarmonyDevice, url: str | None = None, page: str | None = None) -> None:
++    command = f"aa start -a {ABILITY} -b {BUNDLE}"
++    if page:
++        command += f" --ps page {page}"
++    if url:
++        command += f" -U {shlex.quote(url)}"
++    sh(device, command, check=False)
++
++
++def screencap(device: HarmonyDevice, dest_dir: Path) -> Image.Image:
++    out = sh(device, "snapshot_display", check=False)
++    match = re.search(r"(/data/local/tmp/snapshot_[^\s]+\.jpeg)", out)
++    assert match, f"could not find snapshot path in: {out!r}"
++    local = Path(dest_dir) / os.path.basename(match.group(1))
++    device.recv_file(match.group(1), str(local))
++    return Image.open(local).convert("RGB")
++
++
++# --- pixel helpers (JPEG-tolerant; vote over a small neighbourhood) ---------------------
++
++
++def sample(img: Image.Image, xy: tuple[int, int]) -> tuple[int, int, int]:
++    x, y = xy
++    xs = [max(0, x - 4), x, min(img.width - 1, x + 4)]
++    ys = [max(0, y - 4), y, min(img.height - 1, y + 4)]
++    pixels = [img.getpixel((sx, sy)) for sx in xs for sy in ys]
++    n = len(pixels)
++    return tuple(sum(p[c] for p in pixels) // n for c in range(3))  # type: ignore[return-value]
++
++
++def is_green(rgb: tuple[int, int, int]) -> bool:
++    r, g, b = rgb
++    return g > 110 and g - r > 35 and g - b > 35
++
++
++def is_red(rgb: tuple[int, int, int]) -> bool:
++    r, g, b = rgb
++    return r > 110 and r - g > 35 and r - b > 35
++
++
++def is_blue(rgb: tuple[int, int, int]) -> bool:
++    r, g, b = rgb
++    return b > 110 and b - r > 35 and b - g > 35
++
++
++def is_light(rgb: tuple[int, int, int]) -> bool:
++    return min(rgb) > 170
++
++
++def region_changed(
++    before: Image.Image,
++    after: Image.Image,
++    box: tuple[int, int, int, int],
++    delta: int = 40,
++    min_fraction: float = 0.02,
++) -> bool:
++    """True if more than ``min_fraction`` of pixels in ``box`` changed by > ``delta``.
++
++    Tolerant of JPEG noise (a still frame changes a few LSBs everywhere, well under the
++    threshold); a moving element flips a meaningful fraction.
++    """
++    left, top, right, bottom = box
++    b = before.crop(box).getdata()
++    a = after.crop(box).getdata()
++    changed = sum(1 for pb, pa in zip(b, a) if sum(abs(pb[c] - pa[c]) for c in range(3)) > delta)
++    total = (right - left) * (bottom - top)
++    return total > 0 and changed / total > min_fraction
++
++
++# --- fixtures --------------------------------------------------------------------------
++
++
++@pytest.fixture(scope="session")
++def device() -> HarmonyDevice:
++    hdc = Hdc()
++    targets = hdc.list_targets()
++    if not targets:
++        pytest.skip("no hdc device connected")
++    dev = hdc.connect(targets[0])
++    probe = sh(dev, f"if [ -f {SHIM_PATH} ]; then echo __OK__; else echo __MISSING__; fi", check=False)
++    if "__MISSING__" in probe:
++        pytest.skip(f"Servo shim not deployed at {SHIM_PATH} -- run deploy.py first")
++    # The engine-select param is not persistent (resets on reboot); the shim is only
++    # exercised when it is 100.
++    if sh(dev, "param get web.engine.enforce", check=False).strip() != ENGINE_ENFORCE_SERVO:
++        sh(dev, f"param set web.engine.enforce {ENGINE_ENFORCE_SERVO}", check=False)
++    sh(dev, "power-shell wakeup", check=False)
++    sh(dev, "power-shell timeout -o 3600000", check=False)
++    sh(dev, "uinput -T -m 360 1100 360 250 200", check=False)  # swipe-up unlock (no PIN)
++    return dev
++
++
++@pytest.fixture
++def cap(device: HarmonyDevice, tmp_path: Path):
++    """Return a zero-arg function that captures the screen and returns a PIL image."""
++    return lambda: screencap(device, tmp_path)
++
++
++@pytest.fixture
++def launch(device: HarmonyDevice):
++    """Return a function that (re)launches the app on a page and waits for first render.
++
++    Force-stops the app on teardown so each test starts clean.
++    """
++
++    def _launch(url: str | None = None, page: str | None = None, render_timeout: float = 20.0) -> HarmonyDevice:
++        force_stop(device)
++        clear_log(device)
++        launch_page(device, url=url, page=page)
++        assert wait_log(device, "[arkweb] built webview", render_timeout), (
++            "Servo webview never built -- is the engine active (enforce=100)?"
++        )
++        return device
++
++    yield _launch
++    force_stop(device)
+diff --git a/ports/arkweb/tools/test_ime.py b/ports/arkweb/tools/test_ime.py
+index 27cf315719d..9dbe19f1af1 100644
+--- a/ports/arkweb/tools/test_ime.py
++++ b/ports/arkweb/tools/test_ime.py
+@@ -4,84 +4,53 @@
+ # ///
+ """On-device smoke test for the Servo ArkWeb soft-keyboard IME integration.
+ 
+-Run against a device that already has the Servo shim deployed and the Servo engine
+-active (see ``deploy.py``). It launches the arkweb-test app on a self-describing
+-``data:`` page, drives the soft keyboard, and asserts:
+-
+-  * focusing an ``<input>`` raises the keyboard (engine IME attach) and ACE performs
+-    keyboard-avoidance layout (``NeedSoftKeyboard`` -> web viewport shrinks);
+-  * typed text reaches the Servo ``<input>`` (the page recolours its background when the
+-    field equals the expected value, so the assertion is an OCR-free pixel check);
+-  * backspace edits the field;
+-  * blurring hides the keyboard AND the page repaints to full height (regression guard
+-    for the resize stale-frame bug);
+-  * nothing crashes.
+-
+-Because Servo renders web content to a GPU surface (invisible to the ArkUI component
+-tree / UiTest), web-content state is observed two ways: through **hilog markers** for the
+-IME/ACE plumbing and through **screenshot pixel checks** for anything that requires seeing
+-what Servo actually painted.
+-
+-Provisioning (this is a device-lab test, not stock CI):
+-  * a rooted device with ``deploy.py`` already run (shim at ``/system/lib64``);
+-  * ``web.engine.enforce=100`` for the boot session (the fixture sets it if unset);
+-  * the default input method installed and enabled (e.g. ``com.example.kikakeyboard``).
+-
+-Run:  ``uv run ports/arkweb/tools/test_ime.py``   (or ``uv run pytest .../test_ime.py -v``)
+-
+-TODO(test-infra): this is a hand-rolled hdc harness chosen for zero external
+-dependencies and because it works against a plain-OHOS device today. Investigate
+-migrating to a proper host-side UI framework once the tooling is available/validated
+-for this device:
+-  * DevEco Testing **hypium** (Python): nicer UI driving + host-side ``capture_screen`` and
+-    CV image-diff helpers, but it is a Huawei-distributed package (not in the open OHOS
+-    tree) and still cannot see the web DOM (component-tree based) -> web assertions would
+-    stay JS/screenshot based.
+-  * **xDevice** (open, in ``test/testfwk/xdevice``): structured suites/reports/device mgmt.
+-  * On-device **@ohos/hypium** (ArkTS, already scaffolded in arkweb-test ``ohosTest/``):
+-    ``Driver.screenCapture`` + ``@ohos.multimedia.image`` for in-test pixel checks, run via
+-    ``hvigor test``. Good if the suite should live with the app.
+-Also TODO: replace the layout-dependent soft-keyboard key taps (see ``KEY``) with a
+-layout-independent text-injection path, and add an exact-string read-back channel (e.g.
+-routing web ``console.log`` to hilog behind a debug flag, or a test-only JS-eval hook).
+-"""
++Launches the arkweb-test app on a self-describing ``data:`` page and drives the soft
++keyboard, asserting: focusing an ``<input>`` raises the keyboard (engine IME attach) and
++ACE performs keyboard-avoidance layout; typed text reaches the Servo ``<input>``;
++backspace edits it; blurring hides the keyboard AND the page repaints to full height
++(regression guard for the resize stale-frame fix); nothing crashes.
++
++The page recolours its ``<body>`` to encode the field value (light when empty, green when
++it equals the expected string, red otherwise), so the value assertion is an OCR-free pixel
++check. Shared helpers/fixtures and the harness/provisioning notes live in conftest.py.
++
++TODO(test-infra): the soft-keyboard key taps below (``KEY``) are layout-dependent (kika @
++720x1280); replace with a layout-independent text-injection path, and add an exact-string
++read-back channel. See conftest.py for the hypium/xDevice migration note.
+ 
+-from __future__ import annotations
++Run:  ``uv run ports/arkweb/tools/test_ime.py``
++"""
+ 
+-import base64
+-import os
+-import re
+-import shlex
+ import time
+-from pathlib import Path
+ 
+ import pytest
+-from hdc_py import Hdc, HarmonyDevice
+-from PIL import Image
+-
+-BUNDLE = "org.openharmonyrs.arkwebtest"
+-ABILITY = "EntryAbility"
+-SHIM_PATH = "/system/lib64/libservo_arkweb.so"
+-ENGINE_ENFORCE_SERVO = "100"
+-
+-# --- Device-specific coordinates (rk3568, 720x1280, default kika keyboard) -------------
+-# The <input>/blur points come from the test page layout and are stable. The soft-keyboard
+-# KEY / BACKSPACE points are LAYOUT-DEPENDENT (IME app + resolution) and will need updating
+-# elsewhere -- see the module TODO about layout-independent text injection.
+-INPUT_XY = (360, 253)  # the <input> element in TEST_PAGE
+-BLUR_XY = (360, 500)  # empty body area (below the input) to blur the field
+-KEY = {"h": (431, 920), "i": (537, 812)}  # kika key centres
++
++from conftest import (
++    back,
++    clear_log,
++    data_url,
++    force_stop,
++    is_light,
++    is_red,
++    launch_page,
++    read_log,
++    sample,
++    tap,
++    wait_log,
++)
++
++# <input>/blur points come from the page layout and are stable; the soft-keyboard KEY /
++# BACKSPACE points are LAYOUT-DEPENDENT (IME app + resolution) -- see the module TODO.
++INPUT_XY = (360, 253)
++BLUR_XY = (360, 500)
++KEY = {"h": (431, 920), "i": (537, 812)}
+ BACKSPACE_XY = (663, 1035)
+-KEYCODE_BACK = 2  # OHOS MMI KEYCODE_BACK
+ 
+-# Pixel-probe points (whole-screen coords). The page paints its <body> background a colour
+-# that encodes the field state, so a pixel sample is an OCR-free value assertion.
+ PROBE_VISIBLE = (360, 500)  # in the web area whether or not the keyboard is up
+ PROBE_LOW = (360, 1000)  # only inside the web area when it is full-height (keyboard hidden)
+ 
+ EXPECT = "hi"
+ 
+-# <body> background: light when empty, green when the field == EXPECT, red otherwise.
+ TEST_PAGE = f"""<html><head><meta name=viewport content="width=device-width,initial-scale=1"></head>
+ <body id=b style="margin:0;background:#ddddee;font-family:sans-serif">
+ <h2 style="margin:8px">Servo IME test</h2>
+@@ -96,201 +65,73 @@ i.addEventListener('input', function() {{
+ </body></html>"""
+ 
+ 
+-# --- hdc helpers -----------------------------------------------------------------------
+-
+-
+-def sh(device: HarmonyDevice, command: str, check: bool = True) -> str:
+-    return device.cmd(command, capture_output=True, text=True, check=check).stdout
+-
+-
+-def tap(device: HarmonyDevice, xy: tuple[int, int]) -> None:
+-    sh(device, f"uinput -T -c {xy[0]} {xy[1]}", check=False)
+-
+-
+-def key(device: HarmonyDevice, code: int) -> None:
+-    sh(device, f"uinput -K -d {code} -u {code}", check=False)
+-
+-
+-def clear_log(device: HarmonyDevice) -> None:
+-    sh(device, "hilog -r", check=False)
+-
+-
+-def read_log(device: HarmonyDevice) -> str:
+-    # `hilog -x` prints the current buffer and exits (unlike bare `hilog`, which streams).
+-    return sh(device, "hilog -x", check=False)
+-
+-
+-def wait_log(device: HarmonyDevice, needle: str, timeout: float = 12.0) -> bool:
+-    deadline = time.time() + timeout
+-    while time.time() < deadline:
+-        if needle in read_log(device):
+-            return True
+-        time.sleep(0.5)
+-    return False
+-
+-
+-def launch_page(device: HarmonyDevice, html: str) -> None:
+-    url = "data:text/html;base64," + base64.b64encode(html.encode()).decode()
+-    sh(device, f"aa start -a {ABILITY} -b {BUNDLE} -U {shlex.quote(url)}", check=False)
+-
+-
+-def screencap(device: HarmonyDevice, dest_dir: Path) -> Image.Image:
+-    out = sh(device, "snapshot_display", check=False)
+-    match = re.search(r"(/data/local/tmp/snapshot_[^\s]+\.jpeg)", out)
+-    assert match, f"could not find snapshot path in: {out!r}"
+-    device_path = match.group(1)
+-    local = dest_dir / os.path.basename(device_path)
+-    device.recv_file(device_path, str(local))
+-    return Image.open(local).convert("RGB")
+-
+-
+-# --- pixel classification (JPEG-tolerant; vote over a small neighbourhood) --------------
+-
+-
+-def _sample(img: Image.Image, xy: tuple[int, int]) -> tuple[int, int, int]:
+-    x, y = xy
+-    xs = [max(0, x - 4), x, min(img.width - 1, x + 4)]
+-    ys = [max(0, y - 4), y, min(img.height - 1, y + 4)]
+-    pixels = [img.getpixel((sx, sy)) for sx in xs for sy in ys]
+-    n = len(pixels)
+-    return tuple(sum(p[c] for p in pixels) // n for c in range(3))  # type: ignore[return-value]
+-
+-
+-def is_green(rgb: tuple[int, int, int]) -> bool:
+-    r, g, b = rgb
+-    return g > 120 and g - r > 40 and g - b > 40
+-
+-
+-def is_red(rgb: tuple[int, int, int]) -> bool:
++def is_green(rgb):  # local: the test page's exact green, slightly looser than conftest's
+     r, g, b = rgb
+-    return r > 120 and r - g > 40 and r - b > 40
+-
+-
+-def is_light(rgb: tuple[int, int, int]) -> bool:
+-    return min(rgb) > 170  # the empty-field light background
+-
+-
+-# --- fixtures --------------------------------------------------------------------------
+-
+-
+-@pytest.fixture(scope="session")
+-def device() -> HarmonyDevice:
+-    hdc = Hdc()
+-    targets = hdc.list_targets()
+-    if not targets:
+-        pytest.skip("no hdc device connected")
+-    dev = hdc.connect(targets[0])
+-
+-    if "__HDC_MISSING__" in sh(
+-        dev,
+-        f"if [ -f {SHIM_PATH} ]; then echo __HDC_OK__; else echo __HDC_MISSING__; fi",
+-        check=False,
+-    ):
+-        pytest.skip(f"Servo shim not deployed at {SHIM_PATH} -- run deploy.py first")
+-
+-    # The engine-select param is not persistent; it resets to the default on reboot. Set it
+-    # for this boot session if needed (the shim is only exercised when it is 100).
+-    if sh(dev, "param get web.engine.enforce", check=False).strip() != ENGINE_ENFORCE_SERVO:
+-        sh(dev, f"param set web.engine.enforce {ENGINE_ENFORCE_SERVO}", check=False)
+-
+-    # Keep the screen awake and unlocked so the app stays foreground.
+-    sh(dev, "power-shell wakeup", check=False)
+-    sh(dev, "power-shell timeout -o 3600000", check=False)
+-    sh(dev, "uinput -T -m 360 1100 360 250 200", check=False)  # swipe-up unlock (no PIN)
+-    return dev
+-
+-
+-_TMP: Path | None = None
++    return g > 110 and g - r > 35 and g - b > 35
+ 
+ 
+ @pytest.fixture(scope="module")
+-def app(device: HarmonyDevice, tmp_path_factory: pytest.TempPathFactory) -> HarmonyDevice:
+-    global _TMP
+-    _TMP = tmp_path_factory.mktemp("ime")
+-    sh(device, f"aa force-stop {BUNDLE}", check=False)
++def app(device):
++    """Launch the IME page once; the ordered tests below share one keyboard session."""
++    force_stop(device)
+     clear_log(device)
+-    launch_page(device, TEST_PAGE)
+-    if not wait_log(device, "[arkweb] built webview", timeout=20.0):
+-        pytest.fail("Servo webview never built -- check the engine is active (enforce=100)")
+-    # Let the initial page flush + paint.
+-    assert wait_log(device, "flushing pending load", timeout=10.0)
++    launch_page(device, url=data_url(TEST_PAGE))
++    assert wait_log(device, "[arkweb] built webview", 20.0), (
++        "Servo webview never built -- is the engine active (enforce=100)?"
++    )
++    assert wait_log(device, "flushing pending load", 10.0)
+     time.sleep(2.0)
+     yield device
+-    sh(device, f"aa force-stop {BUNDLE}", check=False)
+-
++    force_stop(device)
+ 
+-def _tmp(device: HarmonyDevice) -> Path:
+-    assert _TMP is not None
+-    return _TMP
+ 
++# The tests are ordered: they share the launched app and drive one IME session.
+ 
+-# --- tests (ordered: they share the launched app and drive one IME session) ------------
+ 
++def test_page_rendered_full_height(app, cap):
++    assert is_light(sample(cap(), PROBE_LOW)), "initial render did not paint the full web area"
+ 
+-def test_page_rendered_full_height(app: HarmonyDevice) -> None:
+-    """Baseline: the page painted, and it fills the full web viewport (keyboard down)."""
+-    img = screencap(app, _tmp(app))
+-    assert is_light(_sample(img, PROBE_LOW)), (
+-        "page background not painted at the bottom of the web area -- initial render failed"
+-    )
+ 
+-
+-def test_focus_shows_keyboard_and_avoids(app: HarmonyDevice) -> None:
+-    """Tapping the input attaches the IME (keyboard up) and ACE shrinks the web viewport."""
++def test_focus_shows_keyboard_and_avoids(app, cap):
+     clear_log(app)
+     tap(app, INPUT_XY)
+-    assert wait_log(app, "get_text_config", timeout=12.0), "engine IME did not attach on focus"
+-    # NeedSoftKeyboard -> ACE keyboard-avoidance resizes the web smaller than full height.
+-    assert wait_log(app, "ProcessVirtualKeyBoard", timeout=12.0)
+-    log = read_log(app)
+-    assert "keyboard:0.000000" not in log.split("ProcessVirtualKeyBoard")[-1], (
++    assert wait_log(app, "get_text_config", 12.0), "engine IME did not attach on focus"
++    assert wait_log(app, "ProcessVirtualKeyBoard", 12.0)
++    assert "keyboard:0.000000" not in read_log(app).split("ProcessVirtualKeyBoard")[-1], (
+         "keyboard reported height 0 -- soft keyboard did not show"
+     )
+ 
+ 
+-def test_typing_enters_text(app: HarmonyDevice) -> None:
+-    """Keys typed on the soft keyboard reach the Servo <input> (page turns green on 'hi')."""
++def test_typing_enters_text(app, cap):
+     for ch in EXPECT:
+         tap(app, KEY[ch])
+         time.sleep(0.4)
+     time.sleep(1.2)
+-    img = screencap(app, _tmp(app))
+-    rgb = _sample(img, PROBE_VISIBLE)
++    rgb = sample(cap(), PROBE_VISIBLE)
+     assert is_green(rgb), f"field did not equal {EXPECT!r} after typing (bg={rgb}, expected green)"
+ 
+ 
+-def test_backspace_edits_field(app: HarmonyDevice) -> None:
+-    """Backspace deletes a character (green 'hi' -> red 'h')."""
++def test_backspace_edits_field(app, cap):
+     tap(app, BACKSPACE_XY)
+     time.sleep(1.2)
+-    img = screencap(app, _tmp(app))
+-    rgb = _sample(img, PROBE_VISIBLE)
++    rgb = sample(cap(), PROBE_VISIBLE)
+     assert is_red(rgb), f"backspace did not edit the field (bg={rgb}, expected red for 'h')"
+ 
+ 
+-def test_blur_hides_keyboard_and_repaints_full_height(app: HarmonyDevice) -> None:
+-    """Blur hides the keyboard and the page repaints to full height.
+-
+-    Guards the resize stale-frame regression: the area revealed when the keyboard closes
+-    must be repainted (here: the red 'h' background), not left stale/blank.
+-    """
++def test_blur_hides_keyboard_and_repaints_full_height(app, cap):
+     clear_log(app)
+-    key(app, KEYCODE_BACK)  # back closes the keyboard (see UpdateTextFieldStatus wiring)
+-    assert wait_log(app, "keyboard:0.000000", timeout=12.0), "keyboard did not hide on back"
++    back(app)  # back closes the keyboard (UpdateTextFieldStatus / NeedSoftKeyboard wiring)
++    assert wait_log(app, "keyboard:0.000000", 12.0), "keyboard did not hide on back"
+     time.sleep(1.5)
+-    img = screencap(app, _tmp(app))
+-    rgb = _sample(img, PROBE_LOW)
++    rgb = sample(cap(), PROBE_LOW)
+     assert is_red(rgb), (
+         f"page did not repaint to full height after the keyboard closed (low pixel={rgb}); "
+         "this is the resize stale-frame regression"
+     )
+ 
+ 
+-def test_no_crash(app: HarmonyDevice) -> None:
+-    """The engine did not panic during the session and the app is still running."""
++def test_no_crash(app):
+     assert "[arkweb] servo panic" not in read_log(app), "Servo panicked during the IME session"
+-    alive = sh(app, f"ps -ef | grep {BUNDLE} | grep -v grep", check=False).strip()
+-    assert alive, "app process is gone -- it likely crashed"
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/ports/arkweb/tools/test_multiwebview.py b/ports/arkweb/tools/test_multiwebview.py
+new file mode 100644
+index 00000000000..2282d9a943f
+--- /dev/null
++++ b/ports/arkweb/tools/test_multiwebview.py
+@@ -0,0 +1,35 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""Multiple concurrent Servo surfaces (arkweb-test SplitPage).
++
++SplitPage stacks two live `Web` components in one window, exercising concurrent NWeb
++creation, two EGL surfaces and two vsync drivers. Its built-in content is a red top
++surface (#c0392b "Surface A") and a blue bottom surface (#2471a3 "Surface B"); both must
++build and render. See conftest.py for the harness/provisioning notes.
++"""
++
++import time
++
++import pytest
++
++from conftest import is_blue, is_red, sample, wait_log
++
++
++def test_split_page_two_surfaces_render(launch, cap):
++    device = launch(page="split")
++    assert wait_log(device, "built webview id=2", 15.0), "second Servo surface never built"
++    time.sleep(2.5)
++    img = cap()
++
++    top = sample(img, (360, 380))
++    bottom = sample(img, (360, 980))
++    assert is_red(top), f"top surface (A) not red: {top}"
++    assert is_blue(bottom), f"bottom surface (B) not blue: {bottom}"
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/ports/arkweb/tools/test_navigation.py b/ports/arkweb/tools/test_navigation.py
+new file mode 100644
+index 00000000000..1e575d7c2f5
+--- /dev/null
++++ b/ports/arkweb/tools/test_navigation.py
+@@ -0,0 +1,46 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""Link navigation + history back for the Servo ArkWeb backend.
++
++Exercises in-engine link navigation and the app's history-back button (Load /
++NavigateBack / can_go_back). Page A (green) links to page B (red); tapping the link must
++render B, and the back button must return to A. Content is checked by colour, so this is
++independent of the known URL-bar-stale-on-history-back gap (that is the ArkTS URL bar, not
++the web content). See conftest.py for the harness/provisioning notes.
++"""
++
++import time
++
++import pytest
++
++from conftest import BACK_BUTTON_XY, data_url, is_green, is_red, sample, tap
++
++PAGE_B = data_url("<html><body style='margin:0;background:#cc0000'></body></html>")
++PAGE_A = (
++    "<html><head><meta name=viewport content='width=device-width,initial-scale=1'></head>"
++    "<body style='margin:0;background:#00cc00'>"
++    f'<a href="{PAGE_B}" style="display:block;height:100vh"></a>'
++    "</body></html>"
++)
++
++
++def test_link_navigation_and_back(launch, cap):
++    device = launch(url=data_url(PAGE_A))
++    time.sleep(2.0)
++    assert is_green(sample(cap(), (360, 600))), "page A did not render"
++
++    tap(device, (360, 500))  # tap the viewport-filling link
++    time.sleep(2.5)
++    assert is_red(sample(cap(), (360, 600))), "link tap did not navigate to page B"
++
++    tap(device, BACK_BUTTON_XY)  # app history back button
++    time.sleep(2.5)
++    assert is_green(sample(cap(), (360, 600))), "back did not return to page A"
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/ports/arkweb/tools/test_render.py b/ports/arkweb/tools/test_render.py
+new file mode 100644
+index 00000000000..5ae71f5ff39
+--- /dev/null
++++ b/ports/arkweb/tools/test_render.py
+@@ -0,0 +1,40 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""Basic render/paint correctness for the Servo ArkWeb backend.
++
++A cheap, broad safety net over the whole paint pipeline (WebRender + surfman +
++SET_BUFFER_GEOMETRY + vsync): render a page of solid colour bands and assert each band
++paints its expected colour. See conftest.py for the harness/provisioning notes.
++"""
++
++import time
++
++import pytest
++
++from conftest import data_url, is_blue, is_green, is_red, sample
++
++# Bands sized in vh so their screen positions are density-independent (vh is relative to
++# the web viewport, which is the full-height web component when no keyboard is up).
++PAGE = """<html><head><meta name=viewport content="width=device-width,initial-scale=1"></head>
++<body style="margin:0">
++<div style="height:34vh;background:#00cc00"></div>
++<div style="height:33vh;background:#cc0000"></div>
++<div style="height:33vh;background:#0000cc"></div>
++</body></html>"""
++
++
++def test_renders_solid_colour_bands(launch, cap):
++    launch(url=data_url(PAGE))
++    time.sleep(2.0)
++    img = cap()
++    assert is_green(sample(img, (360, 300))), "top band not green -- render pipeline broken"
++    assert is_red(sample(img, (360, 650))), "middle band not red"
++    assert is_blue(sample(img, (360, 1050))), "bottom band not blue"
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/ports/arkweb/tools/test_scroll.py b/ports/arkweb/tools/test_scroll.py
+new file mode 100644
+index 00000000000..4c764c2c651
+--- /dev/null
++++ b/ports/arkweb/tools/test_scroll.py
+@@ -0,0 +1,44 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""Touch-drag scrolling for the Servo ArkWeb backend.
++
++Regression guard for the batched-`OnTouchMove` scroll fix (M2): ACE forwards touch-move
++through the vector overload, which the shim must forward per point or drags are dropped
++and the page does not scroll. The page is a tall stack of coloured stripes; a swipe must
++visibly move the content (a plain colour would scroll invisibly, so stripes are used).
++See conftest.py for the harness/provisioning notes.
++"""
++
++import time
++
++import pytest
++
++from conftest import WEB_TOP_Y, data_url, region_changed, swipe
++
++STRIPES = """<html><head><meta name=viewport content="width=device-width,initial-scale=1"></head>
++<body id=b style="margin:0"></body>
++<script>
++var b=document.getElementById('b');
++for (var k=0;k<60;k++){var d=document.createElement('div');d.style.height='80px';d.style.background=(k%2)?'#cc0000':'#00cc00';b.appendChild(d);}
++</script></html>"""
++
++
++def test_touch_drag_scrolls(launch, cap):
++    device = launch(url=data_url(STRIPES))
++    time.sleep(2.0)
++    before = cap()
++    # Drag up over the web area -> scroll down; the stripe pattern must shift.
++    swipe(device, 360, 950, 360, 300, 500)
++    time.sleep(1.5)
++    after = cap()
++    assert region_changed(before, after, (0, WEB_TOP_Y, 720, 1200)), (
++        "touch-drag did not scroll the page (batched OnTouchMove regression?)"
++    )
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/ports/arkweb/tools/test_vsync.py b/ports/arkweb/tools/test_vsync.py
+new file mode 100644
+index 00000000000..d4d804b7fb4
+--- /dev/null
++++ b/ports/arkweb/tools/test_vsync.py
+@@ -0,0 +1,66 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""Vsync-driven animation for the Servo ArkWeb backend.
++
++Two checks: (1) a CSS animation advances (frames are produced/presented); (2) the frames
++are driven by the OHOS display vsync. The vsync check needs no engine change: the shim
++names its `OH_NativeVSync` connection `ServoArkWeb-<id>`, and the OHOS Vsync framework logs
++that name when it services the connection -- so grepping hilog for it proves the animation
++is vsync-driven. See conftest.py for the harness/provisioning notes.
++"""
++
++import time
++
++import pytest
++
++from conftest import clear_log, data_url, read_log, region_changed
++
++# Position/size in vh/vw so screen coordinates are density-independent.
++ANIM = """<html><head><meta name=viewport content="width=device-width,initial-scale=1"></head>
++<body style="margin:0;background:#111">
++<div style="width:12vw;height:12vw;background:#00dd00;position:absolute;top:40vh;animation:m 1.2s linear infinite alternate"></div>
++<style>@keyframes m{from{left:2vw}to{left:80vw}}</style>
++</body></html>"""
++
++# Screen band the box sweeps through: top:40vh ~= 0.4*1052 + 160 (web offset); box ~12vw tall.
++ANIM_BAND = (0, 560, 720, 700)
++
++
++def test_animation_advances_frames(launch, cap):
++    launch(url=data_url(ANIM))
++    time.sleep(1.5)
++    before = cap()
++    time.sleep(0.5)
++    after = cap()
++    assert region_changed(before, after, ANIM_BAND), (
++        "animation did not advance between frames -- frames not being produced/presented"
++    )
++
++
++def test_frames_are_vsync_driven(launch):
++    device = launch(url=data_url(ANIM))
++    # The OHOS Vsync framework (tag C01400/Vsync) logs our named connection (NativeVsync
++    # "ServoArkWeb-<id>") when it services vsync -- proof the frames are vsync-driven,
++    # observable without any engine-side instrumentation. It re-logs periodically while the
++    # connection is serviced, but the 256K hilog buffer wraps within seconds on a busy device,
++    # so any line emitted during launch is typically evicted before this runs. Clear the
++    # buffer and wait for the next servicing to land in an empty one; measured at ~10s
++    # between lines, hence the window below.
++    clear_log(device)
++    deadline = time.time() + 40.0
++    vsync_lines: list[str] = []
++    while time.time() < deadline and not vsync_lines:
++        vsync_lines = [line for line in read_log(device).splitlines() if "Vsync" in line and "ServoArkWeb-" in line]
++        if not vsync_lines:
++            time.sleep(0.3)
++    assert vsync_lines, (
++        "OHOS Vsync framework never serviced the ServoArkWeb connection in hilog -- frames may not be vsync-driven"
++    )
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/pyproject.toml b/pyproject.toml
+index eb8ed843829..63ec7bf0ed6 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -50,6 +50,10 @@ ignore = [
+ "**/*_tests.py" = ["ANN"]
+ "**/tests/**/*.py" = ["ANN"]
+ "python/servo/devtools_tests/**" = ["ANN"]
++# The ArkWeb port's on-device smoke tests (pytest); test functions and fixtures follow
++# pytest convention and are not type-annotated, like Servo's other test files above.
++"ports/arkweb/tools/test_*.py" = ["ANN"]
++"ports/arkweb/tools/conftest.py" = ["ANN"]
+ 
+ [tool.pyrefly]
+ search-path = [

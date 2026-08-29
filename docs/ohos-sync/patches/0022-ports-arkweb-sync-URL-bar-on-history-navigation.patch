@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 10 Jul 2026 13:56:14 +0000
+Subject: [PATCH] ports/arkweb: sync URL bar on history navigation
+
+The URL bar only updated from onPageBegin/onPageEnd (LoadStatus), but
+history back/forward reactivates a live pipeline without a fresh load, so
+no load status fires and the URL bar went stale. Wire on_url_changed
+(Servo notify_url_changed) to ArkWeb's OnRefreshAccessedHistory and have
+the test app listen to onRefreshAccessedHistory. Also fixes URL-bar sync
+for history.pushState/replaceState and fragment navigation.
+
+Add test_urlbar.py regression test and a url_bar_text conftest helper.
+Make the hilog read tolerant of non-UTF-8 bytes (errors="replace") so
+log-reading tests don't flake.
+
+Validation: Test by running uv run ports/arkweb/tools/test_urlbar.py on a device.
+AI-assisted: Yes (agent session; implementation and on-device testing)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/arkweb/cpp/servo_handler_proxy.cpp      | 12 ++-
+ .../entry/src/main/ets/pages/Index.ets        |  8 ++
+ ports/arkweb/tools/conftest.py                | 20 ++++-
+ ports/arkweb/tools/test_navigation.py         |  6 +-
+ ports/arkweb/tools/test_urlbar.py             | 73 +++++++++++++++++++
+ 5 files changed, 113 insertions(+), 6 deletions(-)
+ create mode 100644 ports/arkweb/tools/test_urlbar.py
+
+diff --git a/ports/arkweb/cpp/servo_handler_proxy.cpp b/ports/arkweb/cpp/servo_handler_proxy.cpp
+index daca9b4a09e..03d727b4958 100644
+--- a/ports/arkweb/cpp/servo_handler_proxy.cpp
++++ b/ports/arkweb/cpp/servo_handler_proxy.cpp
+@@ -77,8 +77,16 @@ void NWebHandlerProxy::on_load_error(std::int32_t code, const std::string& desc,
+     }
+ }
+ 
+-// No direct NWebHandler equivalent yet; wired up in a later milestone.
+-void NWebHandlerProxy::on_url_changed(const std::string& /*url*/) const {}
++// Servo fires notify_url_changed on every URL change, including history
++// traversal and history.pushState/replaceState, which do not go through a
++// fresh page load (so OnPageLoadBegin/End would not fire). OnRefreshAccessedHistory
++// is ArkWeb's navigation-committed callback (ArkTS onRefreshAccessedHistory), which
++// carries the new URL and lets the embedder keep its URL bar in sync.
++void NWebHandlerProxy::on_url_changed(const std::string& url) const {
++    if (auto h = handler()) {
++        h->OnRefreshAccessedHistory(url, false);
++    }
++}
+ 
+ void NWebHandlerProxy::on_title_changed(const std::string& title) const {
+     if (auto h = handler()) {
+diff --git a/ports/arkweb/test-app/entry/src/main/ets/pages/Index.ets b/ports/arkweb/test-app/entry/src/main/ets/pages/Index.ets
+index cdd1ebaf835..e928cf3ccd1 100644
+--- a/ports/arkweb/test-app/entry/src/main/ets/pages/Index.ets
++++ b/ports/arkweb/test-app/entry/src/main/ets/pages/Index.ets
+@@ -189,6 +189,14 @@ struct Index {
+             markInstant('PageEnd', 3);
+           }
+         })
++        // Fires on navigations that don't trigger a fresh page load, e.g.
++        // history back/forward and history.pushState, so the URL bar stays in
++        // sync where onPageBegin/onPageEnd don't fire.
++        .onRefreshAccessedHistory((event) => {
++          if (event !== undefined) {
++            this.urlBar = event.url;
++          }
++        })
+         .onFirstContentfulPaint(event => {
+           markInstant('FirstContentfulPaint', 4);
+           if (event !== undefined) {
+diff --git a/ports/arkweb/tools/conftest.py b/ports/arkweb/tools/conftest.py
+index 364b17d7e41..93f43cd9a19 100644
+--- a/ports/arkweb/tools/conftest.py
++++ b/ports/arkweb/tools/conftest.py
+@@ -58,7 +58,10 @@ CMD_TIMEOUT = 30.0
+ 
+ 
+ def sh(device: HarmonyDevice, command: str, check: bool = True, timeout: float = CMD_TIMEOUT) -> str:
+-    return device.cmd(command, capture_output=True, text=True, check=check, timeout=timeout).stdout
++    # errors="replace": the hilog buffer occasionally contains non-UTF-8 bytes (raw binary in a
++    # log line), which would otherwise crash the strict decode inside subprocess and flake any
++    # test that reads the log.
++    return device.cmd(command, capture_output=True, text=True, errors="replace", check=check, timeout=timeout).stdout
+ 
+ 
+ def tap(device: HarmonyDevice, xy: tuple[int, int]) -> None:
+@@ -146,6 +149,21 @@ def find_center(tree: dict, text: str) -> tuple[int, int] | None:
+     return found[0] if found else None
+ 
+ 
++def url_bar_text(tree: dict) -> str | None:
++    """Return the text of the app's URL bar (the first `TextInput` in the ArkUI tree)."""
++
++    def walk(node: dict) -> str | None:
++        attributes = node.get("attributes", node)
++        if attributes.get("type") == "TextInput":
++            return attributes.get("text", "")
++        for child in node.get("children", []):
++            if (found := walk(child)) is not None:
++                return found
++        return None
++
++    return walk(tree)
++
++
+ def screencap(device: HarmonyDevice, dest_dir: Path) -> Image.Image:
+     out = sh(device, "snapshot_display", check=False)
+     match = re.search(r"(/data/local/tmp/snapshot_[^\s]+\.jpeg)", out)
+diff --git a/ports/arkweb/tools/test_navigation.py b/ports/arkweb/tools/test_navigation.py
+index 80a98b28c72..3e2afb53179 100644
+--- a/ports/arkweb/tools/test_navigation.py
++++ b/ports/arkweb/tools/test_navigation.py
+@@ -6,9 +6,9 @@
+ 
+ Exercises in-engine link navigation and the app's history-back button (Load /
+ NavigateBack / can_go_back). Page A (green) links to page B (red); tapping the link must
+-render B, and the back button must return to A. Content is checked by colour, so this is
+-independent of the known URL-bar-stale-on-history-back gap (that is the ArkTS URL bar, not
+-the web content). See conftest.py for the harness/provisioning notes.
++render B, and the back button must return to A. Content is checked by colour; the URL bar's
++own history-back sync is covered separately in test_urlbar.py. See conftest.py for the
++harness/provisioning notes.
+ """
+ 
+ import pytest
+diff --git a/ports/arkweb/tools/test_urlbar.py b/ports/arkweb/tools/test_urlbar.py
+new file mode 100644
+index 00000000000..a52fe1dde1e
+--- /dev/null
++++ b/ports/arkweb/tools/test_urlbar.py
+@@ -0,0 +1,73 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""URL-bar sync for the Servo ArkWeb backend.
++
++The app's URL bar is an ArkTS `TextInput` kept in sync with the engine. Load-driven updates go
++through `onPageBegin`/`onPageEnd`, but history back/forward can reactivate a live pipeline without
++a fresh load, so no page-load callback fires. The engine still reports the new URL via Servo's
++`notify_url_changed` -> `on_url_changed` -> ArkWeb `OnRefreshAccessedHistory` (ArkTS
++`onRefreshAccessedHistory`), which the app also listens to. This test guards that path: after
++tapping back, the URL bar must return to page A's URL, not stay on B.
++"""
++
++import time
++
++import pytest
++
++from conftest import (
++    BACK_BUTTON_XY,
++    data_url,
++    dump_layout,
++    is_green,
++    is_red,
++    sample,
++    tap,
++    url_bar_text,
++    wait_for_pixel,
++)
++
++PROBE = (360, 600)
++PAGE_B = data_url("<html><body style='margin:0;background:#cc0000'></body></html>")
++PAGE_A = (
++    "<html><head><meta name=viewport content='width=device-width,initial-scale=1'></head>"
++    "<body style='margin:0;background:#00cc00'>"
++    f'<a href="{PAGE_B}" style="display:block;height:100vh"></a>'
++    "</body></html>"
++)
++
++
++def wait_url_bar(device, dest_dir, expected: str, timeout: float = 6.0) -> str:
++    """Poll the URL bar until it equals `expected` (or timeout); return the last value read."""
++    deadline = time.time() + timeout
++    last = ""
++    while time.time() < deadline:
++        last = url_bar_text(dump_layout(device, dest_dir)) or ""
++        if last == expected:
++            return last
++        time.sleep(0.3)
++    return last
++
++
++def test_url_bar_follows_history_back(launch, cap, tmp_path):
++    url_a = data_url(PAGE_A)
++    device = launch(url=url_a)
++    assert is_green(sample(wait_for_pixel(cap, PROBE, is_green), PROBE)), "page A did not render"
++    assert wait_url_bar(device, tmp_path, url_a) == url_a, "URL bar wrong after loading page A"
++
++    tap(device, (360, 500))  # tap the viewport-filling link -> page B
++    assert is_red(sample(wait_for_pixel(cap, PROBE, is_red), PROBE)), "link tap did not navigate to B"
++    assert wait_url_bar(device, tmp_path, PAGE_B) == PAGE_B, "URL bar did not follow link nav to B"
++
++    tap(device, BACK_BUTTON_XY)  # app history back button -> page A
++    assert is_green(sample(wait_for_pixel(cap, PROBE, is_green), PROBE)), "back did not return to A"
++    assert wait_url_bar(device, tmp_path, url_a) == url_a, (
++        "URL bar stale after history back: it must return to page A, not stay on B"
++    )
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))

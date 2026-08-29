@@ -1,0 +1,3091 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 18 Sep 2026 08:34:49 +0000
+Subject: [PATCH] fonts: Report the load state of @font-face rules in
+ FontFace.status
+
+A FontFace for an @font-face rule was created with the status "loading"
+and kept it forever, and its `loaded` promise never settled, so awaiting
+`FontFace.load()` on such a face hung. Keep the load state on the rule,
+which the FontContext and the FontFace share, and settle the promise when
+the state changes. A rejection is marked handled, because the object exists
+whether or not the page asked for the font.
+
+Fork note: first of four patches that stop Servo from downloading every
+@font-face rule; this one also stands on its own. Meant for upstream; the code is the same
+as in the upstream-based version.
+
+Relies on: `FontFaceRuleInfo` being shared between the FontContext and the
+css-connected FontFace (upstream #45975/#46271), and on
+`ScriptThread::handle_web_font_loaded` / `Document::maybe_fulfill_font_ready_promise`
+as the places where a finished load reaches script.
+
+Drop when upstream reports the load state of css-connected faces: on plain
+upstream, `css/css-fonts/font-palette-add.html` then finishes instead of
+timing out (it awaits `[...document.fonts][0].load()`), and a css-connected
+face reports "loaded" once its font is in use.
+
+Upstream's MathML tests, enabled in #49127, wait for `loadAllFonts()` of
+mathml/support/fonts.js, which awaits `FontFace.load()` for every face
+in `document.fonts`. On upstream that promise never settles for the face
+of an @font-face rule, so 100 of the tests time out, and upstream
+expects TIMEOUT. With this patch they finish: 92 expectations change,
+and 8 go because the tests pass. Five tests end in ERROR because MathML
+elements lack `dataset`, not in a crash. When upstream reports the load
+state of css-connected faces, which is when this patch can be dropped,
+upstream's expectations change the same way.
+
+Validation: `./mach test-wpt --release --processes 1 css/css-font-loading css/css-fonts html/canvas/element/text html/canvas/offscreen/text` (947 tests): font-palette-{add,modify,remove}-2 now pass and font-palette-{add,modify,remove} fail on the unimplemented `font-palette` instead of timing out (expectations updated); the only other unexpected result, font-variant-emoji-1 FAIL, also happens on plain ohos-main. font-variant-emoji-2 and matching/font-unicode-presented-as-emoji-outline keep upstream's FAIL expectations: they fail whenever a colour emoji font is installed, as on CI, and pass only without one. 2026-11-09 sync: `./mach test-wpt --processes 8 --timeout-multiplier 2 mathml` with release builds (2026-10-29): on plain upstream the 100 tests time out as expected; with the stack up to this patch they finish with the same results as on the ohos-main tip, where SpiderMonkey and QuickJS give identical results, subtests included. This sync's full QuickJS run and its reruns with both engines have no unexpected MathML result but mo-single-char-and-children's, which fails on plain 0.8.0 too.
+AI-assisted: Yes (agent session; written and tested by the agent, ported from upstream main to ohos-main's Rc<Promise> API)
+AI-assisted: Yes (agent session; 2026-10-08 sync -- conflict resolution for upstream's RootedPromise conversion (#47935, #48333), resolved to the code of the upstream-bound lazy-webfonts branch; folded the squash commit that keeps the two colour-emoji FAIL expectations)
+AI-assisted: Yes (agent session; 2026-11-09 sync -- folded in "fixup! fonts: Report the load state of @font-face rules in FontFace.status" (bisected and written by the agent between syncs): the expectations of upstream's MathML tests, which finish with this patch)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/fonts/font_context.rs              |  19 +-
+ components/script/dom/css/fontface.rs         |  60 ++++-
+ components/script/dom/css/fontfaceset.rs      |  14 ++
+ components/script/dom/document/document.rs    |   1 +
+ components/script/event_loop/script_thread.rs |   8 +-
+ components/shared/fonts/lib.rs                |  52 +++-
+ .../css/css-fonts/font-palette-add-2.html.ini |   2 -
+ .../css/css-fonts/font-palette-add.html.ini   |   2 +-
+ .../css-fonts/font-palette-modify-2.html.ini  |   2 -
+ .../css-fonts/font-palette-modify.html.ini    |   2 +-
+ .../css-fonts/font-palette-remove-2.html.ini  |   2 -
+ .../css-fonts/font-palette-remove.html.ini    |   2 +-
+ .../matching/font-unicode-PUA.html.ini        |   7 +-
+ .../fractions/frac-1.html.ini                 |  15 +-
+ .../fractions/frac-bar-001.html.ini           |   2 +-
+ .../fractions/frac-bar-002.html.ini           |   2 +-
+ .../fractions/frac-linethickness-002.html.ini |  18 +-
+ .../fractions/frac-parameters-1.html.ini      |  60 ++++-
+ .../fractions/frac-parameters-2.html.ini      |  39 ++-
+ .../fractions/frac-parameters-3.html.ini      |  12 +-
+ .../frac-parameters-gap-001.html.ini          |   2 +-
+ .../frac-parameters-gap-002.html.ini          |   2 +-
+ .../frac-parameters-gap-003.html.ini          |   2 +-
+ .../frac-parameters-gap-004.html.ini          |   2 +-
+ .../frac-parameters-gap-005.html.ini          |   2 +-
+ .../frac-parameters-gap-006.html.ini          |   2 +-
+ .../mrow/inferred-mrow-stretchy.html.ini      |  42 +++-
+ .../mrow/no-spacing.html.ini                  | 162 ++++++++++++-
+ .../mrow/spacing-002.html.ini                 |   9 +-
+ .../stretch-along-block-axis-001.html.ini     |  15 +-
+ .../character-level-mirroring.html.ini        |   9 +-
+ ...operator-min-height-no-workaround.html.ini |   3 +-
+ .../embellished-operator-004.html.ini         |   2 +-
+ .../embellished-operator-dynamic-002.html.ini |  24 +-
+ .../operators/largeop-hit-testing.html.ini    |   3 +-
+ .../operators/mo-axis-height-1.html.ini       |  27 ++-
+ .../operators/mo-fallback-font.html.ini       |   2 +-
+ .../mo-font-relative-lengths-001.html.ini     |  12 +-
+ .../operators/mo-lspace-rspace-5.html.ini     |   2 +-
+ .../operators/mo-minsize-maxsize-001.html.ini |  15 +-
+ ...stment-for-basic-binary-operators.html.ini |   4 -
+ .../mo-stretch-properties-001.html.ini        |   3 +-
+ ...mo-stretch-properties-dynamic-001.html.ini |  15 +-
+ .../operator-dictionary-largeop-001.html.ini  |  12 +-
+ .../operator-dictionary-largeop-002.html.ini  |  12 +-
+ .../operator-dictionary-largeop-003.html.ini  |  12 +-
+ .../operator-dictionary-largeop-004.html.ini  |  12 +-
+ .../operator-dictionary-largeop-005.html.ini  |  12 +-
+ .../operator-dictionary-largeop-006.html.ini  |  12 +-
+ ...ator-dictionary-movablelimits-001.html.ini |  12 +-
+ ...ator-dictionary-movablelimits-002.html.ini |  12 +-
+ ...ator-dictionary-movablelimits-003.html.ini |  12 +-
+ ...ator-dictionary-movablelimits-004.html.ini |  12 +-
+ ...ator-dictionary-movablelimits-005.html.ini |  12 +-
+ ...ator-dictionary-movablelimits-006.html.ini |  12 +-
+ .../operator-dictionary-multi-char.html.ini   |   2 -
+ .../operator-dictionary-spacing-001.html.ini  |   2 -
+ .../operator-dictionary-spacing-002.html.ini  |   2 -
+ .../operator-dictionary-spacing-003.html.ini  |   2 -
+ .../operator-dictionary-spacing-004.html.ini  |   2 -
+ .../operator-dictionary-spacing-005.html.ini  |   2 -
+ .../operator-dictionary-spacing-006.html.ini  |   3 +-
+ .../operator-dictionary-stretchy-001.html.ini |  12 +-
+ .../operator-dictionary-stretchy-002.html.ini |  12 +-
+ .../operator-dictionary-stretchy-003.html.ini |  12 +-
+ .../operator-dictionary-stretchy-004.html.ini |  12 +-
+ .../operator-dictionary-stretchy-005.html.ini |  12 +-
+ .../operator-dictionary-stretchy-006.html.ini |  12 +-
+ ...operator-dictionary-symmetric-001.html.ini |  12 +-
+ ...operator-dictionary-symmetric-002.html.ini |  12 +-
+ ...operator-dictionary-symmetric-003.html.ini |  12 +-
+ ...operator-dictionary-symmetric-004.html.ini |  12 +-
+ ...operator-dictionary-symmetric-005.html.ini |  12 +-
+ ...operator-dictionary-symmetric-006.html.ini |  12 +-
+ .../painting-stretchy-operator-001.html.ini   |   2 +-
+ .../painting-stretchy-operator-002.html.ini   |   2 +-
+ .../operators/symmetric-largeop.html.ini      |   3 +-
+ ...ic-radical-paint-invalidation-001.html.ini |   2 +-
+ .../radicals/glyph-level-mirroring.html.ini   |   6 +-
+ .../radicals/root-parameters-1.html.ini       |  21 +-
+ .../radicals/root-parameters-2.html.ini       |   6 +-
+ .../scripts/cramped-001.html.ini              |  45 +++-
+ .../scripts/subsup-1.html.ini                 |  15 +-
+ .../scripts/subsup-2.html.ini                 |  15 +-
+ .../scripts/subsup-3.html.ini                 |  15 +-
+ .../scripts/subsup-6-rtl.html.ini             |  15 +-
+ .../scripts/subsup-6.html.ini                 |  15 +-
+ .../scripts/subsup-parameters-1.html.ini      |  30 ++-
+ .../scripts/subsup-parameters-2.html.ini      |   9 +-
+ .../scripts/underover-1.html.ini              |  15 +-
+ .../scripts/underover-parameters-1.html.ini   |  12 +-
+ .../scripts/underover-parameters-2.html.ini   |  12 +-
+ .../scripts/underover-parameters-3.html.ini   |  24 +-
+ .../underover-parameters-4.tentative.html.ini |  18 +-
+ ...meters-and-embellished-operator-1.html.ini |  12 +-
+ ...meters-and-embellished-operator-2.html.ini |  12 +-
+ .../tables/table-axis-height.html.ini         |   3 +-
+ .../relations/css-styling/color-005.html.ini  |   2 +-
+ .../relations/css-styling/display-2.html.ini  |  51 +++-
+ .../css-styling/displaystyle-013.html.ini     |   2 +-
+ .../css-styling/displaystyle-014.html.ini     |   2 +-
+ .../css-styling/displaystyle-1.html.ini       | 108 ++++++++-
+ .../css-styling/displaystyle-2.html.ini       |  81 ++++++-
+ .../css-styling/displaystyle-3.html.ini       |  18 +-
+ .../relations/css-styling/lengths-2.html.ini  |  18 +-
+ .../padding-border-margin/border-002.html.ini | 153 +++++++++++-
+ .../padding-border-margin/margin-002.html.ini | 228 +++++++++++++++++-
+ .../padding-002.html.ini                      | 153 +++++++++++-
+ .../css-styling/visibility-005.html.ini       |   2 +-
+ .../css-styling/width-height-004.html.ini     |   2 +-
+ .../css-styling/width-height-005.html.ini     |   2 +-
+ .../css-styling/width-height-006.html.ini     |   2 +-
+ .../html5-tree/dynamic-href-001.html.ini      |   2 -
+ 113 files changed, 1979 insertions(+), 141 deletions(-)
+ delete mode 100644 tests/wpt/meta/css/css-fonts/font-palette-add-2.html.ini
+ delete mode 100644 tests/wpt/meta/css/css-fonts/font-palette-modify-2.html.ini
+ delete mode 100644 tests/wpt/meta/css/css-fonts/font-palette-remove-2.html.ini
+ delete mode 100644 tests/wpt/meta/mathml/presentation-markup/operators/mo-no-vertical-adjustment-for-basic-binary-operators.html.ini
+ delete mode 100644 tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-multi-char.html.ini
+ delete mode 100644 tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-001.html.ini
+ delete mode 100644 tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-002.html.ini
+ delete mode 100644 tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-003.html.ini
+ delete mode 100644 tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-004.html.ini
+ delete mode 100644 tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-005.html.ini
+ delete mode 100644 tests/wpt/meta/mathml/relations/html5-tree/dynamic-href-001.html.ini
+
+diff --git a/components/fonts/font_context.rs b/components/fonts/font_context.rs
+index db34b7dd615..55068adc6a3 100644
+--- a/components/fonts/font_context.rs
++++ b/components/fonts/font_context.rs
+@@ -15,7 +15,7 @@ use content_security_policy::Violation;
+ use fonts_traits::{
+     CSSFontFaceDescriptors, FontDescriptor, FontFaceRuleInfo, FontIdentifier, FontTemplate,
+     FontTemplateRef, FontTemplateRefMethods, StylesheetWebFontLoadFinishedCallback,
+-    WebFontLoadEvent, WebFontSetDifference,
++    WebFontLoadEvent, WebFontLoadState, WebFontSetDifference,
+ };
+ use log::{debug, trace};
+ use malloc_size_of::MallocSizeOf;
+@@ -669,6 +669,9 @@ impl WebFontDownloadState {
+                     .web_fonts
+                     .write()
+                     .add_new_template(family_name, new_template);
++                initiator
++                    .font_face_rule
++                    .set_load_state(WebFontLoadState::Loaded);
+                 self.font_context
+                     .invalidate_font_groups_after_web_font_load();
+ 
+@@ -689,6 +692,9 @@ impl WebFontDownloadState {
+         let family_name = self.css_font_face_descriptors.family_name.clone();
+         match self.initiator {
+             WebFontLoadInitiator::Stylesheet(initiator) => {
++                initiator
++                    .font_face_rule
++                    .set_load_state(WebFontLoadState::Failed);
+                 if self
+                     .font_context
+                     .number_of_loading_web_fonts
+@@ -748,6 +754,7 @@ impl FontContextWebFontMethods for Arc<FontContext> {
+         };
+ 
+         let css_font_face_descriptors = CSSFontFaceDescriptors::from(&font_face_rule.descriptors);
++        font_face_rule.set_load_state(WebFontLoadState::Loading);
+ 
+         let initiator = FontFaceRuleInitiator {
+             font_face_rule: font_face_rule.clone(),
+@@ -1602,11 +1609,11 @@ impl KnownFontFaceRules {
+                 continue;
+             } else {
+                 // This is a new rule that does not conflict with anything that previously existed, so insert it.
+-                let font_face_rule_entry = ServoArc::new(FontFaceRuleInfo {
+-                    cascade_index: AtomicUsize::new(cascade_index),
+-                    descriptors: borrowed_rule.descriptors.clone(),
+-                    rule: rule_with_origin.rule,
+-                });
++                let font_face_rule_entry = ServoArc::new(FontFaceRuleInfo::new(
++                    cascade_index,
++                    borrowed_rule.descriptors.clone(),
++                    rule_with_origin.rule,
++                ));
+                 difference
+                     .added_font_faces
+                     .push(font_face_rule_entry.clone());
+diff --git a/components/script/dom/css/fontface.rs b/components/script/dom/css/fontface.rs
+index 0a733230e37..ca89216d9d1 100644
+--- a/components/script/dom/css/fontface.rs
++++ b/components/script/dom/css/fontface.rs
+@@ -7,7 +7,8 @@ use std::cell::{Cell, Ref, RefCell};
+ use cssparser::Parser;
+ use dom_struct::dom_struct;
+ use fonts::{
+-    FontContext, FontContextWebFontMethods, FontFaceRuleInfo, FontTemplate, LowercaseFontFamilyName,
++    FontContext, FontContextWebFontMethods, FontFaceRuleInfo, FontTemplate,
++    LowercaseFontFamilyName, WebFontLoadState,
+ };
+ use js::context::JSContext;
+ use js::rust::HandleObject;
+@@ -334,7 +335,9 @@ impl FontFace {
+     ) -> Self {
+         Self {
+             reflector: Reflector::new(),
+-            status: Cell::new(FontFaceLoadStatus::Loading),
++            // The status of a css-connected face comes from its `@font-face` rule, see
++            // `Status()`.
++            status: Cell::new(FontFaceLoadStatus::Unloaded),
+             descriptors: DomRefCell::new(descriptors),
+             font_face_set: MutNullableDom::default(),
+             family_name: DomRefCell::new(family_name.traced()),
+@@ -467,6 +470,39 @@ impl FontFace {
+         }
+     }
+ 
++    /// Settle the `[[FontStatusPromise]]` of a [css-connected] face whose `@font-face` rule
++    /// has finished loading in the `FontContext`, which is what loads it.
++    ///
++    /// [css-connected]: https://drafts.csswg.org/css-font-loading/#css-connected
++    pub(crate) fn update_status_from_css_font_face_rule(&self, cx: &mut JSContext) {
++        if !self.is_css_connected() {
++            return;
++        }
++
++        // `status` is not the status of a css-connected face, so it is used here to hold the
++        // status this object last reported, to settle the promise exactly once.
++        let status = self.Status();
++        if status == self.status.get() {
++            return;
++        }
++        self.status.set(status);
++
++        match status {
++            FontFaceLoadStatus::Loaded => self.font_status_promise.resolve_native(cx, &self),
++            FontFaceLoadStatus::Error => {
++                // Nothing necessarily awaits the promise of a css-connected face, because
++                // the object exists whether or not the page asked for the font, so a
++                // rejection here must not be reported as unhandled.
++                let promise = self.font_status_promise.root(cx);
++                promise.set_promise_is_handled(cx);
++                promise.reject_error(cx, Error::Network(Some("Failed to load font data".into())));
++            },
++            // Note: unlike a face that script created, the template of a css-connected face
++            // belongs to the `FontContext` already, so the `FontFaceSet` has nothing to add.
++            FontFaceLoadStatus::Unloaded | FontFaceLoadStatus::Loading => {},
++        }
++    }
++
+     pub(super) fn set_associated_font_face_set(&self, font_face_set: &FontFaceSet) {
+         self.font_face_set.set(Some(font_face_set));
+     }
+@@ -644,7 +680,19 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
+ 
+     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-status>
+     fn Status(&self) -> FontFaceLoadStatus {
+-        self.status.get()
++        // A css-connected face is loaded by the `FontContext` rather than by this object, so
++        // the `@font-face` rule it shares with the `FontContext` is what knows its status.
++        match self
++            .css_font_face_rule()
++            .as_ref()
++            .map(|rule| rule.load_state())
++        {
++            Some(WebFontLoadState::Unloaded) => FontFaceLoadStatus::Unloaded,
++            Some(WebFontLoadState::Loading) => FontFaceLoadStatus::Loading,
++            Some(WebFontLoadState::Loaded) => FontFaceLoadStatus::Loaded,
++            Some(WebFontLoadState::Failed) => FontFaceLoadStatus::Error,
++            None => self.status.get(),
++        }
+     }
+ 
+     /// The load() method of FontFace forces a url-based font face to request its font data and
+@@ -652,6 +700,12 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
+     /// loaded, it does nothing.
+     /// <https://drafts.csswg.org/css-font-loading/#font-face-load>
+     fn Load(&self, cx: &mut JSContext) -> RootedPromise {
++        // A css-connected face is loaded by the `FontContext` together with its
++        // `@font-face` rule.
++        if self.is_css_connected() {
++            return self.font_status_promise.root(cx);
++        }
++
+         // Step 2. If font face’s [[Urls]] slot is null, or its status attribute is anything
+         // other than "unloaded", return font face’s [[FontStatusPromise]] and abort these
+         // steps.
+diff --git a/components/script/dom/css/fontfaceset.rs b/components/script/dom/css/fontfaceset.rs
+index 36a0574ce55..b14b1a7477d 100644
+--- a/components/script/dom/css/fontfaceset.rs
++++ b/components/script/dom/css/fontfaceset.rs
+@@ -99,6 +99,20 @@ impl FontFaceSet {
+         }
+     }
+ 
++    /// Settle the promises of css-connected faces whose `@font-face` rules have finished
++    /// loading. Those faces are loaded by the `FontContext`, so nothing else tells them.
++    pub(crate) fn update_css_connected_face_statuses(&self, cx: &mut JSContext) {
++        let entries: Vec<DomRoot<FontFace>> = self
++            .set_entries
++            .borrow()
++            .iter()
++            .map(|face| face.as_rooted())
++            .collect();
++        for face in entries {
++            face.update_status_from_css_font_face_rule(cx);
++        }
++    }
++
+     /// Fulfill the font ready promise, returning true if it was not already fulfilled beforehand.
+     pub(crate) fn fulfill_ready_promise_if_needed(&self, cx: &mut JSContext) -> bool {
+         let promise = self.promise.borrow();
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index b0a3f874b5c..e0d2bc7903c 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -3463,6 +3463,7 @@ impl Document {
+         }
+ 
+         let fonts = self.Fonts(cx);
++        fonts.update_css_connected_face_statuses(cx);
+         if !fonts.waiting_to_fullfill_promise() {
+             return false;
+         }
+diff --git a/components/script/event_loop/script_thread.rs b/components/script/event_loop/script_thread.rs
+index 0519cea753e..fefb0b57d5a 100644
+--- a/components/script/event_loop/script_thread.rs
++++ b/components/script/event_loop/script_thread.rs
+@@ -1877,7 +1877,7 @@ impl ScriptThread {
+                 // so it attempts to resolve the document.fonts.ready promise. This happens as a result
+                 // of processing this message, so there's nothing more to do.
+                 if event == WebFontLoadEvent::LoadedSuccessfully {
+-                    self.handle_web_font_loaded(cx.no_gc(), pipeline_id)
++                    self.handle_web_font_loaded(cx, pipeline_id)
+                 }
+             },
+             ScriptThreadMessage::IFrameLoadFinished {
+@@ -3377,14 +3377,16 @@ impl ScriptThread {
+     }
+ 
+     /// Handles a Web font being loaded. Does nothing if the page no longer exists.
+-    fn handle_web_font_loaded(&self, no_gc: &NoGC, pipeline_id: PipelineId) {
++    fn handle_web_font_loaded(&self, cx: &mut JSContext, pipeline_id: PipelineId) {
+         let Some(document) = self.documents.borrow().find_document(pipeline_id) else {
+             warn!("Web font loaded in closed pipeline {}.", pipeline_id);
+             return;
+         };
+ 
+         // TODO: This should only dirty nodes that are waiting for a web font to finish loading!
+-        document.dirty_all_nodes(no_gc);
++        document.dirty_all_nodes(cx.no_gc());
++
++        document.Fonts(cx).update_css_connected_face_statuses(cx);
+ 
+         document
+             .window()
+diff --git a/components/shared/fonts/lib.rs b/components/shared/fonts/lib.rs
+index bce69cef6a3..b37348df2f0 100644
+--- a/components/shared/fonts/lib.rs
++++ b/components/shared/fonts/lib.rs
+@@ -10,7 +10,7 @@ mod font_template;
+ mod system_font_service_proxy;
+ 
+ use std::sync::Arc;
+-use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::{AtomicUsize, Ordering};
+ 
+ pub use font_descriptor::*;
+ pub use font_identifier::*;
+@@ -133,6 +133,30 @@ impl WebFontSetDifference {
+     }
+ }
+ 
++/// How far the font described by an `@font-face` rule has got towards being usable.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum WebFontLoadState {
++    /// The face has not started loading.
++    Unloaded,
++    /// The face is being fetched, or is waiting to be.
++    Loading,
++    /// The face has a usable [`FontTemplate`].
++    Loaded,
++    /// None of the sources of the face could be used.
++    Failed,
++}
++
++impl From<usize> for WebFontLoadState {
++    fn from(value: usize) -> Self {
++        match value {
++            0 => Self::Unloaded,
++            1 => Self::Loading,
++            2 => Self::Loaded,
++            _ => Self::Failed,
++        }
++    }
++}
++
+ #[derive(MallocSizeOf)]
+ pub struct FontFaceRuleInfo {
+     /// The index of this `@font-face` in the cascade, relative to all
+@@ -146,4 +170,30 @@ pub struct FontFaceRuleInfo {
+     /// to the set of live `@font-face` rules.
+     #[conditional_malloc_size_of]
+     pub rule: ServoArc<LockedFontFaceRule>,
++    /// The [`WebFontLoadState`] of this rule, shared with the `FontFace` object that
++    /// exposes it to script.
++    load_state: AtomicUsize,
++}
++
++impl FontFaceRuleInfo {
++    pub fn new(
++        cascade_index: usize,
++        descriptors: Descriptors,
++        rule: ServoArc<LockedFontFaceRule>,
++    ) -> Self {
++        Self {
++            cascade_index: AtomicUsize::new(cascade_index),
++            descriptors,
++            rule,
++            load_state: AtomicUsize::new(WebFontLoadState::Unloaded as usize),
++        }
++    }
++
++    pub fn load_state(&self) -> WebFontLoadState {
++        self.load_state.load(Ordering::SeqCst).into()
++    }
++
++    pub fn set_load_state(&self, state: WebFontLoadState) {
++        self.load_state.store(state as usize, Ordering::SeqCst);
++    }
+ }
+diff --git a/tests/wpt/meta/css/css-fonts/font-palette-add-2.html.ini b/tests/wpt/meta/css/css-fonts/font-palette-add-2.html.ini
+deleted file mode 100644
+index 2c1f6729797..00000000000
+--- a/tests/wpt/meta/css/css-fonts/font-palette-add-2.html.ini
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[font-palette-add-2.html]
+-  expected: TIMEOUT
+diff --git a/tests/wpt/meta/css/css-fonts/font-palette-add.html.ini b/tests/wpt/meta/css/css-fonts/font-palette-add.html.ini
+index b233f2d5a10..765859d4996 100644
+--- a/tests/wpt/meta/css/css-fonts/font-palette-add.html.ini
++++ b/tests/wpt/meta/css/css-fonts/font-palette-add.html.ini
+@@ -1,2 +1,2 @@
+ [font-palette-add.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/css/css-fonts/font-palette-modify-2.html.ini b/tests/wpt/meta/css/css-fonts/font-palette-modify-2.html.ini
+deleted file mode 100644
+index 7139fc2f566..00000000000
+--- a/tests/wpt/meta/css/css-fonts/font-palette-modify-2.html.ini
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[font-palette-modify-2.html]
+-  expected: TIMEOUT
+diff --git a/tests/wpt/meta/css/css-fonts/font-palette-modify.html.ini b/tests/wpt/meta/css/css-fonts/font-palette-modify.html.ini
+index 213a4d900b0..bae0422832b 100644
+--- a/tests/wpt/meta/css/css-fonts/font-palette-modify.html.ini
++++ b/tests/wpt/meta/css/css-fonts/font-palette-modify.html.ini
+@@ -1,2 +1,2 @@
+ [font-palette-modify.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/css/css-fonts/font-palette-remove-2.html.ini b/tests/wpt/meta/css/css-fonts/font-palette-remove-2.html.ini
+deleted file mode 100644
+index 326719fff31..00000000000
+--- a/tests/wpt/meta/css/css-fonts/font-palette-remove-2.html.ini
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[font-palette-remove-2.html]
+-  expected: TIMEOUT
+diff --git a/tests/wpt/meta/css/css-fonts/font-palette-remove.html.ini b/tests/wpt/meta/css/css-fonts/font-palette-remove.html.ini
+index cd98290602f..b2f3dffb082 100644
+--- a/tests/wpt/meta/css/css-fonts/font-palette-remove.html.ini
++++ b/tests/wpt/meta/css/css-fonts/font-palette-remove.html.ini
+@@ -1,2 +1,2 @@
+ [font-palette-remove.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/css/css-fonts/matching/font-unicode-PUA.html.ini b/tests/wpt/meta/css/css-fonts/matching/font-unicode-PUA.html.ini
+index d7f2f88d781..e187b9e3e56 100644
+--- a/tests/wpt/meta/css/css-fonts/matching/font-unicode-PUA.html.ini
++++ b/tests/wpt/meta/css/css-fonts/matching/font-unicode-PUA.html.ini
+@@ -1,10 +1,9 @@
+ [font-unicode-PUA.html]
+-  expected: TIMEOUT
+   [PUA character U+F000 is rendered with a non-generic font.]
+-    expected: NOTRUN
++    expected: FAIL
+ 
+   [PUA character U+F001 is rendered with a non-generic font.]
+-    expected: NOTRUN
++    expected: FAIL
+ 
+   [PUA character U+F002 is rendered with a non-generic font.]
+-    expected: NOTRUN
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-1.html.ini b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-1.html.ini
+index 4d5d80ff339..880a8be9f7d 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-1.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-1.html.ini
+@@ -1,2 +1,15 @@
+ [frac-1.html]
+-  expected: TIMEOUT
++  [Fraction axis is aligned on the math axis]
++    expected: FAIL
++
++  [Vertical positions of numerator and denominator]
++    expected: FAIL
++
++  [Horizontal alignments of numerator and denominator]
++    expected: FAIL
++
++  [Dimension of mfrac elements]
++    expected: FAIL
++
++  [Preferred width of mfrac elements]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-bar-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-bar-001.html.ini
+index 8e8ee83b46e..de55ad5aa44 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-bar-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-bar-001.html.ini
+@@ -1,2 +1,2 @@
+ [frac-bar-001.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-bar-002.html.ini b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-bar-002.html.ini
+index 98799c1a204..11b44665457 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-bar-002.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-bar-002.html.ini
+@@ -1,2 +1,2 @@
+ [frac-bar-002.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-linethickness-002.html.ini b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-linethickness-002.html.ini
+index f261a16b459..977329f1e4e 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-linethickness-002.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-linethickness-002.html.ini
+@@ -1,2 +1,18 @@
+ [frac-linethickness-002.html]
+-  expected: TIMEOUT
++  [Positive]
++    expected: FAIL
++
++  [Negative]
++    expected: FAIL
++
++  [Percentage]
++    expected: FAIL
++
++  [Named space]
++    expected: FAIL
++
++  [Calc() expression]
++    expected: FAIL
++
++  [Dynamic linethickness]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-1.html.ini b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-1.html.ini
+index 0f9aaad908f..612c0dbe8fe 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-1.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-1.html.ini
+@@ -1,2 +1,60 @@
+ [frac-parameters-1.html]
+-  expected: TIMEOUT
++  [AxisHeight]
++    expected: FAIL
++
++  [DenominatorDisplayStyleGapMin]
++    expected: FAIL
++
++  [DenominatorDisplayStyleShiftDown]
++    expected: FAIL
++
++  [DenominatorDisplayStyleGapMin Displaystyle]
++    expected: FAIL
++
++  [DenominatorDisplayStyleShiftDown Displaystyle]
++    expected: FAIL
++
++  [DenominatorDisplayStyleGapMin Displaystyle on fraction]
++    expected: FAIL
++
++  [DenominatorDisplayStyleShiftDown Displaystyle on fraction]
++    expected: FAIL
++
++  [DenominatorGapMin]
++    expected: FAIL
++
++  [DenominatorShiftDown]
++    expected: FAIL
++
++  [DenominatorGapMin Displaystyle on fraction]
++    expected: FAIL
++
++  [DenominatorShiftDown Displaystyle on fraction]
++    expected: FAIL
++
++  [NumeratorDisplayStyleGapMin]
++    expected: FAIL
++
++  [NumeratorDisplayStyleShiftDown]
++    expected: FAIL
++
++  [NumeratorDisplayStyleGapMin Displaystyle]
++    expected: FAIL
++
++  [NumeratorDisplayStyleShiftDown Displaystyle]
++    expected: FAIL
++
++  [NumeratorDisplayStyleGapMin Displaystyle on fraction]
++    expected: FAIL
++
++  [NumeratorDisplayStyleShiftDown Displaystyle on fraction]
++    expected: FAIL
++
++  [NumeratorGapMin]
++    expected: FAIL
++
++  [NumeratorShiftDown]
++    expected: FAIL
++
++  [FractionRuleThickness]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-2.html.ini b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-2.html.ini
+index bca0175f01a..bf90c6927a4 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-2.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-2.html.ini
+@@ -1,2 +1,39 @@
+ [frac-parameters-2.html]
+-  expected: TIMEOUT
++  [BottomDisplayStyleShiftDown]
++    expected: FAIL
++
++  [BottomDisplayStyleShiftDown Displaystyle]
++    expected: FAIL
++
++  [BottomDisplayStyleShiftDown Displaystyle om fraction]
++    expected: FAIL
++
++  [BottomShiftDown]
++    expected: FAIL
++
++  [DisplayStyleGapMin]
++    expected: FAIL
++
++  [DisplayStyleGapMin Dsiplaystyle]
++    expected: FAIL
++
++  [DisplayStyleGapMin Dsiplaystyle on fraction]
++    expected: FAIL
++
++  [GapMin]
++    expected: FAIL
++
++  [TopDisplayStyleShiftUp]
++    expected: FAIL
++
++  [TopDisplayStyleShiftUp Displaystyle]
++    expected: FAIL
++
++  [TopDisplayStyleShiftUp Displaystyle on fraction]
++    expected: FAIL
++
++  [ToShiftUp]
++    expected: FAIL
++
++  [ToShiftUp with Displaystyle on fraction]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-3.html.ini b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-3.html.ini
+index 4ac545fd96b..605c7af3b82 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-3.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-3.html.ini
+@@ -1,2 +1,12 @@
+ [frac-parameters-3.html]
+-  expected: TIMEOUT
++  [nonzero linethickness, displaystyle=false]
++    expected: FAIL
++
++  [nonzero linethickness, displaystyle=true]
++    expected: FAIL
++
++  [linethickness=0, displaystyle=false]
++    expected: FAIL
++
++  [linethickness=0, displaystyle=true]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-001.html.ini
+index b3db94d9f5c..a2f4f38fa3d 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-001.html.ini
+@@ -1,2 +1,2 @@
+ [frac-parameters-gap-001.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-002.html.ini b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-002.html.ini
+index d025e1a0e6b..c48a36a536f 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-002.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-002.html.ini
+@@ -1,2 +1,2 @@
+ [frac-parameters-gap-002.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-003.html.ini b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-003.html.ini
+index 1f1be30c3dc..40edf6ec1cb 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-003.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-003.html.ini
+@@ -1,2 +1,2 @@
+ [frac-parameters-gap-003.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-004.html.ini b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-004.html.ini
+index 7a0672fdf64..843a1fda0bc 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-004.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-004.html.ini
+@@ -1,2 +1,2 @@
+ [frac-parameters-gap-004.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-005.html.ini b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-005.html.ini
+index 8d6f246bc57..944f8487f5b 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-005.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-005.html.ini
+@@ -1,2 +1,2 @@
+ [frac-parameters-gap-005.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-006.html.ini b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-006.html.ini
+index 041244633c0..a66a48b581c 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-006.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/fractions/frac-parameters-gap-006.html.ini
+@@ -1,2 +1,2 @@
+ [frac-parameters-gap-006.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/mrow/inferred-mrow-stretchy.html.ini b/tests/wpt/meta/mathml/presentation-markup/mrow/inferred-mrow-stretchy.html.ini
+index 364180ab8bf..42ae9ab3095 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/mrow/inferred-mrow-stretchy.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/mrow/inferred-mrow-stretchy.html.ini
+@@ -1,2 +1,42 @@
+ [inferred-mrow-stretchy.html]
+-  expected: TIMEOUT
++  [operator stretching inside Mrow]
++    expected: FAIL
++
++  [operator stretching inside Sqrt]
++    expected: FAIL
++
++  [operator stretching inside Style]
++    expected: FAIL
++
++  [operator stretching inside Error]
++    expected: FAIL
++
++  [operator stretching inside Phantom]
++    expected: FAIL
++
++  [operator stretching inside Math]
++    expected: FAIL
++
++  [operator stretching inside Menclose]
++    expected: FAIL
++
++  [operator stretching inside Mpadded]
++    expected: FAIL
++
++  [operator stretching inside Unknown]
++    expected: FAIL
++
++  [operator stretching inside Mtd]
++    expected: FAIL
++
++  [operator stretching inside None]
++    expected: FAIL
++
++  [operator stretching inside Mprescripts]
++    expected: FAIL
++
++  [operator stretching inside Mfenced]
++    expected: FAIL
++
++  [operator stretching inside A]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/mrow/no-spacing.html.ini b/tests/wpt/meta/mathml/presentation-markup/mrow/no-spacing.html.ini
+index ea720f249d3..29bafedf0ac 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/mrow/no-spacing.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/mrow/no-spacing.html.ini
+@@ -1,2 +1,162 @@
+ [no-spacing.html]
+-  expected: TIMEOUT
++  [Spacing inside an <mfrac> child of <math>.]
++    expected: FAIL
++
++  [Spacing around an <mfrac> child of an <math>.]
++    expected: FAIL
++
++  [Spacing inside an <mfrac> child of <mrow>.]
++    expected: FAIL
++
++  [Spacing around an <mfrac> child of an <mrow>.]
++    expected: FAIL
++
++  [Spacing inside an <mfrac> child of <mtd>.]
++    expected: FAIL
++
++  [Spacing around an <mfrac> child of an <mtd>.]
++    expected: FAIL
++
++  [Spacing inside an <msub> child of <math>.]
++    expected: FAIL
++
++  [Spacing around an <msub> child of an <math>.]
++    expected: FAIL
++
++  [Spacing inside an <msub> child of <mrow>.]
++    expected: FAIL
++
++  [Spacing around an <msub> child of an <mrow>.]
++    expected: FAIL
++
++  [Spacing inside an <msub> child of <mtd>.]
++    expected: FAIL
++
++  [Spacing around an <msub> child of an <mtd>.]
++    expected: FAIL
++
++  [Spacing inside an <msup> child of <math>.]
++    expected: FAIL
++
++  [Spacing around an <msup> child of an <math>.]
++    expected: FAIL
++
++  [Spacing inside an <msup> child of <mrow>.]
++    expected: FAIL
++
++  [Spacing around an <msup> child of an <mrow>.]
++    expected: FAIL
++
++  [Spacing inside an <msup> child of <mtd>.]
++    expected: FAIL
++
++  [Spacing around an <msup> child of an <mtd>.]
++    expected: FAIL
++
++  [Spacing inside an <msubsup> child of <math>.]
++    expected: FAIL
++
++  [Spacing around an <msubsup> child of an <math>.]
++    expected: FAIL
++
++  [Spacing inside an <msubsup> child of <mrow>.]
++    expected: FAIL
++
++  [Spacing around an <msubsup> child of an <mrow>.]
++    expected: FAIL
++
++  [Spacing inside an <msubsup> child of <mtd>.]
++    expected: FAIL
++
++  [Spacing around an <msubsup> child of an <mtd>.]
++    expected: FAIL
++
++  [Spacing inside an <mmultiscripts> child of <math>.]
++    expected: FAIL
++
++  [Spacing around an <mmultiscripts> child of an <math>.]
++    expected: FAIL
++
++  [Spacing inside an <mmultiscripts> child of <mrow>.]
++    expected: FAIL
++
++  [Spacing around an <mmultiscripts> child of an <mrow>.]
++    expected: FAIL
++
++  [Spacing inside an <mmultiscripts> child of <mtd>.]
++    expected: FAIL
++
++  [Spacing around an <mmultiscripts> child of an <mtd>.]
++    expected: FAIL
++
++  [Spacing inside an <munder> child of <math>.]
++    expected: FAIL
++
++  [Spacing around an <munder> child of an <math>.]
++    expected: FAIL
++
++  [Spacing inside an <munder> child of <mrow>.]
++    expected: FAIL
++
++  [Spacing around an <munder> child of an <mrow>.]
++    expected: FAIL
++
++  [Spacing inside an <munder> child of <mtd>.]
++    expected: FAIL
++
++  [Spacing around an <munder> child of an <mtd>.]
++    expected: FAIL
++
++  [Spacing inside an <mover> child of <math>.]
++    expected: FAIL
++
++  [Spacing around an <mover> child of an <math>.]
++    expected: FAIL
++
++  [Spacing inside an <mover> child of <mrow>.]
++    expected: FAIL
++
++  [Spacing around an <mover> child of an <mrow>.]
++    expected: FAIL
++
++  [Spacing inside an <mover> child of <mtd>.]
++    expected: FAIL
++
++  [Spacing around an <mover> child of an <mtd>.]
++    expected: FAIL
++
++  [Spacing inside an <munderover> child of <math>.]
++    expected: FAIL
++
++  [Spacing around an <munderover> child of an <math>.]
++    expected: FAIL
++
++  [Spacing inside an <munderover> child of <mrow>.]
++    expected: FAIL
++
++  [Spacing around an <munderover> child of an <mrow>.]
++    expected: FAIL
++
++  [Spacing inside an <munderover> child of <mtd>.]
++    expected: FAIL
++
++  [Spacing around an <munderover> child of an <mtd>.]
++    expected: FAIL
++
++  [Spacing inside an <mroot> child of <math>.]
++    expected: FAIL
++
++  [Spacing around an <mroot> child of an <math>.]
++    expected: FAIL
++
++  [Spacing inside an <mroot> child of <mrow>.]
++    expected: FAIL
++
++  [Spacing around an <mroot> child of an <mrow>.]
++    expected: FAIL
++
++  [Spacing inside an <mroot> child of <mtd>.]
++    expected: FAIL
++
++  [Spacing around an <mroot> child of an <mtd>.]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/mrow/spacing-002.html.ini b/tests/wpt/meta/mathml/presentation-markup/mrow/spacing-002.html.ini
+index 138eec751af..6a5649cd8f8 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/mrow/spacing-002.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/mrow/spacing-002.html.ini
+@@ -1,13 +1,12 @@
+ [spacing-002.html]
+-  expected: TIMEOUT
+   [Spacing properly set for <mo> with a previous sibling and a next sibling..]
+-    expected: NOTRUN
++    expected: FAIL
+ 
+   [Spacing properly set for <mo> with only a next sibling.]
+-    expected: NOTRUN
++    expected: FAIL
+ 
+   [Spacing properly set for <mo> with only a previous sibling.]
+-    expected: NOTRUN
++    expected: FAIL
+ 
+   [Spacing properly set for <mo> with no previous/next siblings (aka embellished operator).]
+-    expected: NOTRUN
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/mrow/stretch-along-block-axis-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/mrow/stretch-along-block-axis-001.html.ini
+index c0ca07bd1ea..ceecce471f6 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/mrow/stretch-along-block-axis-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/mrow/stretch-along-block-axis-001.html.ini
+@@ -1,2 +1,15 @@
+ [stretch-along-block-axis-001.html]
+-  expected: TIMEOUT
++  [Taking into account stretch axis.]
++    expected: FAIL
++
++  [Taking into account stretchy property.]
++    expected: FAIL
++
++  [Only operators with a stretchy property and block stretch axis.]
++    expected: FAIL
++
++  [Operators smaller and larger than non-stretchy siblings.]
++    expected: FAIL
++
++  [Embellished operators]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/character-level-mirroring.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/character-level-mirroring.html.ini
+index 08f0d794722..139f8f615cb 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/character-level-mirroring.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/character-level-mirroring.html.ini
+@@ -1,2 +1,9 @@
+ [character-level-mirroring.html]
+-  expected: TIMEOUT
++  [Base glyph (0.5em)]
++    expected: FAIL
++
++  [Size variant (1em)]
++    expected: FAIL
++
++  [Glyph assembly (4em)]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/display-operator-min-height-no-workaround.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/display-operator-min-height-no-workaround.html.ini
+index 2e81d5cf706..3b0a51cdf16 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/display-operator-min-height-no-workaround.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/display-operator-min-height-no-workaround.html.ini
+@@ -1,4 +1,3 @@
+ [display-operator-min-height-no-workaround.html]
+-  expected: TIMEOUT
+   [DisplayOperatorMinHeight is not modified]
+-    expected: NOTRUN
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/embellished-operator-004.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/embellished-operator-004.html.ini
+index 41d6f20f963..d4f39057432 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/embellished-operator-004.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/embellished-operator-004.html.ini
+@@ -1,2 +1,2 @@
+ [embellished-operator-004.html]
+-  expected: TIMEOUT
++  expected: ERROR
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/embellished-operator-dynamic-002.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/embellished-operator-dynamic-002.html.ini
+index 1e457e1097a..d0935b9cecd 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/embellished-operator-dynamic-002.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/embellished-operator-dynamic-002.html.ini
+@@ -1,2 +1,24 @@
+ [embellished-operator-dynamic-002.html]
+-  expected: TIMEOUT
++  [container1: Initially an embellished operator]
++    expected: FAIL
++
++  [container2: Initially not an embellished operator]
++    expected: FAIL
++
++  [ container1: No longer an embellished operator]
++    expected: FAIL
++
++  [container2: Became an embellished operator]
++    expected: FAIL
++
++  [container3: Initially an embellished operator (testing space-like)]
++    expected: FAIL
++
++  [container4/space-like: Initially not an embellished operator (testing space-like)]
++    expected: FAIL
++
++  [ container3: No longer an embellished operator (testing space-like)]
++    expected: FAIL
++
++  [container4: Became an embellished operator (testing space-like)]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/largeop-hit-testing.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/largeop-hit-testing.html.ini
+index 23ed39fd1fa..572fc6d6203 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/largeop-hit-testing.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/largeop-hit-testing.html.ini
+@@ -1,2 +1,3 @@
+ [largeop-hit-testing.html]
+-  expected: TIMEOUT
++  [Large op hit testing]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/mo-axis-height-1.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/mo-axis-height-1.html.ini
+index bc13ffe9610..b74b6e06bc6 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/mo-axis-height-1.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/mo-axis-height-1.html.ini
+@@ -1,2 +1,27 @@
+ [mo-axis-height-1.html]
+-  expected: TIMEOUT
++  [symmetric stretching with respect to the math axis (size variant)]
++    expected: FAIL
++
++  [symmetric stretching with respect to the math axis (glyph assembly)]
++    expected: FAIL
++
++  [Tascent = Tdescent = 0, minsize = 14em]
++    expected: FAIL
++
++  [Tascent = 6em > AxisHeight, Tdescent = 1em, symmetric = false, minsize = 14em]
++    expected: FAIL
++
++  [Tascent = 4em < AxisHeight, Tdescent = 3em, symmetric = false, minsize = 14em]
++    expected: FAIL
++
++  [Tascent = 6em > AxisHeight, Tdescent = 22em, symmetric = false, maxsize = 14em]
++    expected: FAIL
++
++  [Tascent = 4em < AxisHeight, Tdescent = 24em, symmetric = false, maxsize = 14em]
++    expected: FAIL
++
++  [symmetric stretching with respect to the math axis (minsize = 14em)]
++    expected: FAIL
++
++  [symmetric stretching with respect to the math axis (maxsize = 14em)]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/mo-fallback-font.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/mo-fallback-font.html.ini
+index d6753a6da74..bc018649c55 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/mo-fallback-font.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/mo-fallback-font.html.ini
+@@ -1,2 +1,2 @@
+ [mo-fallback-font.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/mo-font-relative-lengths-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/mo-font-relative-lengths-001.html.ini
+index aec34a45a4e..4a8bdf3a667 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/mo-font-relative-lengths-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/mo-font-relative-lengths-001.html.ini
+@@ -1,2 +1,12 @@
+ [mo-font-relative-lengths-001.html]
+-  expected: TIMEOUT
++  [font-relative lspace refers to the core operator]
++    expected: FAIL
++
++  [font-relative rspace refers to the core operator]
++    expected: FAIL
++
++  [font-relative minsize refers to the core operator]
++    expected: FAIL
++
++  [font-relative maxsize refers to the core operator]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/mo-lspace-rspace-5.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/mo-lspace-rspace-5.html.ini
+index 2f030565362..f17da2399f5 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/mo-lspace-rspace-5.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/mo-lspace-rspace-5.html.ini
+@@ -1,2 +1,2 @@
+ [mo-lspace-rspace-5.html]
+-  expected: TIMEOUT
++  expected: ERROR
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/mo-minsize-maxsize-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/mo-minsize-maxsize-001.html.ini
+index 86a69e58795..60933dc9368 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/mo-minsize-maxsize-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/mo-minsize-maxsize-001.html.ini
+@@ -1,2 +1,15 @@
+ [mo-minsize-maxsize-001.html]
+-  expected: TIMEOUT
++  [minsize < 0 is treated as 0]
++    expected: FAIL
++
++  [maxsize < minsize is treated as maxsize = minsize]
++    expected: FAIL
++
++  [target size = 0 is treated as Tascent = Tdescent = minsize/2]
++    expected: FAIL
++
++  [minsize/maxsize percentages are relative to the unstretched size]
++    expected: FAIL
++
++  [default minsize/maxsize values]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/mo-no-vertical-adjustment-for-basic-binary-operators.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/mo-no-vertical-adjustment-for-basic-binary-operators.html.ini
+deleted file mode 100644
+index 0b52e7de4b9..00000000000
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/mo-no-vertical-adjustment-for-basic-binary-operators.html.ini
++++ /dev/null
+@@ -1,4 +0,0 @@
+-[mo-no-vertical-adjustment-for-basic-binary-operators.html]
+-  expected: TIMEOUT
+-  [Vertical alignment of basic binary operators is not adjusted.]
+-    expected: TIMEOUT
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/mo-stretch-properties-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/mo-stretch-properties-001.html.ini
+index 4ce27e061b2..aee27ab9361 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/mo-stretch-properties-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/mo-stretch-properties-001.html.ini
+@@ -1,2 +1,3 @@
+ [mo-stretch-properties-001.html]
+-  expected: TIMEOUT
++  [Stretchy vertical line]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/mo-stretch-properties-dynamic-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/mo-stretch-properties-dynamic-001.html.ini
+index 5c2362863c9..badea51f5b1 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/mo-stretch-properties-dynamic-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/mo-stretch-properties-dynamic-001.html.ini
+@@ -1,2 +1,15 @@
+ [mo-stretch-properties-dynamic-001.html]
+-  expected: TIMEOUT
++  [minsize]
++    expected: FAIL
++
++  [maxsize]
++    expected: FAIL
++
++  [largeop]
++    expected: FAIL
++
++  [symmetric]
++    expected: FAIL
++
++  [stretchy]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-001.html.ini
+index 19b41d5eb4b..c0db18ccad4 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-001.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-largeop-001.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - largeop]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-002.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-002.html.ini
+index 14c7e24093d..1fe58fac9ec 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-002.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-002.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-largeop-002.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - largeop]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-003.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-003.html.ini
+index ad5e9b3d028..f1c605228de 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-003.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-003.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-largeop-003.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - largeop]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-004.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-004.html.ini
+index e2cbc6a6461..38a2480f99e 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-004.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-004.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-largeop-004.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - largeop]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-005.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-005.html.ini
+index daa19f955db..b15ec1cae5c 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-005.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-005.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-largeop-005.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - largeop]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-006.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-006.html.ini
+index 3ab547f43e1..ef3405b8c0e 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-006.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-largeop-006.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-largeop-006.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - largeop]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - largeop]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-001.html.ini
+index 79235a7760b..b567951df06 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-001.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-movablelimits-001.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - movablelimits]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-002.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-002.html.ini
+index 538f51519e9..bae1783ec9e 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-002.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-002.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-movablelimits-002.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - movablelimits]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-003.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-003.html.ini
+index 46238953a7e..82cd339cda0 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-003.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-003.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-movablelimits-003.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - movablelimits]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-004.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-004.html.ini
+index e408b06e93f..12e2154071c 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-004.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-004.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-movablelimits-004.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - movablelimits]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-005.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-005.html.ini
+index 04bf727114c..2f7d44a5073 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-005.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-005.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-movablelimits-005.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - movablelimits]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-006.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-006.html.ini
+index fa14c22288b..6868eb9a561 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-006.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-movablelimits-006.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-movablelimits-006.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - movablelimits]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - movablelimits]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-multi-char.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-multi-char.html.ini
+deleted file mode 100644
+index a54512cfb67..00000000000
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-multi-char.html.ini
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[operator-dictionary-multi-char.html]
+-  expected: TIMEOUT
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-001.html.ini
+deleted file mode 100644
+index bd930697420..00000000000
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-001.html.ini
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[operator-dictionary-spacing-001.html]
+-  expected: TIMEOUT
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-002.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-002.html.ini
+deleted file mode 100644
+index dbe0351d511..00000000000
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-002.html.ini
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[operator-dictionary-spacing-002.html]
+-  expected: TIMEOUT
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-003.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-003.html.ini
+deleted file mode 100644
+index 8b2bb03164b..00000000000
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-003.html.ini
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[operator-dictionary-spacing-003.html]
+-  expected: TIMEOUT
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-004.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-004.html.ini
+deleted file mode 100644
+index 98e89e74ab9..00000000000
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-004.html.ini
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[operator-dictionary-spacing-004.html]
+-  expected: TIMEOUT
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-005.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-005.html.ini
+deleted file mode 100644
+index 58e5df52aa4..00000000000
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-005.html.ini
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[operator-dictionary-spacing-005.html]
+-  expected: TIMEOUT
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-006.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-006.html.ini
+index 8b482998133..11de9335d0f 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-006.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-spacing-006.html.ini
+@@ -1,2 +1,3 @@
+ [operator-dictionary-spacing-006.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - lspace/rspace]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-001.html.ini
+index 75e09df6dbd..267469d6966 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-001.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-stretchy-001.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - stretchy]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-002.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-002.html.ini
+index dfa2f6841d1..651e3b10715 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-002.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-002.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-stretchy-002.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - stretchy]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-003.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-003.html.ini
+index c79095a8dde..50d372831b8 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-003.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-003.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-stretchy-003.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - stretchy]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-004.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-004.html.ini
+index 61c3df6db94..8a190d7d678 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-004.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-004.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-stretchy-004.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - stretchy]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-005.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-005.html.ini
+index 963e5cac55f..c987fb0c8bf 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-005.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-005.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-stretchy-005.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - stretchy]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-006.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-006.html.ini
+index b9d023ff16b..34f0324dd69 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-006.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-stretchy-006.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-stretchy-006.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - stretchy]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - stretchy]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-001.html.ini
+index 8374fd5eb01..2fa7558e23c 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-001.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-symmetric-001.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - symmetric]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-002.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-002.html.ini
+index d9cf618dc17..bb3ff997ed6 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-002.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-002.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-symmetric-002.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - symmetric]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-003.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-003.html.ini
+index c411f9f3b93..8660336440c 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-003.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-003.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-symmetric-003.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - symmetric]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-004.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-004.html.ini
+index 5a3cb16dfb1..10952dc6a67 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-004.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-004.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-symmetric-004.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - symmetric]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-005.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-005.html.ini
+index d7f60c45500..698ecba7047 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-005.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-005.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-symmetric-005.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - symmetric]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-006.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-006.html.ini
+index 5a483c93082..7b0331c8b1f 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-006.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/operator-dictionary-symmetric-006.html.ini
+@@ -1,2 +1,12 @@
+ [operator-dictionary-symmetric-006.html]
+-  expected: TIMEOUT
++  [Operator dictionary chunk 1 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 2 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 3 - symmetric]
++    expected: FAIL
++
++  [Operator dictionary chunk 4 - symmetric]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/painting-stretchy-operator-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/painting-stretchy-operator-001.html.ini
+index a22a2275371..d99fe8b5857 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/painting-stretchy-operator-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/painting-stretchy-operator-001.html.ini
+@@ -1,2 +1,2 @@
+ [painting-stretchy-operator-001.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/painting-stretchy-operator-002.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/painting-stretchy-operator-002.html.ini
+index 43dc4a4f578..8b3ad0ec605 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/painting-stretchy-operator-002.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/painting-stretchy-operator-002.html.ini
+@@ -1,2 +1,2 @@
+ [painting-stretchy-operator-002.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/operators/symmetric-largeop.html.ini b/tests/wpt/meta/mathml/presentation-markup/operators/symmetric-largeop.html.ini
+index dee45db7640..76baa756e65 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/operators/symmetric-largeop.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/operators/symmetric-largeop.html.ini
+@@ -1,2 +1,3 @@
+ [symmetric-largeop.html]
+-  expected: TIMEOUT
++  [Placement of operators]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/radicals/dynamic-radical-paint-invalidation-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/radicals/dynamic-radical-paint-invalidation-001.html.ini
+index 563d28b4df5..3ad6c67e37c 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/radicals/dynamic-radical-paint-invalidation-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/radicals/dynamic-radical-paint-invalidation-001.html.ini
+@@ -1,2 +1,2 @@
+ [dynamic-radical-paint-invalidation-001.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/radicals/glyph-level-mirroring.html.ini b/tests/wpt/meta/mathml/presentation-markup/radicals/glyph-level-mirroring.html.ini
+index 1dcf3ff41bb..1e17efe6f75 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/radicals/glyph-level-mirroring.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/radicals/glyph-level-mirroring.html.ini
+@@ -1,2 +1,6 @@
+ [glyph-level-mirroring.html]
+-  expected: TIMEOUT
++  [LTR Direction]
++    expected: FAIL
++
++  [RTL Direction]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/radicals/root-parameters-1.html.ini b/tests/wpt/meta/mathml/presentation-markup/radicals/root-parameters-1.html.ini
+index 99b9f09ece7..d048787663f 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/radicals/root-parameters-1.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/radicals/root-parameters-1.html.ini
+@@ -1,2 +1,21 @@
+ [root-parameters-1.html]
+-  expected: TIMEOUT
++  [RadicalDegreeBottomRaisePercent]
++    expected: FAIL
++
++  [RadicalDisplayStyleVerticalGap]
++    expected: FAIL
++
++  [RadicalExtraAscender]
++    expected: FAIL
++
++  [RadicalKernAfterDegree]
++    expected: FAIL
++
++  [RadicalKernBeforeDegree]
++    expected: FAIL
++
++  [RadicalRuleThickness]
++    expected: FAIL
++
++  [RadicalVerticalGap]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/radicals/root-parameters-2.html.ini b/tests/wpt/meta/mathml/presentation-markup/radicals/root-parameters-2.html.ini
+index 2600df7d62f..d82a30c0d8f 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/radicals/root-parameters-2.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/radicals/root-parameters-2.html.ini
+@@ -1,2 +1,6 @@
+ [root-parameters-2.html]
+-  expected: TIMEOUT
++  [RadicalKernBeforeDegree = -1em < 0]
++    expected: FAIL
++
++  [RadicalKernBeforeAfterDegree = -5em < -3em = -degree's inline size]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/cramped-001.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/cramped-001.html.ini
+index 1cf4e6842ba..d1d3e92ab3f 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/cramped-001.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/cramped-001.html.ini
+@@ -1,2 +1,45 @@
+ [cramped-001.html]
+-  expected: TIMEOUT
++  [child of non-cramped element]
++    expected: FAIL
++
++  [child of cramped element]
++    expected: FAIL
++
++  [child of msqrt]
++    expected: FAIL
++
++  [child of mroot]
++    expected: FAIL
++
++  [child of mfrac]
++    expected: FAIL
++
++  [child of msub]
++    expected: FAIL
++
++  [child of msup]
++    expected: FAIL
++
++  [child of msubsup]
++    expected: FAIL
++
++  [child of munder]
++    expected: FAIL
++
++  [child of mover (non-accent overscript)]
++    expected: FAIL
++
++  [child of munderover (non-accent overscript)]
++    expected: FAIL
++
++  [accent child of mover (accent overscript)]
++    expected: FAIL
++
++  [accent child of munderover (accent overscript)]
++    expected: FAIL
++
++  [mmultiscripts]
++    expected: FAIL
++
++  [element with specified CSS math-shift]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-1.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-1.html.ini
+index fed2b089541..14478585be7 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-1.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-1.html.ini
+@@ -1,2 +1,15 @@
+ [subsup-1.html]
+-  expected: TIMEOUT
++  [Respective horizontal positions]
++    expected: FAIL
++
++  [Alignment of the base on the baseline]
++    expected: FAIL
++
++  [Vertical position of scripts]
++    expected: FAIL
++
++  [Width of scripted elements]
++    expected: FAIL
++
++  [Height of scripted elements]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-2.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-2.html.ini
+index 556e6dcf62c..6a2f5183479 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-2.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-2.html.ini
+@@ -1,2 +1,15 @@
+ [subsup-2.html]
+-  expected: TIMEOUT
++  [Respective horizontal positions]
++    expected: FAIL
++
++  [Alignment of the base on the baseline]
++    expected: FAIL
++
++  [Vertical position of scripts]
++    expected: FAIL
++
++  [Width of scripted elements]
++    expected: FAIL
++
++  [Height of scripted elements]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-3.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-3.html.ini
+index 1b0bd4985b7..0921bb0c75d 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-3.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-3.html.ini
+@@ -1,2 +1,15 @@
+ [subsup-3.html]
+-  expected: TIMEOUT
++  [Alignment of the base on the baseline]
++    expected: FAIL
++
++  [Dimensions of the scripted elements]
++    expected: FAIL
++
++  [Vertical positions of scripts]
++    expected: FAIL
++
++  [Horizontal alignment of scripts]
++    expected: FAIL
++
++  [Horizontal positions of scripts]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-6-rtl.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-6-rtl.html.ini
+index 454abd1ae21..a1a0cff6b7f 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-6-rtl.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-6-rtl.html.ini
+@@ -1,2 +1,15 @@
+ [subsup-6-rtl.html]
+-  expected: TIMEOUT
++  [mprescripts RTL coordinates and sizes (rtl 2 postscripts)]
++    expected: FAIL
++
++  [mprescripts RTL coordinates and sizes (rtl 2 prescripts)]
++    expected: FAIL
++
++  [mprescripts RTL coordinates and sizes (rtl 2 prescripts, 4 postscripts)]
++    expected: FAIL
++
++  [mprescripts RTL coordinates and sizes (rtl 4 prescripts, 2 postscripts)]
++    expected: FAIL
++
++  [mprescripts RTL coordinates and sizes (rtl prescripts with padding/border/margin)]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-6.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-6.html.ini
+index cec10939427..4525741dea2 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-6.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-6.html.ini
+@@ -1,2 +1,15 @@
+ [subsup-6.html]
+-  expected: TIMEOUT
++  [mprescripts coordinates and sizes (2 postscripts)]
++    expected: FAIL
++
++  [mprescripts coordinates and sizes (2 prescripts)]
++    expected: FAIL
++
++  [mprescripts coordinates and sizes (2 prescripts, 4 postscripts)]
++    expected: FAIL
++
++  [mprescripts coordinates and sizes (4 prescripts, 2 postscripts)]
++    expected: FAIL
++
++  [mprescripts coordinates and sizes (prescripts with padding/border/margin)]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-parameters-1.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-parameters-1.html.ini
+index 4fd32ec113e..679ba2f24b3 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-parameters-1.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-parameters-1.html.ini
+@@ -1,2 +1,30 @@
+ [subsup-parameters-1.html]
+-  expected: TIMEOUT
++  [SpaceAfterScript]
++    expected: FAIL
++
++  [SuperscriptShiftUp]
++    expected: FAIL
++
++  [SuperscriptShiftUpCramped]
++    expected: FAIL
++
++  [SubscriptShiftDown]
++    expected: FAIL
++
++  [SubSuperscriptGapMin]
++    expected: FAIL
++
++  [SuperscriptBottomMaxWithSubscript]
++    expected: FAIL
++
++  [SubscriptTopMax]
++    expected: FAIL
++
++  [SuperscriptBottomMin]
++    expected: FAIL
++
++  [SubscriptBaselineDrop]
++    expected: FAIL
++
++  [SuperscriptBaselineDrop]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-parameters-2.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-parameters-2.html.ini
+index e5574780d8e..39085e85e5a 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-parameters-2.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/subsup-parameters-2.html.ini
+@@ -1,2 +1,9 @@
+ [subsup-parameters-2.html]
+-  expected: TIMEOUT
++  [Null Italic Correction]
++    expected: FAIL
++
++  [NonNull Italic Correction (MathGlyphVariantRecord)]
++    expected: FAIL
++
++  [NonNull Italic Correction (GlyphAssembly)]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-1.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-1.html.ini
+index 335da005a33..3342c320a98 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-1.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-1.html.ini
+@@ -1,2 +1,15 @@
+ [underover-1.html]
+-  expected: TIMEOUT
++  [Alignment of the base on the baseline]
++    expected: FAIL
++
++  [Horizontal alignments of base and scripts]
++    expected: FAIL
++
++  [Relative vertical positions of base and scripts]
++    expected: FAIL
++
++  [Width of scripted elements]
++    expected: FAIL
++
++  [Height of scripted elements]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-1.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-1.html.ini
+index d13a5f126d1..cb1b9ed7d4a 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-1.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-1.html.ini
+@@ -1,2 +1,12 @@
+ [underover-parameters-1.html]
+-  expected: TIMEOUT
++  [LowerLimitBaselineDropMin]
++    expected: FAIL
++
++  [LowerLimitGapMin]
++    expected: FAIL
++
++  [UpperLimitBaselineRiseMin]
++    expected: FAIL
++
++  [UpperLimitGapMin]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-2.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-2.html.ini
+index d24185195d5..4afcf0d8a05 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-2.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-2.html.ini
+@@ -1,2 +1,12 @@
+ [underover-parameters-2.html]
+-  expected: TIMEOUT
++  [StretchStackBottomShiftDown]
++    expected: FAIL
++
++  [StretchStackGapBelowMin]
++    expected: FAIL
++
++  [StretchStackTopShiftUp]
++    expected: FAIL
++
++  [StretchStackGapAboveMin]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-3.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-3.html.ini
+index c46f20f6c1d..dc5d8259c33 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-3.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-3.html.ini
+@@ -1,2 +1,24 @@
+ [underover-parameters-3.html]
+-  expected: TIMEOUT
++  [Baseline alignment]
++    expected: FAIL
++
++  [Heights of bases]
++    expected: FAIL
++
++  [AccentBaseHeight, UnderbarExtraDescender]
++    expected: FAIL
++
++  [AccentBaseHeight, UnderbarVerticalGap]
++    expected: FAIL
++
++  [AccentBaseHeight, OverbarExtraAscender]
++    expected: FAIL
++
++  [AccentBaseHeight, OverbarVerticalGap]
++    expected: FAIL
++
++  [Dynamic change of accentunder attribute]
++    expected: FAIL
++
++  [Dynamic change of accent attribute]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-4.tentative.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-4.tentative.html.ini
+index be7dc1f6052..a140a2c9940 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-4.tentative.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-4.tentative.html.ini
+@@ -1,2 +1,18 @@
+ [underover-parameters-4.tentative.html]
+-  expected: TIMEOUT
++  [Baseline alignment]
++    expected: FAIL
++
++  [Heights of bases]
++    expected: FAIL
++
++  [AccentBaseHeight, UnderbarExtraDescender]
++    expected: FAIL
++
++  [AccentBaseHeight, UnderbarVerticalGap]
++    expected: FAIL
++
++  [AccentBaseHeight, OverbarExtraAscender]
++    expected: FAIL
++
++  [AccentBaseHeight, OverbarVerticalGap]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-and-embellished-operator-1.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-and-embellished-operator-1.html.ini
+index 25d7778b379..8a9815a2011 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-and-embellished-operator-1.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-and-embellished-operator-1.html.ini
+@@ -1,2 +1,12 @@
+ [underover-parameters-and-embellished-operator-1.html]
+-  expected: TIMEOUT
++  [LowerLimitBaselineDropMin]
++    expected: FAIL
++
++  [LowerLimitGapMin]
++    expected: FAIL
++
++  [UpperLimitBaselineRiseMin]
++    expected: FAIL
++
++  [UpperLimitGapMin]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-and-embellished-operator-2.html.ini b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-and-embellished-operator-2.html.ini
+index 33b074070ea..aedfb75058a 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-and-embellished-operator-2.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/scripts/underover-parameters-and-embellished-operator-2.html.ini
+@@ -1,2 +1,12 @@
+ [underover-parameters-and-embellished-operator-2.html]
+-  expected: TIMEOUT
++  [StretchStackBottomShiftDown]
++    expected: FAIL
++
++  [StretchStackGapBelowMin]
++    expected: FAIL
++
++  [StretchStackTopShiftUp]
++    expected: FAIL
++
++  [StretchStackGapAboveMin]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/presentation-markup/tables/table-axis-height.html.ini b/tests/wpt/meta/mathml/presentation-markup/tables/table-axis-height.html.ini
+index 2f6074f91a6..a2902425ae4 100644
+--- a/tests/wpt/meta/mathml/presentation-markup/tables/table-axis-height.html.ini
++++ b/tests/wpt/meta/mathml/presentation-markup/tables/table-axis-height.html.ini
+@@ -1,2 +1,3 @@
+ [table-axis-height.html]
+-  expected: TIMEOUT
++  [AxisHeight]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/color-005.html.ini b/tests/wpt/meta/mathml/relations/css-styling/color-005.html.ini
+index 3b44aa6723e..22a4a885b40 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/color-005.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/color-005.html.ini
+@@ -1,2 +1,2 @@
+ [color-005.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/display-2.html.ini b/tests/wpt/meta/mathml/relations/css-styling/display-2.html.ini
+index 4cb3485caf3..62ddbf4ca94 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/display-2.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/display-2.html.ini
+@@ -1,2 +1,51 @@
+ [display-2.html]
+-  expected: TIMEOUT
++  [block display]
++    expected: FAIL
++
++  [block display with contrained width]
++    expected: FAIL
++
++  [list display inside display block]
++    expected: FAIL
++
++  [inline display]
++    expected: FAIL
++
++  [inline-block display]
++    expected: FAIL
++
++  [table display (math)]
++    expected: FAIL
++
++  [table display (mrow)]
++    expected: FAIL
++
++  [inline-table display (math)]
++    expected: FAIL
++
++  [inline-table display (mrow)]
++    expected: FAIL
++
++  [flexbox display (math)]
++    expected: FAIL
++
++  [flexbox display (mrow)]
++    expected: FAIL
++
++  [grid display (math)]
++    expected: FAIL
++
++  [grid display (mrow)]
++    expected: FAIL
++
++  [ruby display (math)]
++    expected: FAIL
++
++  [ruby display (mrow)]
++    expected: FAIL
++
++  [block display with column width (math)]
++    expected: FAIL
++
++  [block display with column width (mrow)]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/displaystyle-013.html.ini b/tests/wpt/meta/mathml/relations/css-styling/displaystyle-013.html.ini
+index 3f76e60f599..725c36c5407 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/displaystyle-013.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/displaystyle-013.html.ini
+@@ -1,2 +1,2 @@
+ [displaystyle-013.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/displaystyle-014.html.ini b/tests/wpt/meta/mathml/relations/css-styling/displaystyle-014.html.ini
+index 64d97bad47a..d5511281c15 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/displaystyle-014.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/displaystyle-014.html.ini
+@@ -1,2 +1,2 @@
+ [displaystyle-014.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/displaystyle-1.html.ini b/tests/wpt/meta/mathml/relations/css-styling/displaystyle-1.html.ini
+index 9c394633582..e300c8533de 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/displaystyle-1.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/displaystyle-1.html.ini
+@@ -1,2 +1,108 @@
+ [displaystyle-1.html]
+-  expected: TIMEOUT
++  [math element (lowercase)]
++    expected: FAIL
++
++  [math element (explicit display, lowercase)]
++    expected: FAIL
++
++  [mstyle element (lowercase)]
++    expected: FAIL
++
++  [mtable element (lowercase)]
++    expected: FAIL
++
++  [mfrac element (lowercase)]
++    expected: FAIL
++
++  [mroot element (lowercase)]
++    expected: FAIL
++
++  [msub element (lowercase)]
++    expected: FAIL
++
++  [msup element (lowercase)]
++    expected: FAIL
++
++  [msubsup element (lowercase)]
++    expected: FAIL
++
++  [munder element (lowercase)]
++    expected: FAIL
++
++  [mover element (lowercase)]
++    expected: FAIL
++
++  [munderover element (lowercase)]
++    expected: FAIL
++
++  [math element (uppercase)]
++    expected: FAIL
++
++  [math element (explicit display, uppercase)]
++    expected: FAIL
++
++  [mstyle element (uppercase)]
++    expected: FAIL
++
++  [mtable element (uppercase)]
++    expected: FAIL
++
++  [mfrac element (uppercase)]
++    expected: FAIL
++
++  [mroot element (uppercase)]
++    expected: FAIL
++
++  [msub element (uppercase)]
++    expected: FAIL
++
++  [msup element (uppercase)]
++    expected: FAIL
++
++  [msubsup element (uppercase)]
++    expected: FAIL
++
++  [munder element (uppercase)]
++    expected: FAIL
++
++  [mover element (uppercase)]
++    expected: FAIL
++
++  [munderover element (uppercase)]
++    expected: FAIL
++
++  [math element (alternate_case)]
++    expected: FAIL
++
++  [math element (explicit display, alternate_case)]
++    expected: FAIL
++
++  [mstyle element (alternate_case)]
++    expected: FAIL
++
++  [mtable element (alternate_case)]
++    expected: FAIL
++
++  [mfrac element (alternate_case)]
++    expected: FAIL
++
++  [mroot element (alternate_case)]
++    expected: FAIL
++
++  [msub element (alternate_case)]
++    expected: FAIL
++
++  [msup element (alternate_case)]
++    expected: FAIL
++
++  [msubsup element (alternate_case)]
++    expected: FAIL
++
++  [munder element (alternate_case)]
++    expected: FAIL
++
++  [mover element (alternate_case)]
++    expected: FAIL
++
++  [munderover element (alternate_case)]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/displaystyle-2.html.ini b/tests/wpt/meta/mathml/relations/css-styling/displaystyle-2.html.ini
+index 8a3f0a29d10..d498c8143c6 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/displaystyle-2.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/displaystyle-2.html.ini
+@@ -1,2 +1,81 @@
+ [displaystyle-2.html]
+-  expected: TIMEOUT
++  [mtable element (lowercase)]
++    expected: FAIL
++
++  [mfrac element (lowercase)]
++    expected: FAIL
++
++  [mroot element (lowercase)]
++    expected: FAIL
++
++  [msub element (lowercase)]
++    expected: FAIL
++
++  [msup element (lowercase)]
++    expected: FAIL
++
++  [msubsup element (lowercase)]
++    expected: FAIL
++
++  [munder element (lowercase)]
++    expected: FAIL
++
++  [mover element (lowercase)]
++    expected: FAIL
++
++  [munderover element (lowercase)]
++    expected: FAIL
++
++  [mtable element (uppercase)]
++    expected: FAIL
++
++  [mfrac element (uppercase)]
++    expected: FAIL
++
++  [mroot element (uppercase)]
++    expected: FAIL
++
++  [msub element (uppercase)]
++    expected: FAIL
++
++  [msup element (uppercase)]
++    expected: FAIL
++
++  [msubsup element (uppercase)]
++    expected: FAIL
++
++  [munder element (uppercase)]
++    expected: FAIL
++
++  [mover element (uppercase)]
++    expected: FAIL
++
++  [munderover element (uppercase)]
++    expected: FAIL
++
++  [mtable element (alternate_case)]
++    expected: FAIL
++
++  [mfrac element (alternate_case)]
++    expected: FAIL
++
++  [mroot element (alternate_case)]
++    expected: FAIL
++
++  [msub element (alternate_case)]
++    expected: FAIL
++
++  [msup element (alternate_case)]
++    expected: FAIL
++
++  [msubsup element (alternate_case)]
++    expected: FAIL
++
++  [munder element (alternate_case)]
++    expected: FAIL
++
++  [mover element (alternate_case)]
++    expected: FAIL
++
++  [munderover element (alternate_case)]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/displaystyle-3.html.ini b/tests/wpt/meta/mathml/relations/css-styling/displaystyle-3.html.ini
+index 0921609f004..690176e959f 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/displaystyle-3.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/displaystyle-3.html.ini
+@@ -1,2 +1,18 @@
+ [displaystyle-3.html]
+-  expected: TIMEOUT
++  [movablelimits for munder element (displaystyle=false)]
++    expected: FAIL
++
++  [movablelimits for munder element (displaystyle=true)]
++    expected: FAIL
++
++  [movablelimits for mover element (displaystyle=false)]
++    expected: FAIL
++
++  [movablelimits for mover element (displaystyle=true)]
++    expected: FAIL
++
++  [movablelimits for munderover element (displaystyle=false)]
++    expected: FAIL
++
++  [movablelimits for munderover element (displaystyle=true)]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/lengths-2.html.ini b/tests/wpt/meta/mathml/relations/css-styling/lengths-2.html.ini
+index 1446d2094ca..16e0586d0d6 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/lengths-2.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/lengths-2.html.ini
+@@ -1,2 +1,18 @@
+ [lengths-2.html]
+-  expected: TIMEOUT
++  [Units]
++    expected: FAIL
++
++  [Trimming of space]
++    expected: FAIL
++
++  [Non-negative numbers]
++    expected: FAIL
++
++  [Non-positive numbers]
++    expected: FAIL
++
++  [Legacy namedspaces]
++    expected: FAIL
++
++  [Legacy numbers]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/padding-border-margin/border-002.html.ini b/tests/wpt/meta/mathml/relations/css-styling/padding-border-margin/border-002.html.ini
+index 3980b0c7b8a..2df8a64dabb 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/padding-border-margin/border-002.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/padding-border-margin/border-002.html.ini
+@@ -1,2 +1,153 @@
+ [border-002.html]
+-  expected: TIMEOUT
++  [Border properties on a]
++    expected: FAIL
++
++  [Border properties on a (rtl)]
++    expected: FAIL
++
++  [Border properties on maction]
++    expected: FAIL
++
++  [Border properties on maction (rtl)]
++    expected: FAIL
++
++  [Border properties on menclose]
++    expected: FAIL
++
++  [Border properties on menclose (rtl)]
++    expected: FAIL
++
++  [Border properties on merror]
++    expected: FAIL
++
++  [Border properties on merror (rtl)]
++    expected: FAIL
++
++  [Border properties on mfrac]
++    expected: FAIL
++
++  [Border properties on mfrac (rtl)]
++    expected: FAIL
++
++  [Border properties on mi]
++    expected: FAIL
++
++  [Border properties on mi (rtl)]
++    expected: FAIL
++
++  [Border properties on mmultiscripts]
++    expected: FAIL
++
++  [Border properties on mmultiscripts (rtl)]
++    expected: FAIL
++
++  [Border properties on mn]
++    expected: FAIL
++
++  [Border properties on mn (rtl)]
++    expected: FAIL
++
++  [Border properties on mo]
++    expected: FAIL
++
++  [Border properties on mo (rtl)]
++    expected: FAIL
++
++  [Border properties on mover]
++    expected: FAIL
++
++  [Border properties on mover (rtl)]
++    expected: FAIL
++
++  [Border properties on mpadded]
++    expected: FAIL
++
++  [Border properties on mpadded (rtl)]
++    expected: FAIL
++
++  [Border properties on mphantom]
++    expected: FAIL
++
++  [Border properties on mphantom (rtl)]
++    expected: FAIL
++
++  [Border properties on mroot]
++    expected: FAIL
++
++  [Border properties on mroot (rtl)]
++    expected: FAIL
++
++  [Border properties on mrow]
++    expected: FAIL
++
++  [Border properties on mrow (rtl)]
++    expected: FAIL
++
++  [Border properties on ms]
++    expected: FAIL
++
++  [Border properties on ms (rtl)]
++    expected: FAIL
++
++  [Border properties on mspace]
++    expected: FAIL
++
++  [Border properties on msqrt]
++    expected: FAIL
++
++  [Border properties on msqrt (rtl)]
++    expected: FAIL
++
++  [Border properties on mstyle]
++    expected: FAIL
++
++  [Border properties on mstyle (rtl)]
++    expected: FAIL
++
++  [Border properties on msub]
++    expected: FAIL
++
++  [Border properties on msub (rtl)]
++    expected: FAIL
++
++  [Border properties on msubsup]
++    expected: FAIL
++
++  [Border properties on msubsup (rtl)]
++    expected: FAIL
++
++  [Border properties on msup]
++    expected: FAIL
++
++  [Border properties on msup (rtl)]
++    expected: FAIL
++
++  [Border properties on mtable]
++    expected: FAIL
++
++  [Border properties on mtable (rtl)]
++    expected: FAIL
++
++  [Border properties on mtext]
++    expected: FAIL
++
++  [Border properties on mtext (rtl)]
++    expected: FAIL
++
++  [Border properties on munder]
++    expected: FAIL
++
++  [Border properties on munder (rtl)]
++    expected: FAIL
++
++  [Border properties on munderover]
++    expected: FAIL
++
++  [Border properties on munderover (rtl)]
++    expected: FAIL
++
++  [Border properties on semantics]
++    expected: FAIL
++
++  [Border properties on semantics (rtl)]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/padding-border-margin/margin-002.html.ini b/tests/wpt/meta/mathml/relations/css-styling/padding-border-margin/margin-002.html.ini
+index 5ba4f0365d1..ab637b12554 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/padding-border-margin/margin-002.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/padding-border-margin/margin-002.html.ini
+@@ -1,2 +1,228 @@
+ [margin-002.html]
+-  expected: TIMEOUT
++  [Margin properties on a]
++    expected: FAIL
++
++  [Margin properties on a (rtl)]
++    expected: FAIL
++
++  [Margin properties on a (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on maction]
++    expected: FAIL
++
++  [Margin properties on maction (rtl)]
++    expected: FAIL
++
++  [Margin properties on maction (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on menclose]
++    expected: FAIL
++
++  [Margin properties on menclose (rtl)]
++    expected: FAIL
++
++  [Margin properties on menclose (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on merror]
++    expected: FAIL
++
++  [Margin properties on merror (rtl)]
++    expected: FAIL
++
++  [Margin properties on merror (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mfrac]
++    expected: FAIL
++
++  [Margin properties on mfrac (rtl)]
++    expected: FAIL
++
++  [Margin properties on mfrac (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mi]
++    expected: FAIL
++
++  [Margin properties on mi (rtl)]
++    expected: FAIL
++
++  [Margin properties on mi (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mmultiscripts]
++    expected: FAIL
++
++  [Margin properties on mmultiscripts (rtl)]
++    expected: FAIL
++
++  [Margin properties on mmultiscripts (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mn]
++    expected: FAIL
++
++  [Margin properties on mn (rtl)]
++    expected: FAIL
++
++  [Margin properties on mn (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mo]
++    expected: FAIL
++
++  [Margin properties on mo (rtl)]
++    expected: FAIL
++
++  [Margin properties on mo (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mover]
++    expected: FAIL
++
++  [Margin properties on mover (rtl)]
++    expected: FAIL
++
++  [Margin properties on mover (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mpadded]
++    expected: FAIL
++
++  [Margin properties on mpadded (rtl)]
++    expected: FAIL
++
++  [Margin properties on mpadded (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mphantom]
++    expected: FAIL
++
++  [Margin properties on mphantom (rtl)]
++    expected: FAIL
++
++  [Margin properties on mphantom (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mroot]
++    expected: FAIL
++
++  [Margin properties on mroot (rtl)]
++    expected: FAIL
++
++  [Margin properties on mroot (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mrow]
++    expected: FAIL
++
++  [Margin properties on mrow (rtl)]
++    expected: FAIL
++
++  [Margin properties on mrow (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on ms]
++    expected: FAIL
++
++  [Margin properties on ms (rtl)]
++    expected: FAIL
++
++  [Margin properties on ms (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mspace]
++    expected: FAIL
++
++  [Margin properties on msqrt]
++    expected: FAIL
++
++  [Margin properties on msqrt (rtl)]
++    expected: FAIL
++
++  [Margin properties on msqrt (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mstyle]
++    expected: FAIL
++
++  [Margin properties on mstyle (rtl)]
++    expected: FAIL
++
++  [Margin properties on mstyle (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on msub]
++    expected: FAIL
++
++  [Margin properties on msub (rtl)]
++    expected: FAIL
++
++  [Margin properties on msub (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on msubsup]
++    expected: FAIL
++
++  [Margin properties on msubsup (rtl)]
++    expected: FAIL
++
++  [Margin properties on msubsup (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on msup]
++    expected: FAIL
++
++  [Margin properties on msup (rtl)]
++    expected: FAIL
++
++  [Margin properties on msup (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mtable]
++    expected: FAIL
++
++  [Margin properties on mtable (rtl)]
++    expected: FAIL
++
++  [Margin properties on mtable (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on mtext]
++    expected: FAIL
++
++  [Margin properties on mtext (rtl)]
++    expected: FAIL
++
++  [Margin properties on mtext (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on munder]
++    expected: FAIL
++
++  [Margin properties on munder (rtl)]
++    expected: FAIL
++
++  [Margin properties on munder (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on munderover]
++    expected: FAIL
++
++  [Margin properties on munderover (rtl)]
++    expected: FAIL
++
++  [Margin properties on munderover (no margin-collapsing)]
++    expected: FAIL
++
++  [Margin properties on semantics]
++    expected: FAIL
++
++  [Margin properties on semantics (rtl)]
++    expected: FAIL
++
++  [Margin properties on semantics (no margin-collapsing)]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/padding-border-margin/padding-002.html.ini b/tests/wpt/meta/mathml/relations/css-styling/padding-border-margin/padding-002.html.ini
+index 76cd6e677b2..b6d475cb1d8 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/padding-border-margin/padding-002.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/padding-border-margin/padding-002.html.ini
+@@ -1,2 +1,153 @@
+ [padding-002.html]
+-  expected: TIMEOUT
++  [Padding properties on a]
++    expected: FAIL
++
++  [Padding properties on a (rtl)]
++    expected: FAIL
++
++  [Padding properties on maction]
++    expected: FAIL
++
++  [Padding properties on maction (rtl)]
++    expected: FAIL
++
++  [Padding properties on menclose]
++    expected: FAIL
++
++  [Padding properties on menclose (rtl)]
++    expected: FAIL
++
++  [Padding properties on merror]
++    expected: FAIL
++
++  [Padding properties on merror (rtl)]
++    expected: FAIL
++
++  [Padding properties on mfrac]
++    expected: FAIL
++
++  [Padding properties on mfrac (rtl)]
++    expected: FAIL
++
++  [Padding properties on mi]
++    expected: FAIL
++
++  [Padding properties on mi (rtl)]
++    expected: FAIL
++
++  [Padding properties on mmultiscripts]
++    expected: FAIL
++
++  [Padding properties on mmultiscripts (rtl)]
++    expected: FAIL
++
++  [Padding properties on mn]
++    expected: FAIL
++
++  [Padding properties on mn (rtl)]
++    expected: FAIL
++
++  [Padding properties on mo]
++    expected: FAIL
++
++  [Padding properties on mo (rtl)]
++    expected: FAIL
++
++  [Padding properties on mover]
++    expected: FAIL
++
++  [Padding properties on mover (rtl)]
++    expected: FAIL
++
++  [Padding properties on mpadded]
++    expected: FAIL
++
++  [Padding properties on mpadded (rtl)]
++    expected: FAIL
++
++  [Padding properties on mphantom]
++    expected: FAIL
++
++  [Padding properties on mphantom (rtl)]
++    expected: FAIL
++
++  [Padding properties on mroot]
++    expected: FAIL
++
++  [Padding properties on mroot (rtl)]
++    expected: FAIL
++
++  [Padding properties on mrow]
++    expected: FAIL
++
++  [Padding properties on mrow (rtl)]
++    expected: FAIL
++
++  [Padding properties on ms]
++    expected: FAIL
++
++  [Padding properties on ms (rtl)]
++    expected: FAIL
++
++  [Padding properties on mspace]
++    expected: FAIL
++
++  [Padding properties on msqrt]
++    expected: FAIL
++
++  [Padding properties on msqrt (rtl)]
++    expected: FAIL
++
++  [Padding properties on mstyle]
++    expected: FAIL
++
++  [Padding properties on mstyle (rtl)]
++    expected: FAIL
++
++  [Padding properties on msub]
++    expected: FAIL
++
++  [Padding properties on msub (rtl)]
++    expected: FAIL
++
++  [Padding properties on msubsup]
++    expected: FAIL
++
++  [Padding properties on msubsup (rtl)]
++    expected: FAIL
++
++  [Padding properties on msup]
++    expected: FAIL
++
++  [Padding properties on msup (rtl)]
++    expected: FAIL
++
++  [Padding properties on mtable]
++    expected: FAIL
++
++  [Padding properties on mtable (rtl)]
++    expected: FAIL
++
++  [Padding properties on mtext]
++    expected: FAIL
++
++  [Padding properties on mtext (rtl)]
++    expected: FAIL
++
++  [Padding properties on munder]
++    expected: FAIL
++
++  [Padding properties on munder (rtl)]
++    expected: FAIL
++
++  [Padding properties on munderover]
++    expected: FAIL
++
++  [Padding properties on munderover (rtl)]
++    expected: FAIL
++
++  [Padding properties on semantics]
++    expected: FAIL
++
++  [Padding properties on semantics (rtl)]
++    expected: FAIL
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/visibility-005.html.ini b/tests/wpt/meta/mathml/relations/css-styling/visibility-005.html.ini
+index 6db2cd22f71..2d62a772abb 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/visibility-005.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/visibility-005.html.ini
+@@ -1,2 +1,2 @@
+ [visibility-005.html]
+-  expected: TIMEOUT
++  expected: FAIL
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/width-height-004.html.ini b/tests/wpt/meta/mathml/relations/css-styling/width-height-004.html.ini
+index 9226f3fd385..4124f8351a7 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/width-height-004.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/width-height-004.html.ini
+@@ -1,2 +1,2 @@
+ [width-height-004.html]
+-  expected: TIMEOUT
++  expected: ERROR
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/width-height-005.html.ini b/tests/wpt/meta/mathml/relations/css-styling/width-height-005.html.ini
+index 27e3300c5af..8fdd98717e9 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/width-height-005.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/width-height-005.html.ini
+@@ -1,2 +1,2 @@
+ [width-height-005.html]
+-  expected: TIMEOUT
++  expected: ERROR
+diff --git a/tests/wpt/meta/mathml/relations/css-styling/width-height-006.html.ini b/tests/wpt/meta/mathml/relations/css-styling/width-height-006.html.ini
+index 91d07398a79..009136e53a5 100644
+--- a/tests/wpt/meta/mathml/relations/css-styling/width-height-006.html.ini
++++ b/tests/wpt/meta/mathml/relations/css-styling/width-height-006.html.ini
+@@ -1,2 +1,2 @@
+ [width-height-006.html]
+-  expected: TIMEOUT
++  expected: ERROR
+diff --git a/tests/wpt/meta/mathml/relations/html5-tree/dynamic-href-001.html.ini b/tests/wpt/meta/mathml/relations/html5-tree/dynamic-href-001.html.ini
+deleted file mode 100644
+index b9d6f478c01..00000000000
+--- a/tests/wpt/meta/mathml/relations/html5-tree/dynamic-href-001.html.ini
++++ /dev/null
+@@ -1,2 +0,0 @@
+-[dynamic-href-001.html]
+-  expected: TIMEOUT

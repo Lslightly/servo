@@ -1,0 +1,200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 17:46:41 +0000
+Subject: [PATCH] script: Reconnect an EventSource whose stream ends with a
+ network error
+
+An EventSource reestablished its connection when the body of the event
+stream ended without a network error, and did nothing when it ended with
+one, so it stayed open and never reconnected. That happens today when the
+stream fails to decode; net reports a stream cut short by the connection
+as complete, so a dropped connection was reestablished, but it will
+report it as a network error.
+
+The specification only reestablishes the connection when the body ends
+without a network error, as the end-of-body steps do not run for a body
+that errors. Firefox and Chrome reestablish a connection that drops while
+the stream is read. Do the same: when the body of an announced connection
+ends with a network error, reestablish the connection, or fail it if the
+error is one that makes that futile, as for a network error in place of
+the response. A network error in place of the response is still handled
+only once, when the response arrives.
+
+Validation: New test `tests/wpt/mozilla/tests/mozilla/eventsource-network-error.window.js` passes with this patch, before and after `net: End a body cut short by the connection with a network error`; with that patch but without this one, it times out.
+AI-assisted: Yes (agent session; the agent wrote this patch and its test following docs/fetch-p4a-truncated-body-audit-2026-10-22.md in the workspace, and applied an independent review's findings)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/eventsource.rs          | 29 ++++++++++++++-----
+ tests/wpt/mozilla/meta/MANIFEST.json          | 11 +++++++
+ .../eventsource-network-error.window.js       | 17 +++++++++++
+ .../resources/eventsource-network-error.py    | 20 +++++++++++++
+ 4 files changed, 70 insertions(+), 7 deletions(-)
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/eventsource-network-error.window.js
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/resources/eventsource-network-error.py
+
+diff --git a/components/script/dom/eventsource.rs b/components/script/dom/eventsource.rs
+index 489a6090130..da4b75d7661 100644
+--- a/components/script/dom/eventsource.rs
++++ b/components/script/dom/eventsource.rs
+@@ -127,6 +127,8 @@ struct EventSourceContext {
+     event_type: String,
+     data: String,
+     last_event_id: String,
++    /// Whether the response was accepted as an event stream and the connection announced.
++    announced: bool,
+ }
+ 
+ impl Clone for EventSourceContext {
+@@ -142,6 +144,7 @@ impl Clone for EventSourceContext {
+             event_type: self.event_type.clone(),
+             data: self.data.clone(),
+             last_event_id: self.last_event_id.clone(),
++            announced: self.announced,
+         }
+     }
+ }
+@@ -196,6 +199,7 @@ impl EventSourceContext {
+             event_type: String::new(),
+             data: String::new(),
+             last_event_id: String::from(event_source.last_event_id.borrow().clone()),
++            announced: false,
+         };
+         global.task_manager().remote_event_task_source().queue(
+             task!(reestablish_the_event_source_onnection: move |cx| {
+@@ -230,6 +234,15 @@ impl EventSourceContext {
+         );
+     }
+ 
++    /// Step 15.2 of <https://html.spec.whatwg.org/multipage/#dom-eventsource>
++    fn reestablish_the_connection_unless_futile(&self, error: &NetworkError) {
++        if error.is_permanent_failure() {
++            self.fail_the_connection()
++        } else {
++            self.reestablish_the_connection()
++        }
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#processField>
+     fn process_field(&mut self) {
+         match &*self.field {
+@@ -423,17 +436,14 @@ impl FetchResponseListener for EventSourceContext {
+                     .ascii_serialization()
+                     .into_owned();
+                 // Step 15.4 announce the connection and interpret res's body line by line.
++                self.announced = true;
+                 self.announce_the_connection();
+             },
+             Err(error) => {
+                 // Step 15.2 if res is a network error, then reestablish the connection, unless
+                 // the user agent knows that to be futile, in which case the user agent may
+                 // fail the connection.
+-                if error.is_permanent_failure() {
+-                    self.fail_the_connection()
+-                } else {
+-                    self.reestablish_the_connection()
+-                }
++                self.reestablish_the_connection_unless_futile(&error)
+             },
+         }
+     }
+@@ -493,8 +503,12 @@ impl FetchResponseListener for EventSourceContext {
+         if matches!(result, encoding_rs::DecoderResult::Malformed(_, _)) {
+             self.parse(cx, "\u{FFFD}".chars());
+         }
+-        if response.is_ok() {
+-            self.reestablish_the_connection();
++        match &response {
++            Ok(()) => self.reestablish_the_connection(),
++            // The specification leaves a connection whose body ends with a network error open, but
++            // other browsers reestablish it.
++            Err(error) if self.announced => self.reestablish_the_connection_unless_futile(error),
++            Err(_) => {},
+         }
+ 
+         network_listener::submit_timing(cx, global, &self, &response, &timing);
+@@ -659,6 +673,7 @@ impl EventSourceMethods<crate::DomTypeHolder> for EventSource {
+             event_type: String::new(),
+             data: String::new(),
+             last_event_id: String::new(),
++            announced: false,
+         };
+ 
+         let task_source = global.task_manager().networking_task_source().into();
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index e2dae44f4ee..cf97efa57ab 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -11267,6 +11267,10 @@
+       "cb0d6c8b0447959e6bc0b757444e9a80bfd57390",
+       []
+      ],
++     "eventsource-network-error.py": [
++      "8a5953ab3c8a5e875dd65e89ca8c7c49d67799c5",
++      []
++     ],
+      "external.js": [
+       "5f0242874cfa47b84af35325ad651690cd9fb790",
+       []
+@@ -14486,6 +14490,13 @@
+       {}
+      ]
+     ],
++    "eventsource-network-error.window.js": [
++     "63b227f44da14af3ae5d25c98f4ed7d525f5c155",
++     [
++      "mozilla/eventsource-network-error.window.html",
++      {}
++     ]
++    ],
+     "exceptionToRejection.any.js": [
+      "5d892832c29a4075751b313b3ba5c57d51cc19f3",
+      [
+diff --git a/tests/wpt/mozilla/tests/mozilla/eventsource-network-error.window.js b/tests/wpt/mozilla/tests/mozilla/eventsource-network-error.window.js
+new file mode 100644
+index 00000000000..63b227f44da
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/eventsource-network-error.window.js
+@@ -0,0 +1,17 @@
++async_test(t => {
++  const source = new EventSource("resources/eventsource-network-error.py");
++  t.add_cleanup(() => source.close());
++  const events = [];
++  source.onopen = t.step_func(() => {
++    events.push("open");
++    if (events.length > 1) {
++      assert_array_equals(events, ["open", "message", "error", "open"]);
++      t.done();
++    }
++  });
++  source.onmessage = t.step_func(() => events.push("message"));
++  source.onerror = t.step_func(() => {
++    events.push("error");
++    assert_equals(source.readyState, EventSource.CONNECTING, "readyState");
++  });
++}, "EventSource reestablishes the connection when the event stream ends with a network error");
+diff --git a/tests/wpt/mozilla/tests/mozilla/resources/eventsource-network-error.py b/tests/wpt/mozilla/tests/mozilla/resources/eventsource-network-error.py
+new file mode 100644
+index 00000000000..8a5953ab3c8
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/resources/eventsource-network-error.py
+@@ -0,0 +1,20 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++
++def main(request, response):
++    response.add_required_headers = False
++    event = b"retry: 10\ndata: event\n\n"
++    response.writer.write(
++        b"HTTP/1.1 200 OK\r\n"
++        b"Content-Type: text/event-stream\r\n"
++        b"Transfer-Encoding: chunked\r\n"
++        b"Connection: close\r\n"
++        b"\r\n"
++        b"%x\r\n%s\r\n"
++        # The connection closes in the middle of the next chunk.
++        b"100\r\ndata: cut"
++        % (len(event), event)
++    )
++    response.close_connection = True

@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 29 Oct 2026 17:09:58 +0000
+Subject: [PATCH] quickjs: Bump servo-quickjs for mozjs 0.26.9
+
+Upstream's ObservableArray bindings (#48506) pin mozjs 0.26.9 and call
+`CreateForwardingProxyHandler`, a glue function of mozjs_sys 153.4. The
+pinned servo-quickjs c38af5c still called itself mozjs 0.26.7, so Cargo
+left `--js-engine quickjs`'s patch unused and built Servo against
+SpiderMonkey's mozjs, which failed on the QuickJS-only calls of the
+stack. servo-quickjs 544db84 is mozjs 0.26.9 and implements the
+forwarding handler (18891c1), `SetArrayLength` (f1c371c), which every
+assignment to `adoptedStyleSheets` uses, and IsArray for proxies of
+arrays (544db84, QuickJS patch Q44), so that
+`Array.isArray(document.adoptedStyleSheets)` is true, as with
+SpiderMonkey. e335588 lets the finalizers of ObservableArray owners
+write to a proxy that the same cycle collection already finalized, where
+QuickJS's order differs from SpiderMonkey's.
+
+Validation: servo-quickjs's `just test` and `just test-asan` (137 tests, a forwarding handler test and tests of the three other fixes that fail without them), `just lint` and `cargo fmt --check` pass; `just test262` passes on the same QuickJS sources. A QuickJS release build of this stack from this pin runs a page that assigns and pushes to `document.adoptedStyleSheets`, sees an array and exits cleanly. Full WPT with `--js-engine quickjs` against 18891c1 (60,788 tests): 36 crashes from `SetArrayLength` and an abort in the document's finalizer, both fixed since; the 216 tests with unexpected results then ran three times with each engine: the only crash left, load-removes-queued-error-event, crashes with SpiderMonkey too, and 6 tests had consistent QuickJS-only results. Three origin-keyed-agent-clusters tests got QuickJS conditions in patch 49; the other three came from `Array.isArray` being false for ObservableArrays and now pass. A second full run against the same tree as 544db84, before it was merged, has no shim abort, and of its 4 unexpected crashes, load-removes-queued-error-event is the known one and the other three were WebDriver harness errors that passed 5 of 5 reruns. From this pin, css/cssom, origin-keyed-agent-clusters and webidl/ecmascript-binding (431 tests) run as expected with QuickJS. An OpenHarmony headless QuickJS build against 18891c1 ran the media set on a DAYU200 as SpiderMonkey does.
+AI-assisted: Yes (agent session; 2026-10-29 sync -- the agent found the unused patch, the two crashes and the `Array.isArray` gap, wrote the servo-quickjs changes and bumped the pin)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ support/quickjs/cargo-config.toml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/support/quickjs/cargo-config.toml b/support/quickjs/cargo-config.toml
+index d3808421ee8..9af11c534c7 100644
+--- a/support/quickjs/cargo-config.toml
++++ b/support/quickjs/cargo-config.toml
+@@ -5,4 +5,4 @@
+ # were tested with. The shim's version must match the mozjs version that Cargo.toml requires, or
+ # Cargo leaves the patch unused.
+ [patch.crates-io]
+-mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "c38af5cbaf6ac252a65a81ff42b27b0097c19f7f" }
++mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "544db84d9210b332e98baa8bb39a51c4c769001d" }

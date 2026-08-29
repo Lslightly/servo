@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 15 Oct 2026 10:05:29 +0000
+Subject: [PATCH] media (ohos): Prepare the player of an audio element
+
+The OpenHarmony AVPlayer backend only prepared a player once the window
+of its video output was set, and only video elements have one, so an
+audio element never got past HAVE_NOTHING, and its play() promise never
+settled. Prepare a player without video output as soon as AVPlayer is
+initialized.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: Every WPT test that plays an audio element hung on OpenHarmony
+before; see Validation.
+
+Validation: a HiHope DAYU200 (OpenHarmony 7.0, API 26), headless release builds (`./mach build --ohos --headless-binary`) of ohos-main with and without this patch, with and without patches 68 to 71. A direct check: audio elements with sound_0.oga, sound_0.mp3 and test-1s.mp4 now load, play and end (before: readyState 0, no error, play() pending forever); video elements are unchanged. `./mach test-wpt --ohos --processes 2` of the series' ten media tests (gc-unreferenced-media-element, ended-current-playback-position, preload-none-play, allowed-to-play, autoplay, resource-selection-candidate-moved, the three autoplay permissions policy tests, played-loop): without this patch every test with an audio element hangs; with it and patches 68 to 71, all pass with SpiderMonkey and QuickJS except resource-selection-candidate-moved, which hangs until the next patch connects the AVPlayer error callback, and autoplay-default-permissions-policy, which is OK against its TIMEOUT expectation as on Linux on this host. One QuickJS run hung in autoplay.html, possibly from the H.264 decoder limit that the next patch describes; it passed 3 of 3 in isolation with each engine. With this patch but without patches 68 to 71, the GC test and preload-none-play fail with SpiderMonkey, and with QuickJS the tests time out as on Linux before the series.
+AI-assisted: Yes (agent session; root-caused, written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../backends/ohos/ohos_media/avplayer.rs      | 24 ++++++++++++-------
+ components/media/backends/ohos/player.rs      |  2 +-
+ 2 files changed, 16 insertions(+), 10 deletions(-)
+
+diff --git a/components/media/backends/ohos/ohos_media/avplayer.rs b/components/media/backends/ohos/ohos_media/avplayer.rs
+index d2958132323..d24da572d55 100644
+--- a/components/media/backends/ohos/ohos_media/avplayer.rs
++++ b/components/media/backends/ohos/ohos_media/avplayer.rs
+@@ -54,14 +54,16 @@ pub struct OhosPlayer {
+     frame_available_callback_closure: Option<*mut Box<dyn Fn()>>,
+     native_window: Option<*mut OHNativeWindow>,
+     has_set_source_size: bool,
+-    has_set_window: bool,
++    /// Whether the player renders video, in which case it only prepares once its window is set.
++    has_video_output: bool,
++    has_prepared: bool,
+     volume: f64,
+     playback_rate: f64,
+     state: AVPlayerState,
+ }
+ 
+ impl OhosPlayer {
+-    pub fn new() -> Self {
++    pub fn new(has_video_output: bool) -> Self {
+         debug!("Creating OHOS Player!");
+         OhosPlayer {
+             native_image: None,
+@@ -71,7 +73,8 @@ impl OhosPlayer {
+             frame_available_callback_closure: None,
+             native_window: None,
+             has_set_source_size: false,
+-            has_set_window: false,
++            has_video_output,
++            has_prepared: false,
+             volume: 1.0,
+             playback_rate: 1.0,
+             state: AVPlayerState::AV_IDLE,
+@@ -90,14 +93,17 @@ impl OhosPlayer {
+     /// 2. after running external initialize step.
+     ///    e.g. setup_window_buffer_listener
+     pub fn initialize_check_state_action(&mut self) {
+-        if self.state == AVPlayerState::AV_INITIALIZED &&
+-            self.native_window.is_some() &&
+-            !self.has_set_window
+-        {
+-            self.has_set_window = true;
++        if self.state != AVPlayerState::AV_INITIALIZED || self.has_prepared {
++            return;
++        }
++        if self.has_video_output {
++            if self.native_window.is_none() {
++                return;
++            }
+             self.set_window_to_player();
+-            self.prepare(); // only prepare after setting window.
+         }
++        self.has_prepared = true;
++        self.prepare(); // only prepare after setting window, if any.
+     }
+ 
+     fn set_window_to_player(&mut self) {
+diff --git a/components/media/backends/ohos/player.rs b/components/media/backends/ohos/player.rs
+index c170df8538b..079355a2a9d 100644
+--- a/components/media/backends/ohos/player.rs
++++ b/components/media/backends/ohos/player.rs
+@@ -90,7 +90,7 @@ impl OhosAvPlayer {
+         >,
+         backend_chan: Arc<Mutex<mpsc::Sender<BackendMsg>>>,
+     ) -> OhosAvPlayer {
+-        let player_inner = Arc::new(Mutex::new(OhosPlayerInner::new()));
++        let player_inner = Arc::new(Mutex::new(OhosPlayerInner::new(video_renderer.is_some())));
+         let event_sender = Arc::new(Mutex::new(sender));
+         let video_sink = video_renderer.clone().map(|v| {
+             Arc::new(Mutex::new(VideoSink::new(

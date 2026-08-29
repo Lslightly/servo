@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gabriele Cabrini <gabriele@gabrielecabrini.it>
+Date: Sun, 1 Nov 2026 21:09:49 +0000
+Subject: [PATCH] backport: wpt: Wait for web fonts before measuring in
+ Ahem-based testharness tests (#49502)
+
+These tests read layout synchronously while the page is parsing, before
+the
+Ahem web font from /fonts/ahem.css has loaded. Their measurements then
+use a
+fallback font's metrics, and the results depend on load timing. Run the
+measurements after document.fonts.ready so the results are
+deterministic.
+
+With the font loaded, every subtest of
+block-in-inline-self-collapsing-margin-001.html passes, so its
+expectation
+file is removed.
+
+Fixes #49500
+Fixes #49491
+Fixes #49488
+Fixes #49487
+Fixes #43763
+
+Signed-off-by: Gabriele Cabrini <gabriele@gabrielecabrini.it>
+
+Fork note: upstream 2b94d76a697, which came after Servo 0.8.0, backported
+unchanged. With "fonts: Only load @font-face fonts that the page
+uses", Ahem is only fetched once text uses it, so on 0.8.0 the
+table-cell subtest of first-baseline-block-in-inline-001.html measured
+a fallback font and failed. Drop this patch at the first sync onto a
+release that contains #49502, where it applies empty.
+
+Validation: the five changed tests, release builds of this sync's stack on Servo 0.8.0, three runs with SpiderMonkey and three with QuickJS: all as expected (96 subtests each), the table-cell subtest of first-baseline-block-in-inline-001.html passes in each, without an expectation; with the stack's previous version of the test it fails 3 of 3 times. On upstream, bisected: the code of "fonts: Only load @font-face fonts that the page uses" on upstream's commits after 0.8.0 fails it until this commit and passes it from this commit on.
+AI-assisted: Yes (agent session; backported unchanged by the agent during the 2026-11-09 sync)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ tests/wpt/meta/MANIFEST.json                      | 10 +++++-----
+ ...-in-inline-self-collapsing-margin-001.html.ini | 15 ---------------
+ .../CSS2/linebox/inline-negative-margin-001.html  |  2 +-
+ ...lock-in-inline-self-collapsing-margin-001.html |  5 +++++
+ .../first-baseline-block-in-inline-001.html       |  5 +++++
+ ...ecoration-break-clone-block-in-inline-001.html |  5 +++++
+ ...rthogonal-block-in-inline-line-height-001.html |  5 +++++
+ 7 files changed, 26 insertions(+), 21 deletions(-)
+ delete mode 100644 tests/wpt/meta/css/CSS2/normal-flow/block-in-inline-self-collapsing-margin-001.html.ini
+
+diff --git a/tests/wpt/meta/MANIFEST.json b/tests/wpt/meta/MANIFEST.json
+index 3791d5c8d24..34e66693857 100644
+--- a/tests/wpt/meta/MANIFEST.json
++++ b/tests/wpt/meta/MANIFEST.json
+@@ -1171812,7 +1171812,7 @@
+        ]
+       ],
+       "inline-negative-margin-001.html": [
+-       "b1ce232e6e9770a0019c5570f9e6ea57eb87f121",
++       "d75c490bde2dd983cd6e8b5676fc210ac1ff4472",
+        [
+         null,
+         {}
+@@ -1171933,7 +1171933,7 @@
+        ]
+       ],
+       "block-in-inline-self-collapsing-margin-001.html": [
+-       "76e5f0abca1cd0e80a5636194cf10a3835c200f3",
++       "ffd72c3515d6f75668eecc87b87febfa2d2d4412",
+        [
+         null,
+         {}
+@@ -1172810,7 +1172810,7 @@
+      ],
+      "baseline-rules": {
+       "first-baseline-block-in-inline-001.html": [
+-       "0847651fdbbfaf240f38728633be6b92690e8fd9",
++       "86ea81fcbdbcc2872288cbe3aa4a6de35d8e1b5d",
+        [
+         null,
+         {}
+@@ -1178896,7 +1178896,7 @@
+       ]
+      ],
+      "box-decoration-break-clone-block-in-inline-001.html": [
+-      "b14c6c23d2bf1eb2f80f910d49aeec31dba4f38d",
++      "1bc1aede0827f7dbc7666c6a30296f051312c7d2",
+       [
+        null,
+        {}
+@@ -1221837,7 +1221837,7 @@
+       ]
+      ],
+      "orthogonal-block-in-inline-line-height-001.html": [
+-      "7a8e0add6ff75c2063a9c731b8f41a002b25e402",
++      "1b6072da8dcfb37b2c58d90dc1e8e70f96ae15bf",
+       [
+        null,
+        {}
+diff --git a/tests/wpt/meta/css/CSS2/normal-flow/block-in-inline-self-collapsing-margin-001.html.ini b/tests/wpt/meta/css/CSS2/normal-flow/block-in-inline-self-collapsing-margin-001.html.ini
+deleted file mode 100644
+index f04f8f7de66..00000000000
+--- a/tests/wpt/meta/css/CSS2/normal-flow/block-in-inline-self-collapsing-margin-001.html.ini
++++ /dev/null
+@@ -1,15 +0,0 @@
+-[block-in-inline-self-collapsing-margin-001.html]
+-  [A self collapsing block's margin stays inside a containing block with a border (nested)]
+-    expected: FAIL
+-
+-  [A self collapsing block's margin stays inside a containing block with a border (sibling)]
+-    expected: FAIL
+-
+-  [A self collapsing block's margin collapses out of a containing block without one (nested)]
+-    expected: FAIL
+-
+-  [A self collapsing block's margin collapses out of a containing block without one (sibling)]
+-    expected: FAIL
+-
+-  [The margin behaves the same whether the self collapsing block is nested in an inline box or a sibling of inline content (bordered containing block)]
+-    expected: FAIL
+diff --git a/tests/wpt/tests/css/CSS2/linebox/inline-negative-margin-001.html b/tests/wpt/tests/css/CSS2/linebox/inline-negative-margin-001.html
+index b1ce232e6e9..d75c490bde2 100644
+--- a/tests/wpt/tests/css/CSS2/linebox/inline-negative-margin-001.html
++++ b/tests/wpt/tests/css/CSS2/linebox/inline-negative-margin-001.html
+@@ -49,5 +49,5 @@ img {
+     <div class="w4" data-expected-height=20><img class="w3"><img class="w2"><img class="w1" style="margin-left: -2ch"></div>
+     <div class="w4" data-expected-height=20><img class="w2"> <img class="w2"><img class="w1" style="margin-left: -2ch"></div>
+   </section>
+-<script>checkLayout('[data-expected-height]');</script>
++<script>document.fonts.ready.then(() => checkLayout('[data-expected-height]'));</script>
+ </body>
+diff --git a/tests/wpt/tests/css/CSS2/normal-flow/block-in-inline-self-collapsing-margin-001.html b/tests/wpt/tests/css/CSS2/normal-flow/block-in-inline-self-collapsing-margin-001.html
+index 76e5f0abca1..ffd72c3515d 100644
+--- a/tests/wpt/tests/css/CSS2/normal-flow/block-in-inline-self-collapsing-margin-001.html
++++ b/tests/wpt/tests/css/CSS2/normal-flow/block-in-inline-self-collapsing-margin-001.html
+@@ -29,6 +29,9 @@ body { margin: 0; }
+ <div class="container" id="plain-sibling"><div class="selfCollapsing"></div><span class="probe">X</span></div>
+ 
+ <script>
++// Measure only once Ahem has loaded, otherwise the line metrics come from a fallback font.
++setup({explicit_done: true});
++document.fonts.ready.then(() => {
+ // bordered: the 1px border stops the collapse, so the margin sits inside the container. The probe starts
+ //   below the border and the margin, at 1 + 200, and the container encloses border + margin + line + border.
+ // plain: no border, so the margin collapses out through the container's before edge and moves the container
+@@ -67,4 +70,6 @@ for (const root of ["bordered", "plain"]) {
+     }, `The margin behaves the same whether the self collapsing block is nested in an inline box or a sibling `
+        + `of inline content (${root} containing block)`);
+ }
++done();
++});
+ </script>
+diff --git a/tests/wpt/tests/css/css-align/baseline-rules/first-baseline-block-in-inline-001.html b/tests/wpt/tests/css/css-align/baseline-rules/first-baseline-block-in-inline-001.html
+index 0847651fdbb..86ea81fcbdb 100644
+--- a/tests/wpt/tests/css/css-align/baseline-rules/first-baseline-block-in-inline-001.html
++++ b/tests/wpt/tests/css/css-align/baseline-rules/first-baseline-block-in-inline-001.html
+@@ -43,6 +43,9 @@ body { margin: 0; }
+ </div>
+ 
+ <script>
++// Measure only once Ahem has loaded, otherwise the line metrics come from a fallback font.
++setup({explicit_done: true});
++document.fonts.ready.then(() => {
+ const offsetTop = id => document.getElementById(id).offsetTop;
+ 
+ test(() => {
+@@ -63,4 +66,6 @@ test(() => {
+     assert_greater_than_equal(offsetTop('cell-plain'), 49,
+         "the cell without padding is pushed down by (about) the 50px padding of the other cell");
+ }, "Table cell baseline includes the offset of a block-level box nested in an inline box");
++done();
++});
+ </script>
+diff --git a/tests/wpt/tests/css/css-break/box-decoration-break-clone-block-in-inline-001.html b/tests/wpt/tests/css/css-break/box-decoration-break-clone-block-in-inline-001.html
+index b14c6c23d2b..1bc1aede082 100644
+--- a/tests/wpt/tests/css/css-break/box-decoration-break-clone-block-in-inline-001.html
++++ b/tests/wpt/tests/css/css-break/box-decoration-break-clone-block-in-inline-001.html
+@@ -31,6 +31,9 @@ body {
+ <div id="container"><span id="wrapper">a<div class="block" id="first-block"></div><span id="empty"></span><div class="block" id="second-block"></div>c</span></div>
+ 
+ <script>
++// Measure only once Ahem has loaded, otherwise the line metrics come from a fallback font.
++setup({explicit_done: true});
++document.fonts.ready.then(() => {
+ const rect = id => document.getElementById(id).getBoundingClientRect();
+ 
+ // A 20px line for "a", the two 50px tall blocks, then a 20px line for "c". The empty inline
+@@ -63,4 +66,6 @@ test(() => {
+     assert_equals(rect("first-block").left, rect("container").left, "first block");
+     assert_equals(rect("second-block").left, rect("container").left, "second block");
+ }, "Cloned decoration does not wrap the inline box fragments around the block level boxes");
++done();
++});
+ </script>
+diff --git a/tests/wpt/tests/css/css-writing-modes/orthogonal-block-in-inline-line-height-001.html b/tests/wpt/tests/css/css-writing-modes/orthogonal-block-in-inline-line-height-001.html
+index 7a8e0add6ff..1b6072da8dc 100644
+--- a/tests/wpt/tests/css/css-writing-modes/orthogonal-block-in-inline-line-height-001.html
++++ b/tests/wpt/tests/css/css-writing-modes/orthogonal-block-in-inline-line-height-001.html
+@@ -22,6 +22,9 @@ body { margin: 0; }
+ <div class="container" dir="rtl" id="sibling"><div class="orthogonal"></div>123</div>
+ 
+ <script>
++// Measure only once Ahem has loaded, otherwise the line metrics come from a fallback font.
++setup({explicit_done: true});
++document.fonts.ready.then(() => {
+ const LINE_HEIGHT = 20;
+ 
+ for (const id of ["nested", "sibling"]) {
+@@ -46,4 +49,6 @@ test(() => {
+     assert_equals(document.getElementById("nested").offsetHeight,
+                   document.getElementById("sibling").offsetHeight);
+ }, "The empty orthogonal box behaves the same whether it is nested in an inline box or a sibling of inline content");
++done();
++});
+ </script>

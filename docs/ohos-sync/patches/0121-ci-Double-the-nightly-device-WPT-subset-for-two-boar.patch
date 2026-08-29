@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 2 Nov 2026 14:25:50 +0000
+Subject: [PATCH] ci: Double the nightly device WPT subset for two boards
+
+With a chunk per board, the nightly subset takes half the time it took one
+board. Spend that on more of what generated UI uses: all of CSS 2 and the
+CSS modules for overflow, sizing, values, selectors, pseudo-elements,
+tables, alignment, borders, lists, variables, the CSSOM and its view, and
+conditional rules; SVG, which charts and icons use; encoding and streams,
+which streamed responses go through; and from HTML the parser, which
+generated markup goes through with innerHTML, the DOM, scripts, timers
+and the rendering section. It leaves out what Linux covers well enough or
+the board can't run: WebGL, WebAssembly (QuickJS has none), Web Audio and
+media, and the security policies.
+
+Validation: wptrunner's test loader with Servo's include manifest plans 36,567 tests and 13 disabled ones for the new subset, against 17,926 and 12 for the old one (the nightly of 63f2da0c73d planned 17,887 before the last sync); every path exists. At the last nightly's rate of about three hours for the old subset on one board, the new one takes each of two boards about three hours. Paths that contain directories include.ini skips run those too, as /css/css-masking already does: css/css-sizing/contain-intrinsic-size and html/semantics/scripting-1/the-script-element/moving-between-documents. Not run on CI yet.
+AI-assisted: Yes (agent session; the agent picked the directories with the Linux results and counted the tests)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/ohos-device-wpt.yml | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/.github/workflows/ohos-device-wpt.yml b/.github/workflows/ohos-device-wpt.yml
+index e3bc03be204..812b808ca2a 100644
+--- a/.github/workflows/ohos-device-wpt.yml
++++ b/.github/workflows/ohos-device-wpt.yml
+@@ -39,16 +39,21 @@ env:
+   CARGO_INCREMENTAL: 0
+   # The configuration of the stored runs, as in the results job.
+   RESULTS_CONFIG: ohos-dayu200-quickjs
+-  # About 17,900 tests of what generated UI uses: layout, text and fonts, rendering, canvas (for
+-  # charts), animations, images, forms, touch input, storage and the network. They take one board
+-  # about three hours. The stored runs have to keep to one subset for their scores to be comparable.
++  # About 36,000 tests of what generated UI uses: layout, text and fonts, rendering, SVG and canvas
++  # (for charts), animations, images, forms, touch input, storage, markup parsing, scripts and
++  # timers, and the network with streamed responses. They take one board about six hours. The
++  # stored runs have to keep to one subset for their scores to be comparable.
+   NIGHTLY_TESTS: >-
+-    /infrastructure /dom /url /fetch /xhr /eventsource /IndexedDB /webstorage
+-    /css/css-flexbox /css/css-grid /css/css-text /css/css-text-decor /css/css-fonts
++    /infrastructure /dom /url /fetch /xhr /eventsource /IndexedDB /webstorage /encoding /streams
++    /css/CSS2 /css/css-flexbox /css/css-grid /css/css-text /css/css-text-decor /css/css-fonts
+     /css/css-backgrounds /css/css-color /css/css-images /css/css-masking /css/compositing
+     /css/filter-effects /css/css-transforms /css/css-animations /css/css-transitions
+-    /css/css-position /css/mediaqueries /intersection-observer /resize-observer
++    /css/css-position /css/mediaqueries /css/css-ui /css/css-overflow /css/selectors
++    /css/css-sizing /css/css-values /css/css-conditional /css/css-pseudo /css/css-tables
++    /css/css-align /css/css-borders /css/cssom /css/css-variables /css/cssom-view /css/css-lists
++    /svg /intersection-observer /resize-observer
+     /html/canvas/element /html/semantics/embedded-content/the-img-element /html/semantics/forms
++    /html/semantics/scripting-1 /html/syntax /html/dom /html/webappapis /html/rendering
+     /pointerevents /touch-events /uievents
+ 
+ jobs:

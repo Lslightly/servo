@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 9 Nov 2026 10:58:57 +0000
+Subject: [PATCH] deps: Bump mozjs to 0.26.14
+
+Upstream moved mozjs to 0.26.13 with its off-thread compilation of
+classic scripts (#45687), and to 0.26.14 for a potential out-of-bounds
+read (#49514). Take 0.26.14, so that the QuickJS shim, which follows
+ohos-main's mozjs version, can stay at the version it was ported to.
+Servo needs no code change for it.
+
+Keep it until the base requires 0.26.14 itself. Servo 0.8.0 requires
+0.26.13; upstream's bump to 0.26.14 (bbad078a6c2) came after it and,
+like this commit, changes only the version.
+
+Validation: `cargo update -p mozjs` changes only the mozjs crates (mozjs 0.26.14, mozjs_sys 153.6.0-2 and its ICU and glue crates 153.6.0); a release build with SpiderMonkey passes, and `./mach test-wpt --release html/webappapis/scripting/events` runs its 51 tests as expected. The SpiderMonkey tests whose results on this host differ from ohos-main's stored CI run give the same results with ohos-main before this commit, three runs each (image-percentage-height, stale-while-revalidate's stale-css, -image and -script, element_click/navigate.py, window-open-multi-global, which timed out 3 of 3 times before and 2 of 3 after). 2026-11-09 sync: on Servo 0.8.0, which requires 0.26.13, the lock changes only mozjs and mozjs_sys (153.6.0-1 to 153.6.0-2), and the build gates of the stack pass with it.
+AI-assisted: Yes (agent session; written by the agent during the dropped 2026-11-08 sync attempt)
+AI-assisted: Yes (agent session; 2026-11-09 sync -- Servo 0.8.0 requires mozjs 0.26.13: bumped from there; Cargo.lock changes only mozjs and mozjs_sys, as upstream's own bump bbad078a6c2 does; `cargo update -p mozjs` also moved arboard's windows-sys edge, set back to upstream's)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock | 8 ++++----
+ Cargo.toml | 2 +-
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index acb48c8d100..1b9deb95c41 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5419,9 +5419,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "mozjs"
+-version = "0.26.13"
++version = "0.26.14"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b246cd4d322eb2d95c2b33b7e7a8c4c4a56a7cbd3b0a1e70218c9ea176a1beae"
++checksum = "1a28e00320a723648e8d51b9bac89a55abf6f2029287fc3126ec3c0c395bbaa6"
+ dependencies = [
+  "bindgen",
+  "cc",
+@@ -5550,9 +5550,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "mozjs_sys"
+-version = "153.6.0-1"
++version = "153.6.0-2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "199dc451e15dc64f4c879abccb1c9956504dfebdc9f2ab0ecded313d481c949a"
++checksum = "b0f69b286813322420ea4aeea951abe15fa14e27b23600300da6a2128ad6ef04"
+ dependencies = [
+  "bindgen",
+  "cc",
+diff --git a/Cargo.toml b/Cargo.toml
+index 76ded5e6133..b6be293300b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -148,7 +148,7 @@ inventory = "0.3.24"
+ ipc-channel = "0.23"
+ itertools = "0.15"
+ jni = "0.22"
+-js = { package = "mozjs", version = "=0.26.13", default-features = false, features = ["intl", "libz-sys"] }
++js = { package = "mozjs", version = "=0.26.14", default-features = false, features = ["intl", "libz-sys"] }
+ k12 = "0.5"
+ keccak = "0.2"
+ keyboard-types = { version = "0.8.3", features = ["serde", "webdriver"] }

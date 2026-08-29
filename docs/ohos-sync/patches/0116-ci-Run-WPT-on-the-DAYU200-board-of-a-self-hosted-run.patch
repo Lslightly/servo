@@ -1,0 +1,273 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Mon, 26 Oct 2026 16:47:40 +0000
+Subject: [PATCH] ci: Run WPT on the DAYU200 board of a self-hosted runner
+
+The OpenHarmony device WPT workflow builds the headless servoshell for
+aarch64 OpenHarmony on the servo-ohos-linux runners and runs WPT with it
+on the DAYU200 board of the runner labelled servo-ohos-dayu200. There
+are no OpenHarmony expectations yet, so the tests never fail the run.
+
+Every night, when ohos-main changed since the last nightly run, it runs
+a subset of WPT, about 9,000 tests in three hours, and stores the
+results in servo-ohos-wpt as ohos-dayu200-spidermonkey; all of WPT would
+take the board about a day. Otherwise it runs when started by hand, so
+that pull requests don't reach the board.
+
+Folded in "ci: Skip the nightly device WPT run only when its results were stored":
+
+The nightly run skipped a commit when the last successful nightly run
+had tested it. When storing the results failed, which only warns, that
+commit was never stored and never tested again. It now asks
+servo-ohos-wpt whether it has a run of the commit, with the results
+repository's own `tested` command.
+
+Folded in "ci: Store the device WPT results only when every test ran":
+
+When wptrunner can't start Servo again, e.g. because the board
+rebooted, it gives up on the remaining tests, and `--always-succeed`
+makes the run succeed anyway. The first QuickJS nightly run stopped
+after 5,577 of its 17,887 tests and stored them. A step now compares the
+number of tests in the raw log's suite_start with the number of
+test_end events, and fails the job if tests are missing, so the results
+aren't stored and the run shows up as failed. The logs are still
+uploaded.
+
+Validation: actionlint passes, apart from its warnings about the metadata of the repository's local actions that every workflow using them gets, also with the call checked against the store.yml of servo-ohos-wpt that has the `upstream` input; the setup script decides as intended for scheduled runs (new commit, tested commit, no earlier run) and manual ones (defaults, own tests, storing the nightly subset, storing anything else refused); `./mach test-wpt --ohos` accepts the workflow's arguments and looks for the headless servoshell where the workflow downloads it. Not run on GitHub yet.
+Validation: ("ci: Skip the nightly device WPT run only when its results were stored") actionlint passes, apart from its warnings about the metadata of the repository's local actions; the setup script, run against servo-ohos-wpt, runs the commit of the first nightly run, whose results weren't stored, and skips a commit that has a stored linux-spidermonkey run.
+Validation: ("ci: Store the device WPT results only when every test ran") the step's script, extracted from the workflow and run with `uv run --no-project python` as on the runner, passes a complete local DAYU200 run (1596 of 1596) and a 2-test run, and fails a copy of the first log cut to 1000 test_end events (exit 1 with the error annotation); actionlint passes, apart from its warnings about the local actions' metadata and the runner label.
+AI-assisted: Yes (agent session; written by the agent)
+AI-assisted: Yes (agent session; "ci: Skip the nightly device WPT run only when its results were stored": written by the agent)
+AI-assisted: Yes (agent session; "ci: Store the device WPT results only when every test ran": written by the agent)
+AI-assisted: Yes (agent session; 2026-11-09 restack -- folded in "ci: Skip the nightly device WPT run only when its results were stored" and "ci: Store the device WPT results only when every test ran", fixes of this workflow's skip and store steps)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/ohos-device-wpt.yml | 219 ++++++++++++++++++++++++++
+ 1 file changed, 219 insertions(+)
+ create mode 100644 .github/workflows/ohos-device-wpt.yml
+
+diff --git a/.github/workflows/ohos-device-wpt.yml b/.github/workflows/ohos-device-wpt.yml
+new file mode 100644
+index 00000000000..2d39bce2fe7
+--- /dev/null
++++ b/.github/workflows/ohos-device-wpt.yml
+@@ -0,0 +1,219 @@
++# Runs WPT on the DAYU200 board of the self-hosted runner labelled servo-ohos-dayu200, with the
++# headless servoshell of `./mach build --ohos --headless-binary`. There are no expectations for
++# OpenHarmony yet, so the tests never fail the run.
++#
++# Every night, unless servo-ohos-wpt has a run of the ohos-main commit already, it runs the
++# nightly subset of WPT and stores the results in openharmony-rs/servo-ohos-wpt as
++# `ohos-dayu200-spidermonkey`. All of
++# WPT would take the board about a day. Otherwise it runs on request only: pull requests must not
++# reach the board.
++name: OpenHarmony device WPT
++on:
++  schedule:
++    - cron: "0 22 * * *"
++  workflow_dispatch:
++    inputs:
++      tests:
++        description: "WPT paths, separated by spaces. Empty: the nightly subset"
++        type: string
++        default: ""
++      profile:
++        description: "Cargo profile"
++        type: choice
++        options: ["checked-release", "release"]
++        default: "checked-release"
++      store:
++        description: "Store the results in servo-ohos-wpt (only the nightly subset with checked-release, on ohos-main)"
++        type: boolean
++        default: false
++
++# The runner has one board. Of several waiting runs, GitHub only keeps the latest.
++concurrency:
++  group: ${{ github.workflow }}
++  cancel-in-progress: false
++
++env:
++  RUST_BACKTRACE: 1
++  SHELL: /bin/bash
++  CARGO_INCREMENTAL: 0
++  # About 9,000 tests, which take the board about three hours. The stored runs have to keep to
++  # one subset for their scores to be comparable.
++  # The configuration of the stored runs, as in the results job.
++  RESULTS_CONFIG: ohos-dayu200-spidermonkey
++  NIGHTLY_TESTS: >-
++    /infrastructure /dom /url /fetch/api /css/css-flexbox /css/css-grid /css/css-text
++    /css/css-backgrounds /css/css-fonts
++
++jobs:
++  setup:
++    name: Setup
++    runs-on: ubuntu-24.04
++    permissions: {}
++    outputs:
++      run: ${{ steps.setup.outputs.run }}
++      tests: ${{ steps.setup.outputs.tests }}
++      profile: ${{ steps.setup.outputs.profile }}
++      store: ${{ steps.setup.outputs.store }}
++    steps:
++      - name: Choose what to run
++        id: setup
++        env:
++          EVENT: ${{ github.event_name }}
++          TESTS: ${{ inputs.tests }}
++          PROFILE: ${{ inputs.profile || 'checked-release' }}
++          STORE: ${{ inputs.store }}
++        run: |
++          run=true
++          store=false
++          if [ "$EVENT" = schedule ]; then
++            store=true
++            # Asks the results, so that a run whose results weren't stored doesn't count.
++            git clone --quiet --depth 1 --no-tags https://github.com/openharmony-rs/servo-ohos-wpt results
++            git -C results fetch --quiet --no-tags origin "+refs/runs/$RESULTS_CONFIG/*:refs/runs/$RESULTS_CONFIG/*"
++            if (cd results && python3 scripts/wpt_store.py tested --config "$RESULTS_CONFIG" "$GITHUB_SHA"); then
++              run=false
++            fi
++          elif [ "$STORE" = true ]; then
++            if [ -n "$TESTS" ] || [ "$PROFILE" != checked-release ]; then
++              echo "::error::Only runs of the nightly subset with checked-release can be stored."
++              exit 1
++            fi
++            store=true
++          fi
++          {
++            echo "run=$run"
++            echo "tests=${TESTS:-$NIGHTLY_TESTS}"
++            echo "profile=$PROFILE"
++            echo "store=$store"
++          } >> "$GITHUB_OUTPUT"
++
++  build:
++    name: OpenHarmony headless build
++    needs: setup
++    if: ${{ needs.setup.outputs.run == 'true' }}
++    timeout-minutes: 90
++    # The self-hosted runners labelled servo-ohos-linux have the OpenHarmony SDK and cargo-ohos's
++    # LLVM. Runs while the repository variable NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted ones.
++    runs-on: ${{ vars.NO_SELF_HOSTED_RUNNERS && 'ubuntu-24.04' || 'servo-ohos-linux' }}
++    permissions:
++      contents: read
++    steps:
++      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
++      - name: Setup Python
++        if: ${{ runner.environment != 'self-hosted' }}
++        uses: ./.github/actions/setup-python
++      - name: Change Mirror Priorities
++        if: ${{ runner.environment != 'self-hosted' }}
++        uses: ./.github/actions/apt-mirrors
++      - name: Bootstrap dependencies
++        if: ${{ runner.environment != 'self-hosted' }}
++        timeout-minutes: 30
++        run: |
++          sudo apt update
++          ./mach bootstrap --yes --skip-lints --skip-nextest --ohos
++      - name: Install LLVM and Clang
++        if: ${{ runner.environment != 'self-hosted' }}
++        uses: KyleMayes/install-llvm-action@v2
++        with:
++          version: "20.1"
++          directory: ${{ runner.temp }}/llvm
++      - name: Setup OpenHarmony SDK
++        if: ${{ runner.environment != 'self-hosted' }}
++        id: setup_sdk
++        uses: openharmony-rs/setup-ohos-sdk@v1.0.0
++        with:
++          version: "6.1" # api 23 in openharmony
++          fixup-path: true
++      # The self-hosted runners set these in their environment.
++      - name: Set the OpenHarmony SDK env
++        if: ${{ runner.environment != 'self-hosted' }}
++        env:
++          OHOS_SDK_NATIVE: ${{ steps.setup_sdk.outputs.ohos_sdk_native }}
++          OHOS_BASE_SDK_HOME: ${{ steps.setup_sdk.outputs.ohos-base-sdk-home }}
++        run: |
++          echo "OHOS_SDK_NATIVE=$OHOS_SDK_NATIVE" >> "$GITHUB_ENV"
++          echo "OHOS_BASE_SDK_HOME=$OHOS_BASE_SDK_HOME" >> "$GITHUB_ENV"
++      - name: Build
++        env:
++          PROFILE: ${{ needs.setup.outputs.profile }}
++        run: ./mach build --locked --ohos --headless-binary --profile "$PROFILE"
++      - name: Upload the headless servoshell
++        uses: actions/upload-artifact@v7
++        with:
++          name: servoshell-headless-aarch64-unknown-linux-ohos
++          path: target/aarch64-unknown-linux-ohos/${{ needs.setup.outputs.profile }}/servoshell-headless
++          if-no-files-found: error
++
++  wpt:
++    name: WPT on the DAYU200
++    needs: [setup, build]
++    timeout-minutes: 480
++    runs-on: servo-ohos-dayu200
++    permissions:
++      contents: read
++    steps:
++      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
++      # Where `./mach test-wpt --ohos` looks for it.
++      - name: Download the headless servoshell
++        uses: actions/download-artifact@v8
++        with:
++          name: servoshell-headless-aarch64-unknown-linux-ohos
++          path: target/aarch64-unknown-linux-ohos/${{ needs.setup.outputs.profile }}/servoshell-headless
++      # With one board attached, the runner finds it without --ohos-device. The report has the
++      # layout that servo-ohos-wpt's store.yml expects: one chunk.
++      - name: Run the tests
++        env:
++          PROFILE: ${{ needs.setup.outputs.profile }}
++          TESTS: ${{ needs.setup.outputs.tests }}
++        run: |
++          mkdir -p wpt-full-logs/linux/wptreport
++          # shellcheck disable=SC2086 # TESTS holds several paths.
++          ./mach test-wpt --ohos --profile "$PROFILE" --processes 2 --always-succeed \
++            --log-raw wpt-full-logs/raw.log --log-wptreport wpt-full-logs/linux/wptreport/1.json \
++            $TESTS
++      # wptrunner gives up on the remaining tests when it can't start Servo again, e.g. after the
++      # board rebooted, and `--always-succeed` hides that. A partial run must not be stored, as its
++      # scores aren't comparable.
++      - name: Check that all tests ran
++        run: |
++          uv run --no-project python - wpt-full-logs/raw.log <<'EOF'
++          import json
++          import sys
++
++          planned = ended = 0
++          with open(sys.argv[1]) as log:
++              for line in log:
++                  event = json.loads(line)
++                  if event["action"] == "suite_start":
++                      planned += sum(len(tests) for tests in event["tests"].values())
++                  elif event["action"] == "test_end":
++                      ended += 1
++          print(f"{ended} of {planned} tests ran")
++          if ended < planned:
++              print(f"::error::Only {ended} of the {planned} tests ran, so the results aren't stored")
++              sys.exit(1)
++          EOF
++      - name: Upload the results
++        if: ${{ !cancelled() }}
++        uses: actions/upload-artifact@v7
++        with:
++          name: wpt-full-logs-ohos-dayu200
++          path: wpt-full-logs
++          if-no-files-found: error
++
++  # The called workflow takes its token from the `servo-ohos-wpt` environment, which only ohos-main
++  # can use.
++  results:
++    name: Results
++    needs: [setup, wpt]
++    if: ${{ needs.setup.outputs.store == 'true' && needs.wpt.result == 'success' }}
++    uses: openharmony-rs/servo-ohos-wpt/.github/workflows/store.yml@main
++    # The called workflow reads the secret from its job's environment, but only if it is passed.
++    secrets:
++      SERVO_OHOS_WPT_TOKEN: ${{ secrets.SERVO_OHOS_WPT_TOKEN }}
++    with:
++      # RESULTS_CONFIG; `with` can't read env.
++      artifacts: '{"ohos-dayu200-spidermonkey": "wpt-full-logs-ohos-dayu200"}'
++      chunks: 1
++      upstream: false
++    permissions: {}

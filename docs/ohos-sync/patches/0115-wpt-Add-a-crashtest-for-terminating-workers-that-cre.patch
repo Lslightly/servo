@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 15:24:33 +0000
+Subject: [PATCH] wpt: Add a crashtest for terminating workers that create
+ promises
+
+Eight dedicated workers keep creating promises in platform code (a
+ReadableStream's start promise and a reader's read promise) and are
+terminated together. Before servo-quickjs Q36, QuickJS handled the
+interrupt that termination requests inside NewPromiseObject, and the
+worker panicked on the assert in Promise::new_in_realm. The test is
+engine-neutral, waits without timers, and its workers stop by
+themselves after 10 s if termination fails, so it could be upstreamed
+to WPT.
+
+Validation: `./mach test-wpt --profile checked-release --repeat 10` on the test, on ohos-main c5a6c8ef59d: CRASH 10/10 with QuickJS on servo-quickjs a5ebf1f, all at the promise.rs:259 assert; PASS 10/10 with 2de9592 (the previous patch) and with SpiderMonkey. `./mach test-tidy` passes the WPT lint and manifest checks; its only error, a cargo-deny advisory for ctutils 0.4.3, is on ohos-main too.
+AI-assisted: Yes (agent session; the agent wrote the test from the fuzz finding and ran the checks above)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ tests/wpt/meta/MANIFEST.json                  | 13 ++++++++++
+ ...rminate-while-creating-promises-crash.html | 26 +++++++++++++++++++
+ .../workers/support/Worker-create-promises.js | 12 +++++++++
+ 3 files changed, 51 insertions(+)
+ create mode 100644 tests/wpt/tests/workers/Worker-terminate-while-creating-promises-crash.html
+ create mode 100644 tests/wpt/tests/workers/support/Worker-create-promises.js
+
+diff --git a/tests/wpt/meta/MANIFEST.json b/tests/wpt/meta/MANIFEST.json
+index a5cefe7d973..3791d5c8d24 100644
+--- a/tests/wpt/meta/MANIFEST.json
++++ b/tests/wpt/meta/MANIFEST.json
+@@ -16867,6 +16867,15 @@
+      ]
+     ]
+    },
++   "workers": {
++    "Worker-terminate-while-creating-promises-crash.html": [
++     "dab5cd7d7d2d469dde532a6fe15b953524e3c865",
++     [
++      null,
++      {}
++     ]
++    ]
++   },
+    "xml": {
+     "xml-doc-innerHTML-crash.html": [
+      "2187c4667b3e7b5cb6e71bf66e4179b245e8fdc0",
+@@ -627726,6 +627735,10 @@
+       "f0b8efe46bd8c93e5c2af1e239139faae76a16be",
+       []
+      ],
++     "Worker-create-promises.js": [
++      "d14d3a06b119aa83ebf156c6f7c846a44242f203",
++      []
++     ],
+      "Worker-creation-happens-in-parallel.js": [
+       "1e68302a0fc40c592be4a95387bfc315bd79d261",
+       []
+diff --git a/tests/wpt/tests/workers/Worker-terminate-while-creating-promises-crash.html b/tests/wpt/tests/workers/Worker-terminate-while-creating-promises-crash.html
+new file mode 100644
+index 00000000000..dab5cd7d7d2
+--- /dev/null
++++ b/tests/wpt/tests/workers/Worker-terminate-while-creating-promises-crash.html
+@@ -0,0 +1,26 @@
++<!DOCTYPE html>
++<html class="test-wait">
++<meta charset="utf-8">
++<title>Terminating workers while they create promises in platform code</title>
++<link rel="help" href="https://html.spec.whatwg.org/multipage/workers.html#terminate-a-worker">
++<script>
++  // Each worker keeps calling APIs that create promises, so termination likely stops it inside one
++  // of them. The worker threads may still be stopping after terminate() returns, so the test waits
++  // a little longer.
++  const workers = [];
++  let started = 0;
++  for (let i = 0; i < 8; i++) {
++    const worker = new Worker("support/Worker-create-promises.js");
++    worker.onmessage = async () => {
++      if (++started < workers.length)
++        return;
++      for (const w of workers)
++        w.terminate();
++      const start = performance.now();
++      while (performance.now() - start < 200)
++        await new Promise(resolve => requestAnimationFrame(resolve));
++      document.documentElement.classList.remove("test-wait");
++    };
++    workers.push(worker);
++  }
++</script>
+diff --git a/tests/wpt/tests/workers/support/Worker-create-promises.js b/tests/wpt/tests/workers/support/Worker-create-promises.js
+new file mode 100644
+index 00000000000..d14d3a06b11
+--- /dev/null
++++ b/tests/wpt/tests/workers/support/Worker-create-promises.js
+@@ -0,0 +1,12 @@
++// Creates promises in platform code until terminated, for at most 10 seconds: the start promise of
++// a stream and the promise of a read waiting for a chunk. Awaiting between batches runs the queued
++// reactions, so the streams can be collected.
++postMessage("started");
++(async () => {
++  const end = performance.now() + 10000;
++  while (performance.now() < end) {
++    for (let i = 0; i < 100; i++)
++      new ReadableStream().getReader().read();
++    await null;
++  }
++})();

@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 22 Oct 2026 17:46:46 +0000
+Subject: [PATCH] script: Drop the received bytes of an XMLHttpRequest that
+ ends with an error
+
+The request error steps set the response of an XMLHttpRequest to a network
+error before firing `readystatechange`, so `responseText` is empty from
+then on, and fire the `error`, `abort` or `timeout` and `loadend` progress
+events with 0 and 0. XMLHttpRequest kept the bytes it had received, so
+`responseText` returned them and the progress events reported their
+length as loaded. Clear them along with the status and headers; with
+responseType `arraybuffer` or `blob`, `response` is now empty instead of
+the partial body.
+
+This shows today for a request that is aborted or times out while it
+loads. Net reports a body cut short by the connection as complete today;
+it will report it as a network error.
+
+Validation: With `net: End a body cut short by the connection with a network error`, the asynchronous subtests of `xhr/response-body-errors.any.js` and "error while reading body should report zeros for loaded and total" in `xhr/event-error.sub.any.js` pass, in both globals. A WPT run of `xhr/` with this patch and without the net patch has no unexpected results.
+AI-assisted: Yes (agent session; the agent wrote this patch following docs/fetch-p4a-truncated-body-audit-2026-10-22.md in the workspace, and applied an independent review's findings)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/xmlhttprequest/xmlhttprequest.rs | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/components/script/dom/xmlhttprequest/xmlhttprequest.rs b/components/script/dom/xmlhttprequest/xmlhttprequest.rs
+index d92346ab7c8..c41af0ff405 100644
+--- a/components/script/dom/xmlhttprequest/xmlhttprequest.rs
++++ b/components/script/dom/xmlhttprequest/xmlhttprequest.rs
+@@ -1264,7 +1264,8 @@ impl XMLHttpRequest {
+                 self.send_flag.set(false);
+                 *self.status.safe_borrow_mut(cx.no_gc()) = HttpStatus::new_error();
+                 self.response_headers.safe_borrow_mut(cx.no_gc()).clear();
+-                // XXXManishearth set response to NetworkError
++                self.response.safe_borrow_mut(cx.no_gc()).clear();
++                // TODO: Also reset the response URL to that of a network error.
+                 self.change_ready_state(cx, XMLHttpRequestState::Done);
+                 return_if_fetch_was_terminated!();
+ 

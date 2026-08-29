@@ -1,0 +1,400 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 20 Oct 2026 08:01:45 +0000
+Subject: [PATCH] ports/arkweb: Use a disk-backed HTTP cache and persist its
+ index on pause
+
+Two fixes and the device test that found them.
+
+The port set `Opts::config_dir` but never `http_cache_dir`, so
+`open_default_store()` returned `None` and the webview ran with a memory-only HTTP
+cache. That is the opposite of what this embedding wants: a web engine hosted
+inside someone else's application is exactly where keeping cached bodies out of
+the process matters. It now uses `<cacheDir>/web/servo/http-cache`, with the cache
+directory from the application context. ArkWeb keeps its own data in
+`<cacheDir>/web`, which the system's cache trimming spares, and Servo stands in for
+the system webview here. The port's config directory is no guide: ACE passes the
+application's base directory as `--user-data-dir`, outside `cacheDir`.
+
+`ServoNWeb::OnPause` -- which ACE already calls on window hide and host-application
+background, and which the port already implements for throttling -- now also calls
+`NetworkManager::notify_application_backgrounded()`, so the cache index reaches
+disk before the host can be frozen and killed. `NWeb::OnPause` is pure virtual, so
+the webview always receives this; no host cooperation is required. The bridge call
+waits for the flush rather than enqueuing it, bounded by a 500 ms timeout so a busy
+Servo thread cannot stall the ACE UI thread.
+
+`NWeb::NotifyMemoryLevel` is the other lifecycle hook worth wiring here. It is
+still a no-op stub, and was stubbed precisely because Servo had no cache-trim API;
+the embedder API added by patch 121 is the natural place for it.
+
+`test_http_cache_index.py` is the regression guard, end to end on a device: start
+from an empty cache directory, load a cacheable page, send the app to the home
+screen, assert the index reaches disk, force-stop (the kill an OS reaper performs
+on a frozen application), restart, and assert the index was *loaded* rather than
+rebuilt.
+
+That last assertion is the point. A purely functional check cannot tell the two
+apart -- a rebuild finds the same entries, so the page is served from cache either
+way and the test would pass with the flush removed -- so it asserts the
+`http-cache: index loaded from disk` marker and the absence of
+`index rebuilt by scanning`. It also asserts `index-data` does *not* exist before
+the home key, without which the test could be observing the 20 s debounce rather
+than the background flush. The cache directory is located with `find` rather than
+hard-coded, so a layout change fails loudly instead of quietly asserting nothing,
+and it must be under `cache/web/`.
+
+Fork note: from the `http-cache-v2` branch, unchanged.
+
+Validation: on the http-cache-v2 branch, `HDC_TARGET=<serial> uv run ports/arkweb/tools/test_http_cache_index.py` passed 3/3 on the DAYU200 (~20 s), against a shim deployed with `deploy.py`; it must run through the PEP 723 script header, since bare `pytest` does not resolve `hdc-py`. Negative control by hand: deleting `index-data` before the restart makes the log show only `index rebuilt by scanning`. On this stack, with the shim built from patches 120 to 123 including their review fixes: passed 3/3 on the DAYU200 (OpenHarmony 7.0), with the cache in `/data/app/el2/100/base/<bundle>/cache/web/servo/http-cache`; the build before that change put it in `<bundle>/servo/http-cache`, which the test now rejects, and `./mach check --ohos -- -p arkweb` clean. After a rebase, re-run the device test: it is the only coverage of `OnPause` calling the flush and of the port setting `http_cache_dir`.
+AI-assisted: Yes (agent session; the agent wrote this on the http-cache-v2 branch, including the device test, and ported it)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock                                  |   1 +
+ ports/arkweb/Cargo.toml                     |   1 +
+ ports/arkweb/cpp/servo_nweb.cpp             |   4 +
+ ports/arkweb/src/bridge.rs                  |   6 ++
+ ports/arkweb/src/runtime.rs                 |  63 +++++++++++
+ ports/arkweb/tools/conftest.py              |  21 +++-
+ ports/arkweb/tools/test_http_cache_index.py | 112 ++++++++++++++++++++
+ 7 files changed, 205 insertions(+), 3 deletions(-)
+ create mode 100644 ports/arkweb/tools/test_http_cache_index.py
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 3f95b4bc39a..acb48c8d100 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -476,6 +476,7 @@ dependencies = [
+  "hilog",
+  "ipc-channel",
+  "log",
++ "ohos-abilitykit-sys",
+  "ohos-ime",
+  "ohos-ime-sys",
+  "ohos-vsync",
+diff --git a/ports/arkweb/Cargo.toml b/ports/arkweb/Cargo.toml
+index e2dd8b4b896..edb6ca4ed7e 100644
+--- a/ports/arkweb/Cargo.toml
++++ b/ports/arkweb/Cargo.toml
+@@ -26,6 +26,7 @@ hilog = { workspace = true }
+ # force inprocess: ohos is single-process for now, mirroring servoshell.
+ ipc-channel = { workspace = true, features = ["force-inprocess"] }
+ log = { workspace = true }
++ohos-abilitykit-sys = { workspace = true, features = ["api-13"] }
+ # Connects to the OHOS InputMethod framework (libohinputmethod NDK) for soft-keyboard IME,
+ # the same public SDK path servoshell's OHOS port uses.
+ ohos-ime = { workspace = true }
+diff --git a/ports/arkweb/cpp/servo_nweb.cpp b/ports/arkweb/cpp/servo_nweb.cpp
+index d64d836f6a8..1a56537c39d 100644
+--- a/ports/arkweb/cpp/servo_nweb.cpp
++++ b/ports/arkweb/cpp/servo_nweb.cpp
+@@ -63,6 +63,10 @@ void ServoNWeb::Resize(uint32_t width, uint32_t height, bool /*isKeyboard*/) {
+ void ServoNWeb::OnPause() {
+     paused_ = true;
+     UpdateThrottled();
++    // ACE calls OnPause on window hide and when the host application is
++    // backgrounded. A backgrounded application may be killed without any further
++    // callback, so this is the last reliable chance to persist network state.
++    servo::embedder::application_backgrounded();
+ }
+ 
+ void ServoNWeb::OnContinue() {
+diff --git a/ports/arkweb/src/bridge.rs b/ports/arkweb/src/bridge.rs
+index 45b46a96595..8ae1a7d023b 100644
+--- a/ports/arkweb/src/bridge.rs
++++ b/ports/arkweb/src/bridge.rs
+@@ -41,6 +41,9 @@ pub mod ffi {
+         fn navigate_back_or_forward(id: u32, step: i32);
+         fn resize(id: u32, width: u32, height: u32);
+         fn set_throttled(id: u32, throttled: bool);
++        /// The host application moved to the background; persist what would
++        /// otherwise be lost if it is killed while there.
++        fn application_backgrounded();
+         fn focus(id: u32);
+         fn blur(id: u32);
+         fn touch_event(id: u32, kind: u8, x: f32, y: f32, pointer_id: i32);
+@@ -249,6 +252,9 @@ fn resize(id: u32, width: u32, height: u32) {
+ fn set_throttled(id: u32, throttled: bool) {
+     crate::runtime::set_throttled(id, throttled)
+ }
++fn application_backgrounded() {
++    crate::runtime::application_backgrounded()
++}
+ fn focus(id: u32) {
+     crate::runtime::focus(id)
+ }
+diff --git a/ports/arkweb/src/runtime.rs b/ports/arkweb/src/runtime.rs
+index 83e9c89f35f..7ea503719e6 100644
+--- a/ports/arkweb/src/runtime.rs
++++ b/ports/arkweb/src/runtime.rs
+@@ -25,6 +25,7 @@ use cookie::Cookie;
+ use cxx::{CxxString, CxxVector, SharedPtr};
+ use dpi::PhysicalSize;
+ use log::{LevelFilter, error, info};
++use ohos_abilitykit_sys::runtime::application_context;
+ use ohos_ime::{AttachOptions, Ime, ImeProxy, RawTextEditorProxy};
+ use ohos_ime_sys::types::InputMethod_EnterKeyType;
+ use ohos_vsync::NativeVsync;
+@@ -112,6 +113,9 @@ enum Action {
+         id: u32,
+         throttled: bool,
+     },
++    /// The host application is no longer in the foreground. Carries a channel so
++    /// the caller can wait: the application may be frozen once `OnPause` returns.
++    ApplicationBackgrounded(std::sync::mpsc::SyncSender<()>),
+     Touch {
+         id: u32,
+         kind: u8,
+@@ -543,6 +547,38 @@ struct ServoThread {
+     webviews: HashMap<u32, WebViewEntry>,
+ }
+ 
++/// Where the HTTP cache lives: under `web/` in the application's cache directory,
++/// next to ArkWeb's own data. The system's cache trimming spares that directory,
++/// and Servo stands in for the system webview here. `--user-data-dir` is the
++/// application's base directory, outside `cacheDir`.
++fn http_cache_dir() -> PathBuf {
++    application_cache_dir()
++        .unwrap_or_else(|| PathBuf::from("/data/storage/el2/base/cache"))
++        .join("web")
++        .join("servo")
++        .join("http-cache")
++}
++
++/// The application's cache directory, as its application context reports it.
++#[allow(unsafe_code)]
++fn application_cache_dir() -> Option<PathBuf> {
++    const BUFFER_SIZE: i32 = 256;
++    let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE as usize);
++    let mut written = 0;
++    // SAFETY: the getter writes at most `BUFFER_SIZE` bytes to the buffer and the length it
++    // wrote to `written`, which is clamped to the buffer anyway.
++    unsafe {
++        application_context::OH_AbilityRuntime_ApplicationContextGetCacheDir(
++            buffer.as_mut_ptr().cast(),
++            BUFFER_SIZE,
++            &mut written,
++        )
++        .ok()?;
++        buffer.set_len(written.clamp(0, BUFFER_SIZE) as usize);
++    }
++    String::from_utf8(buffer).ok().map(PathBuf::from)
++}
++
+ impl ServoThread {
+     /// Build the Servo engine. This is the expensive step (`Servo::new` spins up the constellation,
+     /// networking, JS and GPU machinery), split out of [`Self::run`] so a `lazy` LibraryLoaded can
+@@ -559,6 +595,9 @@ impl ServoThread {
+         // `config_dir` must be set: the OHOS font cache unwraps `opts::get().config_dir`
+         // (fonts/platform/freetype/ohos/font_cache.rs) when Servo initializes.
+         let opts = Opts {
++            // Without this the store falls back to memory only, which is the opposite
++            // of what a webview embedded in someone else's application wants.
++            http_cache_dir: Some(http_cache_dir()),
+             config_dir: Some(config_dir),
+             ..Default::default()
+         };
+@@ -729,6 +768,15 @@ impl ServoThread {
+                 // not painted and its animations and timers are throttled.
+                 self.with_webview(id, |wv| if throttled { wv.hide() } else { wv.show() })
+             },
++            Action::ApplicationBackgrounded(done) => {
++                // A backgrounded application can be killed without further notice,
++                // so give the networking layer a chance to persist first.
++                info!("[arkweb] application_backgrounded");
++                self.servo
++                    .network_manager()
++                    .notify_application_backgrounded();
++                let _ = done.send(());
++            },
+             Action::Touch {
+                 id,
+                 kind,
+@@ -1691,6 +1739,21 @@ pub fn set_throttled(id: u32, throttled: bool) {
+     })
+ }
+ 
++/// Bound on how long `OnPause` blocks the ACE UI thread waiting for Servo to
++/// persist. The work is a few kilobytes with no `fsync`; the bound only exists so
++/// a busy Servo thread cannot stall the host application.
++const BACKGROUND_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
++
++pub fn application_backgrounded() {
++    guard("application_backgrounded", || {
++        let (done, wait) = std::sync::mpsc::sync_channel(0);
++        send(Action::ApplicationBackgrounded(done));
++        if wait.recv_timeout(BACKGROUND_FLUSH_TIMEOUT).is_err() {
++            error!("[arkweb] servo did not finish persisting before the background timeout");
++        }
++    })
++}
++
+ pub fn focus(id: u32) {
+     guard("focus", || send(Action::Focus(id)))
+ }
+diff --git a/ports/arkweb/tools/conftest.py b/ports/arkweb/tools/conftest.py
+index e570c04302b..eb8b5a40ad9 100644
+--- a/ports/arkweb/tools/conftest.py
++++ b/ports/arkweb/tools/conftest.py
+@@ -376,6 +376,12 @@ navigator.geolocation.getCurrentPosition(
+ 
+ AUTH_OK_PAGE = "<html><body style='margin:0;background:#00cc00'>authed</body></html>"
+ 
++# Served with an explicit freshness lifetime so the HTTP cache stores it; used by
++# the cache-index test, which needs the store to have something to write down.
++CACHEABLE_PAGE = (
++    "<html><body style='margin:0;background:#00cc00'>cacheable<script src='/cacheable.js'></script></body></html>"
++)
++
+ # user:passwd -- matches the credentials ControllerPage's onHttpAuthRequest confirms with.
+ AUTH_CREDENTIALS = "Basic " + base64.b64encode(b"user:passwd").decode()
+ 
+@@ -384,6 +390,10 @@ class _FixtureHandler(http.server.BaseHTTPRequestHandler):
+     def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+         if self.path == "/geo.html":
+             self._page(GEO_PAGE)
++        elif self.path == "/cacheable.html":
++            self._page(CACHEABLE_PAGE, cacheable=True)
++        elif self.path == "/cacheable.js":
++            self._body(b"window.__cacheable = 1;", "text/javascript", cacheable=True)
+         elif self.path == "/auth":
+             if self.headers.get("Authorization") == AUTH_CREDENTIALS:
+                 self._page(AUTH_OK_PAGE)
+@@ -398,11 +408,16 @@ class _FixtureHandler(http.server.BaseHTTPRequestHandler):
+         else:
+             self.send_error(404)
+ 
+-    def _page(self, html: str) -> None:
+-        body = html.encode()
++    def _page(self, html: str, cacheable: bool = False) -> None:
++        self._body(html.encode(), "text/html", cacheable=cacheable)
++
++    def _body(self, body: bytes, content_type: str, cacheable: bool = False) -> None:
+         self.send_response(200)
+-        self.send_header("Content-Type", "text/html")
++        self.send_header("Content-Type", content_type)
+         self.send_header("Content-Length", str(len(body)))
++        if cacheable:
++            self.send_header("Cache-Control", "max-age=3600")
++            self.send_header("ETag", '"fixture-v1"')
+         self.end_headers()
+         self.wfile.write(body)
+ 
+diff --git a/ports/arkweb/tools/test_http_cache_index.py b/ports/arkweb/tools/test_http_cache_index.py
+new file mode 100644
+index 00000000000..d4ebb734eca
+--- /dev/null
++++ b/ports/arkweb/tools/test_http_cache_index.py
+@@ -0,0 +1,112 @@
++# /// script
++# requires-python = ">=3.9"
++# dependencies = ["pytest>=7", "hdc-py>=0.2.0", "pillow>=10"]
++# ///
++"""HTTP cache index survives being backgrounded and killed.
++
++A phone application is frozen and then killed rather than shut down, so the cache
++index -- which is otherwise only written once changes stop -- would never reach
++disk and every cold start would pay a directory scan. `ServoNWeb::OnPause` (which
++ACE calls on window hide and app background) therefore flushes it synchronously.
++
++This is the regression guard for that path, end to end on a device:
++
++  1. start from an empty cache directory,
++  2. load a cacheable page so the store has something to write down,
++  3. send the app to the home screen and assert the index reaches disk,
++  4. force-stop, i.e. the kill an OS reaper would do,
++  5. restart and assert the index was *loaded*, not rebuilt by scanning.
++
++Step 5 is the one that matters and the one a purely functional check would miss:
++the cache still answers from disk either way, because a rebuild finds the same
++entries. The two paths are told apart by the `http-cache: index ...` markers in
++`components/net/http_cache/disk/index.rs`.
++"""
++
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from conftest import BUNDLE, clear_log, force_stop, key, read_log, sh, wait_log
++
++KEYCODE_HOME = 1
++
++LOADED = "http-cache: index loaded from disk"
++REBUILT = "http-cache: index rebuilt by scanning"
++
++# The cache dir is found rather than hard-coded: a layout change should fail
++# loudly here, not silently make the test assert nothing.
++CACHE_GLOB = f"/data/app/el2/100/base/{BUNDLE}"
++
++
++def find_cache_dir(device) -> str | None:
++    found = sh(
++        device,
++        f"find {CACHE_GLOB} -maxdepth 5 -type d -name http-cache 2>/dev/null",
++        check=False,
++    ).strip()
++    return found.splitlines()[0].strip() if found else None
++
++
++def wait_for_file(device, path: str, timeout: float = 15.0) -> bool:
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        probe = sh(device, f"if [ -f {path} ]; then echo __YES__; fi", check=False)
++        if "__YES__" in probe:
++            return True
++        time.sleep(0.5)
++    return False
++
++
++def test_index_is_flushed_on_background_and_reused_on_restart(device, http_server, launch):
++    # (1) An empty cache directory. The app may never have run, so the directory
++    # is located after a first launch and wiped before the run that matters.
++    force_stop(device)
++    existing = find_cache_dir(device)
++    if existing:
++        sh(device, f"rm -rf {existing}", check=False)
++
++    # (2) A page whose subresource is cacheable, so the store commits entries.
++    launch(url=f"{http_server}/cacheable.html")
++
++    cache_dir = find_cache_dir(device)
++    assert cache_dir, (
++        "no http-cache directory appeared under the app data dir; the port may not "
++        "be setting Opts::http_cache_dir any more"
++    )
++    assert cache_dir.startswith(f"{CACHE_GLOB}/cache/web/"), (
++        f"the cache must be under web/ in the app's cache dir, next to ArkWeb's own data: {cache_dir}"
++    )
++    index_data = f"{cache_dir}/index-data"
++
++    entries = sh(device, f"ls {cache_dir}/entries 2>/dev/null | wc -l", check=False).strip()
++    assert entries and int(entries) > 0, f"nothing was cached, so the test proves nothing ({entries=})"
++    assert not wait_for_file(device, index_data, timeout=2.0), (
++        "index-data exists already; the debounce should not have fired this soon, so "
++        "step (3) would not be testing the background flush"
++    )
++
++    # (3) Home screen -> OnPause -> synchronous flush.
++    key(device, KEYCODE_HOME)
++    assert wait_for_file(device, index_data), "backgrounding did not flush the cache index to disk"
++
++    # (4) The kill an OS reaper performs on a frozen application.
++    time.sleep(1.0)
++    force_stop(device)
++
++    # (5) The restart must trust the index instead of scanning for it.
++    clear_log(device)
++    launch(url=f"{http_server}/cacheable.html")
++    assert wait_log(device, LOADED), (
++        f"restart did not load the index from disk; log said:\n"
++        f"{[line for line in read_log(device).splitlines() if 'http-cache:' in line]}"
++    )
++    assert REBUILT not in read_log(device), "the index was rebuilt by scanning despite being flushed"
++
++
++if __name__ == "__main__":
++    import sys
++
++    sys.exit(pytest.main([__file__, "-v"]))

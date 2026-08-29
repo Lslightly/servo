@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 11 Oct 2026 10:43:34 +0000
+Subject: [PATCH] ci: Pass the check-run data to curl through stdin
+
+With hundreds of unexpected results, the check-run summary exceeds the
+argument size limit, and "Report results" failed with "OSError: [Errno 7]
+Argument list too long: 'curl'" (QuickJS WPT run of 2026-10-10).
+
+Validation: the same subprocess call delivered a 3 MB body to a local HTTP server; the step itself only runs in CI.
+AI-assisted: Yes (agent session; written by the agent, which found the cause in the run's log)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ etc/ci/report_aggregated_expected_results.py | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/etc/ci/report_aggregated_expected_results.py b/etc/ci/report_aggregated_expected_results.py
+index 13dd03e049b..a355ea82670 100755
+--- a/etc/ci/report_aggregated_expected_results.py
++++ b/etc/ci/report_aggregated_expected_results.py
+@@ -235,7 +235,8 @@ def create_github_reports(body: str, tag: str = ""):
+         "actions": [],
+     }
+ 
+-    subprocess.Popen(
++    # The data goes through stdin: with many unexpected results, it exceeds the argument size limit.
++    subprocess.run(
+         [
+             "curl",
+             "-L",
+@@ -249,9 +250,11 @@ def create_github_reports(body: str, tag: str = ""):
+             "X-GitHub-Api-Version: 2022-11-28",
+             f"https://api.github.com/repos/{repo}/check-runs",
+             "-d",
+-            json.dumps(data),
+-        ]
+-    ).wait()
++            "@-",
++        ],
++        input=json.dumps(data),
++        text=True,
++    )
+ 
+ 
+ def main():

@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 20 Oct 2026 08:00:19 +0000
+Subject: [PATCH] servoshell (ohos): Write the HTTP cache index when
+ backgrounded
+
+An OpenHarmony application is frozen and then killed rather than shut
+down, so the index of the disk cache, which is written 20 s after the
+last change, is rarely written at all, and every cold start scans the
+cache directory (74 ms at 20 000 entries on a HarmonyOS phone).
+`EntryAbility.onBackground()` now calls the new `onApplicationBackground`
+export, which asks Servo to persist and waits for it, for at most
+500 ms: the application can be frozen once the callback returns.
+
+No background permission is needed. `KEEP_BACKGROUND_RUNNING` covers
+continuous tasks, and a transient task through `requestSuspendDelay` is
+quota'd and sized for work of seconds, not for writing a few kilobytes.
+
+Fork note: from the `http-cache-v2` branch, with the declaration of the
+export added to `index.d.ts`.
+
+Validation: `./mach check --ohos` warning-free. On a HarmonyOS phone (production HAP), with the review fixes of patches 120 and 121: after the Home key, the next start loads the page without a server request in 5 of 5 runs, and the log shows `http-cache: index loaded from disk, 8 entries` instead of a rebuild by scanning in the 4 runs whose log kept the line.
+AI-assisted: Yes (agent session; the agent wrote this on the http-cache-v2 branch, ported it and declared the export)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/servoshell/egl/app.rs                   | 12 +++++++
+ ports/servoshell/egl/ohos/mod.rs              | 32 +++++++++++++++++++
+ .../src/main/cpp/types/libentry/index.d.ts    |  1 +
+ .../main/ets/entryability/EntryAbility.ets    |  8 +++++
+ 4 files changed, 53 insertions(+)
+
+diff --git a/ports/servoshell/egl/app.rs b/ports/servoshell/egl/app.rs
+index e2a16a6af77..535d77b7596 100644
+--- a/ports/servoshell/egl/app.rs
++++ b/ports/servoshell/egl/app.rs
+@@ -425,6 +425,18 @@ impl App {
+         warn!("TODO can't stop won't stop");
+     }
+ 
++    /// Tell Servo the embedding application moved to the background.
++    ///
++    /// A backgrounded application can be killed without any further callback, so
++    /// this is the last reliable chance to persist state such as the HTTP cache
++    /// index.
++    pub fn notify_application_backgrounded(&self) {
++        self.state
++            .servo
++            .network_manager()
++            .notify_application_backgrounded();
++    }
++
+     /// Go back in history.
+     pub fn go_back(&self) {
+         self.window()
+diff --git a/ports/servoshell/egl/ohos/mod.rs b/ports/servoshell/egl/ohos/mod.rs
+index 340ba5b684b..c2b54e00d5c 100644
+--- a/ports/servoshell/egl/ohos/mod.rs
++++ b/ports/servoshell/egl/ohos/mod.rs
+@@ -407,6 +407,9 @@ pub(super) enum ServoAction {
+         width: i32,
+         height: i32,
+     },
++    /// Carries a channel so the caller can wait for the work to finish: the
++    /// application may be frozen shortly after `onBackground` returns.
++    ApplicationBackgrounded(std::sync::mpsc::SyncSender<()>),
+     FocusWindow(u32, Vec<u32>),
+     CreatePlatformWindow(XComponentWrapper, WindowWrapper),
+     RemovePlatformWindow(u32, Vec<u32>),
+@@ -417,6 +420,7 @@ impl std::fmt::Debug for ServoAction {
+         match self {
+             Self::WakeUp => write!(f, "WakeUp"),
+             Self::LoadUrl(arg0) => f.debug_tuple("LoadUrl").field(arg0).finish(),
++            Self::ApplicationBackgrounded(..) => write!(f, "ApplicationBackgrounded"),
+             Self::GoBack => write!(f, "GoBack"),
+             Self::GoForward => write!(f, "GoForward"),
+             Self::TouchEvent {
+@@ -482,6 +486,10 @@ impl ServoAction {
+                 servo.spin_event_loop();
+             },
+             LoadUrl(url) => servo.load_uri(url.as_str()),
++            ApplicationBackgrounded(done) => {
++                servo.notify_application_backgrounded();
++                let _ = done.send(());
++            },
+             GoBack => servo.go_back(),
+             GoForward => servo.go_forward(),
+             TouchEvent {
+@@ -994,6 +1002,30 @@ pub fn load_url(url: String) {
+     call(ServoAction::LoadUrl(url)).expect("Failed to load url");
+ }
+ 
++/// How long `onApplicationBackground` will block the ability's main thread waiting
++/// for Servo to persist. The work itself is a few kilobytes with no `fsync`, so
++/// this bound exists only so that a busy Servo thread cannot stall the
++/// application; hitting it means something else is wrong.
++const BACKGROUND_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
++
++/// Called from `EntryAbility.onBackground()`.
++///
++/// This blocks until Servo has persisted, because the application can be frozen
++/// and then killed once the callback returns. The alternative would be a
++/// `backgroundTaskManager` transient task, but those are quota'd (10 minutes a
++/// day) and are meant for work measured in seconds; writing a few kilobytes is
++/// better done inline.
++#[napi(js_name = "onApplicationBackground")]
++pub fn on_application_background() {
++    let (done, wait) = std::sync::mpsc::sync_channel(0);
++    if call(ServoAction::ApplicationBackgrounded(done)).is_err() {
++        return;
++    }
++    if wait.recv_timeout(BACKGROUND_FLUSH_TIMEOUT).is_err() {
++        warn!("Servo did not finish persisting before the background timeout");
++    }
++}
++
+ #[napi]
+ pub fn go_back() {
+     call(ServoAction::GoBack).expect("Failed to call servo");
+diff --git a/support/openharmony/entry/src/main/cpp/types/libentry/index.d.ts b/support/openharmony/entry/src/main/cpp/types/libentry/index.d.ts
+index 9cedebd4038..1e9def24a47 100644
+--- a/support/openharmony/entry/src/main/cpp/types/libentry/index.d.ts
++++ b/support/openharmony/entry/src/main/cpp/types/libentry/index.d.ts
+@@ -14,3 +14,4 @@ export const focusWebview:(index: number, arkts_ids:number[]) => void;
+ export const deleteWebview:(index: number, arkts_ids:number[]) => void;
+ export const initServo:(options: InitOpts) => void;
+ export const nextWindowId:(arkts_id: number) => void;
++export const onApplicationBackground: () => void;
+diff --git a/support/openharmony/entry/src/main/ets/entryability/EntryAbility.ets b/support/openharmony/entry/src/main/ets/entryability/EntryAbility.ets
+index 0a5f59394d8..4a18dd72492 100644
+--- a/support/openharmony/entry/src/main/ets/entryability/EntryAbility.ets
++++ b/support/openharmony/entry/src/main/ets/entryability/EntryAbility.ets
+@@ -126,5 +126,13 @@ export default class EntryAbility extends UIAbility {
+   onBackground() {
+     // Ability has back to background
+     hilog.info(0x0000, 'testTag', '%{public}s', 'Ability onBackground');
++    // A backgrounded application can be frozen and then killed without any
++    // further callback, so this is the last reliable chance for Servo to persist
++    // state it would otherwise only write on a timer (e.g. the HTTP cache index).
++    try {
++      servoshell.onApplicationBackground();
++    } catch (e) {
++      hilog.warn(0x0000, 'testTag', 'onApplicationBackground failed: %{public}s', JSON.stringify(e));
++    }
+   }
+ };
