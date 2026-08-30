@@ -30,6 +30,10 @@
         fi
     }
 
+    export PATH="$HOME/.local/bin:$PATH"
+    echo $PATH >&2
+    uv --version >&2
+
     run_in_nix_if_needed uv run --frozen python ${MACH_DIR}/mach "$@"
 }
 '''

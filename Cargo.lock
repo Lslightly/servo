@@ -9093,6 +9093,7 @@ dependencies = [
  "servo-jstraceable-derive",
  "servo-malloc-size-of",
  "servo-profile-traits",
+ "servo-tracing",
  "servo-url",
  "servo-webxr-api",
  "servo_arc",

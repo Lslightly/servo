@@ -4774,6 +4774,7 @@ impl Document {
         )
     }
 
+    #[servo_tracing::instrument(name = "Document::get_elements_with_id", level = "trace", skip_all)]
     pub(crate) fn get_elements_with_id(
         &self,
         cx: &mut JSContext,
@@ -4782,6 +4783,7 @@ impl Document {
         self.id_map.get_all(cx.no_gc(), self.upcast(), id)
     }
 
+    #[servo_tracing::instrument(name = "Document::get_elements_with_name", level = "trace", skip_all)]
     pub(crate) fn get_elements_with_name(
         &self,
         cx: &mut JSContext,

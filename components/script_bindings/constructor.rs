@@ -168,6 +168,7 @@ pub(crate) unsafe fn create_callback_interface_objects<D: DomTypes>(
 
 /// SAFETY: cache is a non-null pointer to a valid ProtoOrIfaceArray object.
 /// The returned object needs to be rooted.
+#[servo_tracing::instrument(name = "create_interface", level = "trace", skip_all)]
 pub(crate) unsafe fn create_interface<D: DomTypes>(
     cx: &mut js::context::JSContext,
     init: InterfaceInit,

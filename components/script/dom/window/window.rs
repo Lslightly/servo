@@ -2299,6 +2299,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-window-nameditem>
+    #[servo_tracing::instrument(name = "Window::NamedGetter", level = "trace", skip_all)]
     fn NamedGetter(&self, cx: &mut JSContext, name: DOMString) -> Option<NamedPropertyValue> {
         if name.is_empty() {
             return None;
@@ -3881,6 +3882,7 @@ impl Window {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[servo_tracing::instrument(name = "Window::new", level = "trace", skip_all)]
     pub(crate) fn new(
         cx: &mut JSContext,
         webview_id: WebViewId,
@@ -4225,6 +4227,7 @@ unsafe extern "C" fn dump_js_stack(cx: *mut RawJSContext) {
 }
 
 impl WindowHelpers for Window {
+    #[servo_tracing::instrument(name = "Window::create_named_properties_object", level = "trace", skip_all)]
     fn create_named_properties_object(
         cx: &mut JSContext,
         proto: HandleObject,

@@ -78,6 +78,7 @@ static HANDLER: LazyLock<SyncWrapper> = LazyLock::new(|| {
 });
 
 #[expect(unsafe_code)]
+#[servo_tracing::instrument(name = "WindowProperties::getOwnPropertyDescriptor", level = "trace", skip_all)]
 unsafe extern "C" fn get_own_property_descriptor(
     cx: *mut JSContext,
     proxy: HandleObject,
@@ -251,6 +252,7 @@ static CLASS: JSClass = JSClass {
 };
 
 #[expect(unsafe_code)]
+#[servo_tracing::instrument(name = "WindowProperties::create", level = "trace", skip_all)]
 pub(crate) fn create(
     cx: &mut js::context::JSContext,
     proto: RustHandleObject,

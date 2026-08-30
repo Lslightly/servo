@@ -181,6 +181,7 @@ impl WindowProxy {
 
     #[expect(unsafe_code)]
     #[expect(clippy::too_many_arguments)]
+    #[servo_tracing::instrument(name = "WindowProxy::new", level = "trace", skip_all)]
     pub(crate) fn new(
         cx: &mut JSContext,
         window: &Window,
@@ -1166,6 +1167,7 @@ fn parse_open_feature_boolean(tokenized_features: &IndexMap<String, String>, nam
 // https://html.spec.whatwg.org/multipage/#accessing-other-browsing-contexts
 #[expect(unsafe_code)]
 #[expect(non_snake_case)]
+#[servo_tracing::instrument(name = "GetSubframeWindowProxy", level = "trace", skip_all)]
 unsafe fn GetSubframeWindowProxy(
     cx: &mut JSContext,
     proxy: RawHandleObject,
@@ -1220,6 +1222,7 @@ unsafe fn GetSubframeWindowProxy(
 }
 
 #[expect(unsafe_code)]
+#[servo_tracing::instrument(name = "WindowProxy::getOwnPropertyDescriptor", level = "trace", skip_all)]
 unsafe extern "C" fn get_own_property_descriptor(
     cx: *mut RawJSContext,
     proxy: RawHandleObject,
@@ -1275,6 +1278,7 @@ unsafe extern "C" fn define_property(
 }
 
 #[expect(unsafe_code)]
+#[servo_tracing::instrument(name = "WindowProxy::has", level = "trace", skip_all)]
 unsafe extern "C" fn has(
     cx: *mut RawJSContext,
     proxy: RawHandleObject,
@@ -1305,6 +1309,7 @@ unsafe extern "C" fn has(
 }
 
 #[expect(unsafe_code)]
+#[servo_tracing::instrument(name = "WindowProxy::get", level = "trace", skip_all)]
 unsafe extern "C" fn get(
     cx: *mut RawJSContext,
     proxy: RawHandleObject,
@@ -1489,6 +1494,7 @@ impl WindowProxyHandler {
 
     /// Creates a new WindowProxy object on the C++ side and returns the pointer to it.
     /// The pointer should be owned by the GC.
+    #[servo_tracing::instrument(name = "WindowProxy::new_window_proxy", level = "trace", skip_all)]
     fn new_window_proxy(
         &self,
         cx: &mut JSContext,

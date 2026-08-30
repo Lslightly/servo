@@ -249,6 +249,7 @@ pub(crate) fn create_callback_interface_object<D: DomTypes>(
 
 /// Create the interface prototype object of a non-callback interface.
 #[expect(clippy::too_many_arguments)]
+#[servo_tracing::instrument(name = "create_interface_prototype_object", level = "trace", skip_all)]
 pub(crate) fn create_interface_prototype_object<D: DomTypes>(
     cx: &mut js::context::JSContext,
     global: HandleObject,

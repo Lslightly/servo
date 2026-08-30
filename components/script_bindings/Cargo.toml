@@ -43,6 +43,7 @@ regex = { workspace = true }
 servo-base = { workspace = true }
 servo-config = { workspace = true }
 servo-constellation-traits = { workspace = true }
+servo-tracing = { workspace = true }
 servo-url = { workspace = true }
 servo_arc = { workspace = true }
 smallvec = { workspace = true }
