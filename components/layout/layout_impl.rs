@@ -1107,6 +1107,14 @@ impl LayoutThread {
                 accessibility_damage.as_mut(),
             );
 
+        // A reflow that actually laid out, as opposed to one that found style and
+        // the trees already clean and returned. `restyle_and_build_trees` is
+        // entered for both, so its span cannot be used to count layouts; this
+        // marker is the counterpart of Blink's `LocalFrameView::performLayout`.
+        #[cfg(feature = "tracing")]
+        if reflow_phases_run.contains(ReflowPhasesRun::RanLayout) {
+            tracing::debug!(name: "RanLayout", goal = ?reflow_request.reflow_goal);
+        }
         if self.build_stacking_context_tree_for_reflow(&reflow_request) {
             reflow_phases_run.insert(ReflowPhasesRun::BuiltStackingContextTree);
         }
