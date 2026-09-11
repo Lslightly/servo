@@ -5,6 +5,10 @@ import servoshell from 'libservoshell.so';
 @Component
 struct Index {
   // The state seem to be required to be on the top.
+  // Set by EntryAbility from `--chrome=none`: when false the toolbar and the
+  // tab bar are dropped and the XComponent fills the window. See the comment
+  // in EntryAbility.ets for why measurement runs want that.
+  @LocalStorageProp('showChrome') showChrome: boolean = true
   @State urlToLoad: string = ""
   @State tablist: Array<number> = [0];
   @State currentId: number = 0;
@@ -78,62 +82,64 @@ struct Index {
     // extends beyond the edge of the screen. This does not happen with
     // Flex.
     Flex({ direction: FlexDirection.Column }) {
-      Row() {
-        Button('+')
-          .backgroundColor(Color.White)
-          .fontColor(Color.Black)
-          .fontWeight(FontWeight.Bolder)
-          .fontSize(22)
-          .width('12%')
-          .onClick((event) => {
-            const new_id = this.nextTabId++;
-            // the order is important as adding a new tab will automatically create a new surface.
-            servoshell.nextWindowId(new_id);
-            this.tablist.push(new_id)
-            this.currentId = new_id;
-          })
-        Button('⇦')
-          .backgroundColor(Color.White)
-          .fontColor(Color.Black)
-          .fontWeight(FontWeight.Bolder)
-          .width('12%')
-          .fontSize(12)
-          .onClick(() => {
-            this.onBackPress()
-          })
-        Button('⇨')
-          .backgroundColor(Color.White)
-          .fontColor(Color.Black)
-          .fontWeight(FontWeight.Bolder)
-          .fontSize(12)
-          .width('12%')
-          .onClick(() => {
-            servoshell.goForward()
-          })
-        TextInput({ placeholder: 'URL', text: $$this.urlToLoad })
-          .type(InputType.URL)
-          .width('76%')
-          .onChange((value) => {
-            this.urlToLoad = value
-          })
-          .onSubmit((EnterKeyType) => {
-            servoshell.loadURL(this.urlToLoad)
-            console.info('Load URL: ', this.urlToLoad)
-          })
-      }
+      if (this.showChrome) {
+        Row() {
+          Button('+')
+            .backgroundColor(Color.White)
+            .fontColor(Color.Black)
+            .fontWeight(FontWeight.Bolder)
+            .fontSize(22)
+            .width('12%')
+            .onClick((event) => {
+              const new_id = this.nextTabId++;
+              // the order is important as adding a new tab will automatically create a new surface.
+              servoshell.nextWindowId(new_id);
+              this.tablist.push(new_id)
+              this.currentId = new_id;
+            })
+          Button('⇦')
+            .backgroundColor(Color.White)
+            .fontColor(Color.Black)
+            .fontWeight(FontWeight.Bolder)
+            .width('12%')
+            .fontSize(12)
+            .onClick(() => {
+              this.onBackPress()
+            })
+          Button('⇨')
+            .backgroundColor(Color.White)
+            .fontColor(Color.Black)
+            .fontWeight(FontWeight.Bolder)
+            .fontSize(12)
+            .width('12%')
+            .onClick(() => {
+              servoshell.goForward()
+            })
+          TextInput({ placeholder: 'URL', text: $$this.urlToLoad })
+            .type(InputType.URL)
+            .width('76%')
+            .onChange((value) => {
+              this.urlToLoad = value
+            })
+            .onSubmit((EnterKeyType) => {
+              servoshell.loadURL(this.urlToLoad)
+              console.info('Load URL: ', this.urlToLoad)
+            })
+        }
 
-      List({ space: 10 }) {
-        ForEach(this.tablist, (item: number, index: number) => {
-          ListItem() {
-            this.tabBuilder(item, index)
-          }
-        })
+        List({ space: 10 }) {
+          ForEach(this.tablist, (item: number, index: number) => {
+            ListItem() {
+              this.tabBuilder(item, index)
+            }
+          })
+        }
+        .listDirection(Axis.Horizontal)
+        .height(40)
+        .width('100%')
+        .padding({ left: 10, right: 10 })
+        .backgroundColor('#e1e1e1')
       }
-      .listDirection(Axis.Horizontal)
-      .height(40)
-      .width('100%')
-      .padding({ left: 10, right: 10 })
-      .backgroundColor('#e1e1e1')
 
       Stack() {
         ForEach(this.tablist, (item: number) => {
