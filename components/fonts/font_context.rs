@@ -15,7 +15,7 @@ use content_security_policy::Violation;
 use fonts_traits::{
     CSSFontFaceDescriptors, FontDescriptor, FontFaceRuleInfo, FontIdentifier, FontTemplate,
     FontTemplateRef, FontTemplateRefMethods, StylesheetWebFontLoadFinishedCallback,
-    WebFontLoadEvent, WebFontSetDifference,
+    WebFontLoadEvent, WebFontLoadState, WebFontSetDifference,
 };
 use log::{debug, trace};
 use malloc_size_of::MallocSizeOf;
@@ -669,6 +669,9 @@ impl WebFontDownloadState {
                     .web_fonts
                     .write()
                     .add_new_template(family_name, new_template);
+                initiator
+                    .font_face_rule
+                    .set_load_state(WebFontLoadState::Loaded);
                 self.font_context
                     .invalidate_font_groups_after_web_font_load();
 
@@ -689,6 +692,9 @@ impl WebFontDownloadState {
         let family_name = self.css_font_face_descriptors.family_name.clone();
         match self.initiator {
             WebFontLoadInitiator::Stylesheet(initiator) => {
+                initiator
+                    .font_face_rule
+                    .set_load_state(WebFontLoadState::Failed);
                 if self
                     .font_context
                     .number_of_loading_web_fonts
@@ -748,6 +754,7 @@ impl FontContextWebFontMethods for Arc<FontContext> {
         };
 
         let css_font_face_descriptors = CSSFontFaceDescriptors::from(&font_face_rule.descriptors);
+        font_face_rule.set_load_state(WebFontLoadState::Loading);
 
         let initiator = FontFaceRuleInitiator {
             font_face_rule: font_face_rule.clone(),
@@ -1602,11 +1609,11 @@ impl KnownFontFaceRules {
                 continue;
             } else {
                 // This is a new rule that does not conflict with anything that previously existed, so insert it.
-                let font_face_rule_entry = ServoArc::new(FontFaceRuleInfo {
-                    cascade_index: AtomicUsize::new(cascade_index),
-                    descriptors: borrowed_rule.descriptors.clone(),
-                    rule: rule_with_origin.rule,
-                });
+                let font_face_rule_entry = ServoArc::new(FontFaceRuleInfo::new(
+                    cascade_index,
+                    borrowed_rule.descriptors.clone(),
+                    rule_with_origin.rule,
+                ));
                 difference
                     .added_font_faces
                     .push(font_face_rule_entry.clone());

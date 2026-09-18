@@ -99,6 +99,20 @@ impl FontFaceSet {
         }
     }
 
+    /// Settle the promises of css-connected faces whose `@font-face` rules have finished
+    /// loading. Those faces are loaded by the `FontContext`, so nothing else tells them.
+    pub(crate) fn update_css_connected_face_statuses(&self, cx: &mut JSContext) {
+        let entries: Vec<DomRoot<FontFace>> = self
+            .set_entries
+            .borrow()
+            .iter()
+            .map(|face| face.as_rooted())
+            .collect();
+        for face in entries {
+            face.update_status_from_css_font_face_rule(cx);
+        }
+    }
+
     /// Fulfill the font ready promise, returning true if it was not already fulfilled beforehand.
     pub(crate) fn fulfill_ready_promise_if_needed(&self, cx: &mut JSContext) -> bool {
         let promise = self.promise.borrow();

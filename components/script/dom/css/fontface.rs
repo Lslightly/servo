@@ -7,7 +7,8 @@ use std::cell::{Cell, Ref, RefCell};
 use cssparser::Parser;
 use dom_struct::dom_struct;
 use fonts::{
-    FontContext, FontContextWebFontMethods, FontFaceRuleInfo, FontTemplate, LowercaseFontFamilyName,
+    FontContext, FontContextWebFontMethods, FontFaceRuleInfo, FontTemplate,
+    LowercaseFontFamilyName, WebFontLoadState,
 };
 use js::context::JSContext;
 use js::rust::HandleObject;
@@ -333,7 +334,9 @@ impl FontFace {
     ) -> Self {
         Self {
             reflector: Reflector::new(),
-            status: Cell::new(FontFaceLoadStatus::Loading),
+            // The status of a css-connected face comes from its `@font-face` rule, see
+            // `Status()`.
+            status: Cell::new(FontFaceLoadStatus::Unloaded),
             descriptors: DomRefCell::new(descriptors),
             font_face_set: MutNullableDom::default(),
             family_name: DomRefCell::new(family_name),
@@ -463,6 +466,39 @@ impl FontFace {
                 // switch the FontFaceSet to loaded.
                 font_face_set.handle_font_face_status_changed(cx, self);
             }
+        }
+    }
+
+    /// Settle the `[[FontStatusPromise]]` of a [css-connected] face whose `@font-face` rule
+    /// has finished loading in the `FontContext`, which is what loads it.
+    ///
+    /// [css-connected]: https://drafts.csswg.org/css-font-loading/#css-connected
+    pub(crate) fn update_status_from_css_font_face_rule(&self, cx: &mut JSContext) {
+        if !self.is_css_connected() {
+            return;
+        }
+
+        // `status` is not the status of a css-connected face, so it is used here to hold the
+        // status this object last reported, to settle the promise exactly once.
+        let status = self.Status();
+        if status == self.status.get() {
+            return;
+        }
+        self.status.set(status);
+
+        match status {
+            FontFaceLoadStatus::Loaded => self.font_status_promise.resolve_native(cx, &self),
+            FontFaceLoadStatus::Error => {
+                // Nothing necessarily awaits the promise of a css-connected face, because
+                // the object exists whether or not the page asked for the font, so a
+                // rejection here must not be reported as unhandled.
+                let promise = self.font_status_promise.root(cx);
+                promise.set_promise_is_handled(cx);
+                promise.reject_error(cx, Error::Network(Some("Failed to load font data".into())));
+            },
+            // Note: unlike a face that script created, the template of a css-connected face
+            // belongs to the `FontContext` already, so the `FontFaceSet` has nothing to add.
+            FontFaceLoadStatus::Unloaded | FontFaceLoadStatus::Loading => {},
         }
     }
 
@@ -643,7 +679,19 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
 
     /// <https://drafts.csswg.org/css-font-loading/#dom-fontface-status>
     fn Status(&self) -> FontFaceLoadStatus {
-        self.status.get()
+        // A css-connected face is loaded by the `FontContext` rather than by this object, so
+        // the `@font-face` rule it shares with the `FontContext` is what knows its status.
+        match self
+            .css_font_face_rule()
+            .as_ref()
+            .map(|rule| rule.load_state())
+        {
+            Some(WebFontLoadState::Unloaded) => FontFaceLoadStatus::Unloaded,
+            Some(WebFontLoadState::Loading) => FontFaceLoadStatus::Loading,
+            Some(WebFontLoadState::Loaded) => FontFaceLoadStatus::Loaded,
+            Some(WebFontLoadState::Failed) => FontFaceLoadStatus::Error,
+            None => self.status.get(),
+        }
     }
 
     /// The load() method of FontFace forces a url-based font face to request its font data and
@@ -651,6 +699,12 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
     /// loaded, it does nothing.
     /// <https://drafts.csswg.org/css-font-loading/#font-face-load>
     fn Load(&self, cx: &mut JSContext) -> RootedPromise {
+        // A css-connected face is loaded by the `FontContext` together with its
+        // `@font-face` rule.
+        if self.is_css_connected() {
+            return self.font_status_promise.root(cx);
+        }
+
         // Step 2. If font face’s [[Urls]] slot is null, or its status attribute is anything
         // other than "unloaded", return font face’s [[FontStatusPromise]] and abort these
         // steps.
