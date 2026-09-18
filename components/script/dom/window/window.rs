@@ -3757,11 +3757,12 @@ impl Window {
 
         // A face that was added is unloaded, and only font matching can tell whether the
         // page needs it. Adding an `@font-face` rule does not change any computed style, so
-        // without dirtying nothing would be laid out again and the face would never be
-        // asked for.
+        // without dirtying, text laid out before the rule existed would never be matched
+        // again and the face would never be asked for. Text of other families is matched
+        // against the new rules when it is laid out for the first time anyway.
         //
         // TODO: This should only dirty nodes that could use any of the changed web fonts!
-        if !changed_web_fonts.is_empty() || changed_web_fonts.cascade_index_of_any_rule_changed {
+        if changed_web_fonts.affects_laid_out_text {
             document.dirty_all_nodes(cx.no_gc());
         }
 

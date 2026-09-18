@@ -1845,8 +1845,11 @@ impl ScriptThread {
                 // If the font load did not succeed then this message only serves to bump the script thread
                 // so it attempts to resolve the document.fonts.ready promise. This happens as a result
                 // of processing this message, so there's nothing more to do.
-                if event == WebFontLoadEvent::LoadedSuccessfully {
-                    self.handle_web_font_loaded(cx, pipeline_id)
+                if let WebFontLoadEvent::LoadedSuccessfully {
+                    affects_laid_out_text,
+                } = event
+                {
+                    self.handle_web_font_loaded(cx, pipeline_id, affects_laid_out_text)
                 }
             },
             ScriptThreadMessage::DispatchIFrameLoadEvent {
@@ -3328,14 +3331,21 @@ impl ScriptThread {
     }
 
     /// Handles a Web font being loaded. Does nothing if the page no longer exists.
-    fn handle_web_font_loaded(&self, cx: &mut JSContext, pipeline_id: PipelineId) {
+    fn handle_web_font_loaded(
+        &self,
+        cx: &mut JSContext,
+        pipeline_id: PipelineId,
+        affects_laid_out_text: bool,
+    ) {
         let Some(document) = self.documents.borrow().find_document(pipeline_id) else {
             warn!("Web font loaded in closed pipeline {}.", pipeline_id);
             return;
         };
 
         // TODO: This should only dirty nodes that are waiting for a web font to finish loading!
-        document.dirty_all_nodes(cx.no_gc());
+        if affects_laid_out_text {
+            document.dirty_all_nodes(cx.no_gc());
+        }
 
         document.Fonts(cx).update_css_connected_face_statuses(cx);
 
