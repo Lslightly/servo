@@ -12,6 +12,7 @@ use fonts::{
 };
 use js::context::JSContext;
 use js::rust::HandleObject;
+use layout_api::{QueryMsg, ReflowGoal};
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use servo_arc::Arc as ServoArc;
@@ -699,9 +700,18 @@ impl FontFaceMethods<crate::DomTypeHolder> for FontFace {
     /// loaded, it does nothing.
     /// <https://drafts.csswg.org/css-font-loading/#font-face-load>
     fn Load(&self, cx: &mut JSContext) -> RootedPromise {
-        // A css-connected face is loaded by the `FontContext` together with its
-        // `@font-face` rule.
-        if self.is_css_connected() {
+        // A css-connected face is owned by the `FontContext`, which loads it when the page
+        // needs it. Asking for it here makes it needed, and the load starts at the next
+        // reflow together with the ones that font matching asked for.
+        // Clone the rule out first: the reflow below may disconnect this face from its rule,
+        // which needs the borrow to have ended.
+        let font_face_rule = self.css_font_face_rule().clone();
+        if let Some(font_face_rule) = font_face_rule {
+            let global = self.global();
+            let window = global.as_window();
+            window.font_context().request_web_font_load(&font_face_rule);
+            // Loads that have been asked for are started by the next reflow.
+            window.reflow(cx, ReflowGoal::LayoutQuery(QueryMsg::BoxArea));
             return self.font_status_promise.root(cx);
         }
 

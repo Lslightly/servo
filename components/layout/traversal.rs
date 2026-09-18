@@ -10,6 +10,7 @@ use layout_api::{
 use script::layout_dom::ServoLayoutNode;
 use style::context::{SharedStyleContext, StyleContext};
 use style::dom::{NodeInfo, TElement, TNode};
+use style::properties::ComputedValues;
 use style::selector_parser::RestyleDamage;
 use style::traversal::{DomTraversal, recalc_style_at};
 
@@ -65,6 +66,18 @@ where
             &mut element_data,
             note_child,
         );
+
+        // The first available font of an element is needed even if it has no text, for
+        // instance for `line-height: normal`, so make sure that it gets loaded. Fonts are
+        // inherited, so only elements that change them need to be looked at.
+        if let Some(style) = element_data.styles.get_primary() &&
+            !style.get_box().display.is_none() &&
+            !parent_has_same_font(dangerous_style_element, style)
+        {
+            self.context
+                .font_context
+                .request_first_available_web_font(style.clone_font());
+        }
     }
 
     #[inline]
@@ -79,6 +92,19 @@ where
     fn shared_context(&self) -> &SharedStyleContext<'_> {
         &self.context.style_context
     }
+}
+
+fn parent_has_same_font<E: TElement>(element: E, style: &ComputedValues) -> bool {
+    let Some(parent) = element.traversal_parent() else {
+        return false;
+    };
+    let Some(parent_data) = parent.borrow_data() else {
+        return false;
+    };
+    parent_data
+        .styles
+        .get_primary()
+        .is_some_and(|parent_style| std::ptr::eq(parent_style.get_font(), style.get_font()))
 }
 
 #[servo_tracing::instrument(skip_all)]

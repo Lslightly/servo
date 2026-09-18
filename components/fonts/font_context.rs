@@ -14,8 +14,9 @@ use app_units::Au;
 use content_security_policy::Violation;
 use fonts_traits::{
     CSSFontFaceDescriptors, FontDescriptor, FontFaceRuleInfo, FontIdentifier, FontTemplate,
-    FontTemplateRef, FontTemplateRefMethods, StylesheetWebFontLoadFinishedCallback,
-    WebFontLoadEvent, WebFontLoadState, WebFontSetDifference,
+    FontTemplateDescriptor, FontTemplateRef, FontTemplateRefMethods,
+    StylesheetWebFontLoadFinishedCallback, WebFontLoadEvent, WebFontLoadState,
+    WebFontSetDifference,
 };
 use log::{debug, trace};
 use malloc_size_of::MallocSizeOf;
@@ -131,6 +132,12 @@ pub struct FontContext {
 
     /// The number of fonts that are currently loading.
     number_of_loading_web_fonts: AtomicUsize,
+
+    /// The `@font-face` rules that font matching has selected, but whose `src` has not been
+    /// fetched yet. Filled in while laying out and drained by
+    /// [`FontContextWebFontMethods::process_pending_web_font_loads`] afterwards.
+    #[ignore_malloc_size_of = "The rules are measured as part of `known_font_face_rules`."]
+    pending_web_font_loads: Mutex<Vec<ServoArc<FontFaceRuleInfo>>>,
 }
 
 /// A callback that will be invoked on the Fetch thread if a web font download
@@ -192,6 +199,7 @@ impl FontContext {
             known_font_face_rules: Default::default(),
             font_feature_value_map: Default::default(),
             number_of_loading_web_fonts: Default::default(),
+            pending_web_font_loads: Default::default(),
         }
     }
 
@@ -206,6 +214,16 @@ impl FontContext {
             },
             FontIdentifier::Local(_) => None,
         }
+    }
+
+    /// Ask for the first available font for `style` to be loaded if it is a web font that has
+    /// not been fetched yet. See [`FontGroup::request_first_available_web_font`].
+    pub fn request_first_available_web_font(&self, style: ServoArc<FontStyleStruct>) {
+        if self.web_fonts.read().families.is_empty() {
+            return;
+        }
+        self.font_group(style)
+            .request_first_available_web_font(self);
     }
 
     /// Returns a `FontGroup` representing fonts which can be used for layout, given the `style`.
@@ -282,6 +300,17 @@ impl FontContext {
 
         if let Some(font) = self.fonts.read().get(&cache_key).cloned() {
             return font;
+        }
+
+        // A web font template can describe a face that has not been downloaded yet. It
+        // cannot be turned into a `Font`, and caching the failure would hide the face
+        // once its data arrives.
+        if matches!(
+            &*font_template.identifier(),
+            FontIdentifier::Web(_) | FontIdentifier::ArrayBuffer(_)
+        ) && self.get_font_data(&font_template.identifier()).is_none()
+        {
+            return None;
         }
 
         debug!(
@@ -517,10 +546,16 @@ impl FontContext {
                         .families
                         .get(family_name)
                         .is_some_and(|templates| {
-                            templates
-                                .templates
-                                .iter()
-                                .any(|template| template.borrow().identifier == font_identifier)
+                            templates.templates.iter().any(|template| {
+                                let template = template.borrow();
+                                // A template that has not been loaded yet only describes the
+                                // face by its descriptors and names the URL it will be loaded
+                                // from, so it is not a reason to skip that URL.
+                                template.identifier == font_identifier &&
+                                    template.font_face_rule.as_ref().is_none_or(|rule| {
+                                        rule.load_state() == WebFontLoadState::Loaded
+                                    })
+                            })
                         })
                 }),
             Source::Local(_) => true,
@@ -665,10 +700,16 @@ impl WebFontDownloadState {
                     return;
                 }
 
+                // The face was registered as unloaded when its rule was added, so replace
+                // that entry rather than adding a second one for the same rule.
                 self.font_context
                     .web_fonts
                     .write()
-                    .add_new_template(family_name, new_template);
+                    .set_template_for_font_face_rule(
+                        family_name,
+                        &initiator.font_face_rule,
+                        new_template,
+                    );
                 initiator
                     .font_face_rule
                     .set_load_state(WebFontLoadState::Loaded);
@@ -695,6 +736,10 @@ impl WebFontDownloadState {
                 initiator
                     .font_face_rule
                     .set_load_state(WebFontLoadState::Failed);
+                self.font_context
+                    .web_fonts
+                    .write()
+                    .remove_template_for_font_face_rule(&initiator.font_face_rule);
                 if self
                     .font_context
                     .number_of_loading_web_fonts
@@ -739,6 +784,12 @@ pub trait FontContextWebFontMethods {
         document_context: &WebFontDocumentContext,
     );
     fn handle_web_font_request_failed(&self, url: ServoUrl);
+    fn process_pending_web_font_loads(
+        &self,
+        webview_id: WebViewId,
+        callback: StylesheetWebFontLoadFinishedCallback,
+        document_context: &WebFontDocumentContext,
+    ) -> bool;
 }
 
 impl FontContextWebFontMethods for Arc<FontContext> {
@@ -783,18 +834,27 @@ impl FontContextWebFontMethods for Arc<FontContext> {
             .diff_old_and_new_font_face_rules(stylist, guards);
 
         for added_rule in &difference.added_font_faces {
-            self.load_single_font_face_rule(
-                webview_id,
-                added_rule.clone(),
-                callback.clone(),
-                document_context,
-            );
+            // A face that only has `local()` sources costs nothing to fetch, so it is
+            // loaded here instead of waiting for font matching to ask for it.
+            if !self.register_font_face_rule(added_rule) {
+                self.load_single_font_face_rule(
+                    webview_id,
+                    added_rule.clone(),
+                    callback.clone(),
+                    document_context,
+                );
+            }
         }
         for removed_rule in &difference.removed_font_faces {
             self.remove_single_font_face_rule(removed_rule, &mut self.web_fonts.write());
         }
 
-        if !difference.removed_font_faces.is_empty() || difference.cascade_index_of_any_rule_changed
+        // A new rule can make font matching pick a different face, either because it is the
+        // face that will now be used or because it is unloaded and the text has to be
+        // rendered with a fallback until it arrives.
+        if !difference.added_font_faces.is_empty() ||
+            !difference.removed_font_faces.is_empty() ||
+            difference.cascade_index_of_any_rule_changed
         {
             // Font matching may now yield different results, so invalidate resolved font groups.
             self.resolved_font_groups.write().clear();
@@ -806,6 +866,26 @@ impl FontContextWebFontMethods for Arc<FontContext> {
         }
 
         difference
+    }
+
+    /// Start the loads that font matching asked for while laying out. Returns true if any
+    /// load was started, in which case `document.fonts.ready` is blocked again.
+    fn process_pending_web_font_loads(
+        &self,
+        webview_id: WebViewId,
+        callback: StylesheetWebFontLoadFinishedCallback,
+        document_context: &WebFontDocumentContext,
+    ) -> bool {
+        let pending = std::mem::take(&mut *self.pending_web_font_loads.lock());
+        for font_face_rule in &pending {
+            self.load_single_font_face_rule(
+                webview_id,
+                font_face_rule.clone(),
+                callback.clone(),
+                document_context,
+            );
+        }
+        !pending.is_empty()
     }
 
     fn load_web_font_for_script(
@@ -949,6 +1029,69 @@ impl FontContext {
         });
 
         true
+    }
+
+    /// Add an unloaded [`FontTemplate`] for a new `@font-face` rule, so that font matching
+    /// can see the face without its `src` having been fetched.
+    ///
+    /// Until the face is loaded, the only thing known about it are the descriptors on the
+    /// rule, which is what the face is matched against. Returns false for a rule that has
+    /// nothing to fetch, because all of its sources are `local()`; the caller loads those
+    /// right away.
+    fn register_font_face_rule(&self, font_face_rule: &ServoArc<FontFaceRuleInfo>) -> bool {
+        let Some(family) = font_face_rule.descriptors.font_family.as_ref() else {
+            return true;
+        };
+        let Some(identifier) = Self::first_remote_source(font_face_rule) else {
+            return false;
+        };
+
+        let mut descriptor = FontTemplateDescriptor::default();
+        descriptor.override_values_with_css_font_template_descriptors(
+            &CSSFontFaceDescriptors::from(&font_face_rule.descriptors),
+        );
+
+        self.web_fonts.write().add_new_template(
+            family.name.clone().into(),
+            FontTemplate::new(identifier, descriptor, Some(font_face_rule.clone())),
+        );
+        true
+    }
+
+    /// The URL that a face will be fetched from first, or `None` if it has no source that
+    /// this build can fetch and use.
+    fn first_remote_source(font_face_rule: &ServoArc<FontFaceRuleInfo>) -> Option<FontIdentifier> {
+        font_face_rule
+            .descriptors
+            .src
+            .as_ref()?
+            .0
+            .iter()
+            .filter(Self::is_supported_web_font_source)
+            .find_map(|source| match source {
+                Source::Url(url_source) => url_source.url.url().cloned(),
+                Source::Local(_) => None,
+            })
+            .map(|url| FontIdentifier::Web(url.into()))
+    }
+
+    /// Ask for the `src` of an `@font-face` rule to be fetched, because font matching
+    /// selected the face for text on the page.
+    ///
+    /// This is called while laying out, possibly from several threads at once and without
+    /// the document context needed to start a fetch, so the request is only recorded here.
+    /// [`FontContextWebFontMethods::process_pending_web_font_loads`] starts it.
+    pub fn request_web_font_load(&self, font_face_rule: &ServoArc<FontFaceRuleInfo>) {
+        if font_face_rule.start_loading() {
+            self.pending_web_font_loads
+                .lock()
+                .push(font_face_rule.clone());
+        }
+    }
+
+    /// Whether any web font loads have been asked for but not started yet.
+    pub fn has_pending_web_font_loads(&self) -> bool {
+        !self.pending_web_font_loads.lock().is_empty()
     }
 
     pub fn add_template_to_font_context(

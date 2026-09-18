@@ -926,6 +926,10 @@ impl LayoutThread {
         if self.needs_accessibility_update() || reflow_request.accessibility.is_some() {
             return false;
         }
+        // Script asked for web fonts to be loaded, and loads are started by reflow.
+        if self.font_context.has_pending_web_font_loads() {
+            return false;
+        }
 
         // If we have a fragment tree and it's up-to-date and this reflow
         // doesn't need more reflow results, we can skip the rest of layout.
@@ -1142,6 +1146,14 @@ impl LayoutThread {
             fragment_tree.print();
         }
 
+        // Font matching only records which web fonts the page turned out to need; start
+        // their loads now that laying out and building the display list are done.
+        let started_web_font_loads = self.font_context.process_pending_web_font_loads(
+            self.webview_id,
+            self.web_font_finished_loading_callback.clone(),
+            &reflow_request.document_context,
+        );
+
         let pending_images = std::mem::take(&mut *image_resolver.pending_images.lock());
         let pending_rasterization_images =
             std::mem::take(&mut *image_resolver.pending_rasterization_images.lock());
@@ -1163,6 +1175,7 @@ impl LayoutThread {
             iframe_sizes: Some(iframe_sizes),
             reflow_statistics,
             changed_web_fonts,
+            started_web_font_loads,
             lcp_candidate,
             pending_accessibility_actions,
             container_timing_records: std::mem::take(

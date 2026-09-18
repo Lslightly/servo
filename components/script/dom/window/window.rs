@@ -2805,6 +2805,11 @@ impl Window {
             self.emit_timeline_marker(marker.end());
         }
 
+        if reflow_result.started_web_font_loads {
+            // Font matching found web fonts that the page needs, so `document.fonts.ready`
+            // must wait for them even if it had already been fulfilled.
+            self.Document().Fonts(cx).switch_to_loading(cx);
+        }
         self.handle_new_or_removed_web_fonts_post_reflow(cx, reflow_result.changed_web_fonts);
 
         self.handle_pending_images_post_reflow(
@@ -3750,15 +3755,19 @@ impl Window {
             fonts.notify_font_face_rules_removed(&changed_web_fonts.removed_font_faces);
         }
 
-        if !changed_web_fonts.removed_font_faces.is_empty() ||
-            changed_web_fonts.cascade_index_of_any_rule_changed
-        {
-            // TODO: This should only dirty nodes that are rendered using any of the removed
-            // web fonts!
+        // A face that was added is unloaded, and only font matching can tell whether the
+        // page needs it. Adding an `@font-face` rule does not change any computed style, so
+        // without dirtying nothing would be laid out again and the face would never be
+        // asked for.
+        //
+        // TODO: This should only dirty nodes that could use any of the changed web fonts!
+        if !changed_web_fonts.is_empty() || changed_web_fonts.cascade_index_of_any_rule_changed {
             document.dirty_all_nodes(cx.no_gc());
         }
 
         if !changed_web_fonts.added_font_faces.is_empty() {
+            // The faces are not loading yet, but the reflow that this dirtying causes may
+            // start loading them, so `document.fonts.ready` must not stay fulfilled.
             fonts.switch_to_loading(cx);
 
             for new_web_font in changed_web_fonts.added_font_faces {

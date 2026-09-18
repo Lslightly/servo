@@ -6,6 +6,7 @@ use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::{iter, str};
 
@@ -15,7 +16,7 @@ use bitflags::bitflags;
 use euclid::default::{Point2D, Rect};
 use euclid::num::Zero;
 use font_types::NameId;
-use fonts_traits::FontDescriptor;
+use fonts_traits::{FontDescriptor, WebFontLoadState};
 use icu_locale_core::subtags::Language;
 use icu_properties::props::{EnumeratedProperty, GeneralCategory};
 use log::debug;
@@ -795,6 +796,8 @@ pub struct FontGroup {
     /// It's unclear if this is the right thing to do. Perhaps fallbacks should
     /// always be stored here as it's quite likely that they will be used again.
     fallbacks: RwLock<HashMap<FallbackKey, FontRef>>,
+    /// Whether [`FontGroup::request_first_available_web_font`] has already run.
+    requested_first_available_web_font: AtomicBool,
 }
 
 impl FontGroup {
@@ -810,6 +813,40 @@ impl FontGroup {
             descriptor,
             families,
             fallbacks: Default::default(),
+            requested_first_available_web_font: Default::default(),
+        }
+    }
+
+    /// Ask for the first available font of this group to be loaded if it is a web font
+    /// that has not been fetched yet. Unlike [`FontGroup::first`], this does not need any
+    /// text and does not create fonts, so that it can be done for every element: the first
+    /// available font determines `line-height: normal` and font-relative lengths even for
+    /// elements without text.
+    pub fn request_first_available_web_font(&self, font_context: &FontContext) {
+        if self
+            .requested_first_available_web_font
+            .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+
+        for template in self
+            .families
+            .iter()
+            .flat_map(|family| family.templates(font_context, &self.descriptor))
+            .filter(|template| template.template.char_in_unicode_range(' '))
+        {
+            let Some(font_face_rule) = template.template.font_face_rule() else {
+                return;
+            };
+            match font_face_rule.load_state() {
+                WebFontLoadState::Unloaded => {
+                    font_context.request_web_font_load(&font_face_rule);
+                    return;
+                },
+                WebFontLoadState::Loading | WebFontLoadState::Loaded => return,
+                WebFontLoadState::Failed => {},
+            }
         }
     }
 
@@ -1028,6 +1065,21 @@ impl FontGroupFamilyTemplate {
         if !template_predicate(self.template.clone()) {
             return None;
         }
+
+        // This is the point at which a web font is known to be needed: the face matches the
+        // style and its `unicode-range` covers the character. If its `src` has not been
+        // fetched yet, ask for it now and fall through to the next family in the meantime.
+        if let Some(font_face_rule) = self.template.font_face_rule() {
+            match font_face_rule.load_state() {
+                WebFontLoadState::Loaded => {},
+                WebFontLoadState::Unloaded => {
+                    font_context.request_web_font_load(&font_face_rule);
+                    return None;
+                },
+                WebFontLoadState::Loading | WebFontLoadState::Failed => return None,
+            }
+        }
+
         self.font(font_context, font_descriptor)
             .filter(font_predicate)
     }
