@@ -26,7 +26,11 @@ pub use system_font_service_proxy::*;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum WebFontLoadEvent {
-    LoadedSuccessfully,
+    LoadedSuccessfully {
+        /// Whether laid-out text may use the font, because font matching has looked up
+        /// its family before. If not, nothing needs to be laid out again.
+        affects_laid_out_text: bool,
+    },
     UnblockedFontReadyPromise,
 }
 
@@ -124,6 +128,9 @@ pub struct WebFontSetDifference {
     ///
     /// This can cause different fonts to be selected during font matching.
     pub cascade_index_of_any_rule_changed: bool,
+    /// Whether this update can change the fonts of text that has already been laid out,
+    /// because font matching has looked up the family of a rule that changed.
+    pub affects_laid_out_text: bool,
 }
 
 impl WebFontSetDifference {

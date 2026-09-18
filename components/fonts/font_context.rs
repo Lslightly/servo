@@ -138,6 +138,11 @@ pub struct FontContext {
     /// [`FontContextWebFontMethods::process_pending_web_font_loads`] afterwards.
     #[ignore_malloc_size_of = "The rules are measured as part of `known_font_face_rules`."]
     pending_web_font_loads: Mutex<Vec<ServoArc<FontFaceRuleInfo>>>,
+
+    /// The font families that font matching has looked up among the web fonts, whether or
+    /// not any web font of that family existed at the time. Changes to web fonts of other
+    /// families cannot affect text that has been laid out.
+    used_font_families: RwLock<FxHashSet<LowercaseFontFamilyName>>,
 }
 
 /// A callback that will be invoked on the Fetch thread if a web font download
@@ -200,6 +205,7 @@ impl FontContext {
             font_feature_value_map: Default::default(),
             number_of_loading_web_fonts: Default::default(),
             pending_web_font_loads: Default::default(),
+            used_font_families: Default::default(),
         }
     }
 
@@ -354,10 +360,15 @@ impl FontContext {
             return None;
         };
 
+        let family_name: LowercaseFontFamilyName = family_name.name.clone().into();
+        if !self.used_font_families.read().contains(&family_name) {
+            self.used_font_families.write().insert(family_name.clone());
+        }
+
         self.web_fonts
             .read()
             .families
-            .get(&family_name.name.clone().into())
+            .get(&family_name)
             .map(|templates| {
                 let mut matching_templates =
                     templates.find_for_descriptor(Some(descriptor_to_match));
@@ -700,6 +711,8 @@ impl WebFontDownloadState {
                     return;
                 }
 
+                let affects_laid_out_text = self.font_context.is_font_family_used(&family_name);
+
                 // The face was registered as unloaded when its rule was added, so replace
                 // that entry rather than adding a second one for the same rule.
                 self.font_context
@@ -719,7 +732,9 @@ impl WebFontDownloadState {
                 // Note: We intentionally do not call decrement_count_of_loading_fonts_by_one here.
                 // That is handled in the callback, which avoids document.fonts.ready being resolved
                 // prematurely.
-                (initiator.callback)(WebFontLoadEvent::LoadedSuccessfully);
+                (initiator.callback)(WebFontLoadEvent::LoadedSuccessfully {
+                    affects_laid_out_text,
+                });
             },
             WebFontLoadInitiator::Script(callback) => {
                 self.font_context.decrement_count_of_loading_fonts_by_one();
@@ -828,7 +843,7 @@ impl FontContextWebFontMethods for Arc<FontContext> {
         callback: StylesheetWebFontLoadFinishedCallback,
         document_context: &WebFontDocumentContext,
     ) -> WebFontSetDifference {
-        let difference = self
+        let mut difference = self
             .known_font_face_rules
             .lock()
             .diff_old_and_new_font_face_rules(stylist, guards);
@@ -859,6 +874,13 @@ impl FontContextWebFontMethods for Arc<FontContext> {
             // Font matching may now yield different results, so invalidate resolved font groups.
             self.resolved_font_groups.write().clear();
         }
+
+        difference.affects_laid_out_text = difference.cascade_index_of_any_rule_changed ||
+            difference
+                .added_font_faces
+                .iter()
+                .chain(difference.removed_font_faces.iter())
+                .any(|rule| self.is_font_face_rule_family_used(rule));
 
         if !difference.removed_font_faces.is_empty() {
             // Ensure that we clean up any WebRender resources on the next display list update.
@@ -1087,6 +1109,19 @@ impl FontContext {
                 .lock()
                 .push(font_face_rule.clone());
         }
+    }
+
+    /// Whether font matching has looked up the given family among the web fonts.
+    pub(crate) fn is_font_family_used(&self, family_name: &LowercaseFontFamilyName) -> bool {
+        self.used_font_families.read().contains(family_name)
+    }
+
+    fn is_font_face_rule_family_used(&self, font_face_rule: &FontFaceRuleInfo) -> bool {
+        font_face_rule
+            .descriptors
+            .font_family
+            .as_ref()
+            .is_some_and(|family| self.is_font_family_used(&family.name.clone().into()))
     }
 
     /// Whether any web font loads have been asked for but not started yet.
