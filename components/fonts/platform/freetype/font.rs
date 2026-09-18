@@ -8,9 +8,9 @@ use app_units::Au;
 use euclid::default::{Point2D, Rect, Size2D};
 use fonts_traits::{FontIdentifier, FontTemplateDescriptor, LocalFontIdentifier};
 use freetype_sys::{
-    FT_F26Dot6, FT_Get_Char_Index, FT_Get_Kerning, FT_GlyphSlot, FT_KERNING_DEFAULT,
-    FT_LOAD_DEFAULT, FT_LOAD_NO_HINTING, FT_Load_Glyph, FT_Size_Metrics, FT_SizeRec, FT_UInt,
-    FT_ULong, FT_Vector,
+    FT_F26Dot6, FT_FaceRec, FT_Get_Char_Index, FT_Get_Kerning, FT_GlyphSlot, FT_Int32,
+    FT_KERNING_DEFAULT, FT_LOAD_DEFAULT, FT_LOAD_NO_HINTING, FT_Load_Glyph, FT_Long, FT_MulFix,
+    FT_Pos, FT_Size_Metrics, FT_SizeRec, FT_UInt, FT_ULong, FT_Vector,
 };
 use log::debug;
 use memmap2::Mmap;
@@ -31,6 +31,8 @@ use crate::platform::freetype::freetype_face::{
 };
 
 const SEMI_BOLD_U16: u16 = Weight::SEMI_BOLD.value() as u16;
+
+const FT_LOAD_BITMAP_METRICS_ONLY: FT_Int32 = 1 << 22;
 
 /// Convert FreeType-style 26.6 fixed point to an [`f64`].
 fn fixed_26_dot_6_to_float(fixed: FT_F26Dot6) -> f64 {
@@ -194,25 +196,16 @@ impl PlatformFontMethods for PlatformFont {
 
     fn glyph_h_advance(&self, glyph: GlyphId) -> Option<FractionalPixel> {
         let face = self.face.lock();
-
-        let load_flags = face.glyph_load_flags();
-        let result = unsafe { FT_Load_Glyph(face.as_ptr(), glyph as FT_UInt, load_flags) };
-        if 0 != result {
-            debug!("Unable to load glyph {}. reason: {:?}", glyph, result);
-            return None;
-        }
-
-        let void_glyph = face.as_ref().glyph;
-        let slot: FT_GlyphSlot = void_glyph;
-        if void_glyph.is_null() {
-            return None;
-        }
-
-        if self.synthetic_bold {
-            mozilla_glyphslot_embolden_less(slot);
-        }
-
-        let advance = unsafe { (*slot).metrics.horiAdvance };
+        let advance = if face.has_autohinted_advances() {
+            let advance = face.autohinted_advance(glyph as FT_UInt)?;
+            if self.synthetic_bold {
+                advance + synthetic_bold_strength(face.as_ref())
+            } else {
+                advance
+            }
+        } else {
+            self.loaded_glyph_h_advance(&face, glyph)?
+        };
         Some(fixed_26_dot_6_to_float(advance) * self.unscalable_font_metrics_scale())
     }
 
@@ -412,6 +405,31 @@ impl PlatformFontMethods for PlatformFont {
 }
 
 impl PlatformFont {
+    /// Returns the advance of `glyph` in 26.6 fixed point by loading it.
+    fn loaded_glyph_h_advance(&self, face: &FreeTypeFace, glyph: GlyphId) -> Option<FT_Pos> {
+        let mut load_flags = face.glyph_load_flags();
+        // Only the advance is needed, so don't decode bitmaps. Emboldening needs the bitmap.
+        if !self.synthetic_bold {
+            load_flags |= FT_LOAD_BITMAP_METRICS_ONLY;
+        }
+        let result = unsafe { FT_Load_Glyph(face.as_ptr(), glyph as FT_UInt, load_flags) };
+        if 0 != result {
+            debug!("Unable to load glyph {}. reason: {:?}", glyph, result);
+            return None;
+        }
+
+        let slot: FT_GlyphSlot = face.as_ref().glyph;
+        if slot.is_null() {
+            return None;
+        }
+
+        if self.synthetic_bold {
+            mozilla_glyphslot_embolden_less(slot);
+        }
+
+        Some(unsafe { (*slot).metrics.horiAdvance })
+    }
+
     /// Find the scale to use for metrics of unscalable fonts. Unscalable fonts, those using bitmap
     /// glyphs, are scaled after glyph rasterization. In order for metrics to match the final scaled
     /// font, we need to scale them based on the final size and the actual font size.
@@ -455,15 +473,21 @@ impl std::fmt::Debug for FreeTypeFaceTableProviderData {
     }
 }
 
+/// How much [mozilla_glyphslot_embolden_less] widens outline glyphs, in 26.6 fixed point.
+fn synthetic_bold_strength(face: &FT_FaceRec) -> FT_Pos {
+    // FT_GlyphSlot_Embolden uses a divisor of 24 here; we'll be only half as
+    // bold.
+    let size = unsafe { &*face.size };
+    unsafe { FT_MulFix(face.units_per_EM as FT_Long, size.metrics.y_scale) / 48 }
+}
+
 // This is copied from the webrender glyph rasterizer
 // https://github.com/servo/webrender/blob/c4bd5b47d8f5cd684334b445e67a1f945d106848/wr_glyph_rasterizer/src/platform/unix/font.rs#L115
 //
 // Custom version of FT_GlyphSlot_Embolden to be less aggressive with outline
 // fonts than the default implementation in FreeType.
 fn mozilla_glyphslot_embolden_less(slot: FT_GlyphSlot) {
-    use freetype_sys::{
-        FT_GLYPH_FORMAT_OUTLINE, FT_GlyphSlot_Embolden, FT_Long, FT_MulFix, FT_Outline_Embolden,
-    };
+    use freetype_sys::{FT_GLYPH_FORMAT_OUTLINE, FT_GlyphSlot_Embolden, FT_Outline_Embolden};
 
     if slot.is_null() {
         return;
@@ -477,12 +501,7 @@ fn mozilla_glyphslot_embolden_less(slot: FT_GlyphSlot) {
         return;
     }
 
-    let face_ = unsafe { &*slot_.face };
-
-    // FT_GlyphSlot_Embolden uses a divisor of 24 here; we'll be only half as
-    // bold.
-    let size_ = unsafe { &*face_.size };
-    let strength = unsafe { FT_MulFix(face_.units_per_EM as FT_Long, size_.metrics.y_scale) / 48 };
+    let strength = synthetic_bold_strength(unsafe { &*slot_.face });
     unsafe { FT_Outline_Embolden(&raw mut slot_.outline, strength) };
 
     // Adjust metrics to suit the fattened glyph.
@@ -497,4 +516,67 @@ fn mozilla_glyphslot_embolden_less(slot: FT_GlyphSlot) {
     slot_.metrics.horiAdvance += strength;
     slot_.metrics.vertAdvance += strength;
     slot_.metrics.horiBearingY += strength;
+}
+
+#[cfg(test)]
+mod tests {
+    use servo_url::ServoUrl;
+    use webrender_api::FontHinting;
+
+    use super::*;
+
+    #[test]
+    fn autohinted_advances_match_loaded_advances() {
+        // Embedded rather than read from the source tree, so that the test also runs on
+        // devices, whose glyph loads are not light-hinted.
+        let fonts: [(&str, &[u8]); 4] = [
+            (
+                "DejaVuSans.ttf",
+                include_bytes!("../../tests/support/dejavu-fonts-ttf-2.37/ttf/DejaVuSans.ttf"),
+            ),
+            (
+                "DejaVuSansMono.ttf",
+                include_bytes!("../../tests/support/dejavu-fonts-ttf-2.37/ttf/DejaVuSansMono.ttf"),
+            ),
+            (
+                "DejaVuSerif.ttf",
+                include_bytes!("../../tests/support/dejavu-fonts-ttf-2.37/ttf/DejaVuSerif.ttf"),
+            ),
+            (
+                "csstest-basic-regular.ttf",
+                include_bytes!("../../tests/support/CSSTest/csstest-basic-regular.ttf"),
+            ),
+        ];
+        let sizes = [8.0, 11.0, 12.5, 13.33, 16.0, 17.5, 21.33, 48.0];
+        for (path, bytes) in fonts {
+            let data = FontData::from_bytes(bytes);
+            let url = ServoUrl::parse(&format!("https://fonts.invalid/{path}")).unwrap();
+            let identifier = FontIdentifier::Web(url);
+            for size in sizes {
+                for synthetic_bold in [false, true] {
+                    let font = PlatformFont::new_from_data(
+                        identifier.clone(),
+                        &data,
+                        Some(Au::from_f64_px(size)),
+                        synthetic_bold,
+                    )
+                    .unwrap();
+                    let face = font.face.lock();
+                    assert_eq!(
+                        face.has_autohinted_advances(),
+                        FALLBACK_HINTING_STYLE == FontHinting::Light,
+                        "{path:?}"
+                    );
+                    for glyph in 0..face.as_ref().num_glyphs as GlyphId {
+                        assert_eq!(
+                            font.glyph_h_advance(glyph),
+                            font.loaded_glyph_h_advance(&face, glyph)
+                                .map(fixed_26_dot_6_to_float),
+                            "{path:?} at {size}px, synthetic bold {synthetic_bold}, glyph {glyph}",
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
