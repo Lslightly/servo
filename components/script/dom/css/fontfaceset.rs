@@ -100,7 +100,7 @@ impl FontFaceSet {
     }
 
     /// Settle the promises of css-connected faces whose `@font-face` rules have finished
-    /// loading. Those faces are loaded by the `FontContext`, so nothing else tells them.
+    /// loading. Those faces are loaded by font matching, so nothing else tells them.
     pub(crate) fn update_css_connected_face_statuses(&self, cx: &mut JSContext) {
         let entries: Vec<DomRoot<FontFace>> = self
             .set_entries
@@ -171,10 +171,10 @@ impl FontFaceSet {
         //        We query for the box area here, but we're not interested in the result.
         // FIXME: Figure out what to do for worker scopes.
         if let Some(window) = DomRoot::downcast::<Window>(self.global()) {
-            let document = window.Document();
-            if document.stylesheets_changed_since_last_reflow() {
-                window.reflow(cx, ReflowGoal::LayoutQuery(QueryMsg::BoxArea));
-            }
+            // This must flush layout and not just the cascade: a web font is only loaded
+            // once font matching finds that the page needs it, so pending layout is what
+            // decides whether this set is still waiting on anything.
+            window.reflow(cx, ReflowGoal::LayoutQuery(QueryMsg::BoxArea));
         }
     }
 
@@ -401,6 +401,10 @@ impl FontFaceSetMethods<crate::DomTypeHolder> for FontFaceSet {
                 };
                 let document = window.Document();
 
+                // The css-connected faces of stylesheets that have not been through the
+                // cascade yet are not in the set, so bring it up to date first.
+                this.flush_author_font_set(cx);
+
                 // Step 3. Find the matching font faces from font face set using the font and text
                 // arguments passed to the function, and let font face list be the return value (ignoring
                 // the found faces flag). If a syntax error was returned, reject promise with a SyntaxError
@@ -411,11 +415,16 @@ impl FontFaceSetMethods<crate::DomTypeHolder> for FontFaceSet {
                 };
 
                 // Step 4.1. For all of the font faces in the font face list, call their load()
-                // method.
+                // method. Faces declared by `@font-face` rules are only fetched once
+                // something needs them, and this call is what makes them needed.
+                for font_face in font_face_objects.iter() {
+                    font_face.Load(cx);
+                }
+
                 // Step 4.2. Resolve promise with the result of waiting for all of the
                 // [[FontStatusPromise]]s of each font face in the font face list, in order.
                 //
-                // TODO: These steps are not implemented. Instead we wait until all fonts
+                // TODO: This step is not implemented. Instead we wait until all fonts
                 // are loaded by resolving the returned promise when
                 // `document.fonts.ready` is resolved. The return list of fonts will not
                 // be correct, but any code that waits on the promise will have

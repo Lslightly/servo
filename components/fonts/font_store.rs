@@ -46,6 +46,34 @@ impl FontStore {
             .or_default()
             .add_template(new_template);
     }
+
+    /// Replace the template of a face that finished loading. Until then the family held a
+    /// template describing the face by its `@font-face` descriptors alone.
+    pub(crate) fn set_template_for_font_face_rule(
+        &mut self,
+        family_name: LowercaseFontFamilyName,
+        font_face_rule: &ServoArc<FontFaceRuleInfo>,
+        new_template: FontTemplate,
+    ) {
+        let family = self.families.entry(family_name).or_default();
+        if !family.replace_template_for_font_face_rule(font_face_rule, &new_template) {
+            family.add_template(new_template);
+        }
+    }
+
+    /// Drop the template of a face that could not be loaded, so that font matching stops
+    /// considering it.
+    pub(crate) fn remove_template_for_font_face_rule(
+        &mut self,
+        font_face_rule: &ServoArc<FontFaceRuleInfo>,
+    ) {
+        let Some(family) = font_face_rule.descriptors.font_family.as_ref() else {
+            return;
+        };
+        if let Some(templates) = self.families.get_mut(&family.name.clone().into()) {
+            templates.remove_template_for_font_face_rule(font_face_rule);
+        }
+    }
 }
 
 /// A struct that represents the available templates in a "simple family." A simple family
@@ -185,6 +213,33 @@ impl FontTemplates {
         let new_template = FontTemplateRef::new(new_template);
         self.templates.push(new_template.clone());
         self.update_simple_family(new_template);
+    }
+
+    /// Replace the template that a given `@font-face` rule contributed, returning false if
+    /// the family does not have one.
+    ///
+    /// The descriptor of a face changes when it loads, because the values that the rule
+    /// leaves out are taken from the font file, so the simple family has to be given up.
+    fn replace_template_for_font_face_rule(
+        &mut self,
+        font_face_rule: &ServoArc<FontFaceRuleInfo>,
+        new_template: &FontTemplate,
+    ) -> bool {
+        let Some(index) = self.templates.iter().position(|template| {
+            template
+                .borrow()
+                .is_defined_by_font_face_rule(font_face_rule)
+        }) else {
+            return false;
+        };
+
+        // Put in a new [`FontTemplateRef`] rather than writing through the old one: font
+        // groups hold on to the refs they matched, and a layout thread may be reading one
+        // while the load finishes. Those groups are dropped by
+        // `invalidate_font_groups_after_web_font_load`.
+        self.templates[index] = FontTemplateRef::new(new_template.clone());
+        self.simple_family = None;
+        true
     }
 
     fn update_simple_family(&mut self, added_template: FontTemplateRef) {

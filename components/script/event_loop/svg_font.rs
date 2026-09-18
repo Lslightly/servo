@@ -9,6 +9,7 @@ use fonts::{
     FallbackFontSelectionOptions, FontContext, FontDescriptor, FontFamilyDescriptor,
     FontSearchScope, fallback_font_families,
 };
+use fonts_traits::FontTemplateRefMethods;
 use net_traits::image_cache::FontResolver;
 use resvg::usvg::{Font, FontFamily, FontStretch, FontStyle, fontdb};
 use rustc_hash::FxHashMap;
@@ -66,6 +67,12 @@ impl SvgFontResolver {
                 );
                 continue;
             };
+
+            // A face that has not been downloaded yet cannot be rasterized. Ask for it, like
+            // layout does when it matches the face, and fall back to the next family for now.
+            if let Some(font_face_rule) = font_template.font_face_rule() {
+                self.context.request_web_font_load(&font_face_rule);
+            }
 
             let Some(font_ref) = self.context.font(font_template, &font_descriptor) else {
                 continue;

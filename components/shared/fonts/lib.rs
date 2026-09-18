@@ -134,9 +134,13 @@ impl WebFontSetDifference {
 }
 
 /// How far the font described by an `@font-face` rule has got towards being usable.
+///
+/// A rule starts out [`WebFontLoadState::Unloaded`]: its `src` is only fetched once font
+/// matching picks the face for a character, as required by
+/// <https://drafts.csswg.org/css-fonts-4/#font-face-loading>.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WebFontLoadState {
-    /// The face has not started loading.
+    /// Nothing has asked for this face yet, so it has not been fetched.
     Unloaded,
     /// The face is being fetched, or is waiting to be.
     Loading,
@@ -195,5 +199,19 @@ impl FontFaceRuleInfo {
 
     pub fn set_load_state(&self, state: WebFontLoadState) {
         self.load_state.store(state as usize, Ordering::SeqCst);
+    }
+
+    /// Move this rule from [`WebFontLoadState::Unloaded`] to [`WebFontLoadState::Loading`],
+    /// returning true if this call was the one that started the load. Font matching runs on
+    /// several threads at once, so only one of them may request the load.
+    pub fn start_loading(&self) -> bool {
+        self.load_state
+            .compare_exchange(
+                WebFontLoadState::Unloaded as usize,
+                WebFontLoadState::Loading as usize,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 }

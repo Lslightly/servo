@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Font faces that the document does not use are not loaded</title>
+<link rel="help" href="https://drafts.csswg.org/css-fonts-4/#font-face-loading">
+<link rel="help" href="https://drafts.csswg.org/css-fonts-4/#unicode-range-desc">
+<link rel="help" href="https://drafts.csswg.org/css-font-loading/#dom-fontface-status">
+<meta name="assert" content="A @font-face whose family no style rule uses, or whose unicode-range covers no character in the document, is not loaded.">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<style>
+@font-face {
+    font-family: "used-family";
+    src: url("resources/Rochester.otf") format("opentype");
+    unicode-range: U+0000-00FF;
+}
+@font-face {
+    font-family: "used-family";
+    src: url("resources/GenR102.woff2") format("woff2");
+    unicode-range: U+4E00-9FFF;
+}
+@font-face {
+    font-family: "unused-family";
+    src: url("resources/GenI102.woff2") format("woff2");
+}
+#target {
+    font-family: "used-family";
+}
+</style>
+<div id="target">Hello</div>
+<script>
+function facesFor(family) {
+    return [...document.fonts].filter(face => face.family === family);
+}
+
+promise_test(async () => {
+    await document.fonts.ready;
+
+    const used = facesFor("used-family");
+    assert_equals(used.length, 2, "both faces of the used family are in document.fonts");
+    const cjk = used.find(face => /4E00/i.test(face.unicodeRange));
+    const latin = used.find(face => face !== cjk);
+
+    assert_equals(latin.status, "loaded",
+        "the face whose unicode-range covers the text on the page is loaded");
+    assert_equals(cjk.status, "unloaded",
+        "a face whose unicode-range covers no character on the page is not loaded");
+
+    const [unused] = facesFor("unused-family");
+    assert_equals(unused.status, "unloaded",
+        "a face of a family that no style rule uses is not loaded");
+}, "unused @font-face rules are not loaded");
+
+promise_test(async () => {
+    await document.fonts.ready;
+
+    const [face] = facesFor("unused-family");
+    assert_equals(face.status, "unloaded", "precondition: not loaded yet");
+
+    await face.load();
+    assert_equals(face.status, "loaded", "load() loads a face that is not otherwise used");
+}, "FontFace.load() loads an unused @font-face rule");
+</script>
