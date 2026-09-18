@@ -3463,6 +3463,7 @@ impl Document {
         }
 
         let fonts = self.Fonts(cx);
+        fonts.update_css_connected_face_statuses(cx);
         if !fonts.waiting_to_fullfill_promise() {
             return false;
         }
