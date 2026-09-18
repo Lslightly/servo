@@ -163,7 +163,23 @@ impl SVGSVGElement {
         let _ = root_node.AppendChild(cx, &cloned_node);
     }
 
-    fn invalidate_cached_serialized_subtree_and_rasterization_result(&self, no_gc: &NoGC) {
+    /// Whether this element has been serialized into an image and contains SVG text.
+    pub(crate) fn contains_text(&self, no_gc: &NoGC) -> bool {
+        matches!(*self.cached_serialized_data_url.borrow(), Some(Ok(_))) &&
+            self.upcast::<Node>()
+                .traverse_preorder_unrooted(no_gc, ShadowIncluding::No)
+                .any(|node| {
+                    node.downcast::<Element>().is_some_and(|element| {
+                        *element.namespace() == ns!(svg) &&
+                            element.local_name() == &local_name!("text")
+                    })
+                })
+    }
+
+    pub(crate) fn invalidate_cached_serialized_subtree_and_rasterization_result(
+        &self,
+        no_gc: &NoGC,
+    ) {
         let owner_window = self.owner_window();
         owner_window
             .image_cache()

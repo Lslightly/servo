@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>SVG text is rendered again with a web font once it has loaded</title>
+<link rel="match" href="svg-text-web-font-ref.html">
+<style>
+@font-face {
+  font-family: "TestWebFont";
+  src: url(/fonts/Ahem.ttf);
+}
+body { margin: 0; }
+</style>
+<svg width="300" height="150">
+  <text x="0" y="100" font-family="TestWebFont" font-size="100" fill="green">XX</text>
+</svg>
