@@ -200,7 +200,9 @@ use crate::dom::worklet::Worklet;
 use crate::dom::workletglobalscope::WorkletGlobalScopeType;
 use crate::event_loop::script_thread::ScriptThread;
 use crate::event_loop::script_window_proxies::ScriptWindowProxies;
-use crate::event_loop::timers::{IsInterval, OneshotTimers, TimerCallback};
+use crate::event_loop::timers::{
+    IsInterval, OneshotTimerCallback, OneshotTimerHandle, OneshotTimers, TimerCallback,
+};
 use crate::event_loop::webdriver_handlers::find_node_by_unique_id_in_document;
 use crate::fetch::fetch;
 use crate::fetch::network_listener::{ResourceTimingListener, submit_timing};
@@ -279,6 +281,23 @@ struct PendingLayoutImageAncillaryData {
     node: Dom<Node>,
     #[no_trace]
     destination: LayoutImageDestination,
+}
+
+/// The longest time a web font that finished loading waits for the ones that are still
+/// loading before the page is laid out with it. `font-display: swap`, which most web font
+/// services use, allows fonts to block rendering for up to 100ms, see
+/// <https://drafts.csswg.org/css-fonts-4/#font-display-desc>.
+const WEB_FONT_BATCH_DELAY: Duration = Duration::from_millis(100);
+
+/// Web fonts that finished loading but that the document has not been laid out with yet.
+#[derive(Clone, Copy, Default, JSTraceable, MallocSizeOf)]
+struct PendingWebFontLoads {
+    /// How many loads finished.
+    count: usize,
+    /// Whether any of them can change the fonts of text that has been laid out.
+    affects_laid_out_text: bool,
+    /// The timer that applies the loads if the other ones take too long.
+    timer: Option<OneshotTimerHandle>,
 }
 
 #[dom_struct]
@@ -479,6 +498,10 @@ pub(crate) struct Window {
 
     /// Whether or not this [`Window`] has a pending screenshot readiness request.
     has_pending_screenshot_readiness_request: Cell<bool>,
+
+    /// Web fonts that finished loading, but that the document has not been laid out with
+    /// yet. See [`Window::handle_web_font_loaded`].
+    pending_web_font_loads: Cell<PendingWebFontLoads>,
 
     /// Visual viewport interface that is associated to this [`Window`].
     /// <https://drafts.csswg.org/cssom-view/#dom-window-visualviewport>
@@ -2844,6 +2867,60 @@ impl Window {
         )
     }
 
+    /// Called when a web font used by this document finished loading.
+    ///
+    /// Laying the page out again after every load would lay it out once per font when many
+    /// fonts arrive one after the other, which is what happens when a family is split into
+    /// `unicode-range` subsets. So loads are applied in batches: once no other web font is
+    /// loading, or [`WEB_FONT_BATCH_DELAY`] after the first load of the batch finished.
+    pub(crate) fn handle_web_font_loaded(&self, cx: &mut JSContext, affects_laid_out_text: bool) {
+        let mut pending = self.pending_web_font_loads.get();
+        pending.count += 1;
+        pending.affects_laid_out_text |= affects_laid_out_text;
+
+        // Loads that finished still count as loading until they are applied, so that
+        // `document.fonts.ready` waits for the layout that uses them.
+        if self.font_context().web_fonts_still_loading() <= pending.count {
+            self.pending_web_font_loads.set(pending);
+            self.apply_pending_web_font_loads(cx);
+            return;
+        }
+
+        if pending.timer.is_none() {
+            pending.timer = Some(
+                self.as_global_scope()
+                    .schedule_callback(OneshotTimerCallback::WebFontLoadsDue, WEB_FONT_BATCH_DELAY),
+            );
+        }
+        self.pending_web_font_loads.set(pending);
+    }
+
+    /// Lay the document out again with the web fonts that finished loading since the last
+    /// time, and settle the promises of their `FontFace`s.
+    pub(crate) fn apply_pending_web_font_loads(&self, cx: &mut JSContext) {
+        let pending = self.pending_web_font_loads.take();
+        if let Some(timer) = pending.timer {
+            self.as_global_scope().unschedule_callback(timer);
+        }
+        if pending.count == 0 {
+            return;
+        }
+
+        // TODO: This should only dirty nodes that are waiting for a web font to finish loading!
+        let document = self.Document();
+        if pending.affects_laid_out_text {
+            document.dirty_all_nodes(cx.no_gc());
+        }
+        // Text in SVG images is turned into paths when the image is parsed, so an image that
+        // fell back to another font has to be parsed again to use the web font.
+        if self.font_context().take_svg_waiting_for_web_font() {
+            document.invalidate_svg_images_with_text(cx.no_gc());
+        }
+        document.Fonts(cx).update_css_connected_face_statuses(cx);
+        self.font_context()
+            .decrement_count_of_loading_fonts(pending.count);
+    }
+
     pub(crate) fn request_screenshot_readiness(&self, cx: &mut JSContext) {
         self.has_pending_screenshot_readiness_request.set(true);
         self.maybe_resolve_pending_screenshot_readiness_requests(cx);
@@ -4105,6 +4182,7 @@ impl Window {
             endpoints_list: Default::default(),
             script_window_proxies: ScriptThread::window_proxies(),
             has_pending_screenshot_readiness_request: Default::default(),
+            pending_web_font_loads: Default::default(),
             visual_viewport: Default::default(),
             weak_script_thread,
             has_changed_visual_viewport_dimension: Default::default(),

@@ -3342,17 +3342,9 @@ impl ScriptThread {
             return;
         };
 
-        // TODO: This should only dirty nodes that are waiting for a web font to finish loading!
-        if affects_laid_out_text {
-            document.dirty_all_nodes(cx.no_gc());
-        }
-
-        document.Fonts(cx).update_css_connected_face_statuses(cx);
-
         document
             .window()
-            .font_context()
-            .decrement_count_of_loading_fonts_by_one();
+            .handle_web_font_loaded(cx, affects_laid_out_text);
     }
 
     /// Handles a worklet being loaded by triggering a relayout of the page. Does nothing if the

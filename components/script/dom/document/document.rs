@@ -209,6 +209,7 @@ use crate::dom::selection::Selection;
 use crate::dom::servoparser::ServoParser;
 use crate::dom::shadowroot::shadowroot::ShadowRoot;
 use crate::dom::storageevent::StorageEvent;
+use crate::dom::svg::svgsvgelement::SVGSVGElement;
 use crate::dom::text::Text;
 use crate::dom::textevent::TextEvent;
 use crate::dom::touchevent::TouchEvent as DomTouchEvent;
@@ -1727,6 +1728,24 @@ impl Document {
             .traverse_preorder_unrooted(no_gc, ShadowIncluding::Yes)
         {
             node.dirty(no_gc, NodeDamage::Other)
+        }
+    }
+
+    /// Render the `<svg>` elements that contain text again, for instance because a web font
+    /// that their text might use has loaded.
+    pub(crate) fn invalidate_svg_images_with_text(&self, no_gc: &NoGC) {
+        let Some(root) = self.GetDocumentElement() else {
+            return;
+        };
+        for node in root
+            .upcast::<Node>()
+            .traverse_preorder_unrooted(no_gc, ShadowIncluding::Yes)
+        {
+            if let Some(svg) = node.downcast::<SVGSVGElement>() &&
+                svg.contains_text(no_gc)
+            {
+                svg.invalidate_cached_serialized_subtree_and_rasterization_result(no_gc);
+            }
         }
     }
 
@@ -3401,7 +3420,12 @@ impl Document {
         }
 
         let fonts = self.Fonts(cx);
-        fonts.update_css_connected_face_statuses(cx);
+        // Faces that loaded while others were still loading are only applied in batches,
+        // and their promises are settled then, so only look for failures once nothing is
+        // loading anymore.
+        if self.window().font_context().web_fonts_still_loading() == 0 {
+            fonts.update_css_connected_face_statuses(cx);
+        }
         if !fonts.waiting_to_fullfill_promise() {
             return false;
         }

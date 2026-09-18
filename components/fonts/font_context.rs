@@ -133,6 +133,10 @@ pub struct FontContext {
     /// The number of fonts that are currently loading.
     number_of_loading_web_fonts: AtomicUsize,
 
+    /// Whether an SVG image was rendered with a fallback because a web font that it uses
+    /// was not loaded yet.
+    svg_waiting_for_web_font: AtomicBool,
+
     /// The `@font-face` rules that font matching has selected, but whose `src` has not been
     /// fetched yet. Filled in while laying out and drained by
     /// [`FontContextWebFontMethods::process_pending_web_font_loads`] afterwards.
@@ -204,6 +208,7 @@ impl FontContext {
             known_font_face_rules: Default::default(),
             font_feature_value_map: Default::default(),
             number_of_loading_web_fonts: Default::default(),
+            svg_waiting_for_web_font: Default::default(),
             pending_web_font_loads: Default::default(),
             used_font_families: Default::default(),
         }
@@ -640,8 +645,13 @@ impl FontContext {
 
     /// Decrement the count of font loads blocking the `document.fonts.ready` promise by one.
     pub fn decrement_count_of_loading_fonts_by_one(&self) {
+        self.decrement_count_of_loading_fonts(1);
+    }
+
+    /// Decrement the count of font loads blocking the `document.fonts.ready` promise.
+    pub fn decrement_count_of_loading_fonts(&self, count: usize) {
         self.number_of_loading_web_fonts
-            .fetch_sub(1, Ordering::SeqCst);
+            .fetch_sub(count, Ordering::SeqCst);
     }
 
     /// Returns true iff a `@font-face` rule is part of the active set.
@@ -1122,6 +1132,18 @@ impl FontContext {
             .font_family
             .as_ref()
             .is_some_and(|family| self.is_font_family_used(&family.name.clone().into()))
+    }
+
+    /// Record that an SVG image was rendered with a fallback font because a web font that
+    /// it uses has not been loaded yet.
+    pub fn note_svg_waiting_for_web_font(&self) {
+        self.svg_waiting_for_web_font.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether an SVG image was rendered with a fallback font for a web font that was not
+    /// loaded yet since the last call, and so might look different now.
+    pub fn take_svg_waiting_for_web_font(&self) -> bool {
+        self.svg_waiting_for_web_font.swap(false, Ordering::Relaxed)
     }
 
     /// Whether any web font loads have been asked for but not started yet.

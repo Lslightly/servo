@@ -206,6 +206,8 @@ pub(crate) enum OneshotTimerCallback {
     #[cfg(feature = "testbinding")]
     TestBindingCallback(TestBindingCallback),
     RefreshRedirectDue(RefreshRedirectDue),
+    /// Apply the web fonts that finished loading, see `Window::handle_web_font_loaded`.
+    WebFontLoadsDue,
     /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
     RunStepsAfterTimeout {
         /// Step 1. timerKey
@@ -229,6 +231,9 @@ impl OneshotTimerCallback {
             #[cfg(feature = "testbinding")]
             OneshotTimerCallback::TestBindingCallback(callback) => callback.invoke(cx),
             OneshotTimerCallback::RefreshRedirectDue(callback) => callback.invoke(cx, global),
+            OneshotTimerCallback::WebFontLoadsDue => {
+                global.as_window().apply_pending_web_font_loads(cx)
+            },
             OneshotTimerCallback::RunStepsAfterTimeout { completion, .. } => {
                 // <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
                 // Step 4.4 Perform completionSteps.

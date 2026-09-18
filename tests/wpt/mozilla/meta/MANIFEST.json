@@ -8284,6 +8284,19 @@
        {}
       ]
      ],
+     "svg-text-web-font.html": [
+      "a9117f27538e04fd9d4f473399c80bbbe7180ba8",
+      [
+       null,
+       [
+        [
+         "/_mozilla/mozilla/svg/svg-text-web-font-ref.html",
+         "=="
+        ]
+       ],
+       {}
+      ]
+     ],
      "svg.html": [
       "5b57e5f27c34b1b73e9b3d91a5fd472606be7b73",
       [
@@ -11303,6 +11316,10 @@
      ],
      "svg-relative-units-ref.html": [
       "4631d475a68d0a99c43475887e5d644b49ecfff7",
+      []
+     ],
+     "svg-text-web-font-ref.html": [
+      "e1dbbb1c78b2f8c0f12fb0249ac93b2db22c516d",
       []
      ]
     },
