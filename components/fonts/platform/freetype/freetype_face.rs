@@ -2,18 +2,20 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::ffi::c_long;
+use std::ffi::{CStr, c_char, c_long};
 use std::fmt::Debug;
 use std::ptr;
 
 use app_units::Au;
 use fonts_traits::FontData;
 use freetype_sys::{
-    FT_Done_Face, FT_Done_MM_Var, FT_F26Dot6, FT_FACE_FLAG_COLOR, FT_FACE_FLAG_FIXED_SIZES,
-    FT_FACE_FLAG_SCALABLE, FT_Face, FT_FaceRec, FT_Fixed, FT_Get_MM_Var, FT_HAS_MULTIPLE_MASTERS,
-    FT_Int32, FT_LOAD_COLOR, FT_LOAD_DEFAULT, FT_LOAD_NO_HINTING, FT_LOAD_TARGET_LIGHT,
-    FT_LOAD_TARGET_MONO, FT_LOAD_TARGET_NORMAL, FT_Long, FT_MM_Var, FT_New_Memory_Face, FT_Pos,
-    FT_Select_Size, FT_Set_Char_Size, FT_Set_Var_Design_Coordinates, FTErrorMethods,
+    FT_Done_Face, FT_Done_MM_Var, FT_Error, FT_F26Dot6, FT_FACE_FLAG_COLOR,
+    FT_FACE_FLAG_FIXED_SIZES, FT_FACE_FLAG_SCALABLE, FT_FACE_FLAG_TRICKY, FT_Face, FT_FaceRec,
+    FT_Fixed, FT_Get_MM_Var, FT_HAS_MULTIPLE_MASTERS, FT_Int32, FT_LOAD_COLOR, FT_LOAD_DEFAULT,
+    FT_LOAD_NO_HINTING, FT_LOAD_NO_SCALE, FT_LOAD_TARGET_LIGHT, FT_LOAD_TARGET_MONO,
+    FT_LOAD_TARGET_NORMAL, FT_Library, FT_Long, FT_MM_Var, FT_Module, FT_MulFix,
+    FT_New_Memory_Face, FT_Pos, FT_Select_Size, FT_Set_Char_Size, FT_Set_Var_Design_Coordinates,
+    FT_UInt, FTErrorMethods,
 };
 use memmap2::Mmap;
 use servo_arc::Arc;
@@ -49,6 +51,24 @@ fn fallback_free_type_hinting_load_flags() -> FT_Int32 {
     }
 }
 
+const FT_FACE_FLAG_SVG: FT_Long = 1 << 16;
+
+unsafe extern "C" {
+    fn FT_Get_Advance(
+        face: FT_Face,
+        glyph_index: FT_UInt,
+        load_flags: FT_Int32,
+        advance: *mut FT_Fixed,
+    ) -> FT_Error;
+    fn FT_Get_Font_Format(face: FT_Face) -> *const c_char;
+    fn FT_Get_Module(library: FT_Library, module_name: *const c_char) -> FT_Module;
+}
+
+/// Rounds a 26.6 fixed point value to a whole pixel, like `FT_PIX_ROUND`.
+fn pix_round(value: FT_Pos) -> FT_Pos {
+    (value + 32) & !63
+}
+
 /// A safe wrapper around [FT_Face].
 #[derive(Debug)]
 pub(crate) struct FreeTypeFace {
@@ -57,6 +77,9 @@ pub(crate) struct FreeTypeFace {
     /// backed by `_data`.
     face: ptr::NonNull<FT_FaceRec>,
     _data: FontBackingStore,
+    /// Whether loading a glyph with [Self::glyph_load_flags] always runs FreeType's autohinter,
+    /// which allows [Self::autohinted_advance] to compute its advance without loading the glyph.
+    autohinted: bool,
 }
 
 pub(crate) enum FontBackingStore {
@@ -110,10 +133,35 @@ impl FreeTypeFace {
             return Err("Could not create FreeType face");
         };
 
-        Ok(Self {
+        let mut face = Self {
             face,
             _data: font_backing_store,
-        })
+            autohinted: false,
+        };
+        face.autohinted = face.light_loads_are_autohinted(library);
+        Ok(face)
+    }
+
+    /// Mirrors the conditions under which `FT_Load_Glyph` uses the autohinter for a
+    /// light-hinted load. Only the TrueType driver doesn't hint lightly itself, and fonts
+    /// with bitmap strikes or SVG glyphs may be loaded without the autohinter. Servo never
+    /// sets a transform, which would also disable it. Platforms whose glyph loads are not
+    /// light-hinted (see [FALLBACK_HINTING_STYLE]) never use the autohinter.
+    fn light_loads_are_autohinted(&self, library: &FreeTypeLibraryHandle) -> bool {
+        if fallback_free_type_hinting_load_flags() != FT_LOAD_TARGET_LIGHT {
+            return false;
+        }
+        let required_flags = FT_FACE_FLAG_SCALABLE;
+        let disqualifying_flags = FT_FACE_FLAG_TRICKY | FT_FACE_FLAG_FIXED_SIZES | FT_FACE_FLAG_SVG;
+        if self.as_ref().face_flags & (required_flags | disqualifying_flags) != required_flags {
+            return false;
+        }
+        let format = unsafe { FT_Get_Font_Format(self.as_ptr()) };
+        if format.is_null() || unsafe { CStr::from_ptr(format) } != c"TrueType" {
+            return false;
+        }
+        let autohinter = unsafe { FT_Get_Module(library.freetype_library, c"autofitter".as_ptr()) };
+        !autohinter.is_null()
     }
 
     pub(crate) fn as_ref(&self) -> &FT_FaceRec {
@@ -202,6 +250,37 @@ impl FreeTypeFace {
         }
 
         load_flags as FT_Int32
+    }
+
+    /// Whether [Self::autohinted_advance] returns the same advance as loading the glyph with
+    /// [Self::glyph_load_flags].
+    pub(crate) fn has_autohinted_advances(&self) -> bool {
+        // SAFETY: A face always has an active size.
+        let metrics = unsafe { &(*self.as_ref().size).metrics };
+        // Without a size, FreeType loads glyphs unscaled and unhinted.
+        self.autohinted && metrics.x_ppem != 0 && metrics.y_ppem != 0
+    }
+
+    /// Returns the advance of `glyph` in 26.6 fixed point without loading the glyph, or
+    /// `None` if the glyph doesn't exist. Only valid if [Self::has_autohinted_advances].
+    ///
+    /// In light mode the autohinter never changes the horizontal scale, so the advance it
+    /// produces is the design-unit advance scaled and rounded to whole pixels. Avoiding the
+    /// autohinter also avoids its expensive per-face initialization.
+    ///
+    /// This deliberately diverges for composite glyphs whose `USE_MY_METRICS` component has a
+    /// different advance than the composite's `hmtx` entry: the autohinter uses the component's
+    /// advance, while this uses `hmtx`, like HarfBuzz and other browsers do.
+    pub(crate) fn autohinted_advance(&self, glyph: FT_UInt) -> Option<FT_Pos> {
+        let mut advance = 0;
+        let result =
+            unsafe { FT_Get_Advance(self.as_ptr(), glyph, FT_LOAD_NO_SCALE, &mut advance) };
+        if !result.succeeded() {
+            return None;
+        }
+        // SAFETY: A face always has an active size.
+        let x_scale = unsafe { (*self.as_ref().size).metrics.x_scale };
+        Some(pix_round(unsafe { FT_MulFix(advance, x_scale) }))
     }
 
     /// Applies to provided variations to the font face.
