@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 19 Sep 2026 08:55:34 +0200
+Subject: [PATCH] Add a smoketest, to ensure linking works.
+
+---
+ tests/link.rs | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+ create mode 100644 tests/link.rs
+
+diff --git a/tests/link.rs b/tests/link.rs
+new file mode 100644
+index 0000000..fb37016
+--- /dev/null
++++ b/tests/link.rs
+@@ -0,0 +1,16 @@
++use std::ptr;
++
++#[test]
++fn links_and_initializes_freetype() {
++    let mut library = ptr::null_mut();
++
++    let error = unsafe { freetype_sys::FT_Init_FreeType(&mut library) };
++    assert_eq!(error, 0, "FT_Init_FreeType failed with error {error}");
++    assert!(
++        !library.is_null(),
++        "FT_Init_FreeType returned a null library"
++    );
++
++    let error = unsafe { freetype_sys::FT_Done_FreeType(library) };
++    assert_eq!(error, 0, "FT_Done_FreeType failed with error {error}");
++}

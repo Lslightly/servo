@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 19 Sep 2026 08:42:00 +0200
+Subject: [PATCH] Add script to update libpng
+
+Instead of vendoring everything, this script applies filters
+to only vendor the subset we need.
+---
+ update-libpng.sh | 90 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 90 insertions(+)
+ create mode 100755 update-libpng.sh
+
+diff --git a/update-libpng.sh b/update-libpng.sh
+new file mode 100755
+index 0000000..a6d378b
+--- /dev/null
++++ b/update-libpng.sh
+@@ -0,0 +1,90 @@
++#!/usr/bin/env bash
++# Vendors the subset of libpng that build.rs needs from upstream into libpng/.
++#
++#   ./update-libpng.sh <version>           Replace libpng/ with the subset of upstream tag
++#                                          v<version> and stage it.
++#   ./update-libpng.sh --check <version>   Compare the committed libpng/ (HEAD) with the subset of
++#                                          upstream tag v<version>; exit non-zero if they differ.
++#
++# Keep VENDORED in sync with the files build.rs compiles and the headers they include. A file
++# missing from it shows up as a compile error, so build for x86_64 and aarch64 after updating.
++set -euo pipefail
++
++UPSTREAM=https://github.com/pnggroup/libpng.git
++
++# Paths relative to the libpng root, as bash globs (which don't match across `/`).
++VENDORED=(
++    '*.c'
++    '*.h'
++    'arm/*'
++    'scripts/pnglibconf.h.prebuilt'
++    'LICENSE'
++    'README'
++)
++
++check=false
++if [ "${1-}" = --check ]; then
++    check=true
++    shift
++fi
++if [ $# -ne 1 ]; then
++    sed -n '2,11s/^# \{0,1\}//p' "$0" >&2
++    exit 2
++fi
++version=$1
++
++# Copies the files of directory $1 that VENDORED matches into the new directory $2.
++filter() {
++    mkdir "$2"
++    (
++        cd "$1"
++        shopt -s nullglob
++        for pattern in "${VENDORED[@]}"; do
++            # Unquoted on purpose, so that the glob expands.
++            # shellcheck disable=SC2086
++            for file in $pattern; do
++                if [ -f "$file" ]; then
++                    mkdir -p "$2/$(dirname "$file")"
++                    cp "$file" "$2/$file"
++                fi
++            done
++        done
++    )
++}
++
++cd "$(dirname "$0")"
++work=$(mktemp -d)
++trap 'rm -rf "${work:?}"' EXIT
++
++git -C "$work" init -q
++git -C "$work" fetch -q --depth 1 "$UPSTREAM" "refs/tags/v$version"
++commit=$(git -C "$work" rev-parse FETCH_HEAD^{commit})
++mkdir "$work/full"
++git -C "$work" archive FETCH_HEAD | tar -x -C "$work/full"
++
++header_version=$(sed -n 's/^#define PNG_LIBPNG_VER_STRING "\(.*\)"$/\1/p' "$work/full/png.h")
++if [ "$header_version" != "$version" ]; then
++    echo "upstream tag v$version has PNG_LIBPNG_VER_STRING \"$header_version\"" >&2
++    exit 1
++fi
++filter "$work/full" "$work/upstream"
++
++if $check; then
++    mkdir "$work/committed"
++    git archive HEAD:libpng | tar -x -C "$work/committed"
++    if git diff --no-index --no-renames --quiet "$work/committed" "$work/upstream"; then
++        echo "libpng/ at HEAD matches the vendored subset of libpng v$version (upstream commit $commit)"
++        exit 0
++    fi
++    { git diff --no-index --no-renames --name-status "$work/committed" "$work/upstream" || true; } |
++        sed "s#$work/committed/#libpng/#; s#$work/upstream/#libpng/#"
++    echo "libpng/ at HEAD differs from the vendored subset of libpng v$version (upstream commit $commit)."
++    echo "D: only at HEAD, A: only upstream, M: content differs."
++    exit 1
++fi
++
++rm -rf libpng
++mv "$work/upstream" libpng
++# Staged right away, before any build: build.rs writes a generated pnglibconf.h into libpng/.
++git add --all --force libpng
++echo "Vendored and staged libpng v$version (upstream commit $commit) in libpng/."

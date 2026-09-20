@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 19 Sep 2026 09:49:44 +0200
+Subject: [PATCH] Fix SFNT language tag ABI
+
+---
+ src/lib.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index c3b606c..50e35c5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1339,7 +1339,7 @@ extern "C" {
+     pub fn FT_Get_Sfnt_LangTag(
+         face: FT_Face,
+         langID: FT_UInt,
+-        alangtag: *mut FT_SfntName,
++        alangtag: *mut FT_SfntLangTag,
+     ) -> FT_Error;
+ 
+     pub fn FT_Get_Sfnt_Table(face: FT_Face, tag: FT_Sfnt_Tag) -> *mut c_void;

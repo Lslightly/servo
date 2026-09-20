@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <55576758+jschwe@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 12:18:16 +0200
+Subject: [PATCH] Add FT_Get_Advance and FT_Get_Advances (#8)
+
+* add FT_Get_Advance
+
+* add FT_Get_Advances
+
+* Add FT_ADVANCE_FLAG_FAST_ONLY
+
+---------
+
+Signed-off-by: Richard Tjokroutomo <richard.tjokro2@gmail.com>
+Co-authored-by: Richard Tjokroutomo <richard.tjokro2@gmail.com>
+---
+ src/lib.rs | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index b0f0992..fdf2034 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -541,6 +541,7 @@ pub const FT_LOAD_TARGET_LIGHT: FT_Int32 = (FT_RENDER_MODE_LIGHT << 16) as FT_In
+ pub const FT_LOAD_TARGET_MONO: FT_Int32 = (FT_RENDER_MODE_MONO << 16) as FT_Int32;
+ pub const FT_LOAD_TARGET_LCD: FT_Int32 = (FT_RENDER_MODE_LCD << 16) as FT_Int32;
+ pub const FT_LOAD_TARGET_LCD_V: FT_Int32 = (FT_RENDER_MODE_LCD_V << 16) as FT_Int32;
++pub const FT_ADVANCE_FLAG_FAST_ONLY: FT_Int32 = 0x20000000;
+ 
+ pub const FT_FSTYPE_INSTALLABLE_EMBEDDING: FT_UShort = 0x0000;
+ pub const FT_FSTYPE_RESTRICTED_LICENSE_EMBEDDING: FT_UShort = 0x0002;
+@@ -1372,4 +1373,19 @@ extern "C" {
+         acolor_index: *mut FT_UInt,
+         iterator: *mut FT_LayerIterator,
+     ) -> bool;
++
++    pub fn FT_Get_Advance(
++        face: FT_Face,
++        glyph_index: FT_UInt,
++        load_flags: FT_Int32,
++        padvance: *mut FT_Fixed,
++    ) -> FT_Error;
++
++    pub fn FT_Get_Advances(
++        face: FT_Face,
++        start: FT_UInt,
++        count: FT_UInt,
++        load_flags: FT_Int32,
++        padvance: *mut FT_Fixed,
++    ) -> FT_Error;
+ }

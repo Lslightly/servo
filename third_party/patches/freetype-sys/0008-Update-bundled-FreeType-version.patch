@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 19 Sep 2026 10:12:20 +0200
+Subject: [PATCH] Update bundled FreeType version
+
+---
+ README.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/README.md b/README.md
+index 3e9e81e..01b5117 100644
+--- a/README.md
++++ b/README.md
+@@ -4,7 +4,7 @@ Low level bindings for the FreeType font library.
+ 
+ ## Statically linking against FreeType
+ 
+-If the `bundled` feature is enabled, `freetype-sys` will build and link a static copy of FreeType. This requires a C compiler. The included version of FreeType is 2.13.3.
++If the `bundled` feature is enabled, `freetype-sys` will build and link a static copy of FreeType. This requires a C compiler. The included version of FreeType is 2.14.3.
+ 
+ ```toml
+ [dependencies]

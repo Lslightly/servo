@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 19 Sep 2026 11:01:50 +0200
+Subject: [PATCH] windows: Use windows ftsystem.c
+
+Use optimized windows implementation on windows targets, which also memory maps.
+---
+ build.rs | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/build.rs b/build.rs
+index bea2745..89442c9 100644
+--- a/build.rs
++++ b/build.rs
+@@ -142,6 +142,8 @@ fn main() {
+             .define("HAVE_UNISTD_H", Some("1"))
+             .define("HAVE_FCNTL_H", Some("1"))
+             .file("freetype2/builds/unix/ftsystem.c");
++    } else if env::var_os("CARGO_CFG_WINDOWS").is_some() {
++        build.file("freetype2/builds/windows/ftsystem.c");
+     } else {
+         build.file("freetype2/src/base/ftsystem.c");
+     }
