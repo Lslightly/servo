@@ -25,6 +25,8 @@ pub(crate) enum LoadType {
     Stylesheet(#[no_trace] ServoUrl),
     PageSource(#[no_trace] ServoUrl),
     Media,
+    /// Web fonts that layout found the page to need.
+    WebFonts,
 }
 
 /// Canary value ensuring that manually added blocking loads are always removed by the
