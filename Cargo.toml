@@ -11,7 +11,7 @@ members = [
     "tests/unit/*",
 ]
 default-members = ["ports/servoshell"]
-exclude = [".cargo", "support/crown", "third_party/freetype-sys"]
+exclude = [".cargo", "support/crown", "third_party"]
 
 [workspace.package]
 version = "0.7.0"
@@ -497,3 +497,15 @@ freetype-sys = { path = "third_party/freetype-sys" }
 #
 # [patch."https://github.com/servo/<repository>"]
 # <crate> = { path = "/path/to/local/checkout" }
+
+# Stylo at the commit pinned above with the OpenHarmony patches applied; see
+# third_party/patches/stylo/update.sh.
+[patch."https://github.com/servo/stylo"]
+selectors = { path = "third_party/stylo/selectors" }
+servo_arc = { path = "third_party/stylo/servo_arc" }
+stylo = { path = "third_party/stylo/style" }
+stylo_atoms = { path = "third_party/stylo/stylo_atoms" }
+stylo_dom = { path = "third_party/stylo/stylo_dom" }
+stylo_malloc_size_of = { path = "third_party/stylo/malloc_size_of" }
+stylo_static_prefs = { path = "third_party/stylo/stylo_static_prefs" }
+stylo_traits = { path = "third_party/stylo/style_traits" }

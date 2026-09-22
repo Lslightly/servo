@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 22 Sep 2026 07:52:44 +0000
+Subject: [PATCH] Skip cascading ::before/::after styles that cannot generate a
+ box
+
+After matching an eager ::before/::after, check whether any matched rule
+declares `content` before cascading. Without such a declaration the
+property computes to `none` on these pseudo-elements, so the cascaded
+style would only be thrown away by
+`eager_pseudo_is_definitely_not_generated`.
+
+Universal rules like Tailwind's `*, ::before, ::after { --tw-...: ... }`
+match both pseudo-elements on every element and previously caused a
+full cascade of ~40 custom properties per pseudo-element. Blink has
+skipped this case since 2014 (crbug 412558).
+
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ style/style_resolver.rs | 32 +++++++++++++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/style/style_resolver.rs b/style/style_resolver.rs
+index ce1985a89..df523e0fc 100644
+--- a/style/style_resolver.rs
++++ b/style/style_resolver.rs
+@@ -11,9 +11,10 @@ use crate::data::{EagerPseudoStyles, ElementStyles};
+ use crate::dom::{TElement, TNode};
+ use crate::matching::MatchMethods;
+ use crate::properties::longhands::display::computed_value::T as Display;
+-use crate::properties::{ComputedValues, FirstLineReparenting};
++use crate::properties::{ComputedValues, FirstLineReparenting, LonghandId, PropertyDeclarationId};
+ use crate::rule_tree::{RuleCascadeFlags, RuleTree, StrongRuleNode};
+ use crate::selector_parser::{PseudoElement, SelectorImpl};
++use crate::shared_lock::StylesheetGuards;
+ use crate::stylist::RuleInclusion;
+ use log::Level::Trace;
+ use selectors::matching::{
+@@ -160,6 +161,24 @@ fn eager_pseudo_is_definitely_not_generated(
+     *style.get_box().get_display() == Display::None || style.ineffective_content_property()
+ }
+ 
++/// Whether any of the matched rules declares `content`. If none does, the
++/// property computes to `normal` (which is `none` for `::before` and `::after`,
++/// see <https://drafts.csswg.org/css-content-3/#valdef-content-none>), so no
++/// box gets generated and the cascade would be thrown away anyway.
++///
++/// This is intentionally conservative: any `content` declaration, including
++/// `inherit`, `revert`, `var()` and the like, is enough to keep the style,
++/// which leaves the final decision to `eager_pseudo_is_definitely_not_generated`.
++fn rules_may_generate_content(rules: &StrongRuleNode, guards: &StylesheetGuards) -> bool {
++    rules.self_and_ancestors().any(|node| {
++        node.style_source().is_some_and(|source| {
++            source
++                .read(node.cascade_level().guard(guards))
++                .contains(PropertyDeclarationId::Longhand(LonghandId::Content))
++        })
++    })
++}
++
+ impl<'a, 'ctx, 'le, E> StyleResolverForElement<'a, 'ctx, 'le, E>
+ where
+     'ctx: 'a,
+@@ -470,6 +489,17 @@ where
+             VisitedHandlingMode::AllLinksUnvisited,
+         )?;
+ 
++        // Skip the cascade when it cannot generate a box, which is the common
++        // case for universal `::before` / `::after` rules such as
++        // `*, ::before, ::after { box-sizing: border-box }`. Only the unvisited
++        // rules matter, since the visited cascade only applies colors.
++        if pseudo.is_before_or_after()
++            && !matches!(self.pseudo_resolution, PseudoElementResolution::Force)
++            && !rules_may_generate_content(&rule_node, &self.context.shared.guards)
++        {
++            return None;
++        }
++
+         let mut visited_rules = None;
+         if originating_element_style.style().visited_style().is_some() {
+             visited_rules = self
