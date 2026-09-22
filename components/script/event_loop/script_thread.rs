@@ -1350,6 +1350,7 @@ impl ScriptThread {
     fn maybe_fulfill_font_ready_promises(&self, cx: &mut JSContext) {
         let mut sent_message = false;
         for (_, document) in self.documents.borrow().iter() {
+            document.maybe_stop_delaying_load_event_for_web_fonts(cx);
             sent_message = document.maybe_fulfill_font_ready_promise(cx) || sent_message;
         }
 

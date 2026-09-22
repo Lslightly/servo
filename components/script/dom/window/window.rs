@@ -2833,6 +2833,7 @@ impl Window {
             // must wait for them even if it had already been fulfilled.
             self.Document().Fonts(cx).switch_to_loading(cx);
         }
+        document.delay_load_event_for_web_fonts();
         self.handle_new_or_removed_web_fonts_post_reflow(cx, reflow_result.changed_web_fonts);
 
         self.handle_pending_images_post_reflow(
