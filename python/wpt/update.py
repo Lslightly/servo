@@ -147,6 +147,9 @@ def use_js_engine_property(kwargs: dict[str, Any]) -> None:
 
 
 def suite_start_with_js_engine(self: metadata.ExpectedUpdater, data: dict[str, Any]) -> None:
+    # The expectations have no condition on OpenHarmony, so its results would replace the Linux ones.
+    if data["run_info"].get("ohos"):
+        raise SystemExit("Logs of runs on OpenHarmony devices can not update the expectations")
     data["run_info"].setdefault(JS_ENGINE, DEFAULT_JS_ENGINE)
     LOG_JS_ENGINES.add(data["run_info"][JS_ENGINE])
     WPT_SUITE_START(self, data)

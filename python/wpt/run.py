@@ -34,7 +34,7 @@ TRACKER_DASHBOARD_SECRET_ENV_VAR = "INTERMITTENT_TRACKER_DASHBOARD_SECRET_PROD"
 TRACKER_DASHBOARD_MAXIMUM_OUTPUT_LENGTH = 1024
 
 
-def set_if_none(args: dict, key: str, value: bool | int | str) -> None:
+def set_if_none(args: dict, key: str, value: bool | int | str | None) -> None:
     if key not in args or args[key] is None:
         args[key] = value
 
@@ -65,8 +65,14 @@ def raise_file_handle_limit() -> None:
         print("Could not raise the file handle limit")
 
 
-def run_tests(default_binary_path: str, multiprocess: bool, **kwargs: Any) -> int:
-    print(f"Running WPT tests with {default_binary_path}")
+def run_tests(default_binary_path: Optional[str], multiprocess: bool, openharmony: bool = False, **kwargs: Any) -> int:
+    if openharmony:
+        print(f"Running WPT tests on an OpenHarmony device with {default_binary_path or 'the installed HAP'}")
+        if multiprocess:
+            print("Multiprocess mode is not supported on OpenHarmony.")
+            return 1
+    else:
+        print(f"Running WPT tests with {default_binary_path}")
 
     os.environ["RUST_BACKTRACE"] = "1"
     os.environ["HOST_FILE"] = os.path.join(SERVO_ROOT, "tests", "wpt", "hosts")
@@ -79,7 +85,12 @@ def run_tests(default_binary_path: str, multiprocess: bool, **kwargs: Any) -> in
     # Allow to run with the legacy Servo WPT configuration. This is required
     # until necessary improvements are made to the debugging experience with
     # servodriver. See https://github.com/servo/servo/issues/40751
-    product = "servo_legacy" if kwargs.get("legacy") else "servo"
+    if openharmony:
+        product = "servo_ohos"
+    elif kwargs.get("legacy"):
+        product = "servo_legacy"
+    else:
+        product = "servo"
 
     # Expectations can depend on the engine as `js_engine`, so every run has to set it.
     mozinfo.update({"js_engine": kwargs.pop("js_engine", None) or "spidermonkey"})
@@ -90,7 +101,8 @@ def run_tests(default_binary_path: str, multiprocess: bool, **kwargs: Any) -> in
     set_if_none(kwargs, "manifest_update", False)
 
     raise_file_handle_limit()
-    set_if_none(kwargs, "processes", multiprocessing.cpu_count())
+    # How many instances of Servo a device can run at once depends on the device.
+    set_if_none(kwargs, "processes", 1 if openharmony else multiprocessing.cpu_count())
 
     set_if_none(kwargs, "ca_cert_path", os.path.join(CERTS_PATH, "cacert.pem"))
     set_if_none(kwargs, "host_key_path", os.path.join(CERTS_PATH, "web-platform.test.key"))
@@ -100,7 +112,8 @@ def run_tests(default_binary_path: str, multiprocess: bool, **kwargs: Any) -> in
     set_if_none(kwargs, "chunk_type", "id_hash")
 
     set_if_none(kwargs, "binary", default_binary_path)
-    set_if_none(kwargs, "webdriver_binary", default_binary_path)
+    if not openharmony:
+        set_if_none(kwargs, "webdriver_binary", default_binary_path)
 
     if kwargs.pop("rr_chaos"):
         kwargs["debugger"] = "rr"
@@ -131,6 +144,7 @@ def run_tests(default_binary_path: str, multiprocess: bool, **kwargs: Any) -> in
         test_types = {
             "servo": ["testharness", "reftest", "wdspec", "crashtest"],
             "servo_legacy": ["testharness", "reftest", "wdspec", "crashtest"],
+            "servo_ohos": ["testharness", "reftest", "crashtest"],
         }
         kwargs["test_types"] = test_types[product]
 
@@ -168,10 +182,12 @@ def run_tests(default_binary_path: str, multiprocess: bool, **kwargs: Any) -> in
     logger.add_handler(handler)
 
     with tempfile.TemporaryDirectory(prefix="servo-") as config_dir:
-        kwargs["binary_args"] += ["--config-dir", config_dir]
-        # Temporary workaround to avoid shared storage across parallel processes.
-        # Can be removed once per-process config dirs are supported.
-        kwargs["binary_args"] += ["--temporary-storage"]
+        # On OpenHarmony, the config directory is on the device and set up by the `servo_ohos` product.
+        if not openharmony:
+            kwargs["binary_args"] += ["--config-dir", config_dir]
+            # Temporary workaround to avoid shared storage across parallel processes.
+            # Can be removed once per-process config dirs are supported.
+            kwargs["binary_args"] += ["--temporary-storage"]
 
         wptrunner.run_tests(**kwargs)
 

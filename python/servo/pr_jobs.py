@@ -63,9 +63,8 @@ OHOS_ONLY = (
     "ports/arkweb/",
     "ports/servoshell/egl/ohos/",
     "ports/servoshell/platform/openharmony/",
-    "python/wpt/ohos_test_parser.js",
-    "python/wpt/ohos_webdriver_test.py",
     "support/openharmony/",
+    "tests/wpt/tests/tools/wptrunner/wptrunner/browsers/servo_ohos.py",
 )
 
 # Files that only the QuickJS build reads.
