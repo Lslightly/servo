@@ -16,6 +16,10 @@ pub(crate) mod desktop;
 #[cfg(any(target_os = "android", target_env = "ohos"))]
 mod egl;
 #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+mod headless_event_loop;
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+mod headless_window;
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
 mod panic_hook;
 mod parser;
 mod prefs;
