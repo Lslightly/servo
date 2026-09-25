@@ -21,7 +21,6 @@ import threading
 import time
 from argparse import ArgumentParser
 from contextlib import chdir
-from pathlib import Path
 from typing import Any, List, Optional
 
 import tidy
@@ -490,13 +489,25 @@ class MachCommands(CommandBase):
         help="The JavaScript engine of the binary, which the expectations can depend on. Defaults to js-engine "
         "in .servobuild",
     )
+    @CommandArgument(
+        "--ohos",
+        default=None,
+        action="store_true",
+        help="Run the tests on an OpenHarmony device, with the headless servoshell executable.",
+    )
     # Keep `allow_target_configuration` above `common_command_arguments`: binary_selection requires the
     # target to be configured already.
     @CommandBase.allow_target_configuration
-    @CommandBase.common_command_arguments(binary_selection=True)
+    @CommandBase.common_command_arguments(binary_selection=True, build_type=True)
     def test_wpt(
-        self, servo_binary: Optional[str], multiprocess: bool, update_expectations: bool, **kwargs: Any
+        self,
+        build_type: BuildType,
+        servo_binary: Optional[str],
+        multiprocess: bool,
+        update_expectations: bool,
+        **kwargs: Any,
     ) -> int:
+        kwargs.pop("sanitizer", None)
         if update_expectations:
             if kwargs["log_raw"]:
                 print("Do not specify --log-raw when updating tests directly")
@@ -504,8 +515,27 @@ class MachCommands(CommandBase):
             with tempfile.TemporaryDirectory() as temp_dir:
                 kwargs["log_raw"] = [os.path.join(temp_dir, "wpt.log")]
 
-        if self.target.is_cross_build():
-            print("test-wpt doesn't support any cross build targets (yet).")
+        if is_openharmony(self.target):
+            if update_expectations:
+                print("Updating the test expectations from a run on OpenHarmony is not supported yet.")
+                return 1
+            if kwargs["headless"] is False:
+                print(
+                    "Running WPT in the Servo app is not supported yet: the app ignores the window size that "
+                    "WebDriver sets, `--user-stylesheet` and `--hard-fail`. Run the tests headless instead."
+                )
+                return 1
+            headless_directory = self.target.get_headless_directory(build_type.directory_name())
+            servo_binary = path.join(headless_directory, "servoshell")
+            if not path.exists(servo_binary):
+                print(
+                    f"No headless servoshell executable in {headless_directory}. Build it with "
+                    "`./mach build --ohos --headless-binary`."
+                )
+                return 1
+            test_return_value = self._test_wpt(servo_binary, multiprocess, openharmony=True, **kwargs)
+        elif self.target.is_cross_build():
+            print("test-wpt doesn't support cross build targets other than OpenHarmony (yet).")
             return 1
         else:
             assert servo_binary is not None, "servo_binary should only be none on Android / OpenHarmony"
@@ -522,7 +552,7 @@ class MachCommands(CommandBase):
         return test_return_value
 
     @CommandBase.allow_target_configuration
-    def _test_wpt(self, servo_binary: str, multiprocess: bool, **kwargs: Any) -> int:
+    def _test_wpt(self, servo_binary: Optional[str], multiprocess: bool, **kwargs: Any) -> int:
         kwargs["js_engine"] = self.configure_js_engine(kwargs.get("js_engine"))
         return_value = wpt.run.run_tests(servo_binary, multiprocess, **kwargs)
         return return_value if not kwargs["always_succeed"] else 0
@@ -558,37 +588,6 @@ class MachCommands(CommandBase):
             print("Are you sure you don't want a patch?")
             return 1
         return wpt.update.update_tests(**kwargs)
-
-    @Command("test-ohos-wpt", description="Run a single WPT test on OHOS device using WebDriver", category="testing")
-    @CommandArgument("--test", required=True, help="Path to WPT test (relative to tests/wpt/tests/)")
-    @CommandArgument("--webdriver-port", type=int, default=7000, help="WebDriver server port on OHOS device")
-    @CommandArgument("--wpt-server-port", type=int, default=8000, help="WPT server port on desktop")
-    @CommandArgument("--verbose", action="store_true", help="Enable verbose logging")
-    def test_ohos_wpt(self, **kwargs: Any) -> int:
-        """Run a single WPT test on OHOS device."""
-        script_path = Path(__file__).parent.parent / "wpt" / "ohos_webdriver_test.py"
-
-        cmd = [
-            sys.executable,
-            str(script_path),
-            "--test",
-            kwargs["test"],
-            "--webdriver-port",
-            str(kwargs["webdriver_port"]),
-            "--wpt-server-port",
-            str(kwargs["wpt_server_port"]),
-        ]
-
-        if kwargs.get("verbose"):
-            cmd.append("--verbose")
-
-        print(f"Running OHOS WPT test: {kwargs['test']}")
-        print("Make sure:")
-        print("1. OHOS device is connected and running Servo with WebDriver enabled")
-        print("2. WPT server is running on desktop")
-        print("3. HDC is available in PATH")
-
-        return subprocess.call(cmd)
 
     @Command("test-jquery", description="Run the jQuery test suite", category="testing")
     @CommandBase.common_command_arguments(binary_selection=True)
