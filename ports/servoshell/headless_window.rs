@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 
+use dpi::PhysicalSize;
 use euclid::{Point2D, Scale, Size2D};
 use log::error;
 use servo::{
@@ -18,7 +19,6 @@ use servo::{
     DevicePixel, RenderingContext, ScreenGeometry, SoftwareRenderingContext, WebView,
     convert_rect_to_css_pixel,
 };
-use winit::dpi::PhysicalSize;
 
 use crate::prefs::ServoShellPreferences;
 use crate::window::{MIN_WINDOW_INNER_SIZE, PlatformWindow, ServoShellWindow, ServoShellWindowId};
