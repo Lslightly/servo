@@ -81,6 +81,21 @@ def write_hosts_file(config):
     return hosts_path
 
 
+def find_wpt_prefs(logger):
+    default_path = os.path.join("resources", "wpt-prefs.json")
+    # The cwd is the servo repo for `./mach test-wpt`, but on WPT runners
+    # it is the WPT repo. The nightly tar is extracted inside the Python
+    # virtual environment within the repo. This means that on WPT runners,
+    # the cwd has the `_venv3/servo` directory inside which we find the
+    # binary and the 'resources' directory.
+    for dir in [".", "./_venv3/servo"]:
+        candidate = os.path.abspath(os.path.join(dir, default_path))
+        if os.path.isfile(candidate):
+            return candidate
+    logger.error("Unable to find wpt-prefs.json")
+    return default_path
+
+
 class ServoBrowser(WebDriverBrowser):
     init_timeout = 300  # Large timeout for cases where we're booting an Android emulator
     shutdown_retry_attempts = 3
@@ -118,7 +133,7 @@ class ServoBrowser(WebDriverBrowser):
             args += ["--headless"]
 
         # Add the shared `wpt-prefs.json` file to the list of arguments.
-        args += ["--prefs-file", self.find_wpt_prefs(logger)]
+        args += ["--prefs-file", find_wpt_prefs(logger)]
 
         super().__init__(logger, binary=binary, webdriver_binary=binary,
                          webdriver_args=args, host=webdriver_host, env=env,
@@ -180,17 +195,3 @@ class ServoBrowser(WebDriverBrowser):
             self.logger.warning("Max retry exceeded to normally shut down. Killing instead.")
 
         super().stop(force)
-
-    def find_wpt_prefs(self, logger):
-        default_path = os.path.join("resources", "wpt-prefs.json")
-        # The cwd is the servo repo for `./mach test-wpt`, but on WPT runners
-        # it is the WPT repo. The nightly tar is extracted inside the Python
-        # virtual environment within the repo. This means that on WPT runners,
-        # the cwd has the `_venv3/servo` directory inside which we find the
-        # binary and the 'resources' directory.
-        for dir in [".", "./_venv3/servo"]:
-            candidate = os.path.abspath(os.path.join(dir, default_path))
-            if os.path.isfile(candidate):
-                return candidate
-        logger.error("Unable to find wpt-prefs.json")
-        return default_path

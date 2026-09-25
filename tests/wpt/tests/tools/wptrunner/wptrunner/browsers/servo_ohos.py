@@ -1,0 +1,555 @@
+# mypy: allow-untyped-defs
+
+"""wptrunner product for Servo running on an OpenHarmony device.
+
+wptrunner and the WPT servers run on the host, while Servo runs on the device and is
+controlled through `hdc`. `hdc fport` makes Servo's WebDriver server reachable from the
+host and `hdc rport` makes the WPT servers reachable from the device, so the device does
+not need network access.
+
+Servo is started in one of two ways:
+
+- Headless (the default): The standalone `servoshell` executable built by
+  `./mach build --ohos --headless-binary` is pushed to the device and started from an
+  `hdc shell`. It renders offscreen, and several instances can run on one device.
+- With `--no-headless`: The installed Servo HAP is started with `aa start` and renders to
+  the screen. Only one instance can run per device, and the HAP has to be signed with a
+  debug certificate, since test files can otherwise not be pushed into its sandbox.
+"""
+
+import atexit
+import functools
+import hashlib
+import os
+import re
+import shlex
+import subprocess
+import threading
+import time
+
+import requests
+
+from .base import OutputHandler, WebDriverBrowser, require_arg
+from .base import get_timeout_multiplier  # noqa: F401
+from .servo import find_wpt_prefs, write_hosts_file
+from ..executors import executor_kwargs as base_executor_kwargs
+from ..executors.executorservo import (ServoTestharnessExecutor,  # noqa: F401
+                                       ServoRefTestExecutor,  # noqa: F401
+                                       ServoCrashtestExecutor)  # noqa: F401
+
+__wptrunner__ = {
+    "product": "servo_ohos",
+    "check_args": "check_args",
+    "browser": "ServoOhosBrowser",
+    "executor": {
+        "testharness": "ServoTestharnessExecutor",
+        "reftest": "ServoRefTestExecutor",
+        "crashtest": "ServoCrashtestExecutor",
+    },
+    "browser_kwargs": "browser_kwargs",
+    "executor_kwargs": "executor_kwargs",
+    "env_extras": "env_extras",
+    "env_options": "env_options",
+    "run_info_extras": "run_info_extras",
+    "timeout_multiplier": "get_timeout_multiplier",
+    "update_properties": "update_properties",
+    "add_arguments": "add_arguments",
+}
+
+PACKAGE_NAME = "org.servo.servo"
+# The files directory of the HAP, as seen from inside its sandbox.
+HAP_FILES_DIR = "/data/storage/el2/base/haps/servoshell/files"
+# The same directory, as seen from an `hdc shell`.
+HAP_FILES_DIR_ON_DEVICE = f"/data/app/el2/100/base/{PACKAGE_NAME}/haps/servoshell/files"
+DEVICE_DIR = "/data/local/tmp/servo-wpt"
+FAULTLOG_DIR = "/data/log/faultlog/faultlogger"
+# Everything after this in a fault report is about threads other than the crashing one.
+FAULTLOG_END_MARKER = "Other thread info:"
+
+# Printed by the `hdc shell` running Servo, see `ServoOhosBrowser.make_command`.
+PID_MARKER = "SERVO_PID="
+EXIT_MARKER = "SERVO_EXIT="
+# The exit status of Servo when it is killed with SIGKILL.
+KILLED_EXIT_STATUS = 128 + 9
+# The signals that typically end Servo, by their number on the device, which can differ from
+# the number on the host.
+DEVICE_SIGNALS = {1: "SIGHUP", 2: "SIGINT", 4: "SIGILL", 5: "SIGTRAP", 6: "SIGABRT", 7: "SIGBUS",
+                  8: "SIGFPE", 9: "SIGKILL", 11: "SIGSEGV", 13: "SIGPIPE", 15: "SIGTERM"}
+# The time in seconds since boot at the start of a line of the kernel log.
+DMESG_TIME = re.compile(r"^\[\s*(\d+\.\d+)\]")
+# How many seconds before wptrunner's init timer Servo's start is given up.
+INIT_TIMEOUT_MARGIN = 10
+
+
+def add_arguments(parser):
+    group = parser.add_argument_group("OpenHarmony-specific")
+    group.add_argument("--ohos-device", action="append", dest="ohos_devices",
+                       help="Serial of the OpenHarmony device to run Servo on, as listed by "
+                       "`hdc list targets`. Repeat to spread the browser instances over "
+                       "several devices. Defaults to the only connected device.")
+
+
+def check_args(**kwargs):
+    devices = device_serials(kwargs)
+    if kwargs["headless"] is not False:
+        require_arg(kwargs, "binary")
+        resources = os.path.join(os.path.dirname(kwargs["binary"]), "resources", "named_resources")
+        if not os.path.isdir(resources):
+            raise ValueError(f"{kwargs['binary']} is not the servoshell executable staged by "
+                             "`./mach build --ohos --headless-binary`, since there is no "
+                             f"{resources}")
+    elif kwargs["processes"] > len(devices):
+        raise ValueError("The Servo HAP can only run once per device, so pass at most as many "
+                         "--processes as there are devices, or run headless.")
+
+
+def browser_kwargs(logger, test_type, run_info_data, config, subsuite, **kwargs):
+    return {
+        "binary": kwargs["binary"],
+        "binary_args": kwargs["binary_args"] + subsuite.config.get("binary_args", []),
+        "server_config": config,
+        "user_stylesheets": kwargs.get("user_stylesheets"),
+        "headless": kwargs["headless"] is not False,
+        "device_serials": device_serials(kwargs),
+    }
+
+
+def executor_kwargs(logger, test_type, test_environment, run_info_data, **kwargs):
+    rv = base_executor_kwargs(test_type, test_environment, run_info_data, **kwargs)
+    rv['capabilities'] = {}
+    return rv
+
+
+def env_extras(**kwargs):
+    return []
+
+
+def env_options():
+    return {"server_host": "127.0.0.1",
+            "supports_debugger": False}
+
+
+def run_info_extras(logger, **kwargs):
+    device = Device(device_serials(kwargs)[0])
+    return {"ohos": True,
+            "ohos_api_version": int(device.shell("param get const.ohos.apiversion"))}
+
+
+def update_properties():
+    return (["debug", "os", "processor", "subsuite"], {"os": ["version"], "processor": ["bits"]})
+
+
+def device_serials(kwargs):
+    if kwargs.get("ohos_devices"):
+        return kwargs["ohos_devices"]
+    devices = connected_devices()
+    if len(devices) != 1:
+        raise ValueError(f"Found {len(devices)} connected OpenHarmony devices, select the one "
+                         "to use with --ohos-device.")
+    return devices
+
+
+@functools.cache
+def connected_devices():
+    output = subprocess.run(["hdc", "list", "targets"], capture_output=True, text=True,
+                            check=True).stdout
+    return [line.strip() for line in output.splitlines()
+            if line.strip() and line.strip() != "[Empty]"]
+
+
+class Device:
+    """Runs `hdc` commands on one device."""
+
+    def __init__(self, serial):
+        self.serial = serial
+
+    def command(self, *args):
+        return ["hdc", "-t", self.serial, *args]
+
+    def run(self, *args, timeout=60):
+        command = self.command(*args)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        # hdc exits successfully even when a command fails, and says so on stdout instead.
+        if result.returncode != 0 or result.stdout.startswith("[Fail]"):
+            raise OSError(f"`{shlex.join(command)}` failed: "
+                          f"{(result.stdout + result.stderr).strip()}")
+        return result.stdout.replace("\r\n", "\n").strip()
+
+    def shell(self, command, timeout=60):
+        return self.run("shell", command, timeout=timeout)
+
+
+class PortForwards:
+    """The port forwards of all devices, which the browser instances using the same
+    device share."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.users = {}
+
+    def add(self, device, direction, port):
+        key = (device.serial, direction, port)
+        rule = (f"tcp:{port}", f"tcp:{port}")
+        with self.lock:
+            if key not in self.users:
+                try:
+                    device.run(direction, *rule)
+                except OSError as error:
+                    # A forward left behind by an interrupted run can not be added again.
+                    try:
+                        device.run("fport", "rm", *rule)
+                        device.run(direction, *rule)
+                    except OSError:
+                        raise error
+            self.users[key] = self.users.get(key, 0) + 1
+
+    def remove(self, device, direction, port):
+        key = (device.serial, direction, port)
+        with self.lock:
+            if key not in self.users:
+                return
+            self.users[key] -= 1
+            if self.users[key] > 0:
+                return
+            del self.users[key]
+            try:
+                # `fport rm` removes reverse forwards as well.
+                device.run("fport", "rm", f"tcp:{port}", f"tcp:{port}")
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+
+PORT_FORWARDS = PortForwards()
+
+
+class HeadlessExecutables:
+    """Pushes the headless `servoshell` and everything next to it to the devices, once per
+    device and only when it changed since the last push."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pushed = set()
+
+    def push(self, device, local_dir):
+        device_dir = f"{DEVICE_DIR}/{os.path.basename(local_dir)}"
+        with self.lock:
+            if (device.serial, local_dir) in self.pushed:
+                return device_dir
+            stamp = directory_stamp(local_dir)
+            if device.shell(f"cat {device_dir}.stamp 2>/dev/null") != stamp:
+                device.shell(f"rm -rf {device_dir} {device_dir}.stamp; mkdir -p {DEVICE_DIR}")
+                # `file send` puts the directory into the target directory.
+                device.run("file", "send", local_dir, DEVICE_DIR, timeout=600)
+                device.shell(f"chmod +x {device_dir}/servoshell && echo {stamp} > {device_dir}.stamp")
+            self.pushed.add((device.serial, local_dir))
+        return device_dir
+
+
+HEADLESS_EXECUTABLES = HeadlessExecutables()
+
+
+def describe_exit_status(status):
+    """Describes the exit status of a shell command on the device, which is 128 plus the
+    number of the signal that ended it."""
+    if status > 128:
+        number = status - 128
+        name = DEVICE_SIGNALS.get(number)
+        return f"signal {number} ({name})" if name else f"signal {number}"
+    return f"status {status}"
+
+
+def directory_stamp(path):
+    stamp = hashlib.sha256()
+    for root, dirs, files in os.walk(path):
+        dirs.sort()
+        for name in sorted(files):
+            stat = os.stat(os.path.join(root, name))
+            stamp.update(f"{os.path.relpath(os.path.join(root, name), path)} "
+                         f"{stat.st_size} {stat.st_mtime_ns}\n".encode())
+    return stamp.hexdigest()
+
+
+class DeviceOutputHandler(OutputHandler):
+    """Handles the output of the `hdc shell` running Servo, and picks the pid of Servo on
+    the device and its exit status out of it."""
+
+    def __init__(self, logger, command, browser, dmesg_time):
+        super().__init__(logger, command)
+        self.browser = browser
+        # The time of the kernel log when Servo was started, if known.
+        self.dmesg_time = dmesg_time
+        self.device_pid = None
+        self.exit_status = None
+        self.report_lock = threading.Lock()
+        self.reported = False
+
+    def __call__(self, line):
+        text = line.decode("utf8", "replace").strip() if isinstance(line, bytes) else line.strip()
+        for marker, attribute in ((PID_MARKER, "device_pid"), (EXIT_MARKER, "exit_status")):
+            if text.startswith(marker) and text[len(marker):].isdigit():
+                setattr(self, attribute, int(text[len(marker):]))
+                setattr(self.browser, attribute, int(text[len(marker):]))
+        super().__call__(line)
+        # A crash can end the test before the exit status arrives, and then `check_crash`
+        # doesn't see it.
+        if (text.startswith(EXIT_MARKER) and self.exit_status not in (None, 0, KILLED_EXIT_STATUS) and
+                not self.browser.stopped_on_purpose):
+            # Getting the crash report from the device takes a moment, during which the
+            # process wouldn't count as ended while this thread is busy.
+            threading.Thread(target=self.report_exit, daemon=True).start()
+
+    def report_exit(self):
+        """Log how this run of Servo ended on the device, once."""
+        with self.report_lock:
+            if self.reported:
+                return
+            self.reported = True
+        self.browser.report_exit(self.pid, self.device_pid, self.exit_status, self.dmesg_time)
+
+
+class ServoOhosBrowser(WebDriverBrowser):
+    """Servo on an OpenHarmony device. The process this runs locally is the `hdc shell`
+    that starts Servo and ends with it, and which passes on Servo's output."""
+
+    init_timeout = 120
+
+    def __init__(self, logger, binary, binary_args, server_config, user_stylesheets, headless,
+                 device_serials, **kwargs):
+        super().__init__(logger, binary=binary, webdriver_binary="hdc", supports_pac=False,
+                         **kwargs)
+        self.device = Device(device_serials[self.manager_number % len(device_serials)])
+        self.binary_args = binary_args
+        self.server_config = server_config
+        self.user_stylesheets = user_stylesheets or []
+        self.headless = headless
+        if headless:
+            self.files_dir = f"{DEVICE_DIR}/instance-{self.manager_number}"
+        else:
+            self.files_dir = HAP_FILES_DIR
+        self.executable_dir = None
+        self.device_pid = None
+        self.exit_status = None
+        self.stopping = True
+        self.stopped_on_purpose = False
+        self.crashed = False
+        self.dmesg_time = None
+        self.fault_logs = set()
+        self.holds_wakelock = False
+        atexit.register(self.release_wakelock)
+
+    def setup(self):
+        if self.headless:
+            self.executable_dir = HEADLESS_EXECUTABLES.push(self.device, os.path.dirname(self.binary))
+            self.device.shell(f"rm -rf {self.files_dir}; mkdir -p {self.files_dir}")
+        else:
+            self.prepare_hap()
+
+        hosts_path = write_hosts_file(self.server_config)
+        try:
+            self.push(hosts_path, "wpt-hosts")
+        finally:
+            os.remove(hosts_path)
+        self.push(find_wpt_prefs(self.logger), "wpt-prefs.json")
+        if self.server_config.ssl_config["ca_cert_path"]:
+            self.push(self.server_config.ssl_config["ca_cert_path"], "wpt-cacert.pem")
+        for index, stylesheet in enumerate(self.user_stylesheets):
+            self.push(stylesheet, f"wpt-user-stylesheet-{index}.css")
+
+        PORT_FORWARDS.add(self.device, "fport", self.port)
+        for port in self.wptserve_ports():
+            PORT_FORWARDS.add(self.device, "rport", port)
+
+    def prepare_hap(self):
+        # The screen has to stay on, or the HAP is frozen.
+        self.device.shell("power-shell wakeup")
+        self.device.shell('hidumper -s PowerManagerService -a "-t"')
+        self.holds_wakelock = True
+        # Files can only be pushed into the sandbox of the HAP once it has been started.
+        if "yes" not in self.device.shell(f"test -d {HAP_FILES_DIR_ON_DEVICE} && echo yes"):
+            self.device.shell(f"aa start -a EntryAbility -b {PACKAGE_NAME}")
+            self.device.shell(f"aa force-stop {PACKAGE_NAME}")
+
+    def push(self, local_path, name):
+        if self.headless:
+            self.device.run("file", "send", local_path, f"{self.files_dir}/{name}")
+        else:
+            self.device.run("file", "send", "-b", PACKAGE_NAME, local_path,
+                            f"{self.files_dir}/{name}")
+
+    def wptserve_ports(self):
+        return sorted({port for ports in self.server_config.ports.values()
+                       for port in ports if port is not None})
+
+    def servo_args(self):
+        args = [
+            "--hard-fail",
+            # See https://github.com/servo/servo/issues/30080.
+            "--ignore-certificate-errors",
+            "--enable-experimental-web-platform-features",
+            "--window-size=800x600",
+            f"--webdriver={self.port}",
+            f"--host-file={self.files_dir}/wpt-hosts",
+            f"--prefs-file={self.files_dir}/wpt-prefs.json",
+            f"--config-dir={self.files_dir}/wpt-config",
+            "--temporary-storage",
+        ]
+        if self.server_config.ssl_config["ca_cert_path"]:
+            args.append(f"--certificate-path={self.files_dir}/wpt-cacert.pem")
+        for index in range(len(self.user_stylesheets)):
+            args.append(f"--user-stylesheet={self.files_dir}/wpt-user-stylesheet-{index}.css")
+        if self.headless:
+            args.append("--headless")
+        else:
+            # Reftests take screenshots of 800x600 CSS pixels, which has to fit on the screen.
+            args.append("--device-pixel-ratio=1")
+        return args + self.binary_args
+
+    def make_command(self):
+        args = self.servo_args()
+        if self.headless:
+            executable = f"{self.executable_dir}/servoshell"
+            script = (f"cd {self.files_dir}; "
+                      f"LD_LIBRARY_PATH={self.executable_dir} RUST_BACKTRACE=1 "
+                      f"{executable} {shlex.join(args)} about:blank 2>&1 & "
+                      f"echo {PID_MARKER}$!; wait $!; echo {EXIT_MARKER}$?")
+        else:
+            # The HAP takes its arguments as parameters of the Want that starts it.
+            for arg in args:
+                if not arg.startswith("--"):
+                    raise ValueError(f"Can not pass {arg!r} to the Servo HAP, since it only "
+                                     "takes arguments of the form `--name` or `--name=value`")
+            start = shlex.join(["aa", "start", "-a", "EntryAbility", "-b", PACKAGE_NAME,
+                                "-U", "about:blank", *(f"--psn={arg}" for arg in args)])
+            script = (f"aa force-stop {PACKAGE_NAME}; {start}; "
+                      f"for i in $(seq 100); do pid=$(pidof {PACKAGE_NAME}) && break; sleep 0.1; done; "
+                      f"echo {PID_MARKER}$pid; hilog -P $pid & "
+                      "while kill -0 $pid 2>/dev/null; do sleep 0.2; done; kill $!")
+        return self.device.command("shell", script)
+
+    def create_output_handler(self, cmd):
+        return DeviceOutputHandler(self.logger, cmd, self, self.dmesg_time)
+
+    def start(self, group_metadata, **kwargs):
+        self.device_pid = None
+        self.exit_status = None
+        self.stopped_on_purpose = False
+        self.crashed = False
+        if self.headless:
+            self.dmesg_time = self.last_dmesg_time()
+        else:
+            self.fault_logs = self.list_fault_logs()
+        super().start(group_metadata, **kwargs)
+        # Connecting to the WebDriver port already succeeds when `hdc fport` listens on the
+        # host, so check that Servo answers.
+        while True:
+            if not WebDriverBrowser.is_alive(self):
+                raise OSError("Servo exited before its WebDriver server was ready")
+            try:
+                if requests.get(f"{self.url}status", timeout=1).status_code == 200:
+                    break
+            except requests.RequestException:
+                pass
+            if time.time() > self.init_deadline:
+                raise OSError(f"Servo's WebDriver server did not answer within "
+                              f"{self.init_timeout - INIT_TIMEOUT_MARGIN} seconds")
+            time.sleep(0.1)
+        self.stopping = False
+
+    def _run_server(self, group_metadata, **kwargs):
+        # Give up before wptrunner's init timer of the same length fires, so that a failed
+        # start doesn't also fail the restarted browser.
+        self.init_deadline -= INIT_TIMEOUT_MARGIN
+        super()._run_server(group_metadata, **kwargs)
+
+    def stop(self, force=False):
+        self.stopping = True
+        self.stopped_on_purpose = True
+        # This also ends Servo if it runs in the `hdc shell` that is killed.
+        stopped = super().stop(force)
+        try:
+            if self.headless and self.device_pid is not None:
+                self.device.shell(f"kill -9 {self.device_pid} 2>/dev/null")
+            elif not self.headless:
+                self.device.shell(f"aa force-stop {PACKAGE_NAME}")
+        except (OSError, subprocess.SubprocessError) as error:
+            self.logger.warning(f"Could not stop Servo on the device: {error}")
+        self.device_pid = None
+        return stopped
+
+    def check_crash(self, process, test):
+        # The exit status arrives before the `hdc shell` running Servo ends.
+        exited = self.exit_status is not None or not WebDriverBrowser.is_alive(self)
+        if self.stopping or self.crashed or not exited:
+            return False
+        self.crashed = True
+        if self._output_handler is not None:
+            self._output_handler.report_exit()
+        return True
+
+    def report_exit(self, pid, device_pid, exit_status, dmesg_time):
+        """Log how Servo ended on the device, where `pid` is the local process that ran it."""
+        if exit_status is not None:
+            self.logger.error(f"Servo exited on the device with {describe_exit_status(exit_status)}")
+        else:
+            self.logger.error("Servo exited on the device")
+        try:
+            if self.headless:
+                self.report_kernel_crash_dump(pid, device_pid, dmesg_time)
+            else:
+                self.report_fault_logs(pid)
+        except (OSError, subprocess.SubprocessError) as error:
+            self.logger.warning(f"Could not get the crash report from the device: {error}")
+
+    def last_dmesg_time(self):
+        """The time of the last line of the kernel log, if it can be read."""
+        try:
+            match = DMESG_TIME.match(self.device.shell("dmesg 2>/dev/null | tail -n 1"))
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return float(match.group(1)) if match else None
+
+    def report_kernel_crash_dump(self, pid, device_pid, dmesg_time):
+        """Log the kernel's dump of the thread whose signal ended the headless Servo, since
+        the device writes no fault report for executables started from a shell. Only the
+        HongMeng kernel of HarmonyOS writes one, with lines tagged `[AB_<n>]`."""
+        if device_pid is None:
+            return
+        lines = self.device.shell(f"dmesg 2>/dev/null | grep '] pid={device_pid} .*\\[AB_'").splitlines()
+        # The log can also hold the crash of an earlier process with the same pid.
+        if dmesg_time is not None:
+            lines = [line for line in lines
+                     if (match := DMESG_TIME.match(line)) and float(match.group(1)) > dmesg_time]
+        if lines:
+            self.logger.process_output(pid, "\n".join(lines), command="dmesg")
+
+    def list_fault_logs(self):
+        names = self.device.shell(f"ls {FAULTLOG_DIR}").split()
+        return {name for name in names if f"-{PACKAGE_NAME}-" in name}
+
+    def report_fault_logs(self, pid):
+        """Log the fault reports the device wrote for the HAP since it was started.
+        Writing one takes a moment after the process died."""
+        deadline = time.time() + 5
+        new_fault_logs = set()
+        while not new_fault_logs and time.time() < deadline:
+            time.sleep(0.5)
+            new_fault_logs = self.list_fault_logs() - self.fault_logs
+        for name in sorted(new_fault_logs):
+            report = self.device.shell(f"cat {FAULTLOG_DIR}/{name}")
+            report = report.split(FAULTLOG_END_MARKER)[0]
+            self.logger.process_output(pid, report, command=f"{FAULTLOG_DIR}/{name}")
+
+    def cleanup(self):
+        super().cleanup()
+        PORT_FORWARDS.remove(self.device, "fport", self.port)
+        for port in self.wptserve_ports():
+            PORT_FORWARDS.remove(self.device, "rport", port)
+        self.release_wakelock()
+
+    def release_wakelock(self):
+        if self.holds_wakelock:
+            self.holds_wakelock = False
+            try:
+                self.device.shell('hidumper -s PowerManagerService -a "-f"')
+            except (OSError, subprocess.SubprocessError) as error:
+                self.logger.warning(f"Could not let the screen of the device turn off: {error}")
