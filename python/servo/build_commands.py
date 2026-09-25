@@ -34,7 +34,8 @@ import servo.visual_studio
 
 from servo.command_base import BuildType, CommandBase, check_call
 from servo.gstreamer import windows_dlls, windows_plugins, package_gstreamer_dylibs
-from servo.platform.build_target import BuildTarget
+from servo.package_commands import copy_packaged_resources
+from servo.platform.build_target import BuildTarget, OpenHarmonyTarget, is_openharmony
 
 from python.servo.platform.build_target import SanitizerKind
 
@@ -89,6 +90,12 @@ class MachCommands(CommandBase):
     )
     @CommandArgument("--verbose", "-v", action="store_true", help="Print verbose output")
     @CommandArgument("--very-verbose", "-vv", action="store_true", help="Print very verbose output")
+    @CommandArgument(
+        "--headless-binary",
+        action="store_true",
+        help="For OpenHarmony, build the standalone `servoshell` executable instead of the HAP. "
+        "It runs Servo headless and can be started from an `hdc shell`.",
+    )
     @CommandArgument("params", nargs="...", help="Command-line arguments to be passed through to Cargo")
     @CommandBase.common_command_arguments(build_configuration=True, build_type=True, package_configuration=True)
     def build(
@@ -101,8 +108,13 @@ class MachCommands(CommandBase):
         very_verbose: bool = False,
         sanitizer: SanitizerKind = SanitizerKind.NONE,
         flavor: str | None = None,
+        headless_binary: bool = False,
         **kwargs: Any,
     ) -> int:
+        if headless_binary and not is_openharmony(self.target):
+            print("`--headless-binary` is only supported when building for OpenHarmony.")
+            return 1
+
         opts = params or []
 
         if build_type.is_release():
@@ -162,9 +174,14 @@ class MachCommands(CommandBase):
             for key in env:
                 print((key, env[key]))
 
-        status = self.run_cargo_build_like_command("rustc", opts, env=env, verbose=verbose, **kwargs)
+        status = self.run_cargo_build_like_command(
+            "rustc", opts, env=env, verbose=verbose, headless_binary=headless_binary, **kwargs
+        )
 
-        if status == 0:
+        if status == 0 and headless_binary:
+            assert is_openharmony(self.target)
+            self.stage_ohos_headless_binary(self.target, build_type)
+        elif status == 0:
             if not no_package and self.target.needs_packaging():
                 return_value = Registrar.dispatch(
                     "package", context=self.context, build_type=build_type, flavor=flavor, sanitizer=sanitizer
@@ -183,6 +200,21 @@ class MachCommands(CommandBase):
         print(build_message)
         assert isinstance(status, int)
         return status
+
+    def stage_ohos_headless_binary(self, target: OpenHarmonyTarget, build_type: BuildType) -> None:
+        """Put the headless `servoshell` executable into a directory together with the runtime
+        libraries it links against and Servo's resources, which it looks for next to itself.
+        The directory can then be pushed to a device as a whole."""
+        build_directory = path.join(servo.util.get_target_dir(), target.triple(), build_type.directory_name())
+        headless_directory = target.get_headless_directory(build_type.directory_name())
+        if path.exists(headless_directory):
+            servo.util.delete(headless_directory)
+        os.makedirs(headless_directory)
+        shutil.copy2(path.join(build_directory, "servoshell"), headless_directory)
+        for runtime_library in target.runtime_libraries():
+            shutil.copy2(runtime_library, headless_directory)
+        copy_packaged_resources(self.get_top_dir(), path.join(headless_directory, "resources"))
+        print(f"The headless servoshell executable is in {headless_directory}")
 
     @Command("run-post-build-tasks", description="Run only the post-build tasks", category="build")
     @CommandBase.common_command_arguments(build_configuration=True, build_type=True)

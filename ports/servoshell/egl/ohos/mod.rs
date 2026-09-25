@@ -56,6 +56,8 @@
 /// At this point the initialization is finished, and servoshell is ready.
 mod resources;
 
+pub(crate) mod headless;
+
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
 use std::os::raw::c_void;

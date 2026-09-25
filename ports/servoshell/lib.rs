@@ -9,17 +9,16 @@ mod test;
 
 #[cfg(not(target_os = "android"))]
 mod backtrace;
-#[cfg(not(target_env = "ohos"))]
 mod crash_handler;
 #[cfg(not(any(target_os = "android", target_env = "ohos")))]
 pub(crate) mod desktop;
 #[cfg(any(target_os = "android", target_env = "ohos"))]
 mod egl;
-#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+#[cfg(not(target_os = "android"))]
 mod headless_event_loop;
-#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+#[cfg(not(target_os = "android"))]
 mod headless_window;
-#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+#[cfg(not(target_os = "android"))]
 mod panic_hook;
 mod parser;
 mod prefs;
@@ -43,6 +42,11 @@ pub mod platform {
 #[cfg(not(any(target_os = "android", target_env = "ohos")))]
 pub fn main() {
     desktop::cli::main()
+}
+
+#[cfg(target_env = "ohos")]
+pub fn main() {
+    egl::headless::main()
 }
 
 pub fn init_crypto() {

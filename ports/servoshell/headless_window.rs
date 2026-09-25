@@ -142,7 +142,10 @@ impl PlatformWindow for HeadlessWindow {
         self.fullscreen.get()
     }
 
-    #[cfg(feature = "webxr")]
+    #[cfg(all(
+        feature = "webxr",
+        not(any(target_os = "android", target_env = "ohos"))
+    ))]
     fn new_glwindow(
         &self,
         _event_loop: &winit::event_loop::ActiveEventLoop,
