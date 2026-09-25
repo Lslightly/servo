@@ -5,7 +5,10 @@
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
 pub fn install() {}
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
 pub fn install() {
     use std::io::Write;
     use std::sync::atomic;

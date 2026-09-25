@@ -9,3 +9,6 @@ mod host_trait;
 mod log;
 #[cfg(target_env = "ohos")]
 mod ohos;
+
+#[cfg(target_env = "ohos")]
+pub(crate) use ohos::headless;

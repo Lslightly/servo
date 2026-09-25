@@ -785,6 +785,7 @@ class CommandBase(object):
         capture_output: bool = False,
         target_override: Optional[str] = None,
         subcommand: str | None = None,
+        headless_binary: bool = False,
         **_kwargs: Any,
     ) -> CompletedProcess[bytes] | int:
         env = cast(dict[str, str], env or self.build_env())
@@ -809,7 +810,9 @@ class CommandBase(object):
             if type(self.target) in [AndroidTarget, OpenHarmonyTarget]:
                 # Note: in practice `cargo rustc` should just be used unconditionally.
                 assert command != "build", "For Android / OpenHarmony `cargo rustc` must be used instead of cargo build"
-                if command == "rustc":
+                if command == "rustc" and headless_binary:
+                    args += ["--bin", "servoshell"]
+                elif command == "rustc":
                     args += ["--lib", "--crate-type=cdylib"]
         elif target_override:
             args += ["--target", target_override]

@@ -503,6 +503,11 @@ class OpenHarmonyTarget(CrossBuildTarget):
         build_output_path = path.join("entry", "build", flavor, "outputs", "default")
         return path.join(base_path, build_type_directory, build_output_path, hap_name)
 
+    def get_headless_directory(self, build_type_directory: str) -> str:
+        """The directory holding the standalone headless `servoshell` executable, together with
+        the libraries and resources it needs, as built by `./mach build --ohos --headless-binary`."""
+        return path.join(util.get_target_dir(), self.triple(), build_type_directory, "servoshell-headless")
+
     def abi_string(self) -> str:
         abi_map = {"aarch64-unknown-linux-ohos": "arm64-v8a", "x86_64-unknown-linux-ohos": "x86_64"}
         return abi_map[self.triple()]
