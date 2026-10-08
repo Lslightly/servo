@@ -3499,6 +3499,30 @@ where
         let browsing_context_size = browsing_context.viewport_details;
         debug_assert_eq!(browsing_context_size, load_info.viewport_details);
 
+        // Starting this navigation aborts any earlier navigation of the iframe that has not
+        // activated its document yet, so that the earlier document cannot replace this one later.
+        // See step 20 of <https://html.spec.whatwg.org/multipage/#navigate>. Pending reloads of
+        // history entries belong to traversals, which navigations don't abort.
+        let superseded_pipelines: Vec<_> = self
+            .webviews
+            .get(&webview_id)
+            .into_iter()
+            .flat_map(|webview| &webview.pending_changes)
+            .filter(|change| {
+                change.browsing_context_id == browsing_context_id &&
+                    !matches!(change.replace, Some(NeedsToReload::Yes(..)))
+            })
+            .map(|change| change.new_pipeline_id)
+            .collect();
+        for pipeline_id in superseded_pipelines {
+            debug!("{pipeline_id}: Closing pending pipeline superseded by {new_pipeline_id}");
+            self.close_pipeline(
+                pipeline_id,
+                DiscardBrowsingContext::No,
+                ExitPipelineMode::Normal,
+            );
+        }
+
         // Create the new pipeline, attached to the parent and push to pending changes
         self.new_pipeline(
             new_pipeline_id,

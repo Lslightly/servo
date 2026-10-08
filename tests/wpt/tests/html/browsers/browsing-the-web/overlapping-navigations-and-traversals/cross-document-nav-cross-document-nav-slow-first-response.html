@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Cross-document navigation after a cross-document navigation whose response arrives later</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+
+<!--
+  According to the spec, the navigate algorithm synchronously cancels ongoing
+  non-mature navigations. The first navigation's response arrives after the
+  second navigation's document has been created but before it has finished
+  loading; it must not replace that document.
+-->
+
+<body>
+<script type="module">
+import { createIframe, waitForLoad, waitForPotentialNetworkLoads } from "./resources/helpers.mjs";
+
+promise_test(async t => {
+  const iframe = await createIframe(t);
+
+  const first = new URL("/common/slow.py?delay=500", location.href).href;
+  const second = new URL("/common/blank.html?pipe=trickle(d1.5)", location.href).href;
+  iframe.src = first;
+  iframe.src = second;
+
+  await waitForLoad(iframe);
+  assert_equals(iframe.contentWindow.location.href, second);
+
+  iframe.onload = t.unreached_func("second load event");
+  await waitForPotentialNetworkLoads(t);
+  assert_equals(iframe.contentWindow.location.href, second);
+}, "cross-document navigation then cross-document navigation whose document loads after the first navigation's response arrives");
+</script>
