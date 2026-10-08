@@ -642,6 +642,11 @@ impl App {
             KeyState::Down,
             Key::Named(NamedKey::Process),
         )));
+        // Servo inserts the text of a composition update; the end event only finishes it.
+        webview.notify_input_event(InputEvent::Ime(ImeEvent::Composition(CompositionEvent {
+            state: CompositionState::Update,
+            data: text.clone(),
+        })));
         webview.notify_input_event(InputEvent::Ime(ImeEvent::Composition(CompositionEvent {
             state: CompositionState::End,
             data: text,
