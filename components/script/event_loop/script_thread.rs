@@ -337,10 +337,6 @@ pub struct ScriptThread {
     /// The JavaScript runtime.
     js_runtime: Rc<Runtime>,
 
-    /// List of pipelines that have been owned and closed by this script thread.
-    #[no_trace]
-    closed_pipelines: DomRefCell<FxHashSet<PipelineId>>,
-
     mutation_observers: Rc<ScriptMutationObservers>,
 
     /// A handle to the WebGL thread
@@ -975,7 +971,6 @@ impl ScriptThread {
                     closing,
                     timer_scheduler: Default::default(),
                     js_runtime: Rc::new(runtime),
-                    closed_pipelines: DomRefCell::new(FxHashSet::default()),
                     mutation_observers: Default::default(),
                     system_font_service: Arc::new(state.system_font_service.to_proxy()),
                     #[cfg(feature = "webgl")]
@@ -3143,7 +3138,7 @@ impl ScriptThread {
         metadata: Option<&Metadata>,
         origin: MutableOrigin,
     ) -> Option<DomRoot<Document>> {
-        if self.closed_pipelines.borrow().contains(&pipeline_id) {
+        if self.task_queue.is_pipeline_closed(&pipeline_id) {
             // If the pipeline closed, do not process the headers.
             return None;
         }
@@ -3260,7 +3255,6 @@ impl ScriptThread {
         }
 
         // Prevent any further work for this Pipeline.
-        self.closed_pipelines.borrow_mut().insert(pipeline_id);
         self.task_queue
             .remove_tasks_for_exiting_pipeline(&pipeline_id);
 
