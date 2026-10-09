@@ -1,0 +1,74 @@
+name: OpenHarmony emulator
+
+# Runs the x86_64 servoshell HAP on the OpenHarmony emulator of cargo-ohos, an OpenHarmony 7.0
+# image in QEMU with KVM, and checks that it renders a page (etc/ci/ohos_emulator_smoke_test.py).
+on:
+  workflow_call:
+    inputs:
+      artifact:
+        description: Name of the artifact that holds the x86_64 HAP
+        required: true
+        type: string
+
+env:
+  CARGO_OHOS_VERSION: 0.3.4
+
+jobs:
+  smoke-test:
+    name: Emulator smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: etc/ci/ohos_emulator_smoke_test.py
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact }}
+          path: hap
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The same inputs as the build in ohos.yml, so that the SDK comes from its cache.
+      - name: Setup OpenHarmony SDK
+        uses: openharmony-rs/setup-ohos-sdk@v1.0.0
+        with:
+          version: "6.1"
+          fixup-path: true
+      - name: Add hdc to PATH
+        run: echo "$OHOS_NDK_HOME/toolchains" >> "$GITHUB_PATH"
+      - uses: taiki-e/install-action@cargo-binstall
+      - name: Install cargo-ohos
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo binstall --no-confirm --disable-strategies quick-install,compile cargo-ohos --version "$CARGO_OHOS_VERSION"
+      - name: Start the emulator
+        id: emulator
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          cargo ohos init emulator
+          echo "target=$(cargo ohos emulator start --ephemeral)" >> "$GITHUB_OUTPUT"
+      - name: Run the smoke test
+        env:
+          TARGET: ${{ steps.emulator.outputs.target }}
+        run: python3 etc/ci/ohos_emulator_smoke_test.py hap/*.hap --target "$TARGET" --out smoke-test
+      - name: Stop the emulator
+        if: always() && steps.emulator.outcome == 'success'
+        run: cargo ohos emulator stop
+      - name: Upload the screenshot and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ohos-emulator-smoke-test
+          path: |
+            smoke-test/
+            ~/.cache/cargo-ohos/ohos-emulator/instances/x86_64-phone/*.log
+          if-no-files-found: warn
