@@ -67,6 +67,7 @@ use crate::dom::html::htmlformelement::FormControlElementHelpers;
 use crate::dom::indexeddb::idbdatabase::IDBDatabase;
 use crate::dom::indexeddb::idbrequest::IDBRequest;
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+use crate::dom::mediaquerylist::MediaQueryList;
 use crate::dom::node::virtualmethods::VirtualMethods;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::shadowroot::shadowroot::ShadowRoot;
@@ -477,6 +478,11 @@ impl EventTarget {
     fn notify_listener_added(&self, ty: &Atom) {
         if let Some(interest) = self.interest_for_event_type(ty) {
             self.global().register_interest(interest);
+        }
+        if *ty == atom!("change") &&
+            let Some(mql) = self.downcast::<MediaQueryList>()
+        {
+            mql.keep_alive_for_listeners();
         }
     }
 
