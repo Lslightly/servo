@@ -45,6 +45,7 @@ NOT_BUILT = (
 
 # Code that is only built for OpenHarmony.
 OHOS_ONLY = (
+    ".github/workflows/ohos-emulator.yml",
     ".github/workflows/ohos.yml",
     "components/fonts/platform/freetype/ohos/",
     "components/media/backends/ohos/",
@@ -52,6 +53,7 @@ OHOS_ONLY = (
     "components/storage/indexeddb/engines/ohos_rdb.rs",
     "components/storage/ohos_rdb/",
     "components/storage/webstorage/engines/ohos_rdb.rs",
+    "etc/ci/ohos_emulator_smoke_test.py",
     "ports/arkweb/",
     "ports/servoshell/egl/ohos/",
     "ports/servoshell/platform/openharmony/",
@@ -192,7 +194,11 @@ class TestSelect(unittest.TestCase):
 
     def test_ohos_only(self) -> None:
         self.assertEqual(
-            self.jobs("ports/arkweb/src/lib.rs", "components/fonts/platform/freetype/ohos/font_list.rs"),
+            self.jobs(
+                "ports/arkweb/src/lib.rs",
+                "components/fonts/platform/freetype/ohos/font_list.rs",
+                "etc/ci/ohos_emulator_smoke_test.py",
+            ),
             [self.LINUX, self.LINT, self.OHOS],
         )
 

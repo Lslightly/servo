@@ -149,6 +149,13 @@ jobs:
         run: |
           echo "artifact_ids=${{steps.upload-library.outputs.artifact-id}},${{steps.upload-hap-signed.outputs.artifact-id}}" >> $GITHUB_OUTPUT
 
+  emulator:
+    name: OpenHarmony emulator
+    needs: ["build-openharmony"]
+    uses: ./.github/workflows/ohos-emulator.yml
+    with:
+      artifact: ${{ inputs.profile }}-binary-ohos-x86_64-unknown-linux-ohos
+
   bencher:
     needs: ["build-openharmony"]
     strategy:
