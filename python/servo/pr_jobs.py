@@ -12,9 +12,10 @@
 Every pull request runs the Linux unit tests and lint. On top of that:
 
 - OHOS code: the OHOS build. The Linux WPT run never executes that code.
+- The QuickJS workflow: the QuickJS build.
 - WPT tests or expectations: a Linux WPT run of the directories of those tests.
 - Files that no build or test reads, such as documentation: nothing.
-- Anything else: the OHOS build and the whole Linux WPT suite.
+- Anything else: the OHOS and QuickJS builds and the whole Linux WPT suite.
 
 The path lists are explicit on purpose: a path missing from them only costs a full run.
 """
@@ -35,7 +36,7 @@ from .try_parser import Config, Workflow
 ALWAYS = "linux-unit-tests lint"
 
 # The jobs of a change to code that every platform builds.
-FULL = f"{ALWAYS} linux-wpt ohos"
+FULL = f"{ALWAYS} linux-wpt ohos quickjs"
 
 # Files that no build or test reads, besides Markdown files.
 NOT_BUILT = (
@@ -61,6 +62,9 @@ OHOS_ONLY = (
     "python/wpt/ohos_webdriver_test.py",
     "support/openharmony/",
 )
+
+# Files that only the QuickJS build reads.
+QUICKJS_ONLY = (".github/workflows/quickjs.yml",)
 
 # Test and expectation roots, mapped to the directory that holds their tests.
 WPT_ROOTS = {
@@ -119,13 +123,16 @@ def outermost(directories: Iterable[str]) -> list[str]:
 def select(changed: Iterable[str], count_files: Callable[[str], int]) -> Config:
     """Chooses the jobs for the changed paths. `count_files` returns the number of files in a
     directory of the merged tree, 0 if it does not exist."""
-    ohos = False
+    ohos = quickjs = False
     directories = set()
     for path in changed:
         if is_not_built(path):
             continue
         if path.startswith(OHOS_ONLY):
             ohos = True
+            continue
+        if path.startswith(QUICKJS_ONLY):
+            quickjs = True
             continue
         directory = wpt_directory(path)
         if directory is None:
@@ -139,7 +146,8 @@ def select(changed: Iterable[str], count_files: Callable[[str], int]) -> Config:
         return Config(FULL)
 
     # The WPT run is added after the unit tests, so that both share one Linux job.
-    config = Config(" ".join([ALWAYS, *(["ohos"] if ohos else []), *(["linux-wpt"] if counts else [])]))
+    jobs = [ALWAYS, *(["ohos"] if ohos else []), *(["quickjs"] if quickjs else []), *(["linux-wpt"] if counts else [])]
+    config = Config(" ".join(jobs))
     for job in config.matrix:
         if job.workflow is Workflow.LINUX and counts:
             job.wpt_args = " ".join(f"./{directory}" for directory in counts)
@@ -184,10 +192,14 @@ class TestSelect(unittest.TestCase):
     LINUX = ("linux", True, False, "", 20)
     LINT = ("lint", False, False, "", 20)
     OHOS = ("ohos", False, False, "", 20)
+    QUICKJS = ("quickjs", False, False, "", 20)
 
     def test_shared_code_runs_everything(self) -> None:
         full = json.loads(Config(FULL).to_json())
-        self.assertEqual(self.jobs("components/layout/flow.rs"), [("linux", True, True, "", 20), self.LINT, self.OHOS])
+        self.assertEqual(
+            self.jobs("components/layout/flow.rs"),
+            [("linux", True, True, "", 20), self.LINT, self.OHOS, self.QUICKJS],
+        )
         self.assertEqual(self.select("components/layout/flow.rs"), full)
         self.assertEqual(self.select("ports/arkweb/src/lib.rs", "Cargo.lock"), full)
         self.assertEqual(self.select("components/storage/webstorage/mod.rs"), full)
@@ -200,6 +212,12 @@ class TestSelect(unittest.TestCase):
                 "etc/ci/ohos_emulator_smoke_test.py",
             ),
             [self.LINUX, self.LINT, self.OHOS],
+        )
+
+    def test_quickjs_workflow(self) -> None:
+        self.assertEqual(
+            self.jobs(".github/workflows/quickjs.yml", "ports/arkweb/src/lib.rs"),
+            [self.LINUX, self.LINT, self.OHOS, self.QUICKJS],
         )
 
     def test_not_built_only(self) -> None:
