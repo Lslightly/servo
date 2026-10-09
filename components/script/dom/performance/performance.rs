@@ -632,7 +632,7 @@ impl PerformanceMethods<crate::DomTypeHolder> for Performance {
             (options.start.is_some() ||
                 options.duration.is_some() ||
                 options.end.is_some() ||
-                options.detail.get().is_object_or_null())
+                !options.detail.get().is_undefined())
         {
             // Step 1.1 If endMark is given, throw a TypeError.
             if end_mark.is_some() {
