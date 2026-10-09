@@ -4,8 +4,8 @@
 use std::cell::UnsafeCell;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
+use std::mem;
 use std::ops::Deref;
-use std::{mem, ptr};
 
 use js::context::NoGC;
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
@@ -47,7 +47,7 @@ impl<T: DomObject> MutDom<T> {
     /// Get the value in this `MutDom`.
     pub fn get(&self) -> DomRoot<T> {
         assert_in_script();
-        unsafe { DomRoot::from_ref(&*ptr::read(self.val.get())) }
+        unsafe { DomRoot::from_ref(&**self.val.get()) }
     }
 
     /// Get the [`DomObject`] without rooting it as an [`UnrootedDom`]. This is safe as
@@ -56,7 +56,7 @@ impl<T: DomObject> MutDom<T> {
     pub fn get_unrooted<'a>(&self, _: &'a NoGC) -> UnrootedDom<'a, T> {
         assert_in_script();
         UnrootedDom {
-            inner: unsafe { ptr::read(self.val.get()) },
+            inner: unsafe { (*self.val.get()).clone() },
             _phantom: PhantomData,
         }
     }
@@ -243,7 +243,7 @@ impl<T: DomObject> MutNullableDom<T> {
     /// [`MutNullableDom`].
     pub fn get(&self) -> Option<DomRoot<T>> {
         assert_in_script();
-        unsafe { ptr::read(self.ptr.get()).map(|o| DomRoot::from_ref(&*o)) }
+        unsafe { (*self.ptr.get()).as_ref().map(|o| DomRoot::from_ref(&**o)) }
     }
 
     /// Get a reference to the traced inner value of this [`MutNullableDom`].
@@ -261,11 +261,10 @@ impl<T: DomObject> MutNullableDom<T> {
     /// Get the `DomObject` without rooting it. Constructing an UnrootedDom. This is safe
     /// as we take a reference to NoGC and bound the lifetime by NoGC bound. This implies that
     /// while the `UnrootedDom` is alive we do not have a GC run.
-    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub fn get_unrooted<'a>(&self, _: &'a NoGC) -> Option<UnrootedDom<'a, T>> {
         assert_in_script();
-        let ptr = unsafe { ptr::read(self.ptr.get()) };
-        ptr.map(|traced_value| Dom::from_ref(&*traced_value))
+        let ptr = unsafe { (*self.ptr.get()).as_ref() };
+        ptr.map(|traced_value| Dom::from_ref(&**traced_value))
             .map(|dom| UnrootedDom {
                 inner: dom,
                 _phantom: PhantomData,

@@ -48,6 +48,14 @@ where
             })
         }
 
+        // QuickJS: roots hold counts (`Dom<T>`) and Rust roots are never traced.
+        if cfg!(feature = "js-quickjs") {
+            assert_in_script();
+            return Root {
+                value,
+                root_list: ptr::null(),
+            };
+        }
         let root_list = unsafe { add_to_root_list(value.stable_trace_object()) };
         Root { value, root_list }
     }
@@ -123,6 +131,9 @@ where
     T: StableTraceObject,
 {
     fn drop(&mut self) {
+        if cfg!(feature = "js-quickjs") {
+            return;
+        }
         unsafe {
             (*self.root_list).unroot(self.value.stable_trace_object());
         }
@@ -189,7 +200,19 @@ impl<T> Clone for Dom<T> {
     #[inline]
     fn clone(&self) -> Self {
         assert_in_script();
+        #[cfg(feature = "js-quickjs")]
+        unsafe {
+            quickjs_refs::retain(self.ptr.as_ptr() as *const crate::reflector::Reflector)
+        };
         Dom { ptr: self.ptr }
+    }
+}
+
+/// QuickJS: a `Dom<T>` holds a reference count on its target's reflector.
+#[cfg(feature = "js-quickjs")]
+impl<T> Drop for Dom<T> {
+    fn drop(&mut self) {
+        unsafe { quickjs_refs::release(self.ptr.as_ptr() as *const crate::reflector::Reflector) }
     }
 }
 
@@ -197,6 +220,11 @@ impl<T: DomObject> Dom<T> {
     /// Create a `Dom<T>` from a `&T`
     pub fn from_ref(obj: &T) -> Dom<T> {
         assert_in_script();
+        #[cfg(feature = "js-quickjs")]
+        unsafe {
+            debug_assert!(std::ptr::addr_eq(obj.reflector(), obj));
+            quickjs_refs::retain(obj.reflector() as *const _ as *const crate::reflector::Reflector)
+        };
         Dom {
             ptr: ptr::NonNull::from(obj),
         }
@@ -287,9 +315,8 @@ where
     pub unsafe fn reflect_with(self, obj: *mut JSObject) -> DomRoot<T> {
         let ptr = self.as_ptr();
         drop(self);
-        let root = DomRoot::from_ref(unsafe { &*ptr });
-        unsafe { root.init_reflector::<T>(obj) };
-        root
+        unsafe { (*ptr).init_reflector::<T>(obj) };
+        DomRoot::from_ref(unsafe { &*ptr })
     }
 }
 
@@ -487,4 +514,107 @@ pub fn rooted_heap_handle<'a, T: DomObject, U: GCMethods + Copy>(
     //   of a rooted object. Our safety invariants for DOM objects
     //   ensure that a &T is obtained via a root of T.
     unsafe { Handle::from_raw(f(object).handle()) }
+}
+
+/// QuickJS: reference counts held by `Dom<T>`.
+///
+/// Every DOM struct starts with its `Reflector` (see `trace_refcounted_objects`), so a `Dom<T>`
+/// reaches its target's JS object through the target's Rust struct. During finalization, though,
+/// the target's Rust struct may already have been freed by the same collection, so reflectors
+/// are also registered here and unregistered when their object is finalized: a target that is
+/// missing from the map during finalization has died in the same collection, and its count is
+/// gone with it.
+#[cfg(feature = "js-quickjs")]
+pub(crate) mod quickjs_refs {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+
+    use js::jsapi::JSObject;
+
+    use crate::reflector::Reflector;
+
+    thread_local! {
+        static REFLECTORS: RefCell<HashMap<usize, *mut JSObject>> = RefCell::new(HashMap::new());
+        static FINALIZING: Cell<u32> = const { Cell::new(0) };
+        /// Counts taken by `Dom<T>`s created before their target was reflected (e.g. the
+        /// `WindowProxy` of a `DissimilarOriginWindow`), applied when it is.
+        static PENDING: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
+    }
+
+    pub(crate) fn register(reflector: *const Reflector, object: *mut JSObject) {
+        REFLECTORS.with(|r| r.borrow_mut().insert(reflector as usize, object));
+        let pending = PENDING.with(|p| p.borrow_mut().remove(&(reflector as usize)));
+        for _ in 0..pending.unwrap_or(0) {
+            unsafe { js::quickjs::retain_object(object) };
+        }
+    }
+
+    pub(crate) fn unregister(reflector: *const Reflector) {
+        REFLECTORS.with(|r| r.borrow_mut().remove(&(reflector as usize)));
+        PENDING.with(|p| p.borrow_mut().remove(&(reflector as usize)));
+    }
+
+    /// Drops a count taken while `reflector` was unreflected; false if there is none.
+    fn release_pending(reflector: *const Reflector) -> bool {
+        PENDING.with(|p| {
+            let mut pending = p.borrow_mut();
+            let Some(count) = pending.get_mut(&(reflector as usize)) else {
+                return false;
+            };
+            *count -= 1;
+            if *count == 0 {
+                pending.remove(&(reflector as usize));
+            }
+            true
+        })
+    }
+
+    /// Runs `f` (which drops a finalized DOM object) with `reflector` unregistered.
+    pub(crate) fn finalizing<R>(reflector: *const Reflector, f: impl FnOnce() -> R) -> R {
+        REFLECTORS.with(|r| r.borrow_mut().remove(&(reflector as usize)));
+        FINALIZING.with(|c| c.set(c.get() + 1));
+        let result = f();
+        FINALIZING.with(|c| c.set(c.get() - 1));
+        result
+    }
+
+    /// # Safety
+    /// `reflector` must be the reflector of a live DOM object.
+    pub(crate) unsafe fn retain(reflector: *const Reflector) {
+        let object = unsafe { (*reflector).get_jsobject().get() };
+        if object.is_null() {
+            PENDING.with(|p| *p.borrow_mut().entry(reflector as usize).or_insert(0) += 1);
+            return;
+        }
+        unsafe { js::quickjs::retain_object(object) };
+    }
+
+    /// # Safety
+    /// The caller must own a count taken by `retain`.
+    pub(crate) unsafe fn release(reflector: *const Reflector) {
+        // Destroying the runtime finalized every DOM object, including the one `reflector`
+        // belongs to.
+        if !js::quickjs::runtime_alive() {
+            return;
+        }
+        let object = if FINALIZING.with(|c| c.get()) > 0 {
+            match REFLECTORS.with(|r| r.borrow().get(&(reflector as usize)).copied()) {
+                Some(object) => object,
+                None => {
+                    release_pending(reflector);
+                    return;
+                },
+            }
+        } else {
+            unsafe { (*reflector).get_jsobject().get() }
+        };
+        if object.is_null() {
+            assert!(
+                release_pending(reflector),
+                "Dom<T> released without a count"
+            );
+            return;
+        }
+        unsafe { js::quickjs::release_object(object) };
+    }
 }

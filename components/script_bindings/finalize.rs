@@ -32,11 +32,17 @@ unsafe fn do_finalize_global(obj: *mut JSObject) {
 
 /// # Safety
 /// `this` must point to a valid, non-null instance of T.
-pub(crate) unsafe fn finalize_common<T: DomObject>(this: *const T) {
+pub unsafe fn finalize_common<T: DomObject>(this: *const T) {
     if !this.is_null() {
         // The pointer can be null if the object is the unforgeable holder of that interface.
         let this = unsafe { Box::from_raw(this as *mut T) };
         this.reflector().drop_memory(&*this);
+        #[cfg(feature = "js-quickjs")]
+        unsafe {
+            this.reflector().clear_for_finalize();
+            let reflector = this.reflector() as *const _ as *const crate::reflector::Reflector;
+            crate::root::quickjs_refs::finalizing(reflector, move || drop(this));
+        }
     }
     debug!("{} finalize: {:p}", type_name::<T>(), this);
 }
@@ -58,6 +64,12 @@ pub(crate) unsafe fn finalize_weak_referenceable<T: WeakReferenceable>(this: *co
         // The pointer can be null if the object is the unforgeable holder of that interface.
         let this = unsafe { Rc::from_raw(this) };
         this.reflector().drop_memory(&*this);
+        #[cfg(feature = "js-quickjs")]
+        unsafe {
+            this.reflector().clear_for_finalize();
+            let reflector = this.reflector() as *const _ as *const crate::reflector::Reflector;
+            crate::root::quickjs_refs::finalizing(reflector, move || drop(this));
+        }
     }
     debug!("{} finalize: {:p}", type_name::<T>(), this);
 }

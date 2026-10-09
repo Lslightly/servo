@@ -35,6 +35,7 @@ ProductName = "ServoShell"
 [features]
 # Don't add new features to `default` directly. Add to `default_base` instead.
 default = ["default_base", "media-gstreamer"]
+js-quickjs = ["servo/js-quickjs"]
 # Feature groups:
 # Base default features, without GStreamer media support.
 default_base = ["base", "sqlite-backend"]

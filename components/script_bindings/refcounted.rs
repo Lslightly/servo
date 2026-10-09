@@ -166,6 +166,7 @@ impl LiveDOMReferences {
         let len = table.len();
         if (0 < capacity) && (capacity <= len) {
             trace!("growing refcounted references by {}", len);
+            #[cfg(not(feature = "js-quickjs"))]
             remove_nulls(&mut table);
             table.reserve(len);
         }
@@ -179,6 +180,11 @@ impl LiveDOMReferences {
                 },
             },
             Vacant(entry) => {
+                // QuickJS: a table entry holds a count on the object until it is swept.
+                #[cfg(feature = "js-quickjs")]
+                unsafe {
+                    js::quickjs::retain_object((*(ptr as *const Reflector)).get_jsobject().get())
+                };
                 let refcount = Arc::new(unsafe { TrustedReference::new(ptr) });
                 entry.insert(Arc::downgrade(&refcount));
                 refcount
@@ -198,6 +204,23 @@ fn remove_nulls<K: Eq + Hash + Clone, V>(table: &mut FxHashMap<K, Weak<V>>) {
     for key in to_remove {
         table.remove(&key);
     }
+}
+
+/// QuickJS: drops the counts of reflectable table entries whose `Trusted` values are all gone.
+#[cfg(feature = "js-quickjs")]
+pub fn sweep_live_references() {
+    LIVE_DOM_REFERENCES.with(|live_references| {
+        let mut table = live_references.reflectable_table.borrow_mut();
+        table.retain(|ptr, value| {
+            if Weak::upgrade(value).is_some() {
+                return true;
+            }
+            unsafe {
+                js::quickjs::release_object((*(*ptr as *const Reflector)).get_jsobject().get())
+            };
+            false
+        });
+    });
 }
 
 unsafe impl<T: DomObject> crate::JSTraceable for Trusted<T> {
