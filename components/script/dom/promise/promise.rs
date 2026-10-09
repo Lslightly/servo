@@ -210,6 +210,9 @@ impl Promise {
         let promise = Rc::new(promise);
         unsafe {
             promise.init_reflector_without_associated_memory(self.reflector().get_jsobject().get());
+            // QuickJS: nothing else keeps the object of a `TracedPromise` alive.
+            #[cfg(feature = "js-quickjs")]
+            promise.reflector().hold_object();
         }
         promise
     }

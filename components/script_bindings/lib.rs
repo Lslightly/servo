@@ -25,7 +25,7 @@ pub mod conversions;
 pub mod dom;
 pub mod domstring;
 pub mod error;
-mod finalize;
+pub mod finalize;
 mod guard;
 mod import;
 pub mod inheritance;

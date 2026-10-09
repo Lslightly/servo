@@ -27,6 +27,7 @@ devtools = [
     "servo-constellation-traits/devtools",
 ]
 gamepad = ["script_bindings/gamepad", "embedder_traits/gamepad"]
+js-quickjs = ["script_bindings/js-quickjs"]
 jitspew = ['js/jitspew']
 js_backtrace = []
 js_jit = ["js/jit"]

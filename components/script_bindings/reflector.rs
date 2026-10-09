@@ -42,6 +42,8 @@ impl AssociatedMemorySize for AssociatedMemory {
 #[derive(MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 // If you're renaming or moving this field, update the path in plugins::reflector as well
+// QuickJS: `Dom<T>` reads `object` through a `*const Reflector<()>`, whatever `T` is.
+#[cfg_attr(feature = "js-quickjs", repr(C))]
 pub struct Reflector<T = ()> {
     #[ignore_malloc_size_of = "defined and measured in rust-mozjs"]
     object: Heap<*mut JSObject>,
@@ -49,12 +51,33 @@ pub struct Reflector<T = ()> {
     size: T,
     /// Cached prototype ID for fast type checks.
     proto_id: Cell<u16>,
+    /// QuickJS: whether `object` holds a count, see `hold_object`.
+    #[cfg(feature = "js-quickjs")]
+    counted: Cell<bool>,
 }
 
 unsafe impl<T> js::gc::Traceable for Reflector<T> {
     unsafe fn trace(&self, tracer: *mut js::jsapi::JSTracer) {
+        // QuickJS: only a counted object may be marked.
+        #[cfg(feature = "js-quickjs")]
+        if !self.counted.get() {
+            return;
+        }
         unsafe {
             self.object.trace(tracer);
+        }
+    }
+}
+
+/// QuickJS: an uncounted object pointer must not go through the `Heap` drop barrier. This matters
+/// for reflectors owned by Rust (e.g. a `RootedPromise`'s) rather than by their object; a counted
+/// one (`hold_object`) releases its count through the barrier.
+#[cfg(feature = "js-quickjs")]
+impl<T> Drop for Reflector<T> {
+    fn drop(&mut self) {
+        crate::root::quickjs_refs::unregister(self as *const Self as *const Reflector);
+        if !self.counted.get() {
+            unsafe { *self.object.get_unsafe() = std::ptr::null_mut() };
         }
     }
 }
@@ -93,7 +116,33 @@ impl<T> Reflector<T> {
     unsafe fn set_jsobject(&self, object: *mut JSObject) {
         assert!(self.object.get().is_null());
         assert!(!object.is_null());
+        // QuickJS: the reflector does not hold a count on its own object (that would be a
+        // self-cycle only the cycle collector could break), so bypass the write barrier.
+        #[cfg(feature = "js-quickjs")]
+        unsafe {
+            *self.object.get_unsafe() = object;
+            crate::root::quickjs_refs::register(self as *const Self as *const Reflector, object);
+        }
+        #[cfg(not(feature = "js-quickjs"))]
         self.object.set(object);
+    }
+
+    /// QuickJS: makes the reflector hold a count on its object, which tracing marks and dropping
+    /// releases. For reflectors owned by Rust (a `TracedPromise`'s); the reflector of a DOM object
+    /// holds none on its own object.
+    ///
+    /// # Safety
+    /// The reflector must be initialized and must not move afterwards.
+    #[cfg(feature = "js-quickjs")]
+    pub unsafe fn hold_object(&self) {
+        unsafe { js::quickjs::retain_object(self.object.get()) };
+        self.counted.set(true);
+    }
+
+    /// QuickJS: clears the uncounted object pointer before the reflector is dropped.
+    #[cfg(feature = "js-quickjs")]
+    pub(crate) unsafe fn clear_for_finalize(&self) {
+        unsafe { *self.object.get_unsafe() = std::ptr::null_mut() };
     }
 
     /// Return a pointer to the memory location at which the JS reflector
@@ -113,6 +162,8 @@ impl<T: AssociatedMemorySize> Reflector<T> {
             object: Heap::default(),
             proto_id: Cell::new(u16::MAX),
             size: T::default(),
+            #[cfg(feature = "js-quickjs")]
+            counted: Cell::new(false),
         }
     }
 

@@ -56,6 +56,9 @@ pub(crate) fn run_worker_event_loop<T, WorkerMsg, Event>(
         + DerivedFrom<GlobalScope>
         + DomObject,
 {
+    #[cfg(feature = "js-quickjs")]
+    release_task_values();
+
     let scope = worker_scope.upcast::<WorkerGlobalScope>();
     let task_queue = worker_scope.task_queue();
 
@@ -161,4 +164,13 @@ pub(crate) fn run_worker_event_loop<T, WorkerMsg, Event>(
     worker_scope
         .upcast::<GlobalScope>()
         .perform_a_dom_garbage_collection_checkpoint();
+    #[cfg(feature = "js-quickjs")]
+    release_task_values();
+}
+
+/// QuickJS: no raw JS values live across tasks; release what the tasks kept alive.
+#[cfg(feature = "js-quickjs")]
+fn release_task_values() {
+    script_bindings::refcounted::sweep_live_references();
+    js::quickjs::drain_autorelease_pool();
 }

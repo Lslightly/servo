@@ -35,6 +35,7 @@ ProductName = "ServoShell"
 [features]
 # Don't add new features to `default` directly. Add to `default_without_allocator` instead.
 default = ["default_without_allocator", "servo-allocator/use-jemalloc"]
+js-quickjs = ["servo/js-quickjs"]
 # Feature groups:
 # default features, without a custom allocator.
 default_without_allocator = ["base", "sqlite-backend"]

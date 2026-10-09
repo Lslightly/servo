@@ -1032,6 +1032,12 @@ impl ScriptThread {
     pub(crate) fn start(&self, cx: &mut JSContext) {
         debug!("Starting script thread.");
         while self.handle_msgs(cx) {
+            // QuickJS: no raw JS values live across tasks; release what this task kept alive.
+            #[cfg(feature = "js-quickjs")]
+            {
+                script_bindings::refcounted::sweep_live_references();
+                js::quickjs::drain_autorelease_pool();
+            }
             // Go on...
             debug!("Running script thread.");
         }
