@@ -79,6 +79,11 @@ impl MediaQueryList {
         result
     }
 
+    /// Called when a change listener is added.
+    pub(crate) fn keep_alive_for_listeners(&self) {
+        self.document.window().keep_media_query_list_alive(self);
+    }
+
     pub(crate) fn evaluate(&self) -> bool {
         let quirks_mode = self.document.quirks_mode();
         self.media_query_list.evaluate(

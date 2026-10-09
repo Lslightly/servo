@@ -405,6 +405,10 @@ pub(crate) struct Window {
     /// All the MediaQueryLists we need to update
     media_query_lists: DOMTracker<MediaQueryList>,
 
+    /// The MediaQueryLists with change listeners, which are kept alive as long as the
+    /// listeners can be called, like in other browsers.
+    media_query_lists_with_listeners: DomRefCell<Vec<Dom<MediaQueryList>>>,
+
     #[cfg(feature = "bluetooth")]
     test_runner: MutNullableDom<TestRunner>,
 
@@ -3732,6 +3736,12 @@ impl Window {
         let cx = &mut realm.current_realm();
         rooted_vec!(let mut mql_list);
 
+        self.media_query_lists_with_listeners
+            .borrow_mut()
+            .retain(|mql| {
+                mql.upcast::<EventTarget>()
+                    .has_listeners_for(&atom!("change"))
+            });
         self.media_query_lists.for_each(|mql| {
             if let MediaQueryListMatchState::Changed = mql.evaluate_changes() {
                 // Recording list of changed Media Queries
@@ -3752,6 +3762,13 @@ impl Window {
             event
                 .upcast::<Event>()
                 .fire(cx, mql.upcast::<EventTarget>());
+        }
+    }
+
+    pub(crate) fn keep_media_query_list_alive(&self, mql: &MediaQueryList) {
+        let mut lists = self.media_query_lists_with_listeners.borrow_mut();
+        if !lists.iter().any(|list| &**list == mql) {
+            lists.push(Dom::from_ref(mql));
         }
     }
 
@@ -4153,6 +4170,7 @@ impl Window {
             webdriver_load_status_sender: Default::default(),
             error_reporter,
             media_query_lists: DOMTracker::new(),
+            media_query_lists_with_listeners: Default::default(),
             #[cfg(feature = "bluetooth")]
             test_runner: Default::default(),
             #[cfg(feature = "webgl")]

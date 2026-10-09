@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>A MediaQueryList with a change listener is not collected</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<iframe id="frame" width="600" height="600"></iframe>
+<script>
+promise_test(async function() {
+  const frame = document.getElementById("frame");
+  const matched = new Promise(resolve => {
+    frame.contentWindow.matchMedia("(max-width: 500px)").addEventListener("change", event => {
+      if (event.matches) {
+        resolve();
+      }
+    });
+  });
+  await TestUtils.gc();
+  frame.width = 400;
+  await matched;
+});
+</script>
