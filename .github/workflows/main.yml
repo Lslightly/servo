@@ -13,6 +13,11 @@ on:
     types: [checks_requested]
   workflow_dispatch:
 
+# A new push to a pull request cancels the run of the previous one. Other runs are not grouped.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   decision:
     name: Generate Try Configuration
@@ -24,6 +29,8 @@ jobs:
         with:
           fetch-depth: 1
           sparse-checkout: |
+            python/servo/__init__.py
+            python/servo/pr_jobs.py
             python/servo/try_parser.py
             .github/actions/setup-python
             .python-version
@@ -31,12 +38,24 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Setup Python
         uses: ./.github/actions/setup-python
+      # Pull requests run the jobs that their changed files need.
+      - name: Fetch the pull request base
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git fetch --no-tags --depth=1 --filter=blob:none origin "$BASE_SHA"
       - name: Get Configuration
         id: configuration
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           {
             echo 'result<<EOF'
-            python ./python/servo/try_parser.py ${{ github.event_name == 'pull_request' && 'linux-unit-tests lint' || github.event_name == 'push' && 'full' || 'fail-fast linux-wpt ohos' }}
+            if [ "${{ github.event_name }}" = pull_request ]; then
+              python -m python.servo.pr_jobs "$BASE_SHA"
+            else
+              python ./python/servo/try_parser.py ${{ github.event_name == 'pull_request' && 'linux-unit-tests lint' || github.event_name == 'push' && 'full' || 'fail-fast linux-wpt ohos' }}
+            fi
             echo EOF
            } >> $GITHUB_OUTPUT
 

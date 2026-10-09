@@ -377,6 +377,11 @@ class MachCommands(CommandBase):
         print("Running try_parser tests...")
         passed = try_parser.run_tests() and passed
 
+        import python.servo.pr_jobs as pr_jobs
+
+        print("Running pr_jobs tests...")
+        passed = pr_jobs.run_tests() and passed
+
         print("Running WPT tests...")
         passed = wpt.run_tests() and passed
 
