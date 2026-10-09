@@ -1,0 +1,133 @@
+# Builds servoshell on the QuickJS mozjs shim (openharmony-rs/servo-quickjs) and runs WPT with it.
+# The results are compared against the SpiderMonkey expectations, so the unexpected results are
+# the gaps of the QuickJS backend; the WPT jobs succeed regardless. Pull requests and the merge
+# queue run the build and smoketest only (the `quickjs` job of the try configuration).
+name: QuickJS
+on:
+  schedule:
+    - cron: "30 1 * * *"
+  workflow_call:
+    inputs:
+      profile:
+        required: true
+        type: string
+      wpt:
+        default: false
+        required: false
+        type: boolean
+      wpt-args:
+        default: ""
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      servo-quickjs-ref:
+        description: Branch, tag or commit of openharmony-rs/servo-quickjs, instead of the pinned commit
+        default: ""
+        required: false
+        type: string
+      wpt:
+        description: Run WPT
+        default: true
+        required: false
+        type: boolean
+      wpt-args:
+        description: Extra arguments for `mach test-wpt`, e.g. test paths
+        default: ""
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RUST_BACKTRACE: 1
+  SHELL: /bin/bash
+  SERVO_QUICKJS_URL: https://github.com/openharmony-rs/servo-quickjs
+  # The servo-quickjs commit this tree builds with. Bump it with mozjs at each sync, so that older
+  # commits keep building with the shim they were tested with.
+  SERVO_QUICKJS_REF: ${{ inputs.servo-quickjs-ref || '72fa2b6697a60889969397313ad23405196c5b4e' }}
+  PROFILE: ${{ inputs.profile || 'release' }}
+  RUN_WPT: ${{ github.event_name == 'schedule' || inputs.wpt }}
+
+jobs:
+  build:
+    name: Linux Build (QuickJS)
+    # The WPT runners are Ubuntu 22.04, so build against its glibc.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: false
+          swap-storage: false
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "20.1"
+          directory: ${{ runner.temp }}/llvm
+      - name: Set LIBCLANG_PATH env
+        run: echo "LIBCLANG_PATH=${LLVM_PATH}/lib" >> "$GITHUB_ENV"
+      - name: Setup Python
+        uses: ./.github/actions/setup-python
+      - name: Change Mirror Priorities
+        uses: ./.github/actions/apt-mirrors
+      - name: Bootstrap dependencies
+        timeout-minutes: 30
+        run: |
+          sudo apt update
+          ./mach bootstrap --yes --skip-lints --skip-nextest
+      - name: Install sccache
+        if: ${{ vars.SCCACHE_GHA_ENABLED != 'false' }}
+        uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Enable sccache
+        if: ${{ vars.SCCACHE_GHA_ENABLED != 'false' }}
+        run: |
+          {
+            echo "SCCACHE_GHA_VERSION=${{ vars.SCCACHE_GHA_VERSION || '1' }}"
+            echo "SCCACHE_GHA_ENABLED=true"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "CARGO_INCREMENTAL=0"
+          } >> "$GITHUB_ENV"
+      # `mach` cannot pass `--config`, so the patch goes into `.cargo/config.toml`. It changes
+      # Cargo.lock, so the build below is not `--locked`.
+      - name: Patch mozjs to the QuickJS shim
+        run: |
+          refs=$(git ls-remote "$SERVO_QUICKJS_URL")
+          rev=
+          for ref in "refs/tags/$SERVO_QUICKJS_REF^{}" "refs/tags/$SERVO_QUICKJS_REF" "refs/heads/$SERVO_QUICKJS_REF"; do
+            rev=$(awk -v ref="$ref" '$2 == ref { print $1 }' <<< "$refs")
+            [ -n "$rev" ] && break
+          done
+          rev=${rev:-$SERVO_QUICKJS_REF}
+          if ! [[ $rev =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::$SERVO_QUICKJS_REF is not a branch or tag of $SERVO_QUICKJS_URL, nor a full commit hash"
+            exit 1
+          fi
+          printf '\n[patch.crates-io]\nmozjs = { git = "%s", rev = "%s" }\n' "$SERVO_QUICKJS_URL" "$rev" >> .cargo/config.toml
+          echo "servo-quickjs: \`$SERVO_QUICKJS_REF\` ($rev)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Build
+        run: ./mach build --profile "$PROFILE" --features js-quickjs
+      - name: Smoketest
+        run: xvfb-run ./mach smoketest --profile "$PROFILE"
+      - name: Build mach package
+        if: ${{ env.RUN_WPT == 'true' }}
+        run: ./mach package --profile "$PROFILE"
+      - name: Upload artifact for mach package
+        if: ${{ env.RUN_WPT == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PROFILE }}-binary-linux
+          path: target/${{ env.PROFILE }}/servo-tech-demo.tar.gz
+          if-no-files-found: error
+
+  wpt:
+    needs: build
+    if: ${{ github.event_name == 'schedule' || inputs.wpt }}
+    uses: ./.github/workflows/linux-wpt.yml
+    with:
+      profile: ${{ inputs.profile || 'release' }}
+      binary-path: servo/servoshell
+      wpt-args: --always-succeed ${{ inputs.wpt-args }}

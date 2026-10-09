@@ -155,3 +155,13 @@ jobs:
     with:
       profile: ${{ inputs.profile }}
       bencher: ${{ inputs.bencher }}
+
+  quickjs:
+    if: ${{ inputs.workflow == 'quickjs' }}
+    name: Linux QuickJS
+    # No secrets: QuickJS's WPT results must not reach the intermittent tracker.
+    uses: ./.github/workflows/quickjs.yml
+    with:
+      profile: ${{ inputs.profile }}
+      wpt: ${{ inputs.wpt }}
+      wpt-args: ${{ inputs.wpt-args }}

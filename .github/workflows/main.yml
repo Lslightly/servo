@@ -54,7 +54,7 @@ jobs:
             if [ "${{ github.event_name }}" = pull_request ]; then
               python -m python.servo.pr_jobs "$BASE_SHA"
             else
-              python ./python/servo/try_parser.py ${{ github.event_name == 'pull_request' && 'linux-unit-tests lint' || github.event_name == 'push' && 'full' || 'fail-fast linux-wpt ohos' }}
+              python ./python/servo/try_parser.py ${{ github.event_name == 'pull_request' && 'linux-unit-tests lint' || github.event_name == 'push' && 'full' || 'fail-fast linux-wpt ohos quickjs' }}
             fi
             echo EOF
            } >> $GITHUB_OUTPUT
