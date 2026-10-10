@@ -53,37 +53,47 @@ env:
 jobs:
   build:
     name: Linux Build (QuickJS)
-    # The WPT runners are Ubuntu 22.04, so build against its glibc.
-    runs-on: ubuntu-22.04
+    # The WPT runners are Ubuntu 22.04, so build against its glibc, as the self-hosted runners
+    # labelled servo-ohos-linux do. Their target directory has the checked-release QuickJS build of
+    # a recent ohos-main. Pull requests from forks and runs while the repository variable
+    # NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners.
+    runs-on: ${{ (vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-22.04' || 'servo-ohos-linux' }}
     steps:
       - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
       - name: Free Disk Space (Ubuntu)
+        if: ${{ runner.environment != 'self-hosted' }}
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: false
           large-packages: false
           swap-storage: false
+      # The self-hosted runners have the same LLVM release, see linux-common.yml.
       - name: Install LLVM and Clang
+        if: ${{ runner.environment != 'self-hosted' }}
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: "20.1"
           directory: ${{ runner.temp }}/llvm
       - name: Set LIBCLANG_PATH env
+        if: ${{ runner.environment != 'self-hosted' }}
         run: echo "LIBCLANG_PATH=${LLVM_PATH}/lib" >> "$GITHUB_ENV"
       - name: Setup Python
+        if: ${{ runner.environment != 'self-hosted' }}
         uses: ./.github/actions/setup-python
       - name: Change Mirror Priorities
+        if: ${{ runner.environment != 'self-hosted' }}
         uses: ./.github/actions/apt-mirrors
       - name: Bootstrap dependencies
+        if: ${{ runner.environment != 'self-hosted' }}
         timeout-minutes: 30
         run: |
           sudo apt update
           ./mach bootstrap --yes --skip-lints --skip-nextest
       - name: Install sccache
-        if: ${{ vars.SCCACHE_GHA_ENABLED != 'false' }}
+        if: ${{ runner.environment != 'self-hosted' && vars.SCCACHE_GHA_ENABLED != 'false' }}
         uses: mozilla-actions/sccache-action@v0.0.11
       - name: Enable sccache
-        if: ${{ vars.SCCACHE_GHA_ENABLED != 'false' }}
+        if: ${{ runner.environment != 'self-hosted' && vars.SCCACHE_GHA_ENABLED != 'false' }}
         run: |
           {
             echo "SCCACHE_GHA_VERSION=${{ vars.SCCACHE_GHA_VERSION || '1' }}"
