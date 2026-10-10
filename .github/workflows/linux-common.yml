@@ -79,33 +79,14 @@ env:
   SHELL: /bin/bash
 
 jobs:
-  runner-select:
-    runs-on: ubuntu-24.04
-    outputs:
-      unique-id: ${{ steps.select.outputs.unique-id }}
-      selected-runner-label: ${{ steps.select.outputs.selected-runner-label }}
-      runner-type-label: ${{ steps.select.outputs.runner-type-label }}
-      is-self-hosted: ${{ steps.select.outputs.is-self-hosted }}
-    steps:
-      - name: Runner select
-        id: select
-        uses: servo/ci-runners/actions/runner-select@b42c96524cdd72126255602c69c4ad649c750ebf
-        with:
-          GITHUB_TOKEN: ${{ github.token }}
-          github-hosted-runner-label: ${{ inputs.github-runner-label }}
-          self-hosted-image-name: ${{ inputs.self-hosted-image-name }}
-          # You can disable self-hosted runners globally by creating a repository variable named
-          # NO_SELF_HOSTED_RUNNERS with any non-empty value.
-          # <https://github.com/servo/servo/settings/variables/actions>
-          NO_SELF_HOSTED_RUNNERS: ${{ vars.NO_SELF_HOSTED_RUNNERS }}
-          # Any other boolean conditions that disable self-hosted runners go here.
-          force-github-hosted-runner: ${{ inputs.force-github-hosted-runner }}
-
   build:
-    needs:
-      - runner-select
-    name: Linux Build (${{ inputs.arch }}) [${{ needs.runner-select.outputs.unique-id }}]
-    runs-on: ${{ needs.runner-select.outputs.selected-runner-label }}
+    name: Linux Build (${{ inputs.arch }})
+    # The self-hosted runners labelled servo-ohos-linux have a target directory that is prebuilt
+    # at a recent ohos-main. Pull requests from forks, architectures without self-hosted runners
+    # (an empty self-hosted-image-name) and runs while the repository variable
+    # NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners. `head.repo.fork` is no test for
+    # forks here: it is true for this repository too, a fork of servo/servo.
+    runs-on: ${{ (inputs.self-hosted-image-name == '' || inputs.force-github-hosted-runner || vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository) && inputs.github-runner-label || 'servo-ohos-linux' }}
     outputs:
       artifact_ids: ${{ steps.artifact_ids.outputs.artifact_ids }}
     steps:
@@ -117,12 +98,16 @@ jobs:
           tool-cache: false
           large-packages: false
           swap-storage: false
+      # The self-hosted runners have the same LLVM release. A download into runner.temp would
+      # change LIBCLANG_PATH, which build scripts watch, and so rebuild most of the target directory.
       - name: Install LLVM and Clang
+        if: ${{ runner.environment != 'self-hosted' }}
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: "20.1"
           directory: ${{ runner.temp }}/llvm
       - name: Set LIBCLANG_PATH env
+        if: ${{ runner.environment != 'self-hosted' }}
         run: echo "LIBCLANG_PATH=${LLVM_PATH}/lib" >> $GITHUB_ENV
       - name: Setup Python
         if: ${{ runner.environment != 'self-hosted' }}
@@ -151,10 +136,10 @@ jobs:
       # `sccache` can be turned off by adding a repository-level variable SCCACHE_GHA_ENABLED and
       # setting the value to `false`. See <https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-variables#creating-configuration-variables-for-a-repository>.
       - name: Install sccache
-        if: ${{ github.repository != 'servo/servo' && vars.SCCACHE_GHA_ENABLED != 'false' }}
+        if: ${{ runner.environment != 'self-hosted' && github.repository != 'servo/servo' && vars.SCCACHE_GHA_ENABLED != 'false' }}
         uses: mozilla-actions/sccache-action@v0.0.11
       - name: Enable sccache
-        if: ${{ github.repository != 'servo/servo' && vars.SCCACHE_GHA_ENABLED != 'false' }}
+        if: ${{ runner.environment != 'self-hosted' && github.repository != 'servo/servo' && vars.SCCACHE_GHA_ENABLED != 'false' }}
         run: |
           {
             # Set / Increment SCCACHE_GHA_VERSION as a repository level variable in your fork
