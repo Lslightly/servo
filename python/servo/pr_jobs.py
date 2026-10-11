@@ -12,10 +12,12 @@
 Every pull request runs the Linux unit tests and lint. On top of that:
 
 - OHOS code: the OHOS build. The Linux WPT run never executes that code.
-- The QuickJS workflow: the QuickJS build.
-- WPT tests or expectations: a Linux WPT run of the directories of those tests.
+- The QuickJS workflow or the servo-quickjs pin: the QuickJS build and the whole QuickJS WPT suite.
+- WPT tests or expectations: a Linux WPT run of the directories of those tests, with SpiderMonkey
+  and QuickJS.
 - Files that no build or test reads, such as documentation: nothing.
-- Anything else: the OHOS and QuickJS builds and the whole Linux WPT suite.
+- Anything else: the OHOS and QuickJS builds and the whole Linux WPT suite. The nightly QuickJS
+  workflow runs the whole QuickJS WPT suite.
 
 The path lists are explicit on purpose: a path missing from them only costs a full run.
 """
@@ -146,12 +148,24 @@ def select(changed: Iterable[str], count_files: Callable[[str], int]) -> Config:
         return Config(FULL)
 
     # The WPT run is added after the unit tests, so that both share one Linux job.
-    jobs = [ALWAYS, *(["ohos"] if ohos else []), *(["quickjs"] if quickjs else []), *(["linux-wpt"] if counts else [])]
+    jobs = [
+        ALWAYS,
+        *(["ohos"] if ohos else []),
+        *(["quickjs"] if quickjs or counts else []),
+        *(["linux-wpt"] if counts else []),
+    ]
     config = Config(" ".join(jobs))
+    wpt_args = " ".join(f"./{directory}" for directory in counts)
+    number_of_wpt_chunks = min(20, math.ceil(sum(counts.values()) / FILES_PER_CHUNK))
     for job in config.matrix:
-        if job.workflow is Workflow.LINUX and counts:
-            job.wpt_args = " ".join(f"./{directory}" for directory in counts)
-            job.number_of_wpt_chunks = min(20, math.ceil(sum(counts.values()) / FILES_PER_CHUNK))
+        if job.workflow is Workflow.QUICKJS:
+            job.wpt = True
+            # A change to the QuickJS build runs the whole suite.
+            if not quickjs:
+                job.wpt_args, job.number_of_wpt_chunks = wpt_args, number_of_wpt_chunks
+            job.update_name()
+        elif job.workflow is Workflow.LINUX and counts:
+            job.wpt_args, job.number_of_wpt_chunks = wpt_args, number_of_wpt_chunks
     return config
 
 
@@ -193,6 +207,7 @@ class TestSelect(unittest.TestCase):
     LINT = ("lint", False, False, "", 20)
     OHOS = ("ohos", False, False, "", 20)
     QUICKJS = ("quickjs", False, False, "", 20)
+    QUICKJS_WPT = ("quickjs", False, True, "", 20)
 
     def test_shared_code_runs_everything(self) -> None:
         full = json.loads(Config(FULL).to_json())
@@ -217,7 +232,13 @@ class TestSelect(unittest.TestCase):
     def test_quickjs_workflow(self) -> None:
         self.assertEqual(
             self.jobs(".github/workflows/quickjs.yml", "support/quickjs/cargo-config.toml", "ports/arkweb/src/lib.rs"),
-            [self.LINUX, self.LINT, self.OHOS, self.QUICKJS],
+            [self.LINUX, self.LINT, self.OHOS, self.QUICKJS_WPT],
+        )
+
+    def test_quickjs_pin_and_tests(self) -> None:
+        self.assertEqual(
+            self.jobs("support/quickjs/cargo-config.toml", "tests/wpt/meta/dom/nodes/Node-cloneNode.html.ini"),
+            [("linux", True, True, "./tests/wpt/tests/dom/nodes", 1), self.LINT, self.QUICKJS_WPT],
         )
 
     def test_not_built_only(self) -> None:
@@ -234,13 +255,22 @@ class TestSelect(unittest.TestCase):
                 "tests/wpt/meta/dom/nodes/Node-cloneNode.html.ini",
                 "tests/wpt/meta/MANIFEST.json",
             ),
-            [("linux", True, True, "./tests/wpt/tests/css/css-flexbox ./tests/wpt/tests/dom/nodes", 3), self.LINT],
+            [
+                ("linux", True, True, "./tests/wpt/tests/css/css-flexbox ./tests/wpt/tests/dom/nodes", 3),
+                self.LINT,
+                ("quickjs", False, True, "./tests/wpt/tests/css/css-flexbox ./tests/wpt/tests/dom/nodes", 3),
+            ],
         )
 
     def test_mozilla_tests_and_ohos_code(self) -> None:
         self.assertEqual(
             self.jobs("tests/wpt/mozilla/meta/mozilla/svg/svg-text-web-font.html.ini", "ports/arkweb/src/lib.rs"),
-            [("linux", True, True, "./tests/wpt/mozilla/tests/mozilla/svg", 1), self.LINT, self.OHOS],
+            [
+                ("linux", True, True, "./tests/wpt/mozilla/tests/mozilla/svg", 1),
+                self.LINT,
+                self.OHOS,
+                ("quickjs", False, True, "./tests/wpt/mozilla/tests/mozilla/svg", 1),
+            ],
         )
 
     def test_shared_test_files_run_everything(self) -> None:

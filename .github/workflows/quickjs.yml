@@ -1,7 +1,7 @@
-# Builds servoshell on the QuickJS mozjs shim (openharmony-rs/servo-quickjs) and runs WPT with it.
-# The results are compared against the SpiderMonkey expectations, so the unexpected results are
-# the gaps of the QuickJS backend; the WPT jobs succeed regardless. Pull requests and the merge
-# queue run the build and smoketest only (the `quickjs` job of the try configuration).
+# Builds servoshell on the QuickJS mozjs shim (openharmony-rs/servo-quickjs) and runs WPT with it,
+# against the expectations with their `js_engine == "quickjs"` conditions. Pull requests run WPT
+# on the directories of the Linux WPT job, and the whole suite when they change the shim pin
+# (python/servo/pr_jobs.py); the merge queue runs the build and smoketest only.
 name: QuickJS
 on:
   schedule:
@@ -19,6 +19,10 @@ on:
         default: ""
         required: false
         type: string
+      number-of-wpt-chunks:
+        default: 20
+        required: false
+        type: number
   workflow_dispatch:
     inputs:
       servo-quickjs-ref:
@@ -37,9 +41,6 @@ on:
         required: false
         type: string
 
-permissions:
-  contents: read
-
 env:
   RUST_BACKTRACE: 1
   SHELL: /bin/bash
@@ -57,6 +58,8 @@ jobs:
     # a recent ohos-main. Pull requests from forks and runs while the repository variable
     # NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners.
     runs-on: ${{ (vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-22.04' || 'servo-ohos-linux' }}
+    permissions:
+      contents: read
     steps:
       - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
       - name: Free Disk Space (Ubuntu)
@@ -128,10 +131,12 @@ jobs:
         if: ${{ env.RUN_WPT == 'true' }}
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.PROFILE }}-binary-linux
+          name: ${{ env.PROFILE }}-binary-quickjs
           path: target/${{ env.PROFILE }}/servo-tech-demo.tar.gz
           if-no-files-found: error
 
+  # Takes the token of the caller, like the Linux WPT job: its report creates a check run and
+  # comments on the pull request.
   wpt:
     needs: build
     if: ${{ github.event_name == 'schedule' || inputs.wpt }}
@@ -139,4 +144,6 @@ jobs:
     with:
       profile: ${{ inputs.profile || 'release' }}
       binary-path: servo/servoshell
-      wpt-args: --always-succeed ${{ inputs.wpt-args }}
+      number-of-wpt-chunks: ${{ inputs.number-of-wpt-chunks || 20 }}
+      name: quickjs
+      wpt-args: --js-engine quickjs ${{ inputs.wpt-args }}
