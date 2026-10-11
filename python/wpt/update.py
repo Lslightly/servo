@@ -25,7 +25,7 @@ from . import WPT_PATH, manifestupdate
 
 TEST_ROOT = os.path.join(WPT_PATH, "tests")
 META_ROOTS = [os.path.join(WPT_PATH, "meta"), os.path.join(WPT_PATH, "meta-legacy")]
-GITHUB_ACTION_RUN_URL_REGEX = re.compile(r"github\.com\/(\w+\/\w+)\/actions\/runs\/(\d+)$")
+GITHUB_ACTION_RUN_URL_REGEX = re.compile(r"github\.com\/([\w.-]+\/[\w.-]+)\/actions\/runs\/(\d+)$")
 
 # The run-info property of the JavaScript engine, and the engine of the expectations without a condition on it.
 JS_ENGINE = "js_engine"
