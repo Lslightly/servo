@@ -20,6 +20,7 @@ libXmu-devel
 dbus-devel
 ncurses-devel
 harfbuzz-devel
+icu-devel
 ccache
 glu-devel
 clang
