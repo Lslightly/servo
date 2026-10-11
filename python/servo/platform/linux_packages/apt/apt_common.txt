@@ -28,6 +28,7 @@ libgstrtspserver-1.0-dev
 gstreamer1.0-tools
 libges-1.0-dev
 libharfbuzz-dev
+libicu-dev
 liblzma-dev
 libudev-dev
 libunwind-dev

@@ -5,4 +5,4 @@
 # were tested with. The shim's version must match the mozjs version that Cargo.toml requires, or
 # Cargo leaves the patch unused.
 [patch.crates-io]
-mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "72fa2b6697a60889969397313ad23405196c5b4e" }
+mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "fdb3eab5a906abb563854f08eb9021d095fef18b" }
