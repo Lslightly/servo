@@ -41,9 +41,6 @@ on:
         required: false
         type: string
 
-permissions:
-  contents: read
-
 env:
   RUST_BACKTRACE: 1
   SHELL: /bin/bash
@@ -61,6 +58,8 @@ jobs:
     # a recent ohos-main. Pull requests from forks and runs while the repository variable
     # NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners.
     runs-on: ${{ (vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-22.04' || 'servo-ohos-linux' }}
+    permissions:
+      contents: read
     steps:
       - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
       - name: Free Disk Space (Ubuntu)
@@ -136,6 +135,8 @@ jobs:
           path: target/${{ env.PROFILE }}/servo-tech-demo.tar.gz
           if-no-files-found: error
 
+  # Takes the token of the caller, like the Linux WPT job: its report creates a check run and
+  # comments on the pull request.
   wpt:
     needs: build
     if: ${{ github.event_name == 'schedule' || inputs.wpt }}
