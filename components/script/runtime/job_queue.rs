@@ -232,6 +232,11 @@ pub(crate) fn job_queue_microtask_checkpoint(
     // and https://searchfox.org/firefox-main/rev/7ae92e67d094086cd3e09918ec94b6278a948535/xpcom/base/CycleCollectedJSContext.cpp#1176
     // and its helper functions
     while unsafe { HasAnyMicroTasks(cx) } {
+        // QuickJS: release what this microtask kept alive in the autorelease pool, instead of at
+        // the end of the task. The roots above are written before they are read in each iteration,
+        // and what a microtask leaves for later holds references of its own.
+        #[cfg(feature = "js-quickjs")]
+        let _pool_scope = unsafe { js::quickjs::AutoreleasePoolScope::new() };
         unsafe { JS_DequeueNextMicroTask(cx, generic_task.handle_mut()) };
 
         // Notify the JS engine if the queue is now empty, enabling optimizations
