@@ -41,6 +41,9 @@ from python.servo.platform.build_target import SanitizerKind
 from python.servo.util import get_target_dir
 
 ASAN_LEAK_SUPPRESSION_FILE = "support/suppressed_leaks_for_asan.txt"
+JS_ENGINES = ["spidermonkey", "quickjs"]
+# The Cargo configuration of `--js-engine quickjs`, with the pinned servo-quickjs commit.
+QUICKJS_CARGO_CONFIG = "support/quickjs/cargo-config.toml"
 
 
 @dataclass
@@ -275,6 +278,7 @@ class CommandBase(object):
         self.enable_media = False
         self.enable_code_coverage = False
         self.features = []
+        self.js_engine = "spidermonkey"
 
         # Default to native build target. This will later be overriden
         # by `configure_build_target`
@@ -322,6 +326,7 @@ class CommandBase(object):
         self.config["build"].setdefault("debug-assertions", False)
         self.config["build"].setdefault("debug-mozjs", False)
         self.config["build"].setdefault("media-stack", "auto")
+        self.config["build"].setdefault("js-engine", "spidermonkey")
         self.config["build"].setdefault("ccache", "")
         self.config["build"].setdefault("rustflags", "")
         self.config["build"].setdefault("incremental", None)
@@ -529,6 +534,14 @@ class CommandBase(object):
                     help="Which media stack to use",
                 ),
                 CommandArgument(
+                    "--js-engine",
+                    default=None,
+                    group="Feature Selection",
+                    choices=JS_ENGINES,
+                    help="Which JavaScript engine to build with. quickjs replaces mozjs with servo-quickjs "
+                    "and changes Cargo.lock",
+                ),
+                CommandArgument(
                     "--debug-mozjs",
                     default=False,
                     group="Feature Selection",
@@ -600,6 +613,7 @@ class CommandBase(object):
                     self.configure_build_target(kwargs)
                     self.features = kwargs.get("features", None) or []
                     self.enable_media = self.is_media_enabled(kwargs["media_stack"])
+                    self.js_engine = self.configure_js_engine(kwargs["js_engine"])
 
                 if build_configuration or binary_selection:
                     self.enable_code_coverage = kwargs.pop("coverage", False)
@@ -751,6 +765,13 @@ class CommandBase(object):
 
         return media_stack != "dummy"
 
+    def configure_js_engine(self, js_engine: Optional[str]) -> str:
+        js_engine = js_engine or self.config["build"]["js-engine"]
+        if js_engine not in JS_ENGINES:
+            print(f"Error: unknown js-engine `{js_engine}` in .servobuild, expected one of {', '.join(JS_ENGINES)}")
+            sys.exit(1)
+        return js_engine
+
     def run_cargo_build_like_command(
         self,
         command: str,
@@ -793,6 +814,10 @@ class CommandBase(object):
         elif target_override:
             args += ["--target", target_override]
 
+        # Also with `-p`, so that every command resolves the same Cargo.lock.
+        if self.js_engine == "quickjs":
+            args += ["--config", path.join(self.context.topdir, QUICKJS_CARGO_CONFIG)]
+
         features = []
 
         if use_crown:
@@ -816,6 +841,8 @@ class CommandBase(object):
             features += list(self.features)
             if self.enable_media:
                 features.append("media-gstreamer")
+            if self.js_engine == "quickjs":
+                features.append("js-quickjs")
             if self.config["build"]["debug-mozjs"] or debug_mozjs:
                 features.append("debugmozjs")
 

@@ -19,6 +19,11 @@ android = false
 # Enable `debug_assert!` macros in release mode
 debug-assertions = true
 
+# Set "js-engine" or use `mach build --js-engine` to pick the JavaScript engine: "spidermonkey" or
+# "quickjs", which builds on servo-quickjs (see support/quickjs/cargo-config.toml) and changes
+# Cargo.lock.
+js-engine = "spidermonkey"
+
 # Set "debug-mozjs" or use `mach build --debug-mozjs` to build a debug spidermonkey.
 debug-mozjs = false
 

@@ -64,7 +64,7 @@ OHOS_ONLY = (
 )
 
 # Files that only the QuickJS build reads.
-QUICKJS_ONLY = (".github/workflows/quickjs.yml",)
+QUICKJS_ONLY = (".github/workflows/quickjs.yml", "support/quickjs/")
 
 # Test and expectation roots, mapped to the directory that holds their tests.
 WPT_ROOTS = {
@@ -216,7 +216,7 @@ class TestSelect(unittest.TestCase):
 
     def test_quickjs_workflow(self) -> None:
         self.assertEqual(
-            self.jobs(".github/workflows/quickjs.yml", "ports/arkweb/src/lib.rs"),
+            self.jobs(".github/workflows/quickjs.yml", "support/quickjs/cargo-config.toml", "ports/arkweb/src/lib.rs"),
             [self.LINUX, self.LINT, self.OHOS, self.QUICKJS],
         )
 
