@@ -1,0 +1,8 @@
+# The Cargo configuration of `./mach build --js-engine quickjs`. It replaces mozjs with
+# servo-quickjs, which implements the mozjs API on QuickJS.
+#
+# Bump the commit with mozjs at each sync, so that older commits keep building with the shim they
+# were tested with. The shim's version must match the mozjs version that Cargo.toml requires, or
+# Cargo leaves the patch unused.
+[patch.crates-io]
+mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "72fa2b6697a60889969397313ad23405196c5b4e" }

@@ -44,9 +44,8 @@ env:
   RUST_BACKTRACE: 1
   SHELL: /bin/bash
   SERVO_QUICKJS_URL: https://github.com/openharmony-rs/servo-quickjs
-  # The servo-quickjs commit this tree builds with. Bump it with mozjs at each sync, so that older
-  # commits keep building with the shim they were tested with.
-  SERVO_QUICKJS_REF: ${{ inputs.servo-quickjs-ref || '72fa2b6697a60889969397313ad23405196c5b4e' }}
+  # Replaces the servo-quickjs commit pinned in support/quickjs/cargo-config.toml, if set.
+  SERVO_QUICKJS_REF: ${{ inputs.servo-quickjs-ref }}
   PROFILE: ${{ inputs.profile || 'release' }}
   RUN_WPT: ${{ github.event_name == 'schedule' || inputs.wpt }}
 
@@ -101,9 +100,8 @@ jobs:
             echo "RUSTC_WRAPPER=sccache"
             echo "CARGO_INCREMENTAL=0"
           } >> "$GITHUB_ENV"
-      # `mach` cannot pass `--config`, so the patch goes into `.cargo/config.toml`. It changes
-      # Cargo.lock, so the build below is not `--locked`.
-      - name: Patch mozjs to the QuickJS shim
+      - name: Use another servo-quickjs commit
+        if: ${{ env.SERVO_QUICKJS_REF != '' }}
         run: |
           refs=$(git ls-remote "$SERVO_QUICKJS_URL")
           rev=
@@ -116,10 +114,11 @@ jobs:
             echo "::error::$SERVO_QUICKJS_REF is not a branch or tag of $SERVO_QUICKJS_URL, nor a full commit hash"
             exit 1
           fi
-          printf '\n[patch.crates-io]\nmozjs = { git = "%s", rev = "%s" }\n' "$SERVO_QUICKJS_URL" "$rev" >> .cargo/config.toml
+          sed -i -E "s/rev = \"[0-9a-f]{40}\"/rev = \"$rev\"/" support/quickjs/cargo-config.toml
           echo "servo-quickjs: \`$SERVO_QUICKJS_REF\` ($rev)" >> "$GITHUB_STEP_SUMMARY"
+      # `--js-engine quickjs` changes Cargo.lock, so the build is not `--locked`.
       - name: Build
-        run: ./mach build --profile "$PROFILE" --features js-quickjs
+        run: ./mach build --profile "$PROFILE" --js-engine quickjs
       - name: Smoketest
         run: xvfb-run ./mach smoketest --profile "$PROFILE"
       - name: Build mach package
