@@ -235,7 +235,8 @@ def create_github_reports(body: str, tag: str = ""):
         "actions": [],
     }
 
-    subprocess.Popen(
+    # The data goes through stdin: with many unexpected results, it exceeds the argument size limit.
+    subprocess.run(
         [
             "curl",
             "-L",
@@ -249,9 +250,11 @@ def create_github_reports(body: str, tag: str = ""):
             "X-GitHub-Api-Version: 2022-11-28",
             f"https://api.github.com/repos/{repo}/check-runs",
             "-d",
-            json.dumps(data),
-        ]
-    ).wait()
+            "@-",
+        ],
+        input=json.dumps(data),
+        text=True,
+    )
 
 
 def main():
