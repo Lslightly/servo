@@ -17,6 +17,7 @@ import urllib.request
 from typing import List, NamedTuple, Optional, Union, cast, Any
 from collections.abc import Callable
 
+import mozinfo
 import mozlog
 import mozlog.formatters
 
@@ -79,6 +80,9 @@ def run_tests(default_binary_path: str, multiprocess: bool, **kwargs: Any) -> in
     # until necessary improvements are made to the debugging experience with
     # servodriver. See https://github.com/servo/servo/issues/40751
     product = "servo_legacy" if kwargs.get("legacy") else "servo"
+
+    # Expectations can depend on the engine as `js_engine`, so every run has to set it.
+    mozinfo.update({"js_engine": kwargs.pop("js_engine", None) or "spidermonkey"})
 
     set_if_none(kwargs, "product", product)
     set_if_none(kwargs, "config", os.path.join(WPT_PATH, "config.ini"))

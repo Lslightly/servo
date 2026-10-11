@@ -21,7 +21,7 @@ debug-assertions = true
 
 # Set "js-engine" or use `mach build --js-engine` to pick the JavaScript engine: "spidermonkey" or
 # "quickjs", which builds on servo-quickjs (see support/quickjs/cargo-config.toml) and changes
-# Cargo.lock.
+# Cargo.lock. `mach test-wpt` uses it for the `js_engine` of the expectations.
 js-engine = "spidermonkey"
 
 # Set "debug-mozjs" or use `mach build --debug-mozjs` to build a debug spidermonkey.
