@@ -135,6 +135,9 @@ For each stop:
   re-run `update.sh` and regenerate `Cargo.lock`; `update.sh --check` must
   pass. A stale copy still builds, because `[patch]` resolves to whatever is
   vendored, so check this whenever the pin moved, conflict or not.
+- QuickJS expectations (the `if js_engine == "quickjs"` conditions in
+  `tests/wpt/meta`): take upstream's side of the conflicting hunks; step 3
+  regenerates the conditions.
 - Compile-check the crate(s) affected before continuing:
   `./mach check --ohos -p <crate>` (arkweb and other OHOS-only crates are
   not checkable on the host target). `mach` drops its `--features` when `-p`
@@ -171,6 +174,8 @@ Fold, via `git rebase -i base/<date>`:
   are dropped now, one sync after they were created;
 - patches that upstreaming has whittled down can be merged with their
   remaining sibling if that leaves one coherent patch;
+- commits that only update QuickJS expectations into
+  `wpt: Add the QuickJS expectations`;
 - the `docs: record patches …` commits added between syncs: `STACK.md` and
   the patch set belong to the first commit, so their entries move there and
   the commits disappear (no later commit touches `STACK.md` or `patches/`).
@@ -241,6 +246,21 @@ Mandatory:
    git add docs/ohos-sync/patches   # amend into the docs/manifest commit
    uv run docs/ohos-sync/check_stack.py base/<date>
    ```
+
+8. QuickJS WPT: run the whole suite on a `--js-engine quickjs` build, by
+   dispatching `quickjs.yml` with `wpt` on the sync branch or with
+   `./mach test-wpt --js-engine quickjs --log-raw <log>`. Update the
+   expectations from it (`./mach update-wpt <run URL or log>`) and amend them
+   into `wpt: Add the QuickJS expectations`. An update from QuickJS results
+   alone keeps the SpiderMonkey expectations.
+
+   A local run also reports the host's flaky and environment-specific
+   results. Rerun the tests with unexpected results three times with each
+   engine and update only from the tests whose unexpected results recur in
+   every QuickJS run and never occur with SpiderMonkey (a subtest
+   SpiderMonkey does not report counts as never occurring). A result that
+   also occurs with SpiderMonkey belongs to the SpiderMonkey expectations,
+   unless its expectation is already engine-conditional.
 
 Any failure is a regression until proven a pre-existing upstream issue
 (check the same test on plain `base/<date>`). Regressions are fixed on the
