@@ -597,6 +597,11 @@ class TestGithubActionRunURLRegex(unittest.TestCase):
         assert match
         self.assertEquals(match.group(1), "CaMeL/CaSe")
 
+        url_with_hyphens = "https://github.com/openharmony-rs/servo-ohos/actions/runs/38135694194"
+        match = update.GITHUB_ACTION_RUN_URL_REGEX.search(url_with_hyphens)
+        assert match
+        self.assertEquals(match.group(1), "openharmony-rs/servo-ohos")
+
         url_with_bad_run_id = "https://github.com/servo/servo/actions/runs/19952aa163512"
         match = update.GITHUB_ACTION_RUN_URL_REGEX.search(url_with_bad_run_id)
         self.assertIsNone(match)
