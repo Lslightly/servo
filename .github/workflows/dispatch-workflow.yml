@@ -165,3 +165,4 @@ jobs:
       profile: ${{ inputs.profile }}
       wpt: ${{ inputs.wpt }}
       wpt-args: ${{ inputs.wpt-args }}
+      number-of-wpt-chunks: ${{ inputs.number-of-wpt-chunks }}

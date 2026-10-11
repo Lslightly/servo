@@ -4,6 +4,7 @@
 # pylint: disable=missing-docstring
 
 import dataclasses
+import glob
 import os
 import re
 import shutil
@@ -258,6 +259,8 @@ def download_run_results_and_then_run_update(kwargs: dict[str, Any]) -> bool:
                         run_path,
                         "--pattern",
                         "*stable-unexpected-results-linux*",
+                        "--pattern",
+                        "*stable-unexpected-results-quickjs*",
                     ]
                 )
                 != 0
@@ -265,9 +268,7 @@ def download_run_results_and_then_run_update(kwargs: dict[str, Any]) -> bool:
                 print(f"Could not download artifact from run id {run_id}.")
                 print("Is `gh` installed and authenticated?")
                 return False
-            downloaded_run_logs.append(
-                os.path.join(run_path, "stable-unexpected-results-linux", "stable-unexpected-results.log")
-            )
+            downloaded_run_logs += glob.glob(os.path.join(run_path, "*", "stable-unexpected-results.log"))
 
         kwargs["run_log"] = downloaded_run_logs
         logger = setup_logging(kwargs, {"mach": sys.stdout})

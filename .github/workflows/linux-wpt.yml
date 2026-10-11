@@ -21,6 +21,11 @@ on:
         required: true
         default: ""
         type: string
+      name:
+        description: Distinguishes the artifacts and the report of this run from other WPT runs of the workflow run
+        default: linux
+        required: false
+        type: string
 
 env:
   RUST_BACKTRACE: 1
@@ -82,10 +87,10 @@ jobs:
       - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
       - uses: actions/download-artifact@v8
         with:
-          name: ${{ inputs.profile }}-binary-linux
-          path: ${{ inputs.profile }}-binary-linux
+          name: ${{ inputs.profile }}-binary-${{ inputs.name }}
+          path: ${{ inputs.profile }}-binary-${{ inputs.name }}
       - name: unPackage binary
-        run: tar -xzf ${{ inputs.profile }}-binary-linux/servo-tech-demo.tar.gz
+        run: tar -xzf ${{ inputs.profile }}-binary-${{ inputs.name }}/servo-tech-demo.tar.gz
       - name: Setup Python
         if: ${{ runner.environment != 'self-hosted' }}
         uses: ./.github/actions/setup-python
@@ -124,14 +129,14 @@ jobs:
         uses: actions/upload-artifact@v7
         if: ${{ always() }}
         with:
-          name: wpt-filtered-logs-linux-${{ matrix.chunk_id }}
+          name: wpt-filtered-logs-${{ inputs.name }}-${{ matrix.chunk_id }}
           path: wpt-filtered-logs/*/
           if-no-files-found: error
       - name: Archive results (full)
         uses: actions/upload-artifact@v7
         if: ${{ always() }}
         with:
-          name: wpt-full-logs-linux-${{ matrix.chunk_id }}
+          name: wpt-full-logs-${{ inputs.name }}-${{ matrix.chunk_id }}
           path: wpt-full-logs/*/
           if-no-files-found: error
 
@@ -144,22 +149,22 @@ jobs:
       - name: Merge logs (full)
         uses: actions/upload-artifact/merge@v7
         with:
-          name: wpt-full-logs-linux
-          pattern: wpt-full-logs-linux-*
+          name: wpt-full-logs-${{ inputs.name }}
+          pattern: wpt-full-logs-${{ inputs.name }}-*
           delete-merged: true
       # This job needs to be last. If no filtered results were uploaded, it will fail, but we want to merge other archives in that case.
       - name: Merge logs (filtered)
         uses: actions/upload-artifact/merge@v7
         with:
-          name: wpt-filtered-logs-linux
-          pattern: wpt-filtered-logs-linux-*
+          name: wpt-filtered-logs-${{ inputs.name }}
+          pattern: wpt-filtered-logs-${{ inputs.name }}-*
           delete-merged: true
       - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
         if: ${{ !cancelled() && !inputs.wpt-sync-from-upstream }}
       - uses: actions/download-artifact@v8
         if: ${{ !cancelled() && !inputs.wpt-sync-from-upstream }}
         with:
-          name: wpt-filtered-logs-linux
+          name: wpt-filtered-logs-${{ inputs.name }}
           path: results
       - name: Aggregate results
         if: ${{ !cancelled() && !inputs.wpt-sync-from-upstream }}
@@ -170,14 +175,14 @@ jobs:
         if: ${{ !cancelled() && !inputs.wpt-sync-from-upstream }}
         uses: actions/upload-artifact@v7
         with:
-          name: stable-unexpected-results-linux
+          name: stable-unexpected-results-${{ inputs.name }}
           path: stable-unexpected-results.log
           if-no-files-found: error
       - name: Report results
         if: ${{ !cancelled() && !inputs.wpt-sync-from-upstream }}
         run: |
           etc/ci/report_aggregated_expected_results.py \
-            --tag="linux-wpt" \
+            --tag="${{ inputs.name }}-wpt" \
             results/linux/*.json
         env:
           GITHUB_CONTEXT: ${{ toJson(github) }}
