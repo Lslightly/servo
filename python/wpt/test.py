@@ -607,6 +607,134 @@ class TestGithubActionRunURLRegex(unittest.TestCase):
         self.assertIsNone(match)
 
 
+class TestUpdateExpectationsPerJsEngine(unittest.TestCase):
+    """Tests that updating the expectations from the logs of one JavaScript engine keeps those of the other."""
+
+    SUBTEST = "subtest"
+    QUICKJS_FAILS = '[test.html]\n  [subtest]\n    expected:\n      if js_engine == "quickjs": FAIL\n'
+
+    def setUp(self) -> None:
+        self.tmp_dir = tempfile.mkdtemp()
+        with open(os.path.join(self.tmp_dir, "MANIFEST.json"), "w") as manifest:
+            items = {"testharness": {"test.html": ["0" * 40, [None, {}]]}}
+            json.dump({"items": items, "url_base": "/_test/", "version": 9}, manifest)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def write_log(
+        self, js_engine: Optional[str], results: list[tuple[Optional[str], str, str]], revision: str = "a"
+    ) -> str:
+        """Writes a raw log of one run. `results` are (subtest or None for the test, status, expected status)."""
+        run_info = {"os": "linux", "version": "Ubuntu 22.04", "processor": "x86_64", "bits": 64, "debug": False}
+        run_info["revision"] = revision
+        if js_engine is not None:
+            run_info["js_engine"] = js_engine
+        test = "/_test/test.html"
+        actions: list[dict[str, Any]] = [
+            {"action": "suite_start", "run_info": run_info, "tests": {"default": [test]}},
+            {"action": "add_subsuite", "name": "", "run_info": {"subsuite": ""}},
+            {"action": "test_start", "test": test},
+        ]
+        test_result = {"action": "test_end", "test": test, "status": "OK"}
+        for subtest, status, expected in results:
+            if subtest is None:
+                result = test_result
+            else:
+                result = {"action": "test_status", "test": test, "subtest": subtest}
+                actions.append(result)
+            result["status"] = status
+            if expected != status:
+                result["expected"] = expected
+        actions += [test_result, {"action": "suite_end"}]
+        log_fd, log_path = tempfile.mkstemp(dir=self.tmp_dir, suffix=".log")
+        with os.fdopen(log_fd, "w") as log:
+            for action in actions:
+                log.write(json.dumps({"time": 0, "thread": "", "pid": 1, "source": "test", **action}) + "\n")
+        return log_path
+
+    def update(self, expectations: Optional[str], log_paths: list[str], full_update: bool = False) -> str:
+        from wptrunner import metadata, products
+        from wptrunner.wptcommandline import TestRoot
+
+        from . import update
+
+        ini_path = os.path.join(self.tmp_dir, "test.html.ini")
+        if expectations is not None:
+            with open(ini_path, "w") as ini:
+                ini.write(expectations)
+        kwargs: dict[str, Any] = {"product": products.Product.from_product_name("servo")}
+        update.use_js_engine_property(kwargs)
+        metadata.update_expected(
+            {"/_test/": TestRoot(self.tmp_dir, self.tmp_dir)},
+            log_paths,
+            update_properties=kwargs["product"].update_properties,
+            full_update=full_update,
+        )
+        if not os.path.exists(ini_path):
+            return ""
+        with open(ini_path) as ini:
+            return ini.read()
+
+    def test_quickjs_failure(self) -> None:
+        log = self.write_log("quickjs", [(self.SUBTEST, "FAIL", "PASS")])
+        self.assertEqual(self.update(None, [log]), self.QUICKJS_FAILS)
+
+    def test_spidermonkey_keeps_quickjs_condition(self) -> None:
+        expectations = (
+            "[test.html]\n"
+            "  [subtest]\n"
+            "    expected:\n"
+            '      if js_engine == "quickjs": FAIL\n'
+            "\n"
+            "  [other subtest]\n"
+            "    expected: FAIL\n"
+        )
+        log = self.write_log("spidermonkey", [(self.SUBTEST, "PASS", "PASS"), ("other subtest", "PASS", "FAIL")])
+        self.assertEqual(self.update(expectations, [log]), self.QUICKJS_FAILS)
+
+    def test_logs_of_other_revisions(self) -> None:
+        expectations = "[test.html]\n  [subtest]\n    expected: FAIL\n"
+        logs = [
+            self.write_log("spidermonkey", [(self.SUBTEST, "PASS", "FAIL")], revision="a"),
+            self.write_log("quickjs", [(self.SUBTEST, "FAIL", "FAIL")], revision="b"),
+        ]
+        self.assertEqual(self.update(expectations, logs), self.QUICKJS_FAILS)
+
+    def test_spidermonkey_flaky(self) -> None:
+        expectations = "[test.html]\n  [subtest]\n    expected: FAIL\n"
+        logs = [
+            self.write_log("spidermonkey", [(self.SUBTEST, "PASS", "FAIL")]),
+            self.write_log("spidermonkey", [(self.SUBTEST, "FAIL", "FAIL")]),
+            self.write_log("quickjs", [(self.SUBTEST, "TIMEOUT", "FAIL")]),
+        ]
+        self.assertEqual(
+            self.update(expectations, logs),
+            '[test.html]\n  [subtest]\n    expected:\n      if js_engine == "quickjs": TIMEOUT\n      [PASS, FAIL]\n',
+        )
+
+    def test_spidermonkey_intermittent(self) -> None:
+        expectations = "[test.html]\n  expected: [OK, TIMEOUT]\n"
+        log = self.write_log("quickjs", [(None, "ERROR", "OK")])
+        self.assertEqual(
+            self.update(expectations, [log]),
+            '[test.html]\n  expected:\n    if js_engine == "quickjs": ERROR\n    [OK, TIMEOUT]\n',
+        )
+
+    def test_full_update_with_one_engine(self) -> None:
+        expectations = "[test.html]\n  [subtest]\n    expected: FAIL\n"
+        with self.assertRaises(SystemExit):
+            self.update(expectations, [self.write_log("quickjs", [(self.SUBTEST, "PASS", "FAIL")])], full_update=True)
+
+    def test_log_without_js_engine(self) -> None:
+        expectations = "[test.html]\n  [subtest]\n    expected: FAIL\n"
+        logs = [
+            self.write_log(None, [(self.SUBTEST, "PASS", "FAIL")]),
+            self.write_log("quickjs", [(self.SUBTEST, "FAIL", "FAIL")]),
+        ]
+        self.assertEqual(self.update(expectations, logs, full_update=True), self.QUICKJS_FAILS)
+
+
 def setUpModule() -> None:
     # pylint: disable=invalid-name
     global TMP_DIR, SYNC
@@ -664,5 +792,6 @@ def run_tests() -> bool:
             run_suite(TestCleanUpBodyText),
             run_suite(TestFullSyncRun),
             run_suite(TestGithubActionRunURLRegex),
+            run_suite(TestUpdateExpectationsPerJsEngine),
         ]
     )

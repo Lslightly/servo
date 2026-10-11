@@ -35,6 +35,9 @@ DEFAULT_JS_ENGINE = "spidermonkey"
 WPT_UPDATE_RESULTS = metadata.update_results
 WPT_SUITE_START = metadata.ExpectedUpdater.suite_start
 
+# The JavaScript engines of the logs that the current update has read.
+LOG_JS_ENGINES: set[str] = set()
+
 
 def do_sync(**kwargs: str) -> int:
     last_commit = subprocess.check_output(["git", "log", "-1"])
@@ -140,10 +143,12 @@ def use_js_engine_property(kwargs: dict[str, Any]) -> None:
     if metadata.update_results is not update_results_per_engine:
         metadata.update_results = update_results_per_engine
         metadata.ExpectedUpdater.suite_start = suite_start_with_js_engine
+    LOG_JS_ENGINES.clear()
 
 
 def suite_start_with_js_engine(self: metadata.ExpectedUpdater, data: dict[str, Any]) -> None:
     data["run_info"].setdefault(JS_ENGINE, DEFAULT_JS_ENGINE)
+    LOG_JS_ENGINES.add(data["run_info"][JS_ENGINE])
     WPT_SUITE_START(self, data)
 
 
@@ -155,11 +160,17 @@ def update_results_per_engine(
     update_intermittent: bool,
     remove_intermittent: bool,
 ) -> Generator:
-    with_other_engines = add_default_engine_results(id_test_map)
-    # The files with results of several engines get conditions on `js_engine`, and the value of a condition is
-    # computed without the current one, which would drop its intermittent statuses unless they are updated.
+    if full_update and len(LOG_JS_ENGINES) < 2:
+        # A full update rebuilds the conditions from the logs, which would drop the other engine's.
+        raise SystemExit(
+            "`--full` needs logs of SpiderMonkey and of QuickJS runs, or it drops the other's expectations"
+        )
+    with_intermittents = add_default_engine_results(id_test_map, update_properties)
+    # The value of a new condition on `js_engine` is computed without the current value, which drops its
+    # intermittent statuses, and differing results of the default engine would make the other engine's result
+    # the default, unless they are updated as intermittent.
     yield from WPT_UPDATE_RESULTS(
-        {test_id: test_file for test_id, test_file in id_test_map.items() if test_file in with_other_engines},
+        {test_id: test_file for test_id, test_file in id_test_map.items() if test_file in with_intermittents},
         update_properties,
         full_update,
         disable_intermittent,
@@ -167,7 +178,7 @@ def update_results_per_engine(
         remove_intermittent=remove_intermittent,
     )
     yield from WPT_UPDATE_RESULTS(
-        {test_id: test_file for test_id, test_file in id_test_map.items() if test_file not in with_other_engines},
+        {test_id: test_file for test_id, test_file in id_test_map.items() if test_file not in with_intermittents},
         update_properties,
         full_update,
         disable_intermittent,
@@ -176,34 +187,46 @@ def update_results_per_engine(
     )
 
 
-def add_default_engine_results(id_test_map: dict) -> set:
+def add_default_engine_results(id_test_map: dict, update_properties: Any) -> set:
     """Gives every result of another engine a result of the default engine, from the current expectations,
-    unless the logs have one. Without it, an update from QuickJS logs alone would make the QuickJS results the
-    expectations of both engines. Returns the test files with results of another engine."""
+    unless the logs have one for the same configuration. Without it, an update from QuickJS logs alone would
+    make the QuickJS results the expectations of both engines. Returns the test files where results of both
+    engines meet intermittent or differing statuses of the default engine."""
+    properties, dependents = update_properties
+    keys = [key for key in [*properties, *(d for values in dependents.values() for d in values)] if key != JS_ENGINE]
+
+    def configuration(run_info: metadata.RunInfo) -> tuple:
+        return tuple(run_info.data.get(key) for key in keys)
+
     status = metadata.prop_intern.store("status")
-    with_other_engines = set()
+    with_intermittents = set()
     for test_file in set(id_test_map.values()):
         if not test_file.requires_update or test_file.item_type is None:
             continue
         test_cls = wpttest.manifest_test_cls[test_file.item_type]
-        manifests: dict[metadata.RunInfo, Any] = {}
+        manifests: dict[tuple, Any] = {}
         for test_id, subtests in test_file.data.items():
             for subtest_id, results in subtests.items():
                 result_cls = test_cls.subtest_result_cls if subtest_id is not None else test_cls.result_cls
                 if result_cls is None:
                     continue
-                run_infos = {run_info for prop, run_info, _ in results if prop == "status"}
-                for run_info in [item for item in run_infos if item.data.get(JS_ENGINE) != DEFAULT_JS_ENGINE]:
-                    with_other_engines.add(test_file)
-                    default_run_info = metadata.RunInfo({**run_info.data, JS_ENGINE: DEFAULT_JS_ENGINE})
-                    if default_run_info in run_infos:
+                statuses = [(run_info, value) for prop, run_info, value in results if prop == "status"]
+                others = [run_info for run_info, _ in statuses if run_info.data.get(JS_ENGINE) != DEFAULT_JS_ENGINE]
+                if not others:
+                    continue
+                defaults: dict[tuple, list] = {}
+                for run_info, value in statuses:
+                    if run_info.data.get(JS_ENGINE) == DEFAULT_JS_ENGINE:
+                        defaults.setdefault(configuration(run_info), []).append(value)
+                for run_info in others:
+                    if configuration(run_info) in defaults:
                         continue
-                    run_infos.add(default_run_info)
-                    if default_run_info not in manifests:
-                        manifests[default_run_info] = manifestexpected.get_manifest(
+                    default_run_info = metadata.RunInfo({**run_info.data, JS_ENGINE: DEFAULT_JS_ENGINE})
+                    if configuration(run_info) not in manifests:
+                        manifests[configuration(run_info)] = manifestexpected.get_manifest(
                             test_file.metadata_path, test_file.test_path, default_run_info.data
                         )
-                    manifest = manifests[default_run_info]
+                    manifest = manifests[configuration(run_info)]
                     node = manifest.get_test(get_test_name(test_id)) if manifest else None
                     if node is not None and subtest_id is not None:
                         node = node.get_subtest(subtest_id)
@@ -213,7 +236,12 @@ def add_default_engine_results(id_test_map: dict) -> set:
                         expected, known_intermittent = node.expected, node.known_intermittent
                     result = metadata.pack_result({"status": expected, "known_intermittent": known_intermittent})
                     results.append(status, metadata.run_info_intern.store(default_run_info), result)
-    return with_other_engines
+                    defaults[configuration(run_info)] = [result]
+                for values in defaults.values():
+                    unpacked = [metadata.unpack_result(value) for value in values]
+                    if len(set(unpacked)) > 1 or any(known_intermittent for _, known_intermittent in unpacked):
+                        with_intermittents.add(test_file)
+    return with_intermittents
 
 
 def run_update(**kwargs: Any) -> bool:

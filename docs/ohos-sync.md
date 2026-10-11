@@ -136,7 +136,8 @@ For each stop:
   pass. A stale copy still builds, because `[patch]` resolves to whatever is
   vendored, so check this whenever the pin moved, conflict or not.
 - QuickJS expectations (the `if js_engine == "quickjs"` conditions in
-  `tests/wpt/meta`): take upstream's side of the conflicting hunks; step 3
+  `tests/wpt/meta`, `tests/wpt/mozilla/meta` and `tests/wpt/webgl/meta`):
+  take upstream's side of the conflicting hunks; step 3
   regenerates the conditions.
 - Compile-check the crate(s) affected before continuing:
   `./mach check --ohos -p <crate>` (arkweb and other OHOS-only crates are
@@ -252,7 +253,8 @@ Mandatory:
    `./mach test-wpt --js-engine quickjs --log-raw <log>`. Update the
    expectations from it (`./mach update-wpt <run URL or log>`) and amend them
    into `wpt: Add the QuickJS expectations`. An update from QuickJS results
-   alone keeps the SpiderMonkey expectations.
+   alone keeps the SpiderMonkey expectations; `--full` needs the logs of both
+   engines.
 
    A local run also reports the host's flaky and environment-specific
    results. Rerun the tests with unexpected results three times with each
