@@ -37,7 +37,7 @@ from mach.decorators import (
 
 import servo.devtools_tests
 import servo.try_parser
-from servo.command_base import BuildType, CommandBase, call, check_call
+from servo.command_base import JS_ENGINES, BuildType, CommandBase, call, check_call
 from servo.platform.build_target import AndroidTarget, is_android, is_openharmony
 from servo.post_build_commands import ANDROID_APP_NAME, PostBuildCommands, shell_quote
 from servo.util import delete
@@ -483,6 +483,13 @@ class MachCommands(CommandBase):
         action="store_true",
         help="Update test expectations after test run",
     )
+    @CommandArgument(
+        "--js-engine",
+        default=None,
+        choices=JS_ENGINES,
+        help="The JavaScript engine of the binary, which the expectations can depend on. Defaults to js-engine "
+        "in .servobuild",
+    )
     # Keep `allow_target_configuration` above `common_command_arguments`: binary_selection requires the
     # target to be configured already.
     @CommandBase.allow_target_configuration
@@ -516,6 +523,7 @@ class MachCommands(CommandBase):
 
     @CommandBase.allow_target_configuration
     def _test_wpt(self, servo_binary: str, multiprocess: bool, **kwargs: Any) -> int:
+        kwargs["js_engine"] = self.configure_js_engine(kwargs.get("js_engine"))
         return_value = wpt.run.run_tests(servo_binary, multiprocess, **kwargs)
         return return_value if not kwargs["always_succeed"] else 0
 

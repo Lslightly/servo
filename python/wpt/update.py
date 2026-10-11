@@ -3,6 +3,7 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 # pylint: disable=missing-docstring
 
+import dataclasses
 import os
 import re
 import shutil
@@ -10,9 +11,12 @@ import subprocess
 import sys
 import tempfile
 from argparse import ArgumentParser, Namespace
+from collections.abc import Generator
 from typing import Any
 
+from wptrunner import manifestexpected, metadata, wpttest
 from wptrunner import wptcommandline  # noqa: F401
+from wptrunner.manifestupdate import get_test_name
 from wptrunner.update import WPTUpdate, setup_logging  # noqa: F401
 from wptrunner.update.base import exit_unclean  # noqa: F401
 
@@ -21,6 +25,14 @@ from . import WPT_PATH, manifestupdate
 TEST_ROOT = os.path.join(WPT_PATH, "tests")
 META_ROOTS = [os.path.join(WPT_PATH, "meta"), os.path.join(WPT_PATH, "meta-legacy")]
 GITHUB_ACTION_RUN_URL_REGEX = re.compile(r"github\.com\/(\w+\/\w+)\/actions\/runs\/(\d+)$")
+
+# The run-info property of the JavaScript engine, and the engine of the expectations without a condition on it.
+JS_ENGINE = "js_engine"
+DEFAULT_JS_ENGINE = "spidermonkey"
+
+# The wptrunner functions that `use_js_engine_property` wraps.
+WPT_UPDATE_RESULTS = metadata.update_results
+WPT_SUITE_START = metadata.ExpectedUpdater.suite_start
 
 
 def do_sync(**kwargs: str) -> int:
@@ -106,6 +118,7 @@ def update_tests(**kwargs: Any) -> int:
     kwargs["store_state"] = False
 
     wptcommandline.set_from_config(kwargs)
+    use_js_engine_property(kwargs)
     if hasattr(wptcommandline, "check_paths"):
         wptcommandline.check_paths(kwargs["test_paths"])
 
@@ -113,6 +126,93 @@ def update_tests(**kwargs: Any) -> int:
         return do_sync(**kwargs)
 
     return 0 if run_update(**kwargs) else 1
+
+
+def use_js_engine_property(kwargs: dict[str, Any]) -> None:
+    """Lets the metadata update write conditions on the JavaScript engine. Logs without the property are from
+    SpiderMonkey runs."""
+    product = kwargs["product"]
+    properties, dependents = product.update_properties
+    if JS_ENGINE not in properties:
+        kwargs["product"] = dataclasses.replace(product, update_properties=([*properties, JS_ENGINE], dependents))
+
+    if metadata.update_results is not update_results_per_engine:
+        metadata.update_results = update_results_per_engine
+        metadata.ExpectedUpdater.suite_start = suite_start_with_js_engine
+
+
+def suite_start_with_js_engine(self: metadata.ExpectedUpdater, data: dict[str, Any]) -> None:
+    data["run_info"].setdefault(JS_ENGINE, DEFAULT_JS_ENGINE)
+    WPT_SUITE_START(self, data)
+
+
+def update_results_per_engine(
+    id_test_map: dict,
+    update_properties: Any,
+    full_update: bool,
+    disable_intermittent: Any,
+    update_intermittent: bool,
+    remove_intermittent: bool,
+) -> Generator:
+    with_other_engines = add_default_engine_results(id_test_map)
+    # The files with results of several engines get conditions on `js_engine`, and the value of a condition is
+    # computed without the current one, which would drop its intermittent statuses unless they are updated.
+    yield from WPT_UPDATE_RESULTS(
+        {test_id: test_file for test_id, test_file in id_test_map.items() if test_file in with_other_engines},
+        update_properties,
+        full_update,
+        disable_intermittent,
+        update_intermittent=True,
+        remove_intermittent=remove_intermittent,
+    )
+    yield from WPT_UPDATE_RESULTS(
+        {test_id: test_file for test_id, test_file in id_test_map.items() if test_file not in with_other_engines},
+        update_properties,
+        full_update,
+        disable_intermittent,
+        update_intermittent=update_intermittent,
+        remove_intermittent=remove_intermittent,
+    )
+
+
+def add_default_engine_results(id_test_map: dict) -> set:
+    """Gives every result of another engine a result of the default engine, from the current expectations,
+    unless the logs have one. Without it, an update from QuickJS logs alone would make the QuickJS results the
+    expectations of both engines. Returns the test files with results of another engine."""
+    status = metadata.prop_intern.store("status")
+    with_other_engines = set()
+    for test_file in set(id_test_map.values()):
+        if not test_file.requires_update or test_file.item_type is None:
+            continue
+        test_cls = wpttest.manifest_test_cls[test_file.item_type]
+        manifests: dict[metadata.RunInfo, Any] = {}
+        for test_id, subtests in test_file.data.items():
+            for subtest_id, results in subtests.items():
+                result_cls = test_cls.subtest_result_cls if subtest_id is not None else test_cls.result_cls
+                if result_cls is None:
+                    continue
+                run_infos = {run_info for prop, run_info, _ in results if prop == "status"}
+                for run_info in [item for item in run_infos if item.data.get(JS_ENGINE) != DEFAULT_JS_ENGINE]:
+                    with_other_engines.add(test_file)
+                    default_run_info = metadata.RunInfo({**run_info.data, JS_ENGINE: DEFAULT_JS_ENGINE})
+                    if default_run_info in run_infos:
+                        continue
+                    run_infos.add(default_run_info)
+                    if default_run_info not in manifests:
+                        manifests[default_run_info] = manifestexpected.get_manifest(
+                            test_file.metadata_path, test_file.test_path, default_run_info.data
+                        )
+                    manifest = manifests[default_run_info]
+                    node = manifest.get_test(get_test_name(test_id)) if manifest else None
+                    if node is not None and subtest_id is not None:
+                        node = node.get_subtest(subtest_id)
+                    # pyrefly: ignore[missing-attribute]
+                    expected, known_intermittent = result_cls.default_expected, []
+                    if node is not None and node.has_key("expected"):
+                        expected, known_intermittent = node.expected, node.known_intermittent
+                    result = metadata.pack_result({"status": expected, "known_intermittent": known_intermittent})
+                    results.append(status, metadata.run_info_intern.store(default_run_info), result)
+    return with_other_engines
 
 
 def run_update(**kwargs: Any) -> bool:
