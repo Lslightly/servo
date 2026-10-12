@@ -28,6 +28,7 @@ use crate::running_app_state::RunningAppState;
 use crate::window::{PlatformWindow, TopLevelWebViewCreationRequest};
 
 pub(crate) fn main() {
+    crate::crash_handler::install();
     init_logging();
     panic::set_hook(Box::new(crate::panic_hook::panic_hook));
     crate::init_crypto();
