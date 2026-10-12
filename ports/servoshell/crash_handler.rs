@@ -5,10 +5,7 @@
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
 pub fn install() {}
 
-#[cfg(any(
-    target_os = "macos",
-    all(target_os = "linux", not(target_env = "ohos"))
-))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn install() {
     use std::io::Write;
     use std::sync::atomic;
@@ -48,6 +45,7 @@ pub fn install() {
         raise_signal_or_exit_with_error(siginfo.si_signo);
     }
 
+    #[cfg(not(target_env = "ohos"))]
     unsafe {
         signal_hook_registry::register_unchecked(libc::SIGSEGV, handler)
             .expect("Could not register SIGSEGV handler");
@@ -57,6 +55,32 @@ pub fn install() {
             .expect("Could not register SIGIOT handler");
         signal_hook_registry::register_unchecked(libc::SIGBUS, handler)
             .expect("Could not register SIGBUS handler");
+    }
+
+    // Before `main`, OpenHarmony installs a handler that ends the process, which
+    // `signal_hook_registry` would call before `handler`, so replace it instead. The system's
+    // crash dump handler still runs first, since musl's signal chain calls it before any
+    // handler set with `sigaction`.
+    #[cfg(target_env = "ohos")]
+    {
+        extern "C" fn ohos_handler(_: libc::c_int, siginfo: *mut siginfo_t, _: *mut libc::c_void) {
+            // SAFETY: The kernel passes a valid `siginfo_t` to `SA_SIGINFO` handlers.
+            handler(unsafe { &*siginfo });
+        }
+
+        for signal in [libc::SIGSEGV, libc::SIGILL, libc::SIGIOT, libc::SIGBUS] {
+            // SAFETY: `sigaction` is plain old data, for which all zeroes are valid.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = ohos_handler as *const () as libc::sighandler_t;
+            action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            // SAFETY: `action` is initialized and `handler` is the same that the other
+            // platforms register.
+            let result = unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };
+            assert_eq!(
+                result, 0,
+                "Could not register the handler of signal {signal}"
+            );
+        }
     }
 }
 
