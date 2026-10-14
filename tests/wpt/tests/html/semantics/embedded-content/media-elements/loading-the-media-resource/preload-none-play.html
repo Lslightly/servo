@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>play() plays a media element with preload=none</title>
+<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#concept-media-load-resource">
+<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#attr-media-preload">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script src="/common/media.js"></script>
+<body>
+<script>
+// A user agent may suspend the fetch of a media resource with preload=none until playback is
+// requested, but then it has to fetch the resource and play it.
+
+// The tests run in parallel, so that a media element that never plays only times out its own test.
+function preload_none_test(setup, description) {
+  async_test(t => {
+    const audio = document.createElement("audio");
+    t.add_cleanup(() => audio.pause());
+    audio.preload = "none";
+    const play = t.step_func(() => {
+      audio.play().then(t.step_func_done(() => {
+        assert_false(audio.paused, "paused");
+        assert_greater_than_equal(audio.readyState, audio.HAVE_FUTURE_DATA, "readyState");
+      }), t.unreached_func("play() rejected"));
+    });
+    // Only wait when the setup has to, so that play() can run before resource selection does.
+    const waiting = setup(audio, getAudioURI("/media/sound_5"));
+    if (waiting) {
+      waiting.then(play);
+    } else {
+      play();
+    }
+  }, description);
+}
+
+preload_none_test((audio, src) => {
+  audio.src = src;
+}, "play() right after setting src");
+
+preload_none_test((audio, src) => {
+  audio.src = src;
+  audio.load();
+}, "play() right after load()");
+
+preload_none_test((audio, src) => {
+  audio.src = src;
+  return new Promise(resolve => audio.addEventListener("suspend", resolve, { once: true }));
+}, "play() after the suspend event");
+
+preload_none_test((audio, src) => {
+  audio.src = src;
+  audio.pause();
+  return new Promise(resolve => audio.addEventListener("suspend", resolve, { once: true }));
+}, "play() after pause() and the suspend event");
+
+preload_none_test((audio, src) => {
+  const source = document.createElement("source");
+  source.src = src;
+  audio.appendChild(source);
+  return new Promise(resolve => audio.addEventListener("suspend", resolve, { once: true }));
+}, "play() with a source element after the suspend event");
+
+preload_none_test((audio, src) => {
+  const unsupported = document.createElement("source");
+  unsupported.type = "audio/x-unsupported";
+  unsupported.src = src;
+  const source = document.createElement("source");
+  source.src = src;
+  audio.append(unsupported, source);
+  return new Promise(resolve => audio.addEventListener("suspend", resolve, { once: true }));
+}, "play() with an unsupported and a supported source element after the suspend event");
+</script>
+</body>
