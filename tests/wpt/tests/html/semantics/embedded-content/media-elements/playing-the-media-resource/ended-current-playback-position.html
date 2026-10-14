@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>The current playback position stays at the end once playback has ended</title>
+<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#reaches-the-end">
+<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#ended-playback">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script src="/common/media.js"></script>
+<body>
+<script>
+// When the current playback position reaches the end of the media resource, the element pauses,
+// fires pause and then ended. Nothing moves the position away from the end afterwards, so it has
+// ended playback until something seeks.
+
+function end_of_playback_test(tagName, src) {
+  promise_test(async t => {
+    const media = document.createElement(tagName);
+    const events = [];
+    for (const type of ["pause", "ended"]) {
+      media.addEventListener(type, () => events.push(type));
+    }
+    const ended = new Promise(resolve => media.addEventListener("ended", resolve, { once: true }));
+    media.src = src;
+    await media.play();
+    await ended;
+
+    assert_array_equals(events, ["pause", "ended"], "events");
+    assert_true(media.paused, "paused when ended fires");
+    assert_true(media.ended, "ended when ended fires");
+    assert_equals(media.currentTime, media.duration, "currentTime when ended fires");
+
+    await new Promise(resolve => t.step_timeout(resolve, 250));
+    assert_true(media.ended, "ended later");
+    assert_equals(media.currentTime, media.duration, "currentTime later");
+  }, `${tagName} stays at the end of the media resource once playback has ended`);
+}
+
+end_of_playback_test("audio", getAudioURI("/media/sound_0"));
+end_of_playback_test("video", getVideoURI("/media/test-1s"));
+</script>
+</body>
