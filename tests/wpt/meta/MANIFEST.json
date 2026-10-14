@@ -1315820,6 +1315820,15 @@
           {}
          ]
         ],
+        "gc-unreferenced-media-element.html": [
+         "461e7e40b758993c25816a1838471f660e192f37",
+         [
+          null,
+          {
+           "timeout": "long"
+          }
+         ]
+        ],
         "loop-from-ended.tentative.html": [
          "d099a8a0f8d3f41f08dd825fd42b1b1947e15956",
          [

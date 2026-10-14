@@ -181,6 +181,7 @@ use crate::dom::html::htmlheadelement::HTMLHeadElement;
 use crate::dom::html::htmlhtmlelement::HTMLHtmlElement;
 use crate::dom::html::htmliframeelement::HTMLIFrameElement;
 use crate::dom::html::htmlimageelement::HTMLImageElement;
+use crate::dom::html::htmlmediaelement::HTMLMediaElement;
 use crate::dom::html::htmlscriptelement::{HTMLScriptElement, ScriptResult};
 use crate::dom::html::htmltitleelement::HTMLTitleElement;
 use crate::dom::htmldetailselement::DetailsNameGroups;
@@ -620,6 +621,10 @@ pub(crate) struct Document {
     /// where `id` needs to match any of the registered ShadowRoots
     /// hosting the media controls UI.
     media_controls: DomRefCell<HashMap<String, Dom<ShadowRoot>>>,
+    /// Media elements that may still play or fire events, which are kept alive as long as this
+    /// document is, even if script holds no reference to them.
+    /// <https://html.spec.whatwg.org/multipage/#playing-the-media-resource>
+    media_elements_with_pending_activity: DomRefCell<Vec<Dom<HTMLMediaElement>>>,
     /// A set of dirty HTML canvas elements that need their WebRender images updated the
     /// next time the rendering is updated.
     dirty_canvases: DomRefCell<Vec<Dom<HTMLCanvasElement>>>,
@@ -3303,6 +3308,21 @@ impl Document {
         );
     }
 
+    pub(crate) fn register_media_element_with_pending_activity(&self, element: &HTMLMediaElement) {
+        self.media_elements_with_pending_activity
+            .borrow_mut()
+            .push(Dom::from_ref(element));
+    }
+
+    pub(crate) fn unregister_media_element_with_pending_activity(
+        &self,
+        element: &HTMLMediaElement,
+    ) {
+        self.media_elements_with_pending_activity
+            .borrow_mut()
+            .retain(|registered| **registered != *element);
+    }
+
     pub(crate) fn mark_canvas_as_dirty(&self, canvas: &Dom<HTMLCanvasElement>) {
         let mut dirty_canvases = self.dirty_canvases.borrow_mut();
         if dirty_canvases
@@ -4312,6 +4332,7 @@ impl Document {
             shadow_roots: Default::default(),
             shadow_roots_styles_changed: Cell::new(false),
             media_controls: DomRefCell::new(HashMap::new()),
+            media_elements_with_pending_activity: Default::default(),
             dirty_canvases: DomRefCell::new(Default::default()),
             has_pending_animated_image_update: Cell::new(false),
             selection: MutNullableDom::new(None),
