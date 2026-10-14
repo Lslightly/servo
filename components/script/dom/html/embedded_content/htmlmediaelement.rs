@@ -2441,9 +2441,23 @@ impl HTMLMediaElement {
             return;
         }
 
+        // The media engine can signal the end of the stream before it reports a position at the
+        // end of the media resource in the direction of playback.
         match self.direction_of_playback() {
-            PlaybackDirection::Forwards => self.end_of_playback_in_forwards_direction(cx),
-            PlaybackDirection::Backwards => self.end_of_playback_in_backwards_direction(),
+            PlaybackDirection::Forwards => {
+                let duration = self.duration.get();
+                if duration.is_finite() && self.current_playback_position.get() < duration {
+                    self.playback_position_changed(cx, duration);
+                }
+                self.end_of_playback_in_forwards_direction(cx)
+            },
+            PlaybackDirection::Backwards => {
+                let earliest_possible_position = self.earliest_possible_position();
+                if self.current_playback_position.get() > earliest_possible_position {
+                    self.playback_position_changed(cx, earliest_possible_position);
+                }
+                self.end_of_playback_in_backwards_direction()
+            },
         }
     }
 
