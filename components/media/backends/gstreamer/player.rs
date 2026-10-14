@@ -130,6 +130,9 @@ struct PlayerInner {
     input_size: u64,
     seekable: bool,
     play_state: gstreamer_play::PlayState,
+    /// Whether GstPlay reached the end of the stream and was not played or sought since. Pausing
+    /// GstPlay in that state rewinds it to the start.
+    at_end_of_stream: Cell<bool>,
     paused: Cell<bool>,
     can_resume: Cell<bool>,
     playback_rate: Cell<f64>,
@@ -210,12 +213,14 @@ impl PlayerInner {
 
         self.paused.set(false);
         self.can_resume.set(false);
+        self.at_end_of_stream.set(false);
         self.player.play();
         Ok(())
     }
 
     pub fn stop(&mut self) -> Result<(), PlayerError> {
         self.player.stop();
+        self.at_end_of_stream.set(false);
         self.paused.set(true);
         self.can_resume.set(false);
         self.last_metadata = None;
@@ -229,6 +234,14 @@ impl PlayerInner {
         }
 
         self.paused.set(true);
+
+        // Playback has stopped at the end of the stream already, and the position has to stay
+        // there, so don't let GstPlay rewind. The next seek pauses it.
+        if self.at_end_of_stream.get() {
+            self.can_resume.set(false);
+            return Ok(());
+        }
+
         self.can_resume.set(true);
         self.player.pause();
         Ok(())
@@ -268,6 +281,10 @@ impl PlayerInner {
         {
             gstreamer::warning!(self.cat, obj = &self.player, "Trying to seek out of range");
             return Err(PlayerError::SeekOutOfRange);
+        }
+
+        if self.at_end_of_stream.replace(false) && self.paused.get() {
+            self.player.pause();
         }
 
         let time = time * 1_000_000_000.;
@@ -643,6 +660,7 @@ impl GStreamerPlayer {
             input_size: 0,
             seekable: true,
             play_state: gstreamer_play::PlayState::Stopped,
+            at_end_of_stream: Cell::new(false),
             paused: Cell::new(DEFAULT_PAUSED),
             can_resume: Cell::new(DEFAULT_CAN_RESUME),
             playback_rate: Cell::new(DEFAULT_PLAYBACK_RATE),
@@ -656,9 +674,11 @@ impl GStreamerPlayer {
 
         let inner = self.inner.borrow();
         let inner = inner.as_ref().unwrap();
+        let inner_clone = inner.clone();
         let observer = self.observer.clone();
         // Handle `end-of-stream` signal.
         signal_adapter.connect_end_of_stream(move |_| {
+            inner_clone.lock().unwrap().at_end_of_stream.set(true);
             let _ = notify!(observer, PlayerEvent::EndOfStream);
         });
 
@@ -672,7 +692,12 @@ impl GStreamerPlayer {
         let observer = self.observer.clone();
         // Handle `state-changed` signal.
         signal_adapter.connect_state_changed(move |_, play_state| {
-            inner_clone.lock().unwrap().play_state = play_state;
+            let mut inner = inner_clone.lock().unwrap();
+            inner.play_state = play_state;
+            if play_state == gstreamer_play::PlayState::Playing {
+                inner.at_end_of_stream.set(false);
+            }
+            drop(inner);
 
             let state = match play_state {
                 gstreamer_play::PlayState::Buffering => Some(PlaybackState::Buffering),

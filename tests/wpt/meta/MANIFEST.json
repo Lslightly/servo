@@ -1315813,6 +1315813,13 @@
         ]
        ],
        "playing-the-media-resource": {
+        "ended-current-playback-position.html": [
+         "d3cde36c3efae7ad458ae930bd5e35580b21e016",
+         [
+          null,
+          {}
+         ]
+        ],
         "fragmented-mp4-end.html": [
          "fafb49768cf7652a999c256a9b8e15268bfba5ad",
          [
