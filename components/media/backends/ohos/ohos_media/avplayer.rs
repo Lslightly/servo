@@ -54,14 +54,16 @@ pub struct OhosPlayer {
     frame_available_callback_closure: Option<*mut Box<dyn Fn()>>,
     native_window: Option<*mut OHNativeWindow>,
     has_set_source_size: bool,
-    has_set_window: bool,
+    /// Whether the player renders video, in which case it only prepares once its window is set.
+    has_video_output: bool,
+    has_prepared: bool,
     volume: f64,
     playback_rate: f64,
     state: AVPlayerState,
 }
 
 impl OhosPlayer {
-    pub fn new() -> Self {
+    pub fn new(has_video_output: bool) -> Self {
         debug!("Creating OHOS Player!");
         OhosPlayer {
             native_image: None,
@@ -71,7 +73,8 @@ impl OhosPlayer {
             frame_available_callback_closure: None,
             native_window: None,
             has_set_source_size: false,
-            has_set_window: false,
+            has_video_output,
+            has_prepared: false,
             volume: 1.0,
             playback_rate: 1.0,
             state: AVPlayerState::AV_IDLE,
@@ -90,14 +93,17 @@ impl OhosPlayer {
     /// 2. after running external initialize step.
     ///    e.g. setup_window_buffer_listener
     pub fn initialize_check_state_action(&mut self) {
-        if self.state == AVPlayerState::AV_INITIALIZED &&
-            self.native_window.is_some() &&
-            !self.has_set_window
-        {
-            self.has_set_window = true;
-            self.set_window_to_player();
-            self.prepare(); // only prepare after setting window.
+        if self.state != AVPlayerState::AV_INITIALIZED || self.has_prepared {
+            return;
         }
+        if self.has_video_output {
+            if self.native_window.is_none() {
+                return;
+            }
+            self.set_window_to_player();
+        }
+        self.has_prepared = true;
+        self.prepare(); // only prepare after setting window, if any.
     }
 
     fn set_window_to_player(&mut self) {

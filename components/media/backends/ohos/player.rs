@@ -90,7 +90,7 @@ impl OhosAvPlayer {
         >,
         backend_chan: Arc<Mutex<mpsc::Sender<BackendMsg>>>,
     ) -> OhosAvPlayer {
-        let player_inner = Arc::new(Mutex::new(OhosPlayerInner::new()));
+        let player_inner = Arc::new(Mutex::new(OhosPlayerInner::new(video_renderer.is_some())));
         let event_sender = Arc::new(Mutex::new(sender));
         let video_sink = video_renderer.clone().map(|v| {
             Arc::new(Mutex::new(VideoSink::new(
