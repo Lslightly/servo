@@ -1,7 +1,11 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};
+use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use libc::pollfd;
 use log::{debug, warn};
@@ -24,14 +28,21 @@ use ohos_window_sys::native_image::{
     OH_NativeImage_SetOnFrameAvailableListener, OH_OnFrameAvailableListener,
 };
 use ohos_window_sys::native_window::{
-    OH_NativeWindow_DestroyNativeWindow, OH_NativeWindow_GetBufferHandleFromNative,
-    OH_NativeWindow_NativeObjectReference, OH_NativeWindow_NativeObjectUnreference,
+    OH_NativeWindow_GetBufferHandleFromNative, OH_NativeWindow_NativeObjectReference,
+    OH_NativeWindow_NativeObjectUnreference,
 };
 
 #[cfg(not(sdk_api_21))]
 use crate::ohos_media::dummy_source::MediaSourceWrapper;
 #[cfg(sdk_api_21)]
 use crate::ohos_media::source::MediaSourceWrapper;
+
+/// The frame-available listeners of the native images, by id. A native image can still call its
+/// listener after `OH_NativeImage_Destroy` returns, so it gets the id of the listener rather than a
+/// pointer to it.
+static FRAME_AVAILABLE_LISTENERS: LazyLock<Mutex<HashMap<usize, Box<dyn Fn() + Send>>>> =
+    LazyLock::new(Default::default);
+static NEXT_FRAME_AVAILABLE_LISTENER_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[repr(C)]
 #[derive(Debug)]
@@ -52,7 +63,7 @@ pub struct OhosPlayer {
     media_data_source: Option<MediaSourceWrapper>,
     event_info_callback_closure: Option<*mut Box<dyn Fn(AVPlayerOnInfoType, *mut OH_AVFormat)>>,
     error_callback_closure: Option<*mut Box<dyn Fn(i32, String)>>,
-    frame_available_callback_closure: Option<*mut Box<dyn Fn()>>,
+    frame_available_listener_id: Option<usize>,
     native_window: Option<*mut OHNativeWindow>,
     has_set_source_size: bool,
     /// Whether the player renders video, in which case it only prepares once its window is set.
@@ -72,7 +83,7 @@ impl OhosPlayer {
             media_data_source: None,
             event_info_callback_closure: None,
             error_callback_closure: None,
-            frame_available_callback_closure: None,
+            frame_available_listener_id: None,
             native_window: None,
             has_set_source_size: false,
             has_video_output,
@@ -236,6 +247,20 @@ impl OhosPlayer {
         }
     }
 
+    /// Releases AVPlayer, which then calls no more callbacks. Releasing waits for the running
+    /// callbacks and calls the info callback, and both can lock `this`, so `this` must not be
+    /// locked by the caller.
+    pub fn release(this: &Mutex<Self>) {
+        let ohos_av_player =
+            std::mem::replace(&mut this.lock().unwrap().ohos_av_player, ptr::null_mut());
+        if !ohos_av_player.is_null() {
+            debug!("OH_AVPlayer_Release!");
+            unsafe {
+                OH_AVPlayer_Release(ohos_av_player);
+            }
+        }
+    }
+
     pub fn prepare(&mut self) {
         unsafe {
             debug!("OH_AVPlayer Prepare Called!");
@@ -331,11 +356,14 @@ impl OhosPlayer {
 
     /// External Initialization step.
     pub fn setup_window_buffer_listener<F: Fn() + Send + 'static>(&mut self, f: F) {
-        let f: Box<dyn Fn()> = Box::new(f);
-        let f: Box<Box<dyn Fn()>> = Box::new(f);
+        let id = NEXT_FRAME_AVAILABLE_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
+        FRAME_AVAILABLE_LISTENERS
+            .lock()
+            .unwrap()
+            .insert(id, Box::new(f));
         (
             self.native_image,
-            self.frame_available_callback_closure,
+            self.frame_available_listener_id,
             self.native_window,
         ) = unsafe {
             let native_image = OH_ConsumerSurface_Create();
@@ -348,17 +376,17 @@ impl OhosPlayer {
             debug!("Set consumer surface default usage: {}", ret);
 
             extern "C" fn frame_available_cb(context: *mut c_void) {
-                assert!(
-                    !context.is_null(),
-                    "frame_available_cb: context must not be null"
-                );
-                let f = unsafe { &*(context as *mut Box<dyn Fn()>) };
-                f();
+                if let Some(f) = FRAME_AVAILABLE_LISTENERS
+                    .lock()
+                    .unwrap()
+                    .get(&(context as usize))
+                {
+                    f();
+                }
             }
 
-            let raw_ptr_f = Box::into_raw(f);
             let listener = OH_OnFrameAvailableListener {
-                context: raw_ptr_f as *mut c_void,
+                context: id as *mut c_void,
                 onFrameAvailable: Some(frame_available_cb),
             };
             let res = OH_NativeImage_SetOnFrameAvailableListener(native_image, listener);
@@ -370,7 +398,7 @@ impl OhosPlayer {
                 "Native window acquired from native window {:p}",
                 native_window
             );
-            (Some(native_image), Some(raw_ptr_f), Some(native_window))
+            (Some(native_image), Some(id), Some(native_window))
         };
         self.initialize_check_state_action();
     }
@@ -450,26 +478,23 @@ impl OhosPlayer {
 
 impl Drop for OhosPlayer {
     fn drop(&mut self) {
+        // Releasing AVPlayer here could deadlock on a thread that runs one of its callbacks, so its
+        // owner releases it first, which waits for the running callbacks, and then frees them.
+        debug_assert!(self.ohos_av_player.is_null(), "AVPlayer was not released");
         unsafe {
-            if let Some(closure) = self.frame_available_callback_closure {
-                let box_closure = Box::from_raw(closure);
-                drop(box_closure);
-            }
             if let Some(closure) = self.event_info_callback_closure {
-                let box_closure = Box::from_raw(closure);
-                drop(box_closure);
+                drop(Box::from_raw(closure));
             }
-            debug!("Releasing AVPlayer because drop is called!");
-            OH_AVPlayer_Release(self.ohos_av_player);
             if let Some(closure) = self.error_callback_closure {
                 drop(Box::from_raw(closure));
             }
+            // This also destroys the native window, which the native image owns.
             if let Some(mut native_image) = self.native_image {
                 OH_NativeImage_Destroy(&mut native_image);
             }
-            if let Some(native_window) = self.native_window {
-                OH_NativeWindow_DestroyNativeWindow(native_window);
-            }
+        }
+        if let Some(id) = self.frame_available_listener_id {
+            FRAME_AVAILABLE_LISTENERS.lock().unwrap().remove(&id);
         }
     }
 }
