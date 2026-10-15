@@ -100,6 +100,8 @@ those scripts (they need network access). `check_stack.py` runs each with
 74. `media (ohos): Report AVPlayer errors to the media element` — B · manual · watch: components/media/player/lib.rs components/script/dom/html/embedded_content/htmlmediaelement.rs
 75. `media (ohos): Release AVPlayer when its player is dropped` — B · manual · watch: components/media/player/lib.rs components/script/dom/html/embedded_content/htmlmediaelement.rs
 76. `docs: record patches 68 to 76 in the stack manifest` — B · none · watch: -
+77. `media (ohos): Slide the playback buffer with the reads of AVPlayer` — B · manual · watch: components/media/player/lib.rs components/script/dom/html/embedded_content/htmlmediaelement.rs
+78. `docs: record patches 77 to 78 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
