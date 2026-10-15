@@ -5,7 +5,7 @@
 use std::cell::Cell;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time;
 
 use crossbeam_channel::Sender;
@@ -74,6 +74,12 @@ pub struct OhosAvPlayer {
     /// Whether AVPlayer reported an error, after which its info events are ignored: the player
     /// can still change state, for example to paused, which must not raise the ready state.
     errored: Arc<AtomicBool>,
+    /// Whether this player is being dropped, after which the media element no longer answers
+    /// SeekData events.
+    released: Arc<AtomicBool>,
+    /// The sender of the channel on which reads wait for the media element to answer a SeekData
+    /// event.
+    seek_lock: Option<SeekLock>,
 }
 
 // Procedure for setting up AVPlayer, state change condition:
@@ -124,14 +130,18 @@ impl OhosAvPlayer {
             }))),
             state_manager: Arc::new(Mutex::new(StateManager::new())),
             errored: Arc::new(AtomicBool::new(false)),
+            released: Arc::new(AtomicBool::new(false)),
+            seek_lock: None,
         }
     }
 
     pub fn setup_info_event(&mut self) {
         let sender_clone = self.event_sender.clone();
-        let player_inner_clone = self.player_inner.clone();
+        // The closure is owned by the AVPlayer wrapper, so it must not keep the wrapper or the
+        // video sink, which owns another reference to the wrapper, alive.
+        let player_inner_weak = Arc::downgrade(&self.player_inner);
         let state_manager_clone = self.state_manager.clone();
-        let video_sink_clone = self.video_sink.as_ref().map(|v| v.clone());
+        let video_sink_weak = self.video_sink.as_ref().map(Arc::downgrade);
         let metadata_clone = self.last_metadata.clone();
         let errored_clone = self.errored.clone();
 
@@ -166,8 +176,10 @@ impl OhosAvPlayer {
                         match av_player_state {
                             AVPlayerState::AV_INITIALIZED => {
                                 debug!("Setup Video Sink");
-                                if let Some(ref video_sink_clone) = video_sink_clone {
-                                    video_sink_clone.lock().unwrap().setup(); // TODO: Hide internal state machine
+                                if let Some(video_sink) =
+                                    video_sink_weak.as_ref().and_then(Weak::upgrade)
+                                {
+                                    video_sink.lock().unwrap().setup(); // TODO: Hide internal state machine
                                 }
                             },
                             AVPlayerState::AV_PREPARED => {
@@ -202,14 +214,14 @@ impl OhosAvPlayer {
                                     "AVPlayer entered its error state".to_owned(),
                                 ));
                             },
+                            AVPlayerState::AV_RELEASED => {},
                             _ => {
                                 warn!("Unhandled State: {:?}", av_player_state);
                             },
                         }
-                        player_inner_clone
-                            .lock()
-                            .unwrap()
-                            .set_state(av_player_state);
+                        if let Some(player_inner) = player_inner_weak.upgrade() {
+                            player_inner.lock().unwrap().set_state(av_player_state);
+                        }
                     },
                     AVPlayerOnInfoType::AV_INFO_TYPE_RESOLUTION_CHANGE => {
                         let mut width = -1;
@@ -351,13 +363,23 @@ impl OhosAvPlayer {
     pub fn setup_data_source(&mut self) {
         let sender_clone = self.event_sender.clone();
         let sender_clone_clone = self.event_sender.clone();
-        let seek_channel = Arc::new(Mutex::new(SeekChannel::new()));
+        let released_clone = self.released.clone();
+        let seek_channel = SeekChannel::new();
+        self.seek_lock = Some(seek_channel.sender());
+        let seek_channel = Arc::new(Mutex::new(seek_channel));
         let seekdata_send_closure = move |pos: u64| {
-            let _ = sender_clone.lock().unwrap().send(PlayerEvent::SeekData(
-                pos,
-                seek_channel.lock().unwrap().sender(),
-            ));
-            let (ret, ack_channel) = seek_channel.lock().unwrap().wait();
+            // Checking whether the player is released under the lock that waiting holds makes sure
+            // that the answer that releasing sends reaches the only read that can still wait.
+            let seek_channel = seek_channel.lock().unwrap();
+            if released_clone.load(Ordering::SeqCst) {
+                return false;
+            }
+            let _ = sender_clone
+                .lock()
+                .unwrap()
+                .send(PlayerEvent::SeekData(pos, seek_channel.sender()));
+            let (ret, ack_channel) = seek_channel.wait();
+            drop(seek_channel);
             let _ = ack_channel.send(());
             debug!("Seek Initiated! :{}", pos);
             let _ = sender_clone.lock().unwrap().send(PlayerEvent::NeedData);
@@ -410,6 +432,21 @@ impl SeekChannel {
 impl Drop for OhosAvPlayer {
     fn drop(&mut self) {
         debug!("Ohos Dropping");
+        // Releasing may wait for a pending read, and a read that waits for the answer to its
+        // SeekData event would wait forever, as the media element ignores the events of a player
+        // it dropped, so answer it here.
+        self.released.store(true, Ordering::SeqCst);
+        if let Some(seek_lock) = &self.seek_lock {
+            match channel() {
+                Some((ack_sender, _)) => {
+                    let _ = seek_lock.lock_channel.send((false, ack_sender));
+                },
+                None => {
+                    warn!("Could not answer a pending SeekData event before releasing AVPlayer")
+                },
+            }
+        }
+        OhosPlayerInner::release(&self.player_inner);
         let (sender, _) = std::sync::mpsc::channel::<()>();
         let _ = self
             .backend_chan
