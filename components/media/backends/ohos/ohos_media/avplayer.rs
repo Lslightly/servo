@@ -1,16 +1,16 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-use std::ffi::c_void;
+use std::ffi::{CStr, c_char, c_void};
 
 use libc::pollfd;
 use log::{debug, warn};
 use ohos_media_sys::avformat::OH_AVFormat;
 use ohos_media_sys::avplayer::{
     OH_AVPlayer_Create, OH_AVPlayer_Pause, OH_AVPlayer_Play, OH_AVPlayer_Prepare,
-    OH_AVPlayer_Release, OH_AVPlayer_Seek, OH_AVPlayer_SetOnInfoCallback,
-    OH_AVPlayer_SetPlaybackSpeed, OH_AVPlayer_SetVideoSurface, OH_AVPlayer_SetVolume,
-    OH_AVPlayer_Stop,
+    OH_AVPlayer_Release, OH_AVPlayer_Seek, OH_AVPlayer_SetOnErrorCallback,
+    OH_AVPlayer_SetOnInfoCallback, OH_AVPlayer_SetPlaybackSpeed, OH_AVPlayer_SetVideoSurface,
+    OH_AVPlayer_SetVolume, OH_AVPlayer_Stop,
 };
 use ohos_media_sys::avplayer_base::{
     AVPlaybackSpeed, AVPlayerOnInfoType, AVPlayerSeekMode, AVPlayerState, OH_AVPlayer,
@@ -51,6 +51,7 @@ pub struct OhosPlayer {
     ohos_av_player: *mut OH_AVPlayer,
     media_data_source: Option<MediaSourceWrapper>,
     event_info_callback_closure: Option<*mut Box<dyn Fn(AVPlayerOnInfoType, *mut OH_AVFormat)>>,
+    error_callback_closure: Option<*mut Box<dyn Fn(i32, String)>>,
     frame_available_callback_closure: Option<*mut Box<dyn Fn()>>,
     native_window: Option<*mut OHNativeWindow>,
     has_set_source_size: bool,
@@ -70,6 +71,7 @@ impl OhosPlayer {
             ohos_av_player: unsafe { OH_AVPlayer_Create() },
             media_data_source: None,
             event_info_callback_closure: None,
+            error_callback_closure: None,
             frame_available_callback_closure: None,
             native_window: None,
             has_set_source_size: false,
@@ -291,6 +293,42 @@ impl OhosPlayer {
         self.event_info_callback_closure = Some(raw_ptr_f);
     }
 
+    /// Calls `f` with the error code and message when AVPlayer reports an error.
+    pub fn connect_error_callback<F>(&mut self, f: F)
+    where
+        F: Fn(i32, String) + Send + 'static,
+    {
+        extern "C" fn on_error(
+            _player: *mut OH_AVPlayer,
+            error_code: i32,
+            error_msg: *const c_char,
+            user_data: *mut c_void,
+        ) {
+            assert!(!user_data.is_null(), "on_error: user_data must not be null");
+            let f = unsafe { &*(user_data as *const Box<dyn Fn(i32, String)>) };
+            let message = if error_msg.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(error_msg) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            f(error_code, message);
+        }
+
+        let f: Box<dyn Fn(i32, String)> = Box::new(f);
+        let raw_ptr_f = Box::into_raw(Box::new(f));
+        let ret = unsafe {
+            OH_AVPlayer_SetOnErrorCallback(
+                self.ohos_av_player,
+                Some(on_error),
+                raw_ptr_f as *mut c_void,
+            )
+        };
+        debug!("OH AVPlayer Set Error Callback: {:?}", ret);
+        self.error_callback_closure = Some(raw_ptr_f);
+    }
+
     /// External Initialization step.
     pub fn setup_window_buffer_listener<F: Fn() + Send + 'static>(&mut self, f: F) {
         let f: Box<dyn Fn()> = Box::new(f);
@@ -423,6 +461,9 @@ impl Drop for OhosPlayer {
             }
             debug!("Releasing AVPlayer because drop is called!");
             OH_AVPlayer_Release(self.ohos_av_player);
+            if let Some(closure) = self.error_callback_closure {
+                drop(Box::from_raw(closure));
+            }
             if let Some(mut native_image) = self.native_image {
                 OH_NativeImage_Destroy(&mut native_image);
             }

@@ -4,11 +4,13 @@
 
 use std::cell::Cell;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time;
 
 use crossbeam_channel::Sender;
 use log::{debug, error, warn};
+use ohos_media_sys::averrors::OH_AVErrCode;
 use ohos_media_sys::avformat::{
     OH_AVFormat, OH_AVFormat_GetFloatValue, OH_AVFormat_GetIntValue, OH_AVFormat_GetLongValue,
 };
@@ -69,6 +71,9 @@ pub struct OhosAvPlayer {
     backend_chan: Arc<Mutex<mpsc::Sender<BackendMsg>>>,
     last_metadata: Arc<Mutex<Cell<Metadata>>>,
     state_manager: Arc<Mutex<StateManager>>,
+    /// Whether AVPlayer reported an error, after which its info events are ignored: the player
+    /// can still change state, for example to paused, which must not raise the ready state.
+    errored: Arc<AtomicBool>,
 }
 
 // Procedure for setting up AVPlayer, state change condition:
@@ -118,6 +123,7 @@ impl OhosAvPlayer {
                 title: None,
             }))),
             state_manager: Arc::new(Mutex::new(StateManager::new())),
+            errored: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -127,6 +133,7 @@ impl OhosAvPlayer {
         let state_manager_clone = self.state_manager.clone();
         let video_sink_clone = self.video_sink.as_ref().map(|v| v.clone());
         let metadata_clone = self.last_metadata.clone();
+        let errored_clone = self.errored.clone();
 
         let event_info_closure =
             move |info_type: AVPlayerOnInfoType, info_body: *mut OH_AVFormat| {
@@ -134,6 +141,9 @@ impl OhosAvPlayer {
                     "Info Type received!:{:?}, address: {:p}",
                     info_type, info_body
                 );
+                if errored_clone.load(Ordering::SeqCst) {
+                    return;
+                }
 
                 match info_type {
                     AVPlayerOnInfoType::AV_INFO_TYPE_STATE_CHANGE => {
@@ -185,6 +195,12 @@ impl OhosAvPlayer {
                             },
                             AVPlayerState::AV_COMPLETED => {
                                 let _ = sender_clone.lock().unwrap().send(PlayerEvent::EndOfStream);
+                            },
+                            AVPlayerState::AV_ERROR => {
+                                errored_clone.store(true, Ordering::SeqCst);
+                                let _ = sender_clone.lock().unwrap().send(PlayerEvent::Error(
+                                    "AVPlayer entered its error state".to_owned(),
+                                ));
                             },
                             _ => {
                                 warn!("Unhandled State: {:?}", av_player_state);
@@ -310,6 +326,28 @@ impl OhosAvPlayer {
             .connect_info_event_callback(event_info_closure);
     }
 
+    pub fn setup_error_event(&mut self) {
+        let sender_clone = self.event_sender.clone();
+        let errored_clone = self.errored.clone();
+        self.player_inner
+            .lock()
+            .unwrap()
+            .connect_error_callback(move |error_code, message| {
+                // AVPlayer also reports operations it does not permit, such as a playback speed for
+                // media it treats as a live stream, or an audio interruption, which don't end
+                // playback. A failure that does also moves AVPlayer to its error state.
+                if error_code == OH_AVErrCode::AV_ERR_OPERATE_NOT_PERMIT.0 as i32 {
+                    warn!("AVPlayer did not permit an operation: {}", message);
+                    return;
+                }
+                errored_clone.store(true, Ordering::SeqCst);
+                let _ = sender_clone
+                    .lock()
+                    .unwrap()
+                    .send(PlayerEvent::Error(format!("{error_code}: {message}")));
+            });
+    }
+
     pub fn setup_data_source(&mut self) {
         let sender_clone = self.event_sender.clone();
         let sender_clone_clone = self.event_sender.clone();
@@ -403,7 +441,7 @@ impl MediaInstance for OhosAvPlayer {
     }
 }
 
-// TODO: Connect Error.
+// TODO: Report the errors that the AVPlayer calls return.
 impl Player for OhosAvPlayer {
     fn play(&self) -> Result<(), servo_media::player::PlayerError> {
         debug!("Start playing ohos player");
