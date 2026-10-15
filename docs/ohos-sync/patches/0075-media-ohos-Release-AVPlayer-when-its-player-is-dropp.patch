@@ -1,0 +1,336 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 15 Oct 2026 16:19:35 +0000
+Subject: [PATCH] media (ohos): Release AVPlayer when its player is dropped
+
+The info callback of the OpenHarmony AVPlayer backend held the AVPlayer
+wrapper that owns it, and the video sink, which holds the wrapper too,
+so no AVPlayer was ever released: every media element leaked its
+player, decoder and callbacks until the process exited. Let the
+callback hold weak references instead, and release AVPlayer when the
+player is dropped.
+
+Releasing waits for the running callbacks and calls the info callback,
+both of which lock the wrapper, so release AVPlayer without holding
+that lock. Releasing also waits for a pending read, and a read can wait
+for the media element to answer a SeekData event, which the element
+ignores once it has dropped the player, so answer that read first.
+
+Free the AVPlayer callbacks only after releasing AVPlayer: the info
+callback used to be freed before releasing AVPlayer, which calls it. A
+native image can still call its frame-available listener after
+OH_NativeImage_Destroy returns, so give it the id of the listener in a
+registry rather than a pointer to it. Don't destroy the native window
+after the native image, which already destroys it.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: nothing observable from a test page changes; see Validation.
+
+Validation: a HiHope DAYU200 (OpenHarmony 7.0, API 26), headless release builds (`./mach build --ohos --headless-binary`) of ohos-main with patches 68 to 74, with and without this patch. A page with six video elements that each switch the source of a playing 14 MB video once, five of them 0 to 100 ms after a seek that needs new data, and six more video elements that load and are then dropped, followed by TestUtils.gc() (`--pref dom_testutils_enabled`): AVPlayer logs 18 creations; without this patch none is released, even after the GC; with it, the six switched ones are released at once and all 18 after the GC, and each switch takes 7 to 23 ms. `./mach test-wpt --ohos` of media-elements/loading-the-media-resource, media-elements/error-codes and the series' ten media tests (60 tests): with `--processes 1`, every test matches its expectation with SpiderMonkey and with QuickJS, with 72 creations and 66 (SpiderMonkey) or 67 (QuickJS) releases, the rest belonging to elements that were not collected yet when the run ended; with `--processes 2` (SpiderMonkey, five runs), every test matches its expectation in four runs, and in one, two video subtests of gc-unreferenced-media-element fail with VID_DEC_ERR from the board's decoder limit, as the previous patch describes. No run crashed. A first version also destroyed the native window after the native image; it crashed in DestoryNativeWindow once its player was dropped.
+AI-assisted: Yes (agent session; written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../backends/ohos/ohos_media/avplayer.rs      | 79 ++++++++++++-------
+ components/media/backends/ohos/player.rs      | 67 ++++++++++++----
+ 2 files changed, 104 insertions(+), 42 deletions(-)
+
+diff --git a/components/media/backends/ohos/ohos_media/avplayer.rs b/components/media/backends/ohos/ohos_media/avplayer.rs
+index a2a8a274588..f287723c44a 100644
+--- a/components/media/backends/ohos/ohos_media/avplayer.rs
++++ b/components/media/backends/ohos/ohos_media/avplayer.rs
+@@ -1,7 +1,11 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++use std::collections::HashMap;
+ use std::ffi::{CStr, c_char, c_void};
++use std::ptr;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{LazyLock, Mutex};
+ 
+ use libc::pollfd;
+ use log::{debug, warn};
+@@ -24,8 +28,8 @@ use ohos_window_sys::native_image::{
+     OH_NativeImage_SetOnFrameAvailableListener, OH_OnFrameAvailableListener,
+ };
+ use ohos_window_sys::native_window::{
+-    OH_NativeWindow_DestroyNativeWindow, OH_NativeWindow_GetBufferHandleFromNative,
+-    OH_NativeWindow_NativeObjectReference, OH_NativeWindow_NativeObjectUnreference,
++    OH_NativeWindow_GetBufferHandleFromNative, OH_NativeWindow_NativeObjectReference,
++    OH_NativeWindow_NativeObjectUnreference,
+ };
+ 
+ #[cfg(not(sdk_api_21))]
+@@ -33,6 +37,13 @@ use crate::ohos_media::dummy_source::MediaSourceWrapper;
+ #[cfg(sdk_api_21)]
+ use crate::ohos_media::source::MediaSourceWrapper;
+ 
++/// The frame-available listeners of the native images, by id. A native image can still call its
++/// listener after `OH_NativeImage_Destroy` returns, so it gets the id of the listener rather than a
++/// pointer to it.
++static FRAME_AVAILABLE_LISTENERS: LazyLock<Mutex<HashMap<usize, Box<dyn Fn() + Send>>>> =
++    LazyLock::new(Default::default);
++static NEXT_FRAME_AVAILABLE_LISTENER_ID: AtomicUsize = AtomicUsize::new(0);
++
+ #[repr(C)]
+ #[derive(Debug)]
+ pub struct FrameInfo {
+@@ -52,7 +63,7 @@ pub struct OhosPlayer {
+     media_data_source: Option<MediaSourceWrapper>,
+     event_info_callback_closure: Option<*mut Box<dyn Fn(AVPlayerOnInfoType, *mut OH_AVFormat)>>,
+     error_callback_closure: Option<*mut Box<dyn Fn(i32, String)>>,
+-    frame_available_callback_closure: Option<*mut Box<dyn Fn()>>,
++    frame_available_listener_id: Option<usize>,
+     native_window: Option<*mut OHNativeWindow>,
+     has_set_source_size: bool,
+     /// Whether the player renders video, in which case it only prepares once its window is set.
+@@ -72,7 +83,7 @@ impl OhosPlayer {
+             media_data_source: None,
+             event_info_callback_closure: None,
+             error_callback_closure: None,
+-            frame_available_callback_closure: None,
++            frame_available_listener_id: None,
+             native_window: None,
+             has_set_source_size: false,
+             has_video_output,
+@@ -236,6 +247,20 @@ impl OhosPlayer {
+         }
+     }
+ 
++    /// Releases AVPlayer, which then calls no more callbacks. Releasing waits for the running
++    /// callbacks and calls the info callback, and both can lock `this`, so `this` must not be
++    /// locked by the caller.
++    pub fn release(this: &Mutex<Self>) {
++        let ohos_av_player =
++            std::mem::replace(&mut this.lock().unwrap().ohos_av_player, ptr::null_mut());
++        if !ohos_av_player.is_null() {
++            debug!("OH_AVPlayer_Release!");
++            unsafe {
++                OH_AVPlayer_Release(ohos_av_player);
++            }
++        }
++    }
++
+     pub fn prepare(&mut self) {
+         unsafe {
+             debug!("OH_AVPlayer Prepare Called!");
+@@ -331,11 +356,14 @@ impl OhosPlayer {
+ 
+     /// External Initialization step.
+     pub fn setup_window_buffer_listener<F: Fn() + Send + 'static>(&mut self, f: F) {
+-        let f: Box<dyn Fn()> = Box::new(f);
+-        let f: Box<Box<dyn Fn()>> = Box::new(f);
++        let id = NEXT_FRAME_AVAILABLE_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
++        FRAME_AVAILABLE_LISTENERS
++            .lock()
++            .unwrap()
++            .insert(id, Box::new(f));
+         (
+             self.native_image,
+-            self.frame_available_callback_closure,
++            self.frame_available_listener_id,
+             self.native_window,
+         ) = unsafe {
+             let native_image = OH_ConsumerSurface_Create();
+@@ -348,17 +376,17 @@ impl OhosPlayer {
+             debug!("Set consumer surface default usage: {}", ret);
+ 
+             extern "C" fn frame_available_cb(context: *mut c_void) {
+-                assert!(
+-                    !context.is_null(),
+-                    "frame_available_cb: context must not be null"
+-                );
+-                let f = unsafe { &*(context as *mut Box<dyn Fn()>) };
+-                f();
++                if let Some(f) = FRAME_AVAILABLE_LISTENERS
++                    .lock()
++                    .unwrap()
++                    .get(&(context as usize))
++                {
++                    f();
++                }
+             }
+ 
+-            let raw_ptr_f = Box::into_raw(f);
+             let listener = OH_OnFrameAvailableListener {
+-                context: raw_ptr_f as *mut c_void,
++                context: id as *mut c_void,
+                 onFrameAvailable: Some(frame_available_cb),
+             };
+             let res = OH_NativeImage_SetOnFrameAvailableListener(native_image, listener);
+@@ -370,7 +398,7 @@ impl OhosPlayer {
+                 "Native window acquired from native window {:p}",
+                 native_window
+             );
+-            (Some(native_image), Some(raw_ptr_f), Some(native_window))
++            (Some(native_image), Some(id), Some(native_window))
+         };
+         self.initialize_check_state_action();
+     }
+@@ -450,26 +478,23 @@ impl OhosPlayer {
+ 
+ impl Drop for OhosPlayer {
+     fn drop(&mut self) {
++        // Releasing AVPlayer here could deadlock on a thread that runs one of its callbacks, so its
++        // owner releases it first, which waits for the running callbacks, and then frees them.
++        debug_assert!(self.ohos_av_player.is_null(), "AVPlayer was not released");
+         unsafe {
+-            if let Some(closure) = self.frame_available_callback_closure {
+-                let box_closure = Box::from_raw(closure);
+-                drop(box_closure);
+-            }
+             if let Some(closure) = self.event_info_callback_closure {
+-                let box_closure = Box::from_raw(closure);
+-                drop(box_closure);
++                drop(Box::from_raw(closure));
+             }
+-            debug!("Releasing AVPlayer because drop is called!");
+-            OH_AVPlayer_Release(self.ohos_av_player);
+             if let Some(closure) = self.error_callback_closure {
+                 drop(Box::from_raw(closure));
+             }
++            // This also destroys the native window, which the native image owns.
+             if let Some(mut native_image) = self.native_image {
+                 OH_NativeImage_Destroy(&mut native_image);
+             }
+-            if let Some(native_window) = self.native_window {
+-                OH_NativeWindow_DestroyNativeWindow(native_window);
+-            }
++        }
++        if let Some(id) = self.frame_available_listener_id {
++            FRAME_AVAILABLE_LISTENERS.lock().unwrap().remove(&id);
+         }
+     }
+ }
+diff --git a/components/media/backends/ohos/player.rs b/components/media/backends/ohos/player.rs
+index 1be85892147..d41dd5a20a2 100644
+--- a/components/media/backends/ohos/player.rs
++++ b/components/media/backends/ohos/player.rs
+@@ -5,7 +5,7 @@
+ use std::cell::Cell;
+ use std::ops::Range;
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use std::sync::{Arc, Mutex, mpsc};
++use std::sync::{Arc, Mutex, Weak, mpsc};
+ use std::time;
+ 
+ use crossbeam_channel::Sender;
+@@ -74,6 +74,12 @@ pub struct OhosAvPlayer {
+     /// Whether AVPlayer reported an error, after which its info events are ignored: the player
+     /// can still change state, for example to paused, which must not raise the ready state.
+     errored: Arc<AtomicBool>,
++    /// Whether this player is being dropped, after which the media element no longer answers
++    /// SeekData events.
++    released: Arc<AtomicBool>,
++    /// The sender of the channel on which reads wait for the media element to answer a SeekData
++    /// event.
++    seek_lock: Option<SeekLock>,
+ }
+ 
+ // Procedure for setting up AVPlayer, state change condition:
+@@ -124,14 +130,18 @@ impl OhosAvPlayer {
+             }))),
+             state_manager: Arc::new(Mutex::new(StateManager::new())),
+             errored: Arc::new(AtomicBool::new(false)),
++            released: Arc::new(AtomicBool::new(false)),
++            seek_lock: None,
+         }
+     }
+ 
+     pub fn setup_info_event(&mut self) {
+         let sender_clone = self.event_sender.clone();
+-        let player_inner_clone = self.player_inner.clone();
++        // The closure is owned by the AVPlayer wrapper, so it must not keep the wrapper or the
++        // video sink, which owns another reference to the wrapper, alive.
++        let player_inner_weak = Arc::downgrade(&self.player_inner);
+         let state_manager_clone = self.state_manager.clone();
+-        let video_sink_clone = self.video_sink.as_ref().map(|v| v.clone());
++        let video_sink_weak = self.video_sink.as_ref().map(Arc::downgrade);
+         let metadata_clone = self.last_metadata.clone();
+         let errored_clone = self.errored.clone();
+ 
+@@ -166,8 +176,10 @@ impl OhosAvPlayer {
+                         match av_player_state {
+                             AVPlayerState::AV_INITIALIZED => {
+                                 debug!("Setup Video Sink");
+-                                if let Some(ref video_sink_clone) = video_sink_clone {
+-                                    video_sink_clone.lock().unwrap().setup(); // TODO: Hide internal state machine
++                                if let Some(video_sink) =
++                                    video_sink_weak.as_ref().and_then(Weak::upgrade)
++                                {
++                                    video_sink.lock().unwrap().setup(); // TODO: Hide internal state machine
+                                 }
+                             },
+                             AVPlayerState::AV_PREPARED => {
+@@ -202,14 +214,14 @@ impl OhosAvPlayer {
+                                     "AVPlayer entered its error state".to_owned(),
+                                 ));
+                             },
++                            AVPlayerState::AV_RELEASED => {},
+                             _ => {
+                                 warn!("Unhandled State: {:?}", av_player_state);
+                             },
+                         }
+-                        player_inner_clone
+-                            .lock()
+-                            .unwrap()
+-                            .set_state(av_player_state);
++                        if let Some(player_inner) = player_inner_weak.upgrade() {
++                            player_inner.lock().unwrap().set_state(av_player_state);
++                        }
+                     },
+                     AVPlayerOnInfoType::AV_INFO_TYPE_RESOLUTION_CHANGE => {
+                         let mut width = -1;
+@@ -351,13 +363,23 @@ impl OhosAvPlayer {
+     pub fn setup_data_source(&mut self) {
+         let sender_clone = self.event_sender.clone();
+         let sender_clone_clone = self.event_sender.clone();
+-        let seek_channel = Arc::new(Mutex::new(SeekChannel::new()));
++        let released_clone = self.released.clone();
++        let seek_channel = SeekChannel::new();
++        self.seek_lock = Some(seek_channel.sender());
++        let seek_channel = Arc::new(Mutex::new(seek_channel));
+         let seekdata_send_closure = move |pos: u64| {
+-            let _ = sender_clone.lock().unwrap().send(PlayerEvent::SeekData(
+-                pos,
+-                seek_channel.lock().unwrap().sender(),
+-            ));
+-            let (ret, ack_channel) = seek_channel.lock().unwrap().wait();
++            // Checking whether the player is released under the lock that waiting holds makes sure
++            // that the answer that releasing sends reaches the only read that can still wait.
++            let seek_channel = seek_channel.lock().unwrap();
++            if released_clone.load(Ordering::SeqCst) {
++                return false;
++            }
++            let _ = sender_clone
++                .lock()
++                .unwrap()
++                .send(PlayerEvent::SeekData(pos, seek_channel.sender()));
++            let (ret, ack_channel) = seek_channel.wait();
++            drop(seek_channel);
+             let _ = ack_channel.send(());
+             debug!("Seek Initiated! :{}", pos);
+             let _ = sender_clone.lock().unwrap().send(PlayerEvent::NeedData);
+@@ -410,6 +432,21 @@ impl SeekChannel {
+ impl Drop for OhosAvPlayer {
+     fn drop(&mut self) {
+         debug!("Ohos Dropping");
++        // Releasing may wait for a pending read, and a read that waits for the answer to its
++        // SeekData event would wait forever, as the media element ignores the events of a player
++        // it dropped, so answer it here.
++        self.released.store(true, Ordering::SeqCst);
++        if let Some(seek_lock) = &self.seek_lock {
++            match channel() {
++                Some((ack_sender, _)) => {
++                    let _ = seek_lock.lock_channel.send((false, ack_sender));
++                },
++                None => {
++                    warn!("Could not answer a pending SeekData event before releasing AVPlayer")
++                },
++            }
++        }
++        OhosPlayerInner::release(&self.player_inner);
+         let (sender, _) = std::sync::mpsc::channel::<()>();
+         let _ = self
+             .backend_chan

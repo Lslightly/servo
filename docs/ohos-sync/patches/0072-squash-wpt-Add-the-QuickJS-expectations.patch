@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 14 Oct 2026 09:59:12 +0000
+Subject: [PATCH] squash! wpt: Add the QuickJS expectations
+
+Drop the QuickJS conditions of the media tests that failed because
+nothing kept unreferenced media elements alive: autoplay.html,
+allowed-to-play.html, resource-selection-candidate-moved.html and the
+autoplay-allowed-by and autoplay-default permissions policy tests. Patch 69
+fixes that, and QuickJS gives SpiderMonkey's results for them now.
+Patch 69 drops the conditions of autoplay-disabled-by-permissions-policy
+itself, because it edits that file after this one.
+
+Validation: QuickJS release build of this branch, `./mach test-wpt --js-engine quickjs --processes 2` of these tests, autoplay-disabled-by-permissions-policy, played-loop and the new gc-unreferenced-media-element.html, 2 runs: all as expected for SpiderMonkey, apart from autoplay-default-permissions-policy, which is OK on this host with either engine against its TIMEOUT expectation; without patches 68 to 70 the QuickJS build times out in these tests as the dropped conditions expected.
+AI-assisted: Yes (agent session; validated and written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ...d-by-permissions-policy.https.sub.html.ini | 14 --------
+ ...ault-permissions-policy.https.sub.html.ini |  8 +----
+ ...esource-selection-candidate-moved.html.ini |  4 ---
+ .../ready-states/autoplay.html.ini            | 34 -------------------
+ .../assumptions/allowed-to-play.html.ini      |  6 ----
+ 5 files changed, 1 insertion(+), 65 deletions(-)
+ delete mode 100644 tests/wpt/meta/html/semantics/embedded-content/media-elements/autoplay-allowed-by-permissions-policy.https.sub.html.ini
+ delete mode 100644 tests/wpt/meta/html/semantics/embedded-content/media-elements/loading-the-media-resource/resource-selection-candidate-moved.html.ini
+ delete mode 100644 tests/wpt/meta/html/semantics/embedded-content/media-elements/ready-states/autoplay.html.ini
+ delete mode 100644 tests/wpt/meta/infrastructure/assumptions/allowed-to-play.html.ini
+
+diff --git a/tests/wpt/meta/html/semantics/embedded-content/media-elements/autoplay-allowed-by-permissions-policy.https.sub.html.ini b/tests/wpt/meta/html/semantics/embedded-content/media-elements/autoplay-allowed-by-permissions-policy.https.sub.html.ini
+deleted file mode 100644
+index 8cb46b2b4b5..00000000000
+--- a/tests/wpt/meta/html/semantics/embedded-content/media-elements/autoplay-allowed-by-permissions-policy.https.sub.html.ini
++++ /dev/null
+@@ -1,14 +0,0 @@
+-[autoplay-allowed-by-permissions-policy.https.sub.html]
+-  expected:
+-    if js_engine == "quickjs": TIMEOUT
+-  [Permissions-Policy header: autoplay * allows cross-origin iframes.]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+-
+-  [Permissions-Policy header: autoplay * allows the top-level document.]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+-
+-  [Permissions-Policy header: autoplay * allows same-origin iframes.]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+diff --git a/tests/wpt/meta/html/semantics/embedded-content/media-elements/autoplay-default-permissions-policy.https.sub.html.ini b/tests/wpt/meta/html/semantics/embedded-content/media-elements/autoplay-default-permissions-policy.https.sub.html.ini
+index 9b2f3f369ce..3209316a9d3 100644
+--- a/tests/wpt/meta/html/semantics/embedded-content/media-elements/autoplay-default-permissions-policy.https.sub.html.ini
++++ b/tests/wpt/meta/html/semantics/embedded-content/media-elements/autoplay-default-permissions-policy.https.sub.html.ini
+@@ -1,13 +1,7 @@
+ [autoplay-default-permissions-policy.https.sub.html]
+   expected: TIMEOUT
+   [Default "autoplay" feature policy ["self"\] disallows cross-origin iframes.]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+-      FAIL
++    expected: FAIL
+ 
+   [Default "autoplay" feature policy ["self"\] allows same-origin iframes.]
+     expected: TIMEOUT
+-
+-  [Default "autoplay" feature policy ["self"\] allows the top-level document.]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+diff --git a/tests/wpt/meta/html/semantics/embedded-content/media-elements/loading-the-media-resource/resource-selection-candidate-moved.html.ini b/tests/wpt/meta/html/semantics/embedded-content/media-elements/loading-the-media-resource/resource-selection-candidate-moved.html.ini
+deleted file mode 100644
+index c10e521a13f..00000000000
+--- a/tests/wpt/meta/html/semantics/embedded-content/media-elements/loading-the-media-resource/resource-selection-candidate-moved.html.ini
++++ /dev/null
+@@ -1,4 +0,0 @@
+-[resource-selection-candidate-moved.html]
+-  [moving the candidate source]
+-    expected:
+-      if js_engine == "quickjs": FAIL
+diff --git a/tests/wpt/meta/html/semantics/embedded-content/media-elements/ready-states/autoplay.html.ini b/tests/wpt/meta/html/semantics/embedded-content/media-elements/ready-states/autoplay.html.ini
+deleted file mode 100644
+index 84301649e1d..00000000000
+--- a/tests/wpt/meta/html/semantics/embedded-content/media-elements/ready-states/autoplay.html.ini
++++ /dev/null
+@@ -1,34 +0,0 @@
+-[autoplay.html]
+-  expected:
+-    if js_engine == "quickjs": TIMEOUT
+-  [audio.autoplay]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+-
+-  [audio.autoplay and play()]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+-
+-  [audio.autoplay and pause()]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+-
+-  [audio.autoplay and internal pause steps]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+-
+-  [video.autoplay]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+-
+-  [video.autoplay and play()]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+-
+-  [video.autoplay and pause()]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+-
+-  [video.autoplay and internal pause steps]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+diff --git a/tests/wpt/meta/infrastructure/assumptions/allowed-to-play.html.ini b/tests/wpt/meta/infrastructure/assumptions/allowed-to-play.html.ini
+deleted file mode 100644
+index 87a6218ed69..00000000000
+--- a/tests/wpt/meta/infrastructure/assumptions/allowed-to-play.html.ini
++++ /dev/null
+@@ -1,6 +0,0 @@
+-[allowed-to-play.html]
+-  expected:
+-    if js_engine == "quickjs": TIMEOUT
+-  [<audio> autoplay]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT

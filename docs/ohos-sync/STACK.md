@@ -91,6 +91,15 @@ those scripts (they need network access). `check_stack.py` runs each with
 65. `wptrunner: Add a servo_ohos product for Servo on OpenHarmony devices` — B · manual · watch: tests/wpt/tests/tools/wptrunner/wptrunner/browsers/base.py tests/wpt/tests/tools/wptrunner/wptrunner/executors/executorservo.py tests/wpt/tests/tools/wptrunner/wptrunner/testrunner.py
 66. `mach: Run WPT on OpenHarmony devices with mach test-wpt --ohos` — B · manual · watch: python/servo/command_base.py
 67. `servoshell: Print a backtrace when the headless executable crashes on OpenHarmony` — B · manual · watch: ports/servoshell/panic_hook.rs
+68. `script: Move to the end of the media resource at the end of the stream` — B · CI · watch: -
+69. `script: Keep media elements alive while they can still play` — B · CI · watch: -
+70. `gstreamer: Don't rewind a player that is paused at the end of the stream` — B · CI · watch: -
+71. `script: Honor preload=none, and resume the load when playback is requested` — B · CI · watch: -
+72. `squash! wpt: Add the QuickJS expectations` — B · CI · watch: -
+73. `media (ohos): Prepare the player of an audio element` — B · manual · watch: components/script/dom/html/embedded_content/htmlmediaelement.rs
+74. `media (ohos): Report AVPlayer errors to the media element` — B · manual · watch: components/media/player/lib.rs components/script/dom/html/embedded_content/htmlmediaelement.rs
+75. `media (ohos): Release AVPlayer when its player is dropped` — B · manual · watch: components/media/player/lib.rs components/script/dom/html/embedded_content/htmlmediaelement.rs
+76. `docs: record patches 68 to 76 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

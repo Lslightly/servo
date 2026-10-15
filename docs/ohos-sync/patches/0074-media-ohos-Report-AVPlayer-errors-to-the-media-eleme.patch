@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 15 Oct 2026 11:06:27 +0000
+Subject: [PATCH] media (ohos): Report AVPlayer errors to the media element
+
+The OpenHarmony AVPlayer backend never connected the AVPlayer error
+callback, so a resource that AVPlayer can't play left the media element
+in HAVE_NOTHING without an error: it never moved on to its next source
+candidate, and it kept delaying the load event. Forward AVPlayer errors
+as PlayerEvent::Error, as the GStreamer backend does with its errors.
+Report the error state of AVPlayer as an error too, as some failures
+only change the state, for example a failing play() or pause(). After
+an error, ignore the info events of AVPlayer: it can still change
+state, for example to paused after an I/O error, which would raise the
+ready state of the failed element.
+
+AVPlayer also reports operations that it does not permit, for example
+a playback speed for media it treats as a live stream, which includes
+media without a duration, or an audio interruption. These don't end
+playback, so ignore them: a failure that does also moves AVPlayer to
+its error state.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: resource-selection-candidate-moved hung on OpenHarmony; see
+Validation.
+
+Validation: a HiHope DAYU200 (OpenHarmony 7.0, API 26), headless release builds (`./mach build --ohos --headless-binary`) of ohos-main with patches 68 to 73, with and without this patch. `./mach test-wpt --ohos --processes 1` of media-elements/loading-the-media-resource and media-elements/error-codes (52 tests) plus the series' ten media tests: without this patch, 14 tests hang (load-events-networkState, resource-selection-invoke-insert-source-networkState, and the resource-selection-candidate-* and resource-selection-pointer-* tests); with it, every test matches its expectation with SpiderMonkey and with QuickJS, except autoplay-default-permissions-policy, which is OK against its TIMEOUT expectation as on Linux. Some failures now fire error where elements used to wait forever: (1) AVPlayer reports VID_DEC_ERR when the board runs too many H.264 decoders, for example with two processes that each autoplay 8 videos: without this patch the failed elements stay in HAVE_NOTHING without an event and the others stall, with it they fire error. With `--processes 2`, gc-unreferenced-media-element and autoplay each failed this way once, now that they can overlap with other video tests (the candidate-moved hang used to keep the other process busy); this backend also never releases an AVPlayer (a pre-existing reference cycle), so players of earlier tests in the same process may add to the load. (2) The system media_service crashed in its video decoder pipeline several times during these runs (also before this patch); AVPlayer then reports "mediaserver is died" for every player, which now fires error, and rejects play() for elements that load from a src attribute and have no metadata yet. Later re-validation, with the error state reported and not permitted operations ignored: the same 60 tests match their expectations with SpiderMonkey and with QuickJS, and a Vorbis WebM muxed for streaming, which AVPlayer treats as a live stream, loads and resumes after pause() without an error event.
+AI-assisted: Yes (agent session; written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/media/backends/ohos/lib.rs         |  1 +
+ .../backends/ohos/ohos_media/avplayer.rs      | 49 +++++++++++++++++--
+ components/media/backends/ohos/player.rs      | 40 ++++++++++++++-
+ 3 files changed, 85 insertions(+), 5 deletions(-)
+
+diff --git a/components/media/backends/ohos/lib.rs b/components/media/backends/ohos/lib.rs
+index 8fd369169ce..fc8e52d2d6f 100644
+--- a/components/media/backends/ohos/lib.rs
++++ b/components/media/backends/ohos/lib.rs
+@@ -134,6 +134,7 @@ impl Backend for OhosBackend {
+             self.backend_chan.clone(),
+         );
+ 
++        player.setup_error_event();
+         player.setup_info_event();
+         player.setup_data_source();
+         Arc::new(Mutex::new(player))
+diff --git a/components/media/backends/ohos/ohos_media/avplayer.rs b/components/media/backends/ohos/ohos_media/avplayer.rs
+index d24da572d55..a2a8a274588 100644
+--- a/components/media/backends/ohos/ohos_media/avplayer.rs
++++ b/components/media/backends/ohos/ohos_media/avplayer.rs
+@@ -1,16 +1,16 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+-use std::ffi::c_void;
++use std::ffi::{CStr, c_char, c_void};
+ 
+ use libc::pollfd;
+ use log::{debug, warn};
+ use ohos_media_sys::avformat::OH_AVFormat;
+ use ohos_media_sys::avplayer::{
+     OH_AVPlayer_Create, OH_AVPlayer_Pause, OH_AVPlayer_Play, OH_AVPlayer_Prepare,
+-    OH_AVPlayer_Release, OH_AVPlayer_Seek, OH_AVPlayer_SetOnInfoCallback,
+-    OH_AVPlayer_SetPlaybackSpeed, OH_AVPlayer_SetVideoSurface, OH_AVPlayer_SetVolume,
+-    OH_AVPlayer_Stop,
++    OH_AVPlayer_Release, OH_AVPlayer_Seek, OH_AVPlayer_SetOnErrorCallback,
++    OH_AVPlayer_SetOnInfoCallback, OH_AVPlayer_SetPlaybackSpeed, OH_AVPlayer_SetVideoSurface,
++    OH_AVPlayer_SetVolume, OH_AVPlayer_Stop,
+ };
+ use ohos_media_sys::avplayer_base::{
+     AVPlaybackSpeed, AVPlayerOnInfoType, AVPlayerSeekMode, AVPlayerState, OH_AVPlayer,
+@@ -51,6 +51,7 @@ pub struct OhosPlayer {
+     ohos_av_player: *mut OH_AVPlayer,
+     media_data_source: Option<MediaSourceWrapper>,
+     event_info_callback_closure: Option<*mut Box<dyn Fn(AVPlayerOnInfoType, *mut OH_AVFormat)>>,
++    error_callback_closure: Option<*mut Box<dyn Fn(i32, String)>>,
+     frame_available_callback_closure: Option<*mut Box<dyn Fn()>>,
+     native_window: Option<*mut OHNativeWindow>,
+     has_set_source_size: bool,
+@@ -70,6 +71,7 @@ impl OhosPlayer {
+             ohos_av_player: unsafe { OH_AVPlayer_Create() },
+             media_data_source: None,
+             event_info_callback_closure: None,
++            error_callback_closure: None,
+             frame_available_callback_closure: None,
+             native_window: None,
+             has_set_source_size: false,
+@@ -291,6 +293,42 @@ impl OhosPlayer {
+         self.event_info_callback_closure = Some(raw_ptr_f);
+     }
+ 
++    /// Calls `f` with the error code and message when AVPlayer reports an error.
++    pub fn connect_error_callback<F>(&mut self, f: F)
++    where
++        F: Fn(i32, String) + Send + 'static,
++    {
++        extern "C" fn on_error(
++            _player: *mut OH_AVPlayer,
++            error_code: i32,
++            error_msg: *const c_char,
++            user_data: *mut c_void,
++        ) {
++            assert!(!user_data.is_null(), "on_error: user_data must not be null");
++            let f = unsafe { &*(user_data as *const Box<dyn Fn(i32, String)>) };
++            let message = if error_msg.is_null() {
++                String::new()
++            } else {
++                unsafe { CStr::from_ptr(error_msg) }
++                    .to_string_lossy()
++                    .into_owned()
++            };
++            f(error_code, message);
++        }
++
++        let f: Box<dyn Fn(i32, String)> = Box::new(f);
++        let raw_ptr_f = Box::into_raw(Box::new(f));
++        let ret = unsafe {
++            OH_AVPlayer_SetOnErrorCallback(
++                self.ohos_av_player,
++                Some(on_error),
++                raw_ptr_f as *mut c_void,
++            )
++        };
++        debug!("OH AVPlayer Set Error Callback: {:?}", ret);
++        self.error_callback_closure = Some(raw_ptr_f);
++    }
++
+     /// External Initialization step.
+     pub fn setup_window_buffer_listener<F: Fn() + Send + 'static>(&mut self, f: F) {
+         let f: Box<dyn Fn()> = Box::new(f);
+@@ -423,6 +461,9 @@ impl Drop for OhosPlayer {
+             }
+             debug!("Releasing AVPlayer because drop is called!");
+             OH_AVPlayer_Release(self.ohos_av_player);
++            if let Some(closure) = self.error_callback_closure {
++                drop(Box::from_raw(closure));
++            }
+             if let Some(mut native_image) = self.native_image {
+                 OH_NativeImage_Destroy(&mut native_image);
+             }
+diff --git a/components/media/backends/ohos/player.rs b/components/media/backends/ohos/player.rs
+index 079355a2a9d..1be85892147 100644
+--- a/components/media/backends/ohos/player.rs
++++ b/components/media/backends/ohos/player.rs
+@@ -4,11 +4,13 @@
+ 
+ use std::cell::Cell;
+ use std::ops::Range;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex, mpsc};
+ use std::time;
+ 
+ use crossbeam_channel::Sender;
+ use log::{debug, error, warn};
++use ohos_media_sys::averrors::OH_AVErrCode;
+ use ohos_media_sys::avformat::{
+     OH_AVFormat, OH_AVFormat_GetFloatValue, OH_AVFormat_GetIntValue, OH_AVFormat_GetLongValue,
+ };
+@@ -69,6 +71,9 @@ pub struct OhosAvPlayer {
+     backend_chan: Arc<Mutex<mpsc::Sender<BackendMsg>>>,
+     last_metadata: Arc<Mutex<Cell<Metadata>>>,
+     state_manager: Arc<Mutex<StateManager>>,
++    /// Whether AVPlayer reported an error, after which its info events are ignored: the player
++    /// can still change state, for example to paused, which must not raise the ready state.
++    errored: Arc<AtomicBool>,
+ }
+ 
+ // Procedure for setting up AVPlayer, state change condition:
+@@ -118,6 +123,7 @@ impl OhosAvPlayer {
+                 title: None,
+             }))),
+             state_manager: Arc::new(Mutex::new(StateManager::new())),
++            errored: Arc::new(AtomicBool::new(false)),
+         }
+     }
+ 
+@@ -127,6 +133,7 @@ impl OhosAvPlayer {
+         let state_manager_clone = self.state_manager.clone();
+         let video_sink_clone = self.video_sink.as_ref().map(|v| v.clone());
+         let metadata_clone = self.last_metadata.clone();
++        let errored_clone = self.errored.clone();
+ 
+         let event_info_closure =
+             move |info_type: AVPlayerOnInfoType, info_body: *mut OH_AVFormat| {
+@@ -134,6 +141,9 @@ impl OhosAvPlayer {
+                     "Info Type received!:{:?}, address: {:p}",
+                     info_type, info_body
+                 );
++                if errored_clone.load(Ordering::SeqCst) {
++                    return;
++                }
+ 
+                 match info_type {
+                     AVPlayerOnInfoType::AV_INFO_TYPE_STATE_CHANGE => {
+@@ -186,6 +196,12 @@ impl OhosAvPlayer {
+                             AVPlayerState::AV_COMPLETED => {
+                                 let _ = sender_clone.lock().unwrap().send(PlayerEvent::EndOfStream);
+                             },
++                            AVPlayerState::AV_ERROR => {
++                                errored_clone.store(true, Ordering::SeqCst);
++                                let _ = sender_clone.lock().unwrap().send(PlayerEvent::Error(
++                                    "AVPlayer entered its error state".to_owned(),
++                                ));
++                            },
+                             _ => {
+                                 warn!("Unhandled State: {:?}", av_player_state);
+                             },
+@@ -310,6 +326,28 @@ impl OhosAvPlayer {
+             .connect_info_event_callback(event_info_closure);
+     }
+ 
++    pub fn setup_error_event(&mut self) {
++        let sender_clone = self.event_sender.clone();
++        let errored_clone = self.errored.clone();
++        self.player_inner
++            .lock()
++            .unwrap()
++            .connect_error_callback(move |error_code, message| {
++                // AVPlayer also reports operations it does not permit, such as a playback speed for
++                // media it treats as a live stream, or an audio interruption, which don't end
++                // playback. A failure that does also moves AVPlayer to its error state.
++                if error_code == OH_AVErrCode::AV_ERR_OPERATE_NOT_PERMIT.0 as i32 {
++                    warn!("AVPlayer did not permit an operation: {}", message);
++                    return;
++                }
++                errored_clone.store(true, Ordering::SeqCst);
++                let _ = sender_clone
++                    .lock()
++                    .unwrap()
++                    .send(PlayerEvent::Error(format!("{error_code}: {message}")));
++            });
++    }
++
+     pub fn setup_data_source(&mut self) {
+         let sender_clone = self.event_sender.clone();
+         let sender_clone_clone = self.event_sender.clone();
+@@ -403,7 +441,7 @@ impl MediaInstance for OhosAvPlayer {
+     }
+ }
+ 
+-// TODO: Connect Error.
++// TODO: Report the errors that the AVPlayer calls return.
+ impl Player for OhosAvPlayer {
+     fn play(&self) -> Result<(), servo_media::player::PlayerError> {
+         debug!("Start playing ohos player");

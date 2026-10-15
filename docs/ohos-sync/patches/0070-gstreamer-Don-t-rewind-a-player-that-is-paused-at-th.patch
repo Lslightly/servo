@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 14 Oct 2026 09:59:10 +0000
+Subject: [PATCH] gstreamer: Don't rewind a player that is paused at the end of
+ the stream
+
+A media element pauses its player once playback has ended. GstPlay
+rewinds to the start when it is paused after the end of the stream, and
+the player then reported that position, which moved the current playback
+position back to the start: a moment after the `ended` event,
+`currentTime` returned 0 and `ended` false. Keep the player where it
+stopped instead, and pause it for real at the next seek, so that it stays
+paused at the new position.
+
+The last playback state the player reports after the end is now GstPlay's
+stopped state instead of paused, so the media session's playback state
+ends as "none" rather than "paused".
+
+Fork note: meant for upstream, with the two patches before. Drop once
+upstream has it.
+
+Testing: Adds a WPT test that the position stays at the end after
+playback ended; it fails without this change.
+
+Validation: Release builds of upstream f040186a7ee: the new test fails both subtests without the series (no `pause` before `ended`), fails the `<video>` one with only patch 68 (`ended` false 250 ms later), and passes with the series in every run; chrome-headless-shell 154 passes it. After the end, `currentTime = 0.5` while paused fires seeking/seeked and stays paused at 0.5. `./mach test-wpt --processes 4` of the 460 media tests: identical results to the build without this patch, apart from the new test. The independent review's should-fix for this patch (a seek racing with the end of the stream could leave the end-of-stream flag set while GstPlay plays again) is addressed by also clearing the flag when GstPlay reports that it plays.
+AI-assisted: Yes (agent session; root-caused, written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/media/backends/gstreamer/player.rs | 27 +++++++++++-
+ tests/wpt/meta/MANIFEST.json                  |  7 ++++
+ .../ended-current-playback-position.html      | 41 +++++++++++++++++++
+ 3 files changed, 74 insertions(+), 1 deletion(-)
+ create mode 100644 tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/ended-current-playback-position.html
+
+diff --git a/components/media/backends/gstreamer/player.rs b/components/media/backends/gstreamer/player.rs
+index 087aaa426ad..e95d32a09ee 100644
+--- a/components/media/backends/gstreamer/player.rs
++++ b/components/media/backends/gstreamer/player.rs
+@@ -130,6 +130,9 @@ struct PlayerInner {
+     input_size: u64,
+     seekable: bool,
+     play_state: gstreamer_play::PlayState,
++    /// Whether GstPlay reached the end of the stream and was not played or sought since. Pausing
++    /// GstPlay in that state rewinds it to the start.
++    at_end_of_stream: Cell<bool>,
+     paused: Cell<bool>,
+     can_resume: Cell<bool>,
+     playback_rate: Cell<f64>,
+@@ -210,12 +213,14 @@ impl PlayerInner {
+ 
+         self.paused.set(false);
+         self.can_resume.set(false);
++        self.at_end_of_stream.set(false);
+         self.player.play();
+         Ok(())
+     }
+ 
+     pub fn stop(&mut self) -> Result<(), PlayerError> {
+         self.player.stop();
++        self.at_end_of_stream.set(false);
+         self.paused.set(true);
+         self.can_resume.set(false);
+         self.last_metadata = None;
+@@ -229,6 +234,14 @@ impl PlayerInner {
+         }
+ 
+         self.paused.set(true);
++
++        // Playback has stopped at the end of the stream already, and the position has to stay
++        // there, so don't let GstPlay rewind. The next seek pauses it.
++        if self.at_end_of_stream.get() {
++            self.can_resume.set(false);
++            return Ok(());
++        }
++
+         self.can_resume.set(true);
+         self.player.pause();
+         Ok(())
+@@ -270,6 +283,10 @@ impl PlayerInner {
+             return Err(PlayerError::SeekOutOfRange);
+         }
+ 
++        if self.at_end_of_stream.replace(false) && self.paused.get() {
++            self.player.pause();
++        }
++
+         let time = time * 1_000_000_000.;
+         self.player
+             .seek(gstreamer::ClockTime::from_nseconds(time as u64));
+@@ -643,6 +660,7 @@ impl GStreamerPlayer {
+             input_size: 0,
+             seekable: true,
+             play_state: gstreamer_play::PlayState::Stopped,
++            at_end_of_stream: Cell::new(false),
+             paused: Cell::new(DEFAULT_PAUSED),
+             can_resume: Cell::new(DEFAULT_CAN_RESUME),
+             playback_rate: Cell::new(DEFAULT_PLAYBACK_RATE),
+@@ -656,9 +674,11 @@ impl GStreamerPlayer {
+ 
+         let inner = self.inner.borrow();
+         let inner = inner.as_ref().unwrap();
++        let inner_clone = inner.clone();
+         let observer = self.observer.clone();
+         // Handle `end-of-stream` signal.
+         signal_adapter.connect_end_of_stream(move |_| {
++            inner_clone.lock().unwrap().at_end_of_stream.set(true);
+             let _ = notify!(observer, PlayerEvent::EndOfStream);
+         });
+ 
+@@ -672,7 +692,12 @@ impl GStreamerPlayer {
+         let observer = self.observer.clone();
+         // Handle `state-changed` signal.
+         signal_adapter.connect_state_changed(move |_, play_state| {
+-            inner_clone.lock().unwrap().play_state = play_state;
++            let mut inner = inner_clone.lock().unwrap();
++            inner.play_state = play_state;
++            if play_state == gstreamer_play::PlayState::Playing {
++                inner.at_end_of_stream.set(false);
++            }
++            drop(inner);
+ 
+             let state = match play_state {
+                 gstreamer_play::PlayState::Buffering => Some(PlaybackState::Buffering),
+diff --git a/tests/wpt/meta/MANIFEST.json b/tests/wpt/meta/MANIFEST.json
+index b3785cabda9..2dc32f09d30 100644
+--- a/tests/wpt/meta/MANIFEST.json
++++ b/tests/wpt/meta/MANIFEST.json
+@@ -1315813,6 +1315813,13 @@
+         ]
+        ],
+        "playing-the-media-resource": {
++        "ended-current-playback-position.html": [
++         "d3cde36c3efae7ad458ae930bd5e35580b21e016",
++         [
++          null,
++          {}
++         ]
++        ],
+         "fragmented-mp4-end.html": [
+          "fafb49768cf7652a999c256a9b8e15268bfba5ad",
+          [
+diff --git a/tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/ended-current-playback-position.html b/tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/ended-current-playback-position.html
+new file mode 100644
+index 00000000000..d3cde36c3ef
+--- /dev/null
++++ b/tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/ended-current-playback-position.html
+@@ -0,0 +1,41 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<title>The current playback position stays at the end once playback has ended</title>
++<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#reaches-the-end">
++<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#ended-playback">
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script src="/common/media.js"></script>
++<body>
++<script>
++// When the current playback position reaches the end of the media resource, the element pauses,
++// fires pause and then ended. Nothing moves the position away from the end afterwards, so it has
++// ended playback until something seeks.
++
++function end_of_playback_test(tagName, src) {
++  promise_test(async t => {
++    const media = document.createElement(tagName);
++    const events = [];
++    for (const type of ["pause", "ended"]) {
++      media.addEventListener(type, () => events.push(type));
++    }
++    const ended = new Promise(resolve => media.addEventListener("ended", resolve, { once: true }));
++    media.src = src;
++    await media.play();
++    await ended;
++
++    assert_array_equals(events, ["pause", "ended"], "events");
++    assert_true(media.paused, "paused when ended fires");
++    assert_true(media.ended, "ended when ended fires");
++    assert_equals(media.currentTime, media.duration, "currentTime when ended fires");
++
++    await new Promise(resolve => t.step_timeout(resolve, 250));
++    assert_true(media.ended, "ended later");
++    assert_equals(media.currentTime, media.duration, "currentTime later");
++  }, `${tagName} stays at the end of the media resource once playback has ended`);
++}
++
++end_of_playback_test("audio", getAudioURI("/media/sound_0"));
++end_of_playback_test("video", getVideoURI("/media/test-1s"));
++</script>
++</body>

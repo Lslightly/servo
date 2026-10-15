@@ -1,0 +1,406 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 14 Oct 2026 09:59:11 +0000
+Subject: [PATCH] script: Honor preload=none, and resume the load when playback
+ is requested
+
+The resource fetch algorithm suspended the fetch for preload=none only
+when the can-autoplay flag was false, which is the case once play() or
+pause() ran before resource selection, and nothing ever resumed it. So
+preload=none was ignored while the element was not asked to play, and an
+element that was asked to play, e.g. with `src`, `load()` and `play()`,
+never loaded or played.
+
+Like Gecko and Blink, suspend the fetch for preload=none only while the
+element is paused, has no autoplay attribute and is not loading through an
+explicit `load()`, and never for a blob URL, which is a local resource.
+Suspend before creating a media player. Resume, with steps 5.remote.1.5
+to 5.remote.1.7 and after the task that stops delaying the load event,
+when `play()` is called, the autoplay attribute is set, or the preload
+attribute changes to another state.
+
+As in other browsers, a `<video preload=none>` that is not playing no
+longer fetches its metadata, so it has no natural size until it plays.
+
+Fork note: meant for upstream, with the three patches before (it uses
+patch 69's network-state setter). Drop once upstream has it.
+
+Testing: Adds a WPT test that play() plays a media element with
+preload=none, also with source elements; three of its six subtests time
+out without this change.
+
+Validation: Release builds of upstream f040186a7ee with the series, against the same build without this patch, a direct check of preload=none cases: `play()` right after setting `src`, after `load()`, and after `pause()` now load and play (before, `readyState` stayed 0 and the `play()` promise never settled); without a request to play, the element now stays at NETWORK_IDLE and HAVE_NOTHING instead of downloading the resource; `play()`, setting `preload` to auto and setting the autoplay attribute resume the load; `load()` alone, the autoplay attribute, blob URLs and `load()` with a first source element that is unsupported or fails still load right away; `load()` followed by a `src` change suspends (like Blink); setting `currentTime` while suspended doesn't resume. The new test: 3 of 6 subtests time out without this patch, 6 of 6 pass with it (3 runs), and chrome-headless-shell 154 passes 6 of 6. `./mach test-wpt --processes 4` of the same 461 media tests as for the previous patches: only the new test changes, apart from tests that are intermittent with both builds. Unreferenced preload=none elements with `play()` now play to the end and are collected afterwards (before, they never played and were kept alive). Two rounds of independent agent review; all should-fix findings are fixed (explicit `load()` now covers every source candidate of the resource selection, blob URLs are never suspended, a resume before the stop-delaying task waits for it, so `suspend` sees NETWORK_IDLE); not done: gating the autoplay override on the sandboxed automatic features flag, whose only effect is an extra fetch.
+AI-assisted: Yes (agent session; root-caused, written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../html/embedded_content/htmlmediaelement.rs | 180 ++++++++++++++----
+ tests/unit/script/size_of.rs                  |   2 +-
+ tests/wpt/meta/MANIFEST.json                  |   7 +
+ .../preload-none-play.html                    |  73 +++++++
+ 4 files changed, 219 insertions(+), 43 deletions(-)
+ create mode 100644 tests/wpt/tests/html/semantics/embedded-content/media-elements/loading-the-media-resource/preload-none-play.html
+
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 600c5527f09..fd06d951ff6 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -165,6 +165,17 @@ impl SourceChildrenPointer {
+     }
+ }
+ 
++/// A fetch of a media resource that is suspended for preload=none.
++/// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
++#[derive(MallocSizeOf)]
++struct SuspendedLoad {
++    url: ServoUrl,
++    /// Whether the task that stops delaying the load event has yet to run (Step 5.remote.1.4).
++    waiting_for_task: bool,
++    /// Whether the fetch is to resume once that task has run.
++    resume_requested: bool,
++}
++
+ /// Generally the presence of the loop attribute should be considered to mean playback has not
+ /// "ended", as "ended" and "looping" are mutually exclusive.
+ /// <https://html.spec.whatwg.org/multipage/#ended-playback>
+@@ -208,6 +219,12 @@ pub(crate) struct HTMLMediaElement {
+     /// Whether the owner document keeps this element alive, because it may still play or fire
+     /// events after script has dropped all references to it.
+     kept_alive_by_document: Cell<bool>,
++    /// The fetch of the media resource, if it is suspended for preload=none.
++    #[no_trace]
++    suspended_load: DomRefCell<Option<SuspendedLoad>>,
++    /// Whether an explicit call to `load()` started the current resource selection, which then
++    /// fetches the media resource even with preload=none.
++    explicit_load: Cell<bool>,
+     /// <https://html.spec.whatwg.org/multipage/#list-of-pending-play-promises>
+     pending_play_promises: DomRefCell<Vec<TracedPromise>>,
+     /// Play promises which are soon to be fulfilled by a queued task.
+@@ -411,6 +428,8 @@ impl HTMLMediaElement {
+             autoplaying: Cell::new(true),
+             delaying_the_load_event_flag: Default::default(),
+             kept_alive_by_document: Cell::new(false),
++            suspended_load: Default::default(),
++            explicit_load: Cell::new(false),
+             pending_play_promises: Default::default(),
+             in_flight_play_promises_queue: Default::default(),
+             player: Default::default(),
+@@ -865,6 +884,9 @@ impl HTMLMediaElement {
+             self.invoke_resource_selection_algorithm(cx);
+         }
+ 
++        // A fetch that is suspended for preload=none waits for a request to play.
++        self.resume_suspended_load(cx);
++
+         // Step 2. If the playback has ended and the direction of playback is forwards, seek to the
+         // earliest possible position of the media resource.
+         // Generally "ended" and "looping" are exclusive. Here, the loop attribute is ignored to
+@@ -1189,6 +1211,8 @@ impl HTMLMediaElement {
+ 
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-algorithm>
+     fn invoke_resource_selection_algorithm(&self, cx: &mut JSContext) {
++        self.explicit_load.set(false);
++
+         // Step 1. Set the element's networkState attribute to the NETWORK_NO_SOURCE value.
+         self.set_network_state(NetworkState::NoSource);
+ 
+@@ -1643,6 +1667,105 @@ impl HTMLMediaElement {
+ 
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
+     fn resource_fetch_algorithm(&self, cx: &JSContext, resource: Resource) {
++        // Step 5.remote.1. Optionally, run the following substeps. This is the expected behavior
++        // if the user agent intends to not attempt to fetch the resource until the user requests
++        // it explicitly (e.g. as a way to implement the preload attribute's none keyword).
++        // Like other browsers, honor preload=none unless the autoplay attribute, play() or an
++        // explicit load() asks for the media resource, and suspend before creating a player. A
++        // blob URL is a local resource, which has no such step.
++        if let Resource::Url(ref url) = resource &&
++            url.scheme() != "blob" &&
++            self.Preload() == "none" &&
++            self.Paused() &&
++            !self.Autoplay() &&
++            !self.explicit_load.get()
++        {
++            self.suspend_load(url.clone());
++            return;
++        }
++
++        self.fetch_resource(cx, resource);
++    }
++
++    /// Steps 5.remote.1.1 to 5.remote.1.4 of
++    /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
++    fn suspend_load(&self, url: ServoUrl) {
++        *self.suspended_load.borrow_mut() = Some(SuspendedLoad {
++            url,
++            waiting_for_task: true,
++            resume_requested: false,
++        });
++
++        // Step 5.remote.1.1. Set the networkState to NETWORK_IDLE.
++        self.set_network_state(NetworkState::Idle);
++
++        // Step 5.remote.1.2. Queue a media element task given the media element to fire an event
++        // named suspend at the element.
++        self.queue_media_element_task_to_fire_event(atom!("suspend"));
++
++        // Step 5.remote.1.3. Queue a media element task given the media element to set the
++        // element's delaying-the-load-event flag to false. This stops delaying the load event.
++        let this = Trusted::new(self);
++        let generation_id = self.generation_id.get();
++
++        self.owner_global()
++            .task_manager()
++            .media_element_task_source()
++            .queue(task!(queue_delay_load_event: move |cx| {
++                let this = this.root();
++                if generation_id != this.generation_id.get() {
++                    return;
++                }
++
++                let resume_requested = match this.suspended_load.borrow_mut().as_mut() {
++                    Some(suspended_load) => {
++                        suspended_load.waiting_for_task = false;
++                        suspended_load.resume_requested
++                    },
++                    None => false,
++                };
++
++                this.delay_load_event(cx, false);
++
++                if resume_requested {
++                    this.resume_suspended_load(cx);
++                }
++            }));
++    }
++
++    /// Steps 5.remote.1.5 to 5.remote.1.7 of
++    /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>, which continue a
++    /// fetch that is suspended for preload=none.
++    fn resume_suspended_load(&self, cx: &mut JSContext) {
++        let url = {
++            let mut suspended_load = self.suspended_load.borrow_mut();
++            let Some(load) = suspended_load.as_mut() else {
++                return;
++            };
++
++            // Step 5.remote.1.4. Wait for the task to be run.
++            if load.waiting_for_task {
++                load.resume_requested = true;
++                return;
++            }
++
++            // Step 5.remote.1.5. Wait for an implementation-defined event (e.g., the user
++            // requesting that the media element begin playback).
++            suspended_load.take().expect("The fetch is suspended").url
++        };
++
++        // Step 5.remote.1.6. Set the element's delaying-the-load-event flag back to true (this
++        // delays the load event again, in case it hasn't been fired yet).
++        self.delay_load_event(cx, true);
++
++        // Step 5.remote.1.7. Set the networkState to NETWORK_LOADING.
++        self.set_network_state(NetworkState::Loading);
++
++        self.fetch_resource(cx, Resource::Url(url));
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
++    fn fetch_resource(&self, cx: &JSContext, resource: Resource) {
+         if let Err(e) = self.create_media_player(&resource) {
+             error!("Create media player error {:?}", e);
+             self.resource_selection_algorithm_failure_steps(cx);
+@@ -1659,47 +1782,6 @@ impl HTMLMediaElement {
+         // Step 5. Run the appropriate steps from the following list:
+         match resource {
+             Resource::Url(url) => {
+-                // Step 5.remote.1. Optionally, run the following substeps. This is the expected
+-                // behavior if the user agent intends to not attempt to fetch the resource until the
+-                // user requests it explicitly (e.g. as a way to implement the preload attribute's
+-                // none keyword).
+-                if self.Preload() == "none" && !self.autoplaying.get() {
+-                    // Step 5.remote.1.1. Set the networkState to NETWORK_IDLE.
+-                    self.set_network_state(NetworkState::Idle);
+-
+-                    // Step 5.remote.1.2. Queue a media element task given the media element to fire
+-                    // an event named suspend at the element.
+-                    self.queue_media_element_task_to_fire_event(atom!("suspend"));
+-
+-                    // Step 5.remote.1.3. Queue a media element task given the media element to set
+-                    // the element's delaying-the-load-event flag to false. This stops delaying the
+-                    // load event.
+-                    let this = Trusted::new(self);
+-                    let generation_id = self.generation_id.get();
+-
+-                    self.owner_global()
+-                        .task_manager()
+-                        .media_element_task_source()
+-                        .queue(task!(queue_delay_load_event: move |cx| {
+-                            let this = this.root();
+-                            if generation_id != this.generation_id.get() {
+-                                return;
+-                            }
+-
+-                            this.delay_load_event(cx, false);
+-                        }));
+-
+-                    // TODO Steps 5.remote.1.4. Wait for the task to be run.
+-                    // FIXME(nox): Somehow we should wait for the task from previous
+-                    // step to be ran before continuing.
+-
+-                    // TODO Steps 5.remote.1.5-5.remote.1.7.
+-                    // FIXME(nox): Wait for an implementation-defined event and
+-                    // then continue with the normal set of steps instead of just
+-                    // returning.
+-                    return;
+-                }
+-
+                 *self.resource_url.borrow_mut() = Some(url);
+ 
+                 // Steps 5.remote.2-5.remote.8
+@@ -1841,6 +1923,7 @@ impl HTMLMediaElement {
+         // Step 2. Abort any already-running instance of the resource selection algorithm for this
+         // element.
+         self.generation_id.set(self.generation_id.get() + 1);
++        *self.suspended_load.borrow_mut() = None;
+ 
+         self.load_state.set(LoadState::NotLoaded);
+         *self.source_children_pointer.borrow_mut() = None;
+@@ -3414,6 +3497,9 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
+     /// <https://html.spec.whatwg.org/multipage/#dom-media-load>
+     fn Load(&self, cx: &mut JSContext) {
+         self.media_element_load_algorithm(cx);
++        // Invoking the resource selection algorithm resets this, and the algorithm only fetches
++        // once a stable state is reached.
++        self.explicit_load.set(true);
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#dom-navigator-canplaytype>
+@@ -3754,7 +3840,17 @@ impl VirtualMethods for HTMLMediaElement {
+                     self.remove_controls(cx);
+                 }
+             },
+-            local_name!("autoplay") => self.update_keep_alive(),
++            local_name!("autoplay") => {
++                if mutation.new_value(attr).is_some() {
++                    self.resume_suspended_load(cx);
++                }
++                self.update_keep_alive();
++            },
++            local_name!("preload") => {
++                if self.Preload() != "none" {
++                    self.resume_suspended_load(cx);
++                }
++            },
+             _ => (),
+         };
+     }
+diff --git a/tests/unit/script/size_of.rs b/tests/unit/script/size_of.rs
+index b23489a869c..2ceba622150 100644
+--- a/tests/unit/script/size_of.rs
++++ b/tests/unit/script/size_of.rs
+@@ -37,7 +37,7 @@ sizeof_checker!(size_div, HTMLDivElement, 344);
+ sizeof_checker!(size_span, HTMLSpanElement, 344);
+ sizeof_checker!(size_htmlscript, HTMLScriptElement, 488);
+ sizeof_checker!(size_htmlimage, HTMLImageElement, 576);
+-sizeof_checker!(size_htmlvideo, HTMLVideoElement, 1216);
++sizeof_checker!(size_htmlvideo, HTMLVideoElement, 1248);
+ sizeof_checker!(size_text, Text, 168);
+ sizeof_checker!(size_characterdata, CharacterData, 168);
+ sizeof_checker!(size_contentattributedata, ContentAttributeData, 72);
+diff --git a/tests/wpt/meta/MANIFEST.json b/tests/wpt/meta/MANIFEST.json
+index 2dc32f09d30..0f1d8e9811e 100644
+--- a/tests/wpt/meta/MANIFEST.json
++++ b/tests/wpt/meta/MANIFEST.json
+@@ -1315065,6 +1315065,13 @@
+           {}
+          ]
+         ],
++        "preload-none-play.html": [
++         "29dbc85091358605772d8e48e99a4f7114c48508",
++         [
++          null,
++          {}
++         ]
++        ],
+         "resource-selection-candidate-insert-before.html": [
+          "39c9887505271b157bdf1b27691c9315f729746d",
+          [
+diff --git a/tests/wpt/tests/html/semantics/embedded-content/media-elements/loading-the-media-resource/preload-none-play.html b/tests/wpt/tests/html/semantics/embedded-content/media-elements/loading-the-media-resource/preload-none-play.html
+new file mode 100644
+index 00000000000..29dbc850913
+--- /dev/null
++++ b/tests/wpt/tests/html/semantics/embedded-content/media-elements/loading-the-media-resource/preload-none-play.html
+@@ -0,0 +1,73 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<title>play() plays a media element with preload=none</title>
++<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#concept-media-load-resource">
++<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#attr-media-preload">
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script src="/common/media.js"></script>
++<body>
++<script>
++// A user agent may suspend the fetch of a media resource with preload=none until playback is
++// requested, but then it has to fetch the resource and play it.
++
++// The tests run in parallel, so that a media element that never plays only times out its own test.
++function preload_none_test(setup, description) {
++  async_test(t => {
++    const audio = document.createElement("audio");
++    t.add_cleanup(() => audio.pause());
++    audio.preload = "none";
++    const play = t.step_func(() => {
++      audio.play().then(t.step_func_done(() => {
++        assert_false(audio.paused, "paused");
++        assert_greater_than_equal(audio.readyState, audio.HAVE_FUTURE_DATA, "readyState");
++      }), t.unreached_func("play() rejected"));
++    });
++    // Only wait when the setup has to, so that play() can run before resource selection does.
++    const waiting = setup(audio, getAudioURI("/media/sound_5"));
++    if (waiting) {
++      waiting.then(play);
++    } else {
++      play();
++    }
++  }, description);
++}
++
++preload_none_test((audio, src) => {
++  audio.src = src;
++}, "play() right after setting src");
++
++preload_none_test((audio, src) => {
++  audio.src = src;
++  audio.load();
++}, "play() right after load()");
++
++preload_none_test((audio, src) => {
++  audio.src = src;
++  return new Promise(resolve => audio.addEventListener("suspend", resolve, { once: true }));
++}, "play() after the suspend event");
++
++preload_none_test((audio, src) => {
++  audio.src = src;
++  audio.pause();
++  return new Promise(resolve => audio.addEventListener("suspend", resolve, { once: true }));
++}, "play() after pause() and the suspend event");
++
++preload_none_test((audio, src) => {
++  const source = document.createElement("source");
++  source.src = src;
++  audio.appendChild(source);
++  return new Promise(resolve => audio.addEventListener("suspend", resolve, { once: true }));
++}, "play() with a source element after the suspend event");
++
++preload_none_test((audio, src) => {
++  const unsupported = document.createElement("source");
++  unsupported.type = "audio/x-unsupported";
++  unsupported.src = src;
++  const source = document.createElement("source");
++  source.src = src;
++  audio.append(unsupported, source);
++  return new Promise(resolve => audio.addEventListener("suspend", resolve, { once: true }));
++}, "play() with an unsupported and a supported source element after the suspend event");
++</script>
++</body>

@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 14 Oct 2026 09:59:08 +0000
+Subject: [PATCH] script: Move to the end of the media resource at the end of
+ the stream
+
+The media engine can signal the end of the stream before it reports a
+playback position at the end of the media resource, for example for short
+resources. The element then fired `ended` without `pause`, and stayed
+unpaused with `ended` false. Move the current playback position to the end
+of the media resource first, like other browsers do, so that the steps for
+reaching the end pause the element. Likewise, move it to the earliest
+possible position when the stream ends while playing backwards.
+
+video-loading-lazy-autoplay-when-visible.html now times out instead of
+failing. With the timeout multiplier of CI, its check that the video
+did not play yet runs after the 3 s video ended, and now finds it
+paused. It then waits for a play event that never comes, as Servo
+doesn't defer the load of lazy videos.
+
+Fork note: meant for upstream, together with the next patch, which
+depends on it: without this change, elements that end playback with the
+position short of the end stay unpaused, and the next patch would keep
+them alive until their document goes away. Drop once upstream has it.
+
+Testing: played-loop.html passes now, and the expectation of
+video-loading-lazy-autoplay-when-visible.html is updated.
+
+Validation: Release builds of upstream f040186a7ee: played-loop.html passes with this change and fails without it in every run; `<audio>` with sound_0 and `<video>` with test-1s now end with `pause` before `ended` and with `currentTime == duration` (before, `ended` fired with `paused` false); a `<video>` played backwards from 1 s now ends at 0 (without the backwards part of this change, at 0.007 s in some runs). The whole series on that base against the same build without it, `./mach test-wpt --processes 4` of html/semantics/embedded-content/media-elements, the-video-element, the-audio-element, infrastructure/assumptions/allowed-to-play.html, webaudio/the-audio-api/the-mediaelementaudiosourcenode-interface and 2 _mozilla media tests (460 tests): see the next two patches. video-loading-lazy-autoplay-when-visible.html, in a CI run of this branch and locally with `--timeout-multiplier 2` as CI runs it: TIMEOUT with this change in every run (2 alone, 3 in parallel with the media tests at `--processes 16`), FAIL without it (2 runs); without the multiplier, FAIL either way.
+AI-assisted: Yes (agent session; root-caused, written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../html/embedded_content/htmlmediaelement.rs  | 18 ++++++++++++++++--
+ .../media-elements/played-loop.html.ini        |  3 ---
+ ...loading-lazy-autoplay-when-visible.html.ini |  2 +-
+ 3 files changed, 17 insertions(+), 6 deletions(-)
+ delete mode 100644 tests/wpt/meta/html/semantics/embedded-content/media-elements/played-loop.html.ini
+
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 9266f37f2f5..fefeac2c16b 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -2441,9 +2441,23 @@ impl HTMLMediaElement {
+             return;
+         }
+ 
++        // The media engine can signal the end of the stream before it reports a position at the
++        // end of the media resource in the direction of playback.
+         match self.direction_of_playback() {
+-            PlaybackDirection::Forwards => self.end_of_playback_in_forwards_direction(cx),
+-            PlaybackDirection::Backwards => self.end_of_playback_in_backwards_direction(),
++            PlaybackDirection::Forwards => {
++                let duration = self.duration.get();
++                if duration.is_finite() && self.current_playback_position.get() < duration {
++                    self.playback_position_changed(cx, duration);
++                }
++                self.end_of_playback_in_forwards_direction(cx)
++            },
++            PlaybackDirection::Backwards => {
++                let earliest_possible_position = self.earliest_possible_position();
++                if self.current_playback_position.get() > earliest_possible_position {
++                    self.playback_position_changed(cx, earliest_possible_position);
++                }
++                self.end_of_playback_in_backwards_direction()
++            },
+         }
+     }
+ 
+diff --git a/tests/wpt/meta/html/semantics/embedded-content/media-elements/played-loop.html.ini b/tests/wpt/meta/html/semantics/embedded-content/media-elements/played-loop.html.ini
+deleted file mode 100644
+index d2ae9fd373f..00000000000
+--- a/tests/wpt/meta/html/semantics/embedded-content/media-elements/played-loop.html.ini
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[played-loop.html]
+-  [played TimeRanges should be preserved and not reset when video loops]
+-    expected: FAIL
+diff --git a/tests/wpt/meta/html/semantics/embedded-content/the-video-element/video-loading-lazy-autoplay-when-visible.html.ini b/tests/wpt/meta/html/semantics/embedded-content/the-video-element/video-loading-lazy-autoplay-when-visible.html.ini
+index c3daf0f98b4..3a3b6300762 100644
+--- a/tests/wpt/meta/html/semantics/embedded-content/the-video-element/video-loading-lazy-autoplay-when-visible.html.ini
++++ b/tests/wpt/meta/html/semantics/embedded-content/the-video-element/video-loading-lazy-autoplay-when-visible.html.ini
+@@ -1,4 +1,4 @@
+ [video-loading-lazy-autoplay-when-visible.html]
+   expected: ERROR
+   [Video with loading=lazy and autoplay does not play while not visible, then plays once scrolled into view]
+-    expected: FAIL
++    expected: TIMEOUT

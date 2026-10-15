@@ -1,0 +1,648 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 14 Oct 2026 09:59:09 +0000
+Subject: [PATCH] script: Keep media elements alive while they can still play
+
+Nothing kept a media element alive while it loaded or played: the player
+only holds a weak reference to it. An element that script no longer
+referenced was collected at the next garbage collection, which stopped
+its playback, and a detached element that delayed the load event let the
+load event fire early. The specification requires that "media elements
+must not stop playing just because all references to them have been
+removed".
+
+Like Gecko, and Blink apart from autoplay, keep a media element alive
+while it delays the load event or seeks, and, until it has ended
+playback, while it plays or waits for data to play or is eligible for
+autoplay. Its owner document holds such elements, so they never outlive
+the document.
+
+Fork note: meant for upstream; found with the QuickJS backend, which
+frees such elements as soon as script drops them (the media tests have
+failed on QuickJS since patch 61's pool scopes), but SpiderMonkey loses
+them too once a GC runs (the new test times out without this change).
+Besides the upstream change, this drops the QuickJS conditions in the
+expectations of autoplay-disabled-by-permissions-policy; patch 72 drops
+the others. Drop once upstream has it.
+
+Testing: Adds a WPT test that unreferenced media elements keep playing
+across a garbage collection; it times out without this change.
+
+Validation: Release builds of upstream f040186a7ee with SpiderMonkey, with and without the series, `./mach test-wpt --processes 4` of html/semantics/embedded-content/media-elements, the-video-element, the-audio-element, infrastructure/assumptions/allowed-to-play.html, webaudio/the-audio-api/the-mediaelementaudiosourcenode-interface and 2 _mozilla media tests: the new test passes 7 of 7 (harness timeout without), autoplay-disabled-by-permissions-policy and played-loop as in the updated expectations (autoplay-disabled timed out intermittently before, upstream issues #46012 and #46804); the remaining differences are track timeouts and track-cues-sorted-before-dispatch failures that both builds show intermittently, and one seek-to-max-value failure in 7 runs with the series (`currentTime` 0 right after setting it), not reproduced in 6 reruns, apart from load-removes-queued-error-event, which now hangs whenever GStreamer 1.24.2's playbin3 stalls on a `<video>` with an audio-only MP3: 4 of 6 runs on this host without the series too; the stalled element delays the load event, and before, only a garbage collection that freed it let the load event fire (upstream's intermittent tracker has 9 unexpected results for that test in total). The three tests that fail on QuickJS CI pass with forced GCs every 20 ms too. With logging of the keep-alive updates, every element in direct checks stopped being kept alive once it had been loaded and never played, played to the end, paused, replayed after the end without a seekable range, or played backwards to the start. An independent agent review found no blockers; its two should-fix findings for this patch (ended but unpaused elements were kept alive; changes of the error went through no hook) are fixed. QuickJS release build of this stack: the new tests and the media tests that had QuickJS expectations (autoplay.html, allowed-to-play.html, resource-selection-candidate-moved.html and the three autoplay permissions policy tests) give SpiderMonkey's results in 2 of 2 runs; without the series they time out as the dropped expectations said.
+AI-assisted: Yes (agent session; root-caused, written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/document/document.rs    |  21 +++
+ .../html/embedded_content/htmlmediaelement.rs | 137 ++++++++++++++---
+ tests/unit/script/size_of.rs                  |   2 +-
+ tests/wpt/meta/MANIFEST.json                  |   9 ++
+ ...d-by-permissions-policy.https.sub.html.ini |  11 +-
+ .../gc-unreferenced-media-element.html        | 143 ++++++++++++++++++
+ 6 files changed, 288 insertions(+), 35 deletions(-)
+ create mode 100644 tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/gc-unreferenced-media-element.html
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index d10055ffa94..8ad87a2de4f 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -181,6 +181,7 @@ use crate::dom::html::htmlheadelement::HTMLHeadElement;
+ use crate::dom::html::htmlhtmlelement::HTMLHtmlElement;
+ use crate::dom::html::htmliframeelement::HTMLIFrameElement;
+ use crate::dom::html::htmlimageelement::HTMLImageElement;
++use crate::dom::html::htmlmediaelement::HTMLMediaElement;
+ use crate::dom::html::htmlscriptelement::{HTMLScriptElement, ScriptResult};
+ use crate::dom::html::htmltitleelement::HTMLTitleElement;
+ use crate::dom::htmldetailselement::DetailsNameGroups;
+@@ -620,6 +621,10 @@ pub(crate) struct Document {
+     /// where `id` needs to match any of the registered ShadowRoots
+     /// hosting the media controls UI.
+     media_controls: DomRefCell<HashMap<String, Dom<ShadowRoot>>>,
++    /// Media elements that may still play or fire events, which are kept alive as long as this
++    /// document is, even if script holds no reference to them.
++    /// <https://html.spec.whatwg.org/multipage/#playing-the-media-resource>
++    media_elements_with_pending_activity: DomRefCell<Vec<Dom<HTMLMediaElement>>>,
+     /// A set of dirty HTML canvas elements that need their WebRender images updated the
+     /// next time the rendering is updated.
+     dirty_canvases: DomRefCell<Vec<Dom<HTMLCanvasElement>>>,
+@@ -3303,6 +3308,21 @@ impl Document {
+         );
+     }
+ 
++    pub(crate) fn register_media_element_with_pending_activity(&self, element: &HTMLMediaElement) {
++        self.media_elements_with_pending_activity
++            .borrow_mut()
++            .push(Dom::from_ref(element));
++    }
++
++    pub(crate) fn unregister_media_element_with_pending_activity(
++        &self,
++        element: &HTMLMediaElement,
++    ) {
++        self.media_elements_with_pending_activity
++            .borrow_mut()
++            .retain(|registered| **registered != *element);
++    }
++
+     pub(crate) fn mark_canvas_as_dirty(&self, canvas: &Dom<HTMLCanvasElement>) {
+         let mut dirty_canvases = self.dirty_canvases.borrow_mut();
+         if dirty_canvases
+@@ -4312,6 +4332,7 @@ impl Document {
+             shadow_roots: Default::default(),
+             shadow_roots_styles_changed: Cell::new(false),
+             media_controls: DomRefCell::new(HashMap::new()),
++            media_elements_with_pending_activity: Default::default(),
+             dirty_canvases: DomRefCell::new(Default::default()),
+             has_pending_animated_image_update: Cell::new(false),
+             selection: MutNullableDom::new(None),
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index fefeac2c16b..600c5527f09 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -205,6 +205,9 @@ pub(crate) struct HTMLMediaElement {
+     autoplaying: Cell<bool>,
+     /// <https://html.spec.whatwg.org/multipage/#delaying-the-load-event-flag>
+     delaying_the_load_event_flag: DomRefCell<Option<LoadBlocker>>,
++    /// Whether the owner document keeps this element alive, because it may still play or fire
++    /// events after script has dropped all references to it.
++    kept_alive_by_document: Cell<bool>,
+     /// <https://html.spec.whatwg.org/multipage/#list-of-pending-play-promises>
+     pending_play_promises: DomRefCell<Vec<TracedPromise>>,
+     /// Play promises which are soon to be fulfilled by a queued task.
+@@ -407,6 +410,7 @@ impl HTMLMediaElement {
+             // FIXME(nox): Why is this initialised to true?
+             autoplaying: Cell::new(true),
+             delaying_the_load_event_flag: Default::default(),
++            kept_alive_by_document: Cell::new(false),
+             pending_play_promises: Default::default(),
+             in_flight_play_promises_queue: Default::default(),
+             player: Default::default(),
+@@ -445,6 +449,78 @@ impl HTMLMediaElement {
+         self.network_state.get()
+     }
+ 
++    fn set_network_state(&self, network_state: NetworkState) {
++        self.network_state.set(network_state);
++        self.update_keep_alive();
++    }
++
++    fn set_paused(&self, paused: bool) {
++        self.paused.set(paused);
++        self.update_keep_alive();
++    }
++
++    fn set_seeking(&self, seeking: bool) {
++        self.seeking.set(seeking);
++        self.update_keep_alive();
++    }
++
++    fn set_autoplaying(&self, autoplaying: bool) {
++        self.autoplaying.set(autoplaying);
++        self.update_keep_alive();
++    }
++
++    fn set_error(&self, error: Option<&MediaError>) {
++        self.error.set(error);
++        self.update_keep_alive();
++    }
++
++    /// Whether the element may still play audio or fire events without script acting on it, as
++    /// in other browsers: while it delays the load event (resource selection and loading up to
++    /// HAVE_CURRENT_DATA), and, with a resource and no error, while it seeks, or, until it has
++    /// ended playback, while it plays (also while waiting for data) or is eligible for autoplay.
++    /// While a fetch is in progress, the fetch listener keeps the element alive anyway.
++    fn has_pending_activity(&self) -> bool {
++        if self.delaying_the_load_event_flag.borrow().is_some() {
++            return true;
++        }
++        if self.in_error_state() ||
++            !matches!(
++                self.network_state.get(),
++                NetworkState::Loading | NetworkState::Idle
++            )
++        {
++            return false;
++        }
++        if self.seeking.get() {
++            return true;
++        }
++        if self.ended_playback(LoopCondition::Included) {
++            return false;
++        }
++        !self.paused.get() ||
++            (self.ready_state.get() < ReadyState::HaveEnoughData && self.eligible_for_autoplay())
++    }
++
++    /// Keeps the element alive through its owner document while it has pending activity.
++    ///
++    /// <https://html.spec.whatwg.org/multipage/#playing-the-media-resource>
++    /// > Media elements must not stop playing just because all references to them have been
++    /// > removed; only once a media element is in a state where no further audio could ever be
++    /// > played by that element may the element be garbage collected.
++    fn update_keep_alive(&self) {
++        let keep_alive = self.has_pending_activity();
++        if keep_alive == self.kept_alive_by_document.get() {
++            return;
++        }
++        self.kept_alive_by_document.set(keep_alive);
++        let document = self.owner_document();
++        if keep_alive {
++            document.register_media_element_with_pending_activity(self);
++        } else {
++            document.unregister_media_element_with_pending_activity(self);
++        }
++    }
++
+     pub(crate) fn get_ready_state(&self) -> ReadyState {
+         self.ready_state.get()
+     }
+@@ -504,6 +580,8 @@ impl HTMLMediaElement {
+         } else {
+             LoadBlocker::terminate(cx, blocker);
+         }
++
++        self.update_keep_alive();
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#time-marches-on>
+@@ -806,7 +884,7 @@ impl HTMLMediaElement {
+         // Step 3. If the media element's paused attribute is true, then:
+         if self.Paused() {
+             // Step 3.1. Change the value of paused to false.
+-            self.paused.set(false);
++            self.set_paused(false);
+ 
+             // Step 3.2. If the show poster flag is true, set the element's show poster flag to
+             // false and run the time marches on steps.
+@@ -859,7 +937,7 @@ impl HTMLMediaElement {
+         }
+ 
+         // Step 5. Set the media element's can autoplay flag to false.
+-        self.autoplaying.set(false);
++        self.set_autoplaying(false);
+ 
+         self.update_media_state();
+     }
+@@ -867,12 +945,12 @@ impl HTMLMediaElement {
+     /// <https://html.spec.whatwg.org/multipage/#internal-pause-steps>
+     fn internal_pause_steps(&self) {
+         // Step 1. Set the media element's can autoplay flag to false.
+-        self.autoplaying.set(false);
++        self.set_autoplaying(false);
+ 
+         // Step 2. If the media element's paused attribute is false, run the following steps:
+         if !self.Paused() {
+             // Step 2.1. Change the value of paused to true.
+-            self.paused.set(true);
++            self.set_paused(true);
+ 
+             // Step 2.2. Take pending play promises and let promises be the result.
+             self.take_pending_play_promises(Err(Error::Abort(Some(
+@@ -951,6 +1029,7 @@ impl HTMLMediaElement {
+         let old_ready_state = self.ready_state.get();
+         let was_potentially_playing = self.is_potentially_playing();
+         self.ready_state.set(ready_state);
++        self.update_keep_alive();
+ 
+         // > When the ready state of a media element whose networkState is not NETWORK_EMPTY changes,
+         // > the user agent must follow the steps given below:
+@@ -1075,7 +1154,7 @@ impl HTMLMediaElement {
+                 // > The user agent may run the following substeps:
+                 if self.eligible_for_autoplay() {
+                     // Step 1. Set the paused attribute to false.
+-                    self.paused.set(false);
++                    self.set_paused(false);
+ 
+                     // Step 2. If the element's show poster flag is true, set it to false and run the
+                     // time marches on steps.
+@@ -1111,7 +1190,7 @@ impl HTMLMediaElement {
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-algorithm>
+     fn invoke_resource_selection_algorithm(&self, cx: &mut JSContext) {
+         // Step 1. Set the element's networkState attribute to the NETWORK_NO_SOURCE value.
+-        self.network_state.set(NetworkState::NoSource);
++        self.set_network_state(NetworkState::NoSource);
+ 
+         // Step 2. Set the element's show poster flag to true.
+         self.show_poster.set(true);
+@@ -1179,7 +1258,7 @@ impl HTMLMediaElement {
+             self.load_state.set(LoadState::NotLoaded);
+ 
+             // Step 6.none.1. Set the networkState to NETWORK_EMPTY.
+-            self.network_state.set(NetworkState::Empty);
++            self.set_network_state(NetworkState::Empty);
+ 
+             // Step 6.none.2. Set the element's delaying-the-load-event flag to false. This stops
+             // delaying the load event.
+@@ -1190,7 +1269,7 @@ impl HTMLMediaElement {
+         };
+ 
+         // Step 7. Set the media element's networkState to NETWORK_LOADING.
+-        self.network_state.set(NetworkState::Loading);
++        self.set_network_state(NetworkState::Loading);
+ 
+         // Step 8. Queue a media element task given the media element to fire an event named
+         // loadstart at the media element.
+@@ -1422,7 +1501,7 @@ impl HTMLMediaElement {
+ 
+         // Step 9.children.18. Waiting: Set the element's networkState attribute to the
+         // NETWORK_NO_SOURCE value.
+-        self.network_state.set(NetworkState::NoSource);
++        self.set_network_state(NetworkState::NoSource);
+ 
+         // Step 9.children.19. Set the element's show poster flag to true.
+         self.show_poster.set(true);
+@@ -1586,7 +1665,7 @@ impl HTMLMediaElement {
+                 // none keyword).
+                 if self.Preload() == "none" && !self.autoplaying.get() {
+                     // Step 5.remote.1.1. Set the networkState to NETWORK_IDLE.
+-                    self.network_state.set(NetworkState::Idle);
++                    self.set_network_state(NetworkState::Idle);
+ 
+                     // Step 5.remote.1.2. Queue a media element task given the media element to fire
+                     // an event named suspend at the element.
+@@ -1679,7 +1758,7 @@ impl HTMLMediaElement {
+                 this.fulfill_in_flight_play_promises(cx, |cx| {
+                     // Step 1. Set the error attribute to the result of creating a MediaError with
+                     // MEDIA_ERR_SRC_NOT_SUPPORTED.
+-                    this.error.set(Some(&*MediaError::new(
++                    this.set_error(Some(&*MediaError::new(
+                         cx,
+                         &this.owner_window(),
+                         MEDIA_ERR_SRC_NOT_SUPPORTED)));
+@@ -1690,7 +1769,7 @@ impl HTMLMediaElement {
+ 
+                     // Step 3. Set the element's networkState attribute to the NETWORK_NO_SOURCE
+                     // value.
+-                    this.network_state.set(NetworkState::NoSource);
++                    this.set_network_state(NetworkState::NoSource);
+ 
+                     // Step 4. Set the element's show poster flag to true.
+                     this.show_poster.set(true);
+@@ -1820,7 +1899,7 @@ impl HTMLMediaElement {
+             // Step 7.6. If the paused attribute is false, then:
+             if !self.Paused() {
+                 // Step 7.6.1. Set the paused attribute to true.
+-                self.paused.set(true);
++                self.set_paused(true);
+ 
+                 // Step 7.6.2. Take pending play promises and reject pending play promises with the
+                 // result and an "AbortError" DOMException.
+@@ -1831,7 +1910,7 @@ impl HTMLMediaElement {
+             }
+ 
+             // Step 7.7. If seeking is true, set it to false.
+-            self.seeking.set(false);
++            self.set_seeking(false);
+ 
+             self.current_seek_position.set(f64::NAN);
+ 
+@@ -1855,8 +1934,8 @@ impl HTMLMediaElement {
+         self.playback_rate.set(self.default_playback_rate.get());
+ 
+         // Step 9. Set the error attribute to null and the can autoplay flag to true.
+-        self.error.set(None);
+-        self.autoplaying.set(true);
++        self.set_error(None);
++        self.set_autoplaying(true);
+ 
+         // Step 10. Invoke the media element's resource selection algorithm.
+         self.invoke_resource_selection_algorithm(cx);
+@@ -1982,7 +2061,7 @@ impl HTMLMediaElement {
+         self.delay_load_event(cx, true);
+ 
+         // Step 9.children.25. Set the networkState back to NETWORK_LOADING.
+-        self.network_state.set(NetworkState::Loading);
++        self.set_network_state(NetworkState::Loading);
+ 
+         // Step 9.children.26. Jump back to the find next candidate step above.
+         self.select_next_source_child(cx);
+@@ -2016,11 +2095,10 @@ impl HTMLMediaElement {
+ 
+         // Step 2. Set the error attribute to the result of creating a MediaError with
+         // MEDIA_ERR_NETWORK/MEDIA_ERR_DECODE.
+-        self.error
+-            .set(Some(&*MediaError::new(cx, &self.owner_window(), error)));
++        self.set_error(Some(&*MediaError::new(cx, &self.owner_window(), error)));
+ 
+         // Step 3. Set the element's networkState attribute to the NETWORK_IDLE value.
+-        self.network_state.set(NetworkState::Idle);
++        self.set_network_state(NetworkState::Idle);
+ 
+         // Step 4. Set the element's delaying-the-load-event flag to false. This stops delaying
+         // the load event.
+@@ -2048,7 +2126,7 @@ impl HTMLMediaElement {
+         self.current_seek_position.set(f64::NAN);
+ 
+         // Step 4. Set the seeking IDL attribute to true.
+-        self.seeking.set(true);
++        self.set_seeking(true);
+ 
+         // Step 5. If the seek was in response to a DOM method call or setting of an IDL attribute,
+         // then continue the script. The remainder of these steps must be run in parallel.
+@@ -2069,7 +2147,7 @@ impl HTMLMediaElement {
+         let seekable = self.seekable();
+ 
+         if seekable.is_empty() {
+-            self.seeking.set(false);
++            self.set_seeking(false);
+             return;
+         }
+ 
+@@ -2141,7 +2219,7 @@ impl HTMLMediaElement {
+             .set(self.current_playback_position.get());
+ 
+         // Step 14. Set the seeking IDL attribute to false.
+-        self.seeking.set(false);
++        self.set_seeking(false);
+ 
+         self.current_seek_position.set(f64::NAN);
+ 
+@@ -2405,7 +2483,7 @@ impl HTMLMediaElement {
+                     this.direction_of_playback() == PlaybackDirection::Forwards &&
+                     !this.Paused() {
+                     // Step 3.2.1. Set the paused attribute to true.
+-                    this.paused.set(true);
++                    this.set_paused(true);
+ 
+                     // Step 3.2.2. Fire an event named pause at the media element.
+                     this.upcast::<EventTarget>().fire_event(cx, atom!("pause"));
+@@ -2433,6 +2511,8 @@ impl HTMLMediaElement {
+         if self.current_playback_position.get() <= self.earliest_possible_position() {
+             self.queue_media_element_task_to_fire_event(atom!("timeupdate"));
+         }
++
++        self.update_keep_alive();
+     }
+ 
+     fn playback_end(&self, cx: &mut JSContext) {
+@@ -3674,6 +3754,7 @@ impl VirtualMethods for HTMLMediaElement {
+                     self.remove_controls(cx);
+                 }
+             },
++            local_name!("autoplay") => self.update_keep_alive(),
+             _ => (),
+         };
+     }
+@@ -3698,6 +3779,12 @@ impl VirtualMethods for HTMLMediaElement {
+     fn adopting_steps(&self, cx: &mut JSContext, old_doc: &Document) {
+         self.super_type().unwrap().adopting_steps(cx, old_doc);
+ 
++        if self.kept_alive_by_document.get() {
++            old_doc.unregister_media_element_with_pending_activity(self);
++            self.owner_document()
++                .register_media_element_with_pending_activity(self);
++        }
++
+         // Note that media control id should be adopting between documents so "privileged"
+         // document.servoGetMediaControls(id) API is keeping access to the whitelist of media
+         // controls identifiers.
+@@ -4175,7 +4262,7 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
+ 
+             // Step 2. Set the networkState to NETWORK_IDLE and fire an event named suspend at the
+             // media element.
+-            element.network_state.set(NetworkState::Idle);
++            element.set_network_state(NetworkState::Idle);
+ 
+             element
+                 .upcast::<EventTarget>()
+diff --git a/tests/unit/script/size_of.rs b/tests/unit/script/size_of.rs
+index c837b092f5d..b23489a869c 100644
+--- a/tests/unit/script/size_of.rs
++++ b/tests/unit/script/size_of.rs
+@@ -37,7 +37,7 @@ sizeof_checker!(size_div, HTMLDivElement, 344);
+ sizeof_checker!(size_span, HTMLSpanElement, 344);
+ sizeof_checker!(size_htmlscript, HTMLScriptElement, 488);
+ sizeof_checker!(size_htmlimage, HTMLImageElement, 576);
+-sizeof_checker!(size_htmlvideo, HTMLVideoElement, 1208);
++sizeof_checker!(size_htmlvideo, HTMLVideoElement, 1216);
+ sizeof_checker!(size_text, Text, 168);
+ sizeof_checker!(size_characterdata, CharacterData, 168);
+ sizeof_checker!(size_contentattributedata, ContentAttributeData, 72);
+diff --git a/tests/wpt/meta/MANIFEST.json b/tests/wpt/meta/MANIFEST.json
+index 7469c060b76..b3785cabda9 100644
+--- a/tests/wpt/meta/MANIFEST.json
++++ b/tests/wpt/meta/MANIFEST.json
+@@ -1315820,6 +1315820,15 @@
+           {}
+          ]
+         ],
++        "gc-unreferenced-media-element.html": [
++         "461e7e40b758993c25816a1838471f660e192f37",
++         [
++          null,
++          {
++           "timeout": "long"
++          }
++         ]
++        ],
+         "loop-from-ended.tentative.html": [
+          "d099a8a0f8d3f41f08dd825fd42b1b1947e15956",
+          [
+diff --git a/tests/wpt/meta/html/semantics/embedded-content/media-elements/autoplay-disabled-by-permissions-policy.https.sub.html.ini b/tests/wpt/meta/html/semantics/embedded-content/media-elements/autoplay-disabled-by-permissions-policy.https.sub.html.ini
+index f3f5ad38ebf..5e63d839c46 100644
+--- a/tests/wpt/meta/html/semantics/embedded-content/media-elements/autoplay-disabled-by-permissions-policy.https.sub.html.ini
++++ b/tests/wpt/meta/html/semantics/embedded-content/media-elements/autoplay-disabled-by-permissions-policy.https.sub.html.ini
+@@ -1,13 +1,6 @@
+ [autoplay-disabled-by-permissions-policy.https.sub.html]
+-  expected: TIMEOUT
+   [Permissions-Policy header: autoplay "none" disallows same-origin iframes.]
+-    expected: TIMEOUT
++    expected: FAIL
+ 
+   [Permissions-Policy header: autoplay "none" disallows cross-origin iframes.]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
+-      FAIL
+-
+-  [Permissions-Policy header: autoplay "none" has no effect on the top level document.]
+-    expected:
+-      if js_engine == "quickjs": TIMEOUT
++    expected: FAIL
+diff --git a/tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/gc-unreferenced-media-element.html b/tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/gc-unreferenced-media-element.html
+new file mode 100644
+index 00000000000..461e7e40b75
+--- /dev/null
++++ b/tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/gc-unreferenced-media-element.html
+@@ -0,0 +1,143 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<title>Media elements keep playing when all references to them have been removed</title>
++<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#playing-the-media-resource">
++<meta name="timeout" content="long">
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script src="/common/gc.js"></script>
++<script src="/common/media.js"></script>
++<body>
++<script>
++// "Media elements must not stop playing just because all references to them have been removed;
++// only once a media element is in a state where no further audio could ever be played by that
++// element may the element be garbage collected."
++//
++// Each test creates a media element that is not in a document and keeps no reference to it: only
++// the element's own event listeners see it. The test forces a garbage collection while the
++// element can still play audio or fire events, then waits for the element to carry on. The tests
++// run in parallel, so that an element that is collected only times out its own test.
++
++const AUDIO_SRC = getAudioURI("/media/sound_5"); // audio only, 5 s
++const VIDEO_SRC = getVideoURI("/media/test-1s"); // audio and video, 1 s
++const SILENT_VIDEO_SRC = getVideoURI("/media/white"); // video without audio, 10 s
++const SRC = { audio: AUDIO_SRC, video: VIDEO_SRC };
++
++// Forwards events of an unreferenced media element to whoever waits for them. It must not keep
++// the element, so it hands out copies of the values the tests need, never the element.
++class MediaEventObserver {
++  #waiters = [];
++
++  // Resolves with the element's currentTime at the next `type` event for which `predicate`
++  // returns true, and rejects at the next `error` event.
++  next(type, predicate = () => true) {
++    return new Promise((resolve, reject) => {
++      this.#waiters.push({ type, predicate, resolve, reject });
++    });
++  }
++
++  fail(error) {
++    for (const waiter of this.#waiters.splice(0)) {
++      waiter.reject(error);
++    }
++  }
++
++  dispatch(event) {
++    const element = event.target;
++    if (event.type == "error") {
++      this.fail(new Error(`error event, MediaError code ${element.error?.code}`));
++      return;
++    }
++    this.#waiters = this.#waiters.filter(waiter => {
++      if (waiter.type != event.type || !waiter.predicate(element)) {
++        return true;
++      }
++      waiter.resolve(element.currentTime);
++      return false;
++    });
++  }
++}
++
++// `start` is one of:
++// - "play": call play();
++// - "autoplay": set the autoplay attribute;
++// - "play-on-canplay": call play() from a canplay listener.
++function unreferencedMediaElement(tagName, src, start) {
++  const observer = new MediaEventObserver();
++  createDetachedElement(tagName, src, start, observer);
++  return observer;
++}
++
++// A separate function, so that nothing that outlives the call refers to the element.
++function createDetachedElement(tagName, src, start, observer) {
++  const element = document.createElement(tagName);
++  for (const type of ["playing", "timeupdate", "ended", "error"]) {
++    element.addEventListener(type, event => observer.dispatch(event));
++  }
++  const play = target => target.play().catch(error => observer.fail(error));
++  if (start == "autoplay") {
++    element.autoplay = true;
++  } else if (start == "play-on-canplay") {
++    element.addEventListener("canplay", event => play(event.target), { once: true });
++  }
++  element.src = src;
++  if (start == "play") {
++    play(element);
++  }
++}
++
++function parallel_test(func, name) {
++  async_test(t => {
++    func().then(() => t.done(), t.step_func(error => { throw error; }));
++  }, name);
++}
++
++for (const tagName of ["audio", "video"]) {
++  parallel_test(async () => {
++    const media = unreferencedMediaElement(tagName, SRC[tagName], "play");
++    await media.next("playing");
++    const ended = media.next("ended");
++    await garbageCollect();
++    await ended;
++  }, `An unreferenced ${tagName} element that is playing keeps playing until it ends`);
++
++  parallel_test(async () => {
++    const media = unreferencedMediaElement(tagName, SRC[tagName], "play");
++    const playing = media.next("playing");
++    const ended = media.next("ended");
++    await garbageCollect();
++    await playing;
++    await ended;
++  }, `An unreferenced ${tagName} element that is loading after play() starts playing`);
++}
++
++parallel_test(async () => {
++  const media = unreferencedMediaElement("audio", AUDIO_SRC, "autoplay");
++  const playing = media.next("playing");
++  await garbageCollect();
++  await playing;
++  const ended = media.next("ended");
++  await garbageCollect();
++  await ended;
++}, "An unreferenced audio element that is eligible for autoplay plays until it ends");
++
++parallel_test(async () => {
++  const media = unreferencedMediaElement("audio", AUDIO_SRC, "play-on-canplay");
++  const playing = media.next("playing");
++  await garbageCollect();
++  await playing;
++  const ended = media.next("ended");
++  await garbageCollect();
++  await ended;
++}, "An unreferenced audio element that is buffering, with a listener that starts playback, " +
++   "plays until it ends");
++
++parallel_test(async () => {
++  const media = unreferencedMediaElement("video", SILENT_VIDEO_SRC, "play");
++  const start = await media.next("playing");
++  const progressed = media.next("timeupdate", element => element.currentTime >= start + 1);
++  await garbageCollect();
++  await progressed;
++}, "An unreferenced video element without audio tracks, with event listeners, keeps playing");
++</script>
++</body>
