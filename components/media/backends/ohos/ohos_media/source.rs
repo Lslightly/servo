@@ -4,16 +4,16 @@
 
 use core::slice;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
-use log::debug;
+use log::warn;
 use ohos_media_sys::avbuffer::OH_AVBuffer;
 use ohos_media_sys::avcodec_base::OH_AVDataSourceExt;
 use ohos_media_sys::avplayer::OH_AVPlayer_SetDataSource;
 use ohos_media_sys::avplayer_base::OH_AVPlayer;
 
+use crate::ohos_media::playback_buffer::PlaybackBuffer;
 use crate::ohos_media::source_builder::MediaSourceBuilder;
-
-const DEFAULT_CACHE_SIZE: usize = 8 * 1024 * 1024; // 8MB
 
 pub struct MediaSourceWrapper {
     pub(crate) data_src: ohos_media_sys::avcodec_base::OH_AVDataSourceExt,
@@ -31,8 +31,6 @@ impl MediaSourceWrapper {
     }
 }
 
-// AVPlayer itself already have a short buffer internally,
-// we can just schedule fetch if we does not have data for that specific location.
 impl MediaSourceWrapper {
     pub fn new(source_cb: MediaSourceBuilder) -> Self {
         let playback_buffer = Arc::new(Mutex::new(PlaybackBuffer::new(source_cb.enough_data)));
@@ -46,8 +44,11 @@ impl MediaSourceWrapper {
                 length,
                 pos
             );
+            let Ok(pos) = u64::try_from(pos) else {
+                return 0;
+            };
             let buffer = unsafe { slice::from_raw_parts_mut(buffer, length as usize) };
-            let (read_bytes, seek_pos) = {
+            let (read_bytes, restart_pos) = {
                 let mut playback_buffer_lock = playback_buffer_clone.lock().unwrap();
                 playback_buffer_lock.read_data(buffer, pos)
             };
@@ -55,12 +56,31 @@ impl MediaSourceWrapper {
             // closure, which blocks on IPC with the script thread. Holding the
             // lock here would deadlock if the script thread is simultaneously
             // trying to push_data (which also acquires this lock).
-            if let Some(seek_pos) = seek_pos {
-                if let Some(seek_closure) = &source_cb.seek_data {
-                    seek_closure(seek_pos);
+            if let Some(restart_pos) = restart_pos &&
+                let Some(seek_closure) = &source_cb.seek_data
+            {
+                let restart = {
+                    let seek_closure = seek_closure.clone();
+                    let playback_buffer = playback_buffer_clone.clone();
+                    move || {
+                        seek_closure(restart_pos, &|success| {
+                            playback_buffer.lock().unwrap().restarted(success)
+                        })
+                    }
+                };
+                // Restarting the fetch waits for the script thread, which must not hold up the
+                // reads of AVPlayer.
+                if let Err(error) = thread::Builder::new()
+                    .name("Media Fetch Restart".to_owned())
+                    .spawn(restart)
+                {
+                    warn!("Could not restart the fetch on its own thread: {error}");
+                    seek_closure(restart_pos, &|success| {
+                        playback_buffer_clone.lock().unwrap().restarted(success)
+                    });
                 }
             }
-            read_bytes
+            read_bytes as i32
         };
 
         let box_closure: Box<dyn Fn(*mut u8, u32, i64) -> i32> = Box::new(read_at_closure);
@@ -103,13 +123,17 @@ impl MediaSourceWrapper {
         if self.total_media_source_size == 0 {
             self.total_media_source_size = size;
             self.data_src.size = size as i64;
+            self.playback_buffer.lock().unwrap().set_size(size as u64);
         }
-        self.playback_buffer.lock().unwrap().notify_seek_done();
+    }
+
+    pub fn set_seekable(&self, seekable: bool) {
+        self.playback_buffer.lock().unwrap().set_seekable(seekable);
     }
 
     pub fn push_data(&self, data: Vec<u8>) -> bool {
         let mut playback_buffer_lock = self.playback_buffer.lock().unwrap();
-        playback_buffer_lock.push_buffer(data)
+        playback_buffer_lock.push_buffer(&data)
     }
 
     pub fn end_of_stream(&self) {
@@ -133,118 +157,5 @@ impl Drop for MediaSourceWrapper {
             let box_closure = Box::from_raw(self.closure_handle);
             drop(box_closure);
         }
-    }
-}
-
-/// There would be two thread interact with playbackbuffer,
-/// 1. AVPlayer Client Thread, will call read.
-/// 2. Script Thread, will try to push_buffer into buffer.
-pub struct PlaybackBuffer {
-    enough_data_closure: Option<Box<dyn Fn() + Send + Sync>>,
-    buffer_data_head: i64,
-    has_active_request: bool,
-    last_read_end: i64,
-    is_seeking: bool,
-    buffer: Vec<u8>,
-}
-
-impl PlaybackBuffer {
-    pub fn new(enough_data_closure: Option<Box<dyn Fn() + Send + Sync>>) -> Self {
-        PlaybackBuffer {
-            enough_data_closure,
-            buffer_data_head: 0,
-            has_active_request: false,
-            is_seeking: false,
-            last_read_end: 0,
-            buffer: Vec::with_capacity(DEFAULT_CACHE_SIZE),
-        }
-    }
-
-    pub fn notify_seek_done(&mut self) {
-        self.is_seeking = false;
-    }
-
-    /// Return (Number of Bytes read, Some(Seek Position) if no data at that position)
-    pub fn read_data(&mut self, dest_slice: &mut [u8], pos: i64) -> (i32, Option<u64>) {
-        if self.is_seeking {
-            debug!(
-                "Currently seeking, cannot read data at position {}, buffer head is at {}, buffer len is {}， has_active_request: {}",
-                pos,
-                self.buffer_data_head,
-                self.buffer.len(),
-                self.has_active_request
-            );
-            return (0, None);
-        }
-        // First check whether we have enough data at that position.
-        let pos_offset = pos - self.buffer_data_head;
-
-        let available_data = self.buffer.len() as i64 - pos_offset;
-        let need_seek = pos_offset < 0 ||
-            (available_data <= 0 &&
-                (!self.has_active_request ||
-                    pos >= self.buffer_data_head + self.buffer.capacity() as i64));
-        if need_seek {
-            debug!(
-                "We don't have data at position {}, buffer head is at {}, buffer len is {}， has_active_request: {}",
-                pos,
-                self.buffer_data_head,
-                self.buffer.len(),
-                self.has_active_request
-            );
-            self.buffer.clear();
-            self.buffer_data_head = pos;
-            self.has_active_request = true;
-            self.is_seeking = true;
-            return (0, Some(pos as u64));
-        }
-        let read_len = available_data.clamp(0, dest_slice.len() as i64) as usize;
-        if read_len == 0 {
-            debug!(
-                "No available data to read at position {}, buffer head is at {}, buffer len is {}， has_active_request: {}",
-                pos,
-                self.buffer_data_head,
-                self.buffer.len(),
-                self.has_active_request
-            );
-            return (0, None);
-        }
-        dest_slice[..read_len]
-            .copy_from_slice(&self.buffer[(pos_offset) as usize..(pos_offset as usize + read_len)]);
-
-        self.last_read_end = pos + read_len as i64;
-        (read_len as i32, None)
-    }
-
-    /// Return False when we have enough data.
-    pub fn push_buffer(&mut self, data: Vec<u8>) -> bool {
-        // Reject data while a seek is in progress. Between the buffer being
-        // cleared/reset for a new seek position and the old fetch being
-        // cancelled, stale data from the previous fetch could arrive and
-        // corrupt the buffer (it would be appended as if it started at the
-        // new seek position). Silently discard it.
-        if self.is_seeking {
-            return true;
-        }
-        if self.buffer.len() + data.len() > self.buffer.capacity() {
-            debug!(
-                "Buffer is full, cannot push more data,current head: {}, current len: {}, incoming data len: {}, capacity: {}",
-                self.buffer_data_head,
-                self.buffer.len(),
-                data.len(),
-                self.buffer.capacity()
-            );
-            self.has_active_request = false;
-            if let Some(enough_data_closure) = &self.enough_data_closure {
-                enough_data_closure();
-            }
-            return false;
-        }
-        self.buffer.extend_from_slice(&data);
-        true
-    }
-
-    pub fn end_of_stream(&mut self) {
-        self.has_active_request = false;
     }
 }

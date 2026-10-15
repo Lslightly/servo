@@ -26,6 +26,10 @@ impl MediaSourceWrapper {
         // No-op for dummy source
     }
 
+    pub fn set_seekable(&self, _seekable: bool) {
+        // No-op for dummy source
+    }
+
     pub fn push_data(&self, _data: Vec<u8>) {
         // No-op for dummy source
     }

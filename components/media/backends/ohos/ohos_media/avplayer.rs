@@ -168,6 +168,12 @@ impl OhosPlayer {
         }
     }
 
+    pub fn set_seekable(&self, seekable: bool) {
+        if let Some(inner_source) = &self.media_data_source {
+            inner_source.set_seekable(seekable);
+        }
+    }
+
     pub fn play(&self) {
         unsafe {
             debug!("OH_AVPlayer_Play!");
