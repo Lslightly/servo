@@ -367,12 +367,12 @@ impl OhosAvPlayer {
         let seek_channel = SeekChannel::new();
         self.seek_lock = Some(seek_channel.sender());
         let seek_channel = Arc::new(Mutex::new(seek_channel));
-        let seekdata_send_closure = move |pos: u64| {
+        let seekdata_send_closure = move |pos: u64, answered: &dyn Fn(bool)| {
             // Checking whether the player is released under the lock that waiting holds makes sure
-            // that the answer that releasing sends reaches the only read that can still wait.
+            // that the answer that releasing sends reaches the only restart that can still wait.
             let seek_channel = seek_channel.lock().unwrap();
             if released_clone.load(Ordering::SeqCst) {
-                return false;
+                return;
             }
             let _ = sender_clone
                 .lock()
@@ -380,10 +380,12 @@ impl OhosAvPlayer {
                 .send(PlayerEvent::SeekData(pos, seek_channel.sender()));
             let (ret, ack_channel) = seek_channel.wait();
             drop(seek_channel);
-            let _ = ack_channel.send(());
+            // The media element waits for the acknowledgement before it can push the bytes of the
+            // restarted fetch.
+            answered(ret);
             debug!("Seek Initiated! :{}", pos);
             let _ = sender_clone.lock().unwrap().send(PlayerEvent::NeedData);
-            ret
+            let _ = ack_channel.send(());
         };
 
         let source = MediaSourceWrapper::builder()
@@ -432,9 +434,9 @@ impl SeekChannel {
 impl Drop for OhosAvPlayer {
     fn drop(&mut self) {
         debug!("Ohos Dropping");
-        // Releasing may wait for a pending read, and a read that waits for the answer to its
-        // SeekData event would wait forever, as the media element ignores the events of a player
-        // it dropped, so answer it here.
+        // A restart of the fetch that waits for the answer to its SeekData event would wait
+        // forever, as the media element ignores the events of a player it dropped, so answer it
+        // here.
         self.released.store(true, Ordering::SeqCst);
         if let Some(seek_lock) = &self.seek_lock {
             match channel() {
@@ -542,7 +544,7 @@ impl Player for OhosAvPlayer {
 
     fn set_seekable(&self, seekable: bool) -> Result<(), servo_media::player::PlayerError> {
         debug!("SetSeekable: {}", seekable);
-
+        self.player_inner.lock().unwrap().set_seekable(seekable);
         Ok(())
     }
 
