@@ -2677,7 +2677,15 @@ impl HTMLMediaElement {
         match self.direction_of_playback() {
             PlaybackDirection::Forwards => {
                 let duration = self.duration.get();
-                if duration.is_finite() && self.current_playback_position.get() < duration {
+                let position = self.current_playback_position.get();
+                if duration == f64::INFINITY {
+                    // > If an "infinite" stream ends for some reason, then the duration would
+                    // > change from positive Infinity to the time of the last frame or sample in
+                    // > the stream, and the durationchange event would be fired.
+                    // <https://html.spec.whatwg.org/multipage/#offsets-into-the-media-resource>
+                    self.duration.set(position);
+                    self.queue_media_element_task_to_fire_event(atom!("durationchange"));
+                } else if duration.is_finite() && position < duration {
                     self.playback_position_changed(cx, duration);
                 }
                 self.end_of_playback_in_forwards_direction(cx)
