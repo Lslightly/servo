@@ -13,14 +13,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use headers::{
-    CacheControl, ContentRange, Expires, HeaderMapExt, LastModified, Pragma, Range, Vary,
+    CacheControl, ContentLength, ContentRange, Expires, HeaderMapExt, LastModified, Pragma, Range,
+    Vary,
 };
 use http::{HeaderMap, Method, StatusCode, header};
 use log::{debug, error, info};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::http_status::HttpStatus;
-use net_traits::request::{CacheMode, Request};
+use net_traits::request::{CacheMode, Destination, Request};
 use net_traits::response::{Response, ResponseBody};
 use net_traits::{CacheEntryDescriptor, Metadata, ResourceFetchTiming};
 use parking_lot::Mutex as ParkingLotMutex;
@@ -383,6 +384,40 @@ fn response_is_cacheable(metadata: &Metadata) -> bool {
         return false;
     }
     is_cacheable
+}
+
+/// The largest response to an audio or video request that the cache stores.
+const MAX_STORED_MEDIA_RESPONSE_SIZE: u64 = 8 * 1024 * 1024;
+
+/// Whether the cache may store `response` to `request` under its rules for audio and video. Net
+/// only keeps the body of a media response that these rules let the cache store.
+///
+/// Media elements request `bytes=N-` ranges and start every load at byte 0, so a stored partial
+/// response is rarely used. A 200 or 206 to a media request is only stored if it holds the whole
+/// resource, if its size is at most 8 MiB, as given by Content-Length or, for a 206, by
+/// Content-Range and any Content-Length, and if it has no Content-Encoding, so that this is the
+/// size of the body that net keeps. Other statuses follow the usual rules.
+pub(crate) fn may_store_media_response(request: &Request, response: &Response) -> bool {
+    if !matches!(request.destination, Destination::Audio | Destination::Video) {
+        return true;
+    }
+    let headers = &response.headers;
+    let content_length = headers.typed_get::<ContentLength>().map(|length| length.0);
+    let size = if response.status == StatusCode::OK {
+        content_length
+    } else if response.status == StatusCode::PARTIAL_CONTENT {
+        let content_range = headers.typed_get::<ContentRange>();
+        match content_range.map(|range| (range.bytes_range(), range.bytes_len())) {
+            Some((Some((0, last)), Some(length))) if last.checked_add(1) == Some(length) => {
+                Some(length.max(content_length.unwrap_or(0)))
+            },
+            _ => None,
+        }
+    } else {
+        return true;
+    };
+    !headers.contains_key(header::CONTENT_ENCODING) &&
+        size.is_some_and(|size| size <= MAX_STORED_MEDIA_RESPONSE_SIZE)
 }
 
 /// Calculating Age
@@ -1112,6 +1147,15 @@ impl HttpCache {
             .map(|cached| cached.validation_status)
     }
 
+    /// The number of responses stored for the URL of `request`.
+    #[cfg(feature = "test-util")]
+    pub async fn stored_response_count(&self, request: &Request) -> usize {
+        match self.entries.get(&CacheKey::new(request)) {
+            Some(entry) => entry.read().await.len(),
+            None => 0,
+        }
+    }
+
     /// Invalidate cache entries referenced by Location/Content-Location headers.
     pub(crate) async fn invalidate_related_urls(
         &self,
@@ -1198,6 +1242,9 @@ impl<'a> CachedResourcesOrGuard<'a> {
             return;
         };
         if !response_is_cacheable(&metadata) {
+            return;
+        }
+        if !may_store_media_response(request, response) {
             return;
         }
         let expiry = get_response_expiry(response);

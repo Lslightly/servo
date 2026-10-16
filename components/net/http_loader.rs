@@ -93,7 +93,7 @@ use crate::fetch::methods::{Data, DoneChannel, FetchContext, Target, fetch, main
 use crate::hsts::HstsList;
 use crate::http_cache::{
     CacheKey, CachedResourcesOrGuard, HttpCache, ValidationStatus, construct_response,
-    invalidate_cached_resources, refresh,
+    invalidate_cached_resources, may_store_media_response, refresh,
 };
 use crate::resource_thread::{AuthCache, AuthCacheEntry};
 use crate::websocket_loader::start_websocket;
@@ -2380,7 +2380,18 @@ async fn http_network_fetch(
     }
     .min(pref!(network_max_content_length) as usize);
     let _ = done_sender.send(Data::ContentLength(prealloc_size));
-    *response_body.lock() = ResponseBody::Receiving(Vec::with_capacity(prealloc_size));
+
+    // Consumers get the body in chunks. The copy kept here is only read by the HTTP cache,
+    // subresource integrity checks and preloads, so do not keep media that none of them reads.
+    let keep_body = may_store_media_response(request, &response) ||
+        !request.integrity_metadata.is_empty() ||
+        request.preload_id.is_some();
+    let body = if keep_body {
+        Vec::with_capacity(prealloc_size)
+    } else {
+        Vec::new()
+    };
+    *response_body.lock() = ResponseBody::Receiving(body);
     let response_body2 = response_body.clone();
 
     spawn_task(
@@ -2396,7 +2407,9 @@ async fn http_network_fetch(
                     )));
                 }
                 if let ResponseBody::Receiving(ref mut body) = *response_body_accumulator.lock() {
-                    body.extend_from_slice(&chunk);
+                    if keep_body {
+                        body.extend_from_slice(&chunk);
+                    }
                     let _ = done_sender.send(Data::Payload(chunk));
                 }
                 future::ready(Ok(response_body_accumulator))
