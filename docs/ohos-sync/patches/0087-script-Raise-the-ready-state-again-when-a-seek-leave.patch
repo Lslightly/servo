@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 16 Oct 2026 20:35:14 +0000
+Subject: [PATCH] script: Raise the ready state again when a seek leaves the
+ end of the media
+
+When playback reaches the end of the media resource, the media element
+lowers its ready state to HAVE_CURRENT_DATA. Nothing raised it again:
+the only other place that raises the ready state, a state change of the
+player, only did so from HAVE_METADATA. So once a media element had
+played to its end, it stayed a blocked media element, was never
+potentially playing again and never asked the player to play. Calling
+play() after `ended` seeked back to the start and fired `seeking`,
+`waiting` and `seeked`, but playback never restarted and the play()
+promise never settled; seeking back first and calling play() later
+hung the same way. This happened with the GStreamer and the OpenHarmony
+AVPlayer backends alike, which both accept a seek and a play request
+after the end of the stream. `loop` was not affected, because it seeks
+back before the ready state is lowered.
+
+Once the media engine completed a seek back from the end, raise the
+ready state to HAVE_FUTURE_DATA, unless the element is in an error
+state. This reflects that data at the new position is available after
+the seek completed, not a measured buffer level. It fires `canplay`,
+and `playing` if the element is not paused, resolves the play()
+promise and makes the element ask the player to play. Raise it on to
+HAVE_ENOUGH_DATA, which fires `canplaythrough`, when the player reports
+that it plays. Going to HAVE_ENOUGH_DATA right after the seek would run
+the autoplay steps: the can autoplay flag of an element with an
+`autoplay` attribute stays set when it ends by itself, so seeking it
+back after the end, or setting `currentTime = 0` in its `ended`
+handler, would play it again, the latter forever.
+
+A seek back after the end while paused now fires `canplay` too.
+Buffering is still not mapped to the ready state, so a stall after the
+seek doesn't fire `waiting`.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: a new test, playing-the-media-resource/play-after-ended.html.
+Its video subtest passes, and its audio subtest fails on Linux, where
+the GStreamer backend reports no seekable range for Ogg resources, so
+play() can't seek back; that is unchanged. Not running the autoplay
+steps again is Servo's choice, since the spec allows it, so a
+Servo-specific test, mozilla/media-autoplay-seek-after-ended.html,
+covers it.
+
+Validation: host release builds (`./mach build --release`) of ohos-main and of ohos-main with the previous patch, this one and the two that follow it, a page whose muted `<video>` plays a 30 s, 14 MB H.264 MP4 from a local server and calls play() in its `ended` handler: without the patches, `seeked` fired with `readyState` 2 and playback did not restart within 110 s; with them, the video replayed and fired `ended` again, twice in a row with range support and once without, seeking back after the end and calling play() 1 s after `seeked` works too, and `loop` still wraps. A muted `<video autoplay>` whose `ended` handler sets `currentTime = 0` played once and stayed paused with `readyState` 3 after `canplay` and `seeked`; with an earlier version of this patch that raised the ready state to HAVE_ENOUGH_DATA, it played five times in 5 s, and media-autoplay-seek-after-ended.html fails. A HiHope DAYU200 (OpenHarmony 7.0, API 26) with headless release builds (`./mach build --ohos --release --headless-binary`): the same replays and seeks back, and the `autoplay` video stays paused. `./mach test-wpt --release --timeout-multiplier 2` of media-elements and the-video-element (434 tests) with the patches and without: the new tests pass with them, except for the audio subtest above, and time out without them; loop-from-ended.tentative.html, track-cues-seeking.html, track-cues-sorted-before-dispatch.html, track-remove-by-setting-innerHTML.html, src_object_blob.html and video_timeupdate_on_seek.html differed between the two runs: re-run three times in isolation with and without the patches, src_object_blob.html passed each time, and the others failed or timed out in some runs of either build with the same messages (each subtest of video_timeupdate_on_seek.html, expected to time out, passes in 3 or 4 of 10 runs either way); media_fragment_seek.html fails in most runs on this host either way. `./mach test-wpt --ohos --processes 1` on the DAYU200 of the 60 media tests of the series, the two new tests, loop-from-ended.tentative.html, video_loop_base.html and audio_loop_base.html: the 60 tests give the same results as an earlier run of ohos-main, and every subtest of the others passes, the audio subtest included. A QuickJS host build (`--js-engine quickjs`) of the same tree gives the same results as SpiderMonkey for the two new tests, three runs out of three.
+AI-assisted: Yes (agent session; root-caused, fixed, reworked after review and tested by the agent on Linux and on the device)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../html/embedded_content/htmlmediaelement.rs | 19 ++++-
+ tests/wpt/meta/MANIFEST.json                  |  7 ++
+ .../play-after-ended.html.ini                 |  5 ++
+ tests/wpt/mozilla/meta/MANIFEST.json          |  7 ++
+ .../media-autoplay-seek-after-ended.html      | 41 +++++++++++
+ .../play-after-ended.html                     | 71 +++++++++++++++++++
+ 6 files changed, 148 insertions(+), 2 deletions(-)
+ create mode 100644 tests/wpt/meta/html/semantics/embedded-content/media-elements/playing-the-media-resource/play-after-ended.html.ini
+ create mode 100644 tests/wpt/mozilla/tests/mozilla/media-autoplay-seek-after-ended.html
+ create mode 100644 tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/play-after-ended.html
+
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 8abe4635d25..af310433f14 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -3104,7 +3104,7 @@ impl HTMLMediaElement {
+         );
+     }
+ 
+-    fn playback_seek_done(&self, cx: &JSContext, position: f64) {
++    fn playback_seek_done(&self, cx: &mut JSContext, position: f64) {
+         // If the seek was initiated by script or by the user agent itself continue with the
+         // following steps, otherwise abort.
+         let delta = (position - self.current_seek_position.get()).abs();
+@@ -3112,6 +3112,18 @@ impl HTMLMediaElement {
+             return;
+         }
+ 
++        // Reaching the end of the media resource lowered the ready state to HAVE_CURRENT_DATA, which
++        // blocks the element. Once the media engine completed a seek back from there, data at the
++        // new position is available, so raise the ready state to HAVE_FUTURE_DATA. That reflects no
++        // measured buffer level, and HAVE_ENOUGH_DATA, at which the element could autoplay again,
++        // waits until playback starts.
++        if self.ready_state.get() == ReadyState::HaveCurrentData &&
++            !self.ended_playback(LoopCondition::Ignored) &&
++            !self.in_error_state()
++        {
++            self.change_ready_state(cx, ReadyState::HaveFutureData);
++        }
++
+         // <https://html.spec.whatwg.org/multipage/#dom-media-seek>
+         // Step 13. Await a stable state.
+         let task = MediaElementMicrotask::Seeked {
+@@ -3133,7 +3145,10 @@ impl HTMLMediaElement {
+             },
+             PlaybackState::Playing => {
+                 media_session_playback_state = MediaSessionPlaybackState::Playing;
+-                if self.ready_state.get() == ReadyState::HaveMetadata {
++                if matches!(
++                    self.ready_state.get(),
++                    ReadyState::HaveMetadata | ReadyState::HaveFutureData
++                ) {
+                     self.change_ready_state(cx, ReadyState::HaveEnoughData);
+                 }
+             },
+diff --git a/tests/wpt/meta/MANIFEST.json b/tests/wpt/meta/MANIFEST.json
+index 91b06a9378b..3afcc60dbfe 100644
+--- a/tests/wpt/meta/MANIFEST.json
++++ b/tests/wpt/meta/MANIFEST.json
+@@ -1315900,6 +1315900,13 @@
+           {}
+          ]
+         ],
++        "play-after-ended.html": [
++         "7b730f706abd9c08f37ee86f817a037c07d7dd8c",
++         [
++          null,
++          {}
++         ]
++        ],
+         "play-in-detached-document.html": [
+          "8e9a7843b734f5e2296593f50daa76f98abacaad",
+          [
+diff --git a/tests/wpt/meta/html/semantics/embedded-content/media-elements/playing-the-media-resource/play-after-ended.html.ini b/tests/wpt/meta/html/semantics/embedded-content/media-elements/playing-the-media-resource/play-after-ended.html.ini
+new file mode 100644
+index 00000000000..37cb5144b28
+--- /dev/null
++++ b/tests/wpt/meta/html/semantics/embedded-content/media-elements/playing-the-media-resource/play-after-ended.html.ini
+@@ -0,0 +1,5 @@
++[play-after-ended.html]
++  [audio: play() after playback has ended plays again and fires ended again]
++    expected:
++      if product == "servo_ohos": PASS
++      FAIL
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index db69d3f6dff..7026561dba0 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -14829,6 +14829,13 @@
+       {}
+      ]
+     ],
++    "media-autoplay-seek-after-ended.html": [
++     "a6ac984c9da3bd61fefc18c7736ce94bfe8a149c",
++     [
++      null,
++      {}
++     ]
++    ],
+     "media-query-list-gc-listener.html": [
+      "5439e6dcf2588ee99222c49c8fa2963d9527d6ee",
+      [
+diff --git a/tests/wpt/mozilla/tests/mozilla/media-autoplay-seek-after-ended.html b/tests/wpt/mozilla/tests/mozilla/media-autoplay-seek-after-ended.html
+new file mode 100644
+index 00000000000..a6ac984c9da
+--- /dev/null
++++ b/tests/wpt/mozilla/tests/mozilla/media-autoplay-seek-after-ended.html
+@@ -0,0 +1,41 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<title>Seeking back after an autoplay video has ended doesn't play it again</title>
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script src="/common/media.js"></script>
++<body>
++<script>
++// The can autoplay flag stays true when playback ends by itself, and the spec allows, but doesn't
++// require, the autoplay steps to run again once the ready state reaches HAVE_ENOUGH_DATA after a
++// seek back. Servo doesn't run them, so that seeking back in an ended handler doesn't loop forever.
++promise_test(async t => {
++  const video = document.createElement("video");
++  video.muted = true;
++  video.autoplay = true;
++  document.body.appendChild(video);
++  t.add_cleanup(() => {
++    video.removeAttribute("src");
++    video.load();
++    video.remove();
++  });
++  const events = [];
++  const seeked = new Promise(resolve => {
++    video.addEventListener("ended", () => {
++      for (const type of ["play", "playing"]) {
++        video.addEventListener(type, () => events.push(type));
++      }
++      video.addEventListener("seeked", resolve, { once: true });
++      video.currentTime = 0;
++    }, { once: true });
++  });
++  video.src = getVideoURI("/media/test-1s");
++  await seeked;
++  await new Promise(resolve => t.step_timeout(resolve, 500));
++
++  assert_array_equals(events, [], "events after seeking back");
++  assert_true(video.paused, "paused after seeking back");
++  assert_false(video.ended, "ended after seeking back");
++}, "Seeking back after an autoplay video has ended doesn't play it again");
++</script>
++</body>
+diff --git a/tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/play-after-ended.html b/tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/play-after-ended.html
+new file mode 100644
+index 00000000000..7b730f706ab
+--- /dev/null
++++ b/tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/play-after-ended.html
+@@ -0,0 +1,71 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<title>play() after playback has ended plays the media resource again from the start</title>
++<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#dom-media-play">
++<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#internal-play-steps">
++<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#dom-media-seek">
++<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#reaches-the-end">
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script src="/common/media.js"></script>
++<body>
++<script>
++// Once playback has ended, play() seeks to the earliest possible position, so playback starts
++// again, reaches the end again and fires ended again.
++
++function create_media(t, tagName) {
++  const media = document.createElement(tagName);
++  media.muted = true;
++  document.body.appendChild(media);
++  t.add_cleanup(() => {
++    media.removeAttribute("src");
++    media.load();
++    media.remove();
++  });
++  return media;
++}
++
++function play_after_ended_test(tagName, src) {
++  promise_test(async t => {
++    const media = create_media(t, tagName);
++    media.src = src;
++
++    let ended = new Promise(resolve => media.addEventListener("ended", resolve, { once: true }));
++    await media.play();
++    await ended;
++    assert_true(media.ended, "ended after the first playback");
++    assert_equals(media.currentTime, media.duration, "currentTime after the first playback");
++    assert_greater_than(media.seekable.length, 0,
++                        "seekable ranges after the first playback, to seek back to the start");
++
++    const events = [];
++    let timeAtSeeked, endedAtSeeked;
++    for (const type of ["play", "seeking", "seeked", "playing", "pause", "ended"]) {
++      media.addEventListener(type, () => events.push(type));
++    }
++    media.addEventListener("seeked", () => {
++      timeAtSeeked = media.currentTime;
++      endedAtSeeked = media.ended;
++    }, { once: true });
++
++    ended = new Promise(resolve => media.addEventListener("ended", resolve, { once: true }));
++    await media.play();
++    assert_false(media.paused, "paused once the play() promise resolved");
++    await ended;
++
++    assert_less_than(timeAtSeeked, media.duration, "currentTime at seeked");
++    assert_false(endedAtSeeked, "ended at seeked");
++    for (const type of ["play", "seeking", "seeked", "playing"]) {
++      assert_true(events.includes(type), `${type} fired`);
++    }
++    assert_array_equals(events.slice(-2), ["pause", "ended"], "last events");
++    assert_true(media.ended, "ended after playing again");
++    assert_true(media.paused, "paused after playing again");
++    assert_equals(media.currentTime, media.duration, "currentTime after playing again");
++  }, `${tagName}: play() after playback has ended plays again and fires ended again`);
++}
++
++play_after_ended_test("video", getVideoURI("/media/test-1s"));
++play_after_ended_test("audio", getAudioURI("/media/sound_0"));
++</script>
++</body>

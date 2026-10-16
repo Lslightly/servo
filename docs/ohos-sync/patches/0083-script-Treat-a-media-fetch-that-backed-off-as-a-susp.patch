@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 16 Oct 2026 21:02:03 +0000
+Subject: [PATCH] script: Treat a media fetch that backed off as a suspended
+ download
+
+Net ends a fetch that the media element aborted with success, so a
+fetch that was cancelled because the player had enough data ran the
+steps for an entirely fetched resource: it fired progress, set the
+networkState to NETWORK_IDLE, fired suspend, and queued the end of the
+stream in the queue of the cancelled fetch. For a response that gives
+no complete length, it also set the input size of the player to the
+bytes fetched so far, which the OpenHarmony backend keeps as the size
+of the resource.
+
+Such a fetch restarts once the player needs data again, so its download
+is suspended, not complete. When the fetch is cancelled for that reason,
+queue a media element task that sets the networkState to NETWORK_IDLE
+and fires suspend, and ignore the end of its response, which is dropped
+anyway when the fetch restarts before it arrives. Queue one that sets
+the networkState back to NETWORK_LOADING when the download resumes,
+whether at the byte where the player stopped or after a seek, as the
+HTML specification asks. No progress event fires in between, since
+progress only fires when data arrives.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: no test; a fetch only backs off once the player's 50 MiB queue
+is full. See Validation.
+
+Validation: the setup of the first patch of the series, sampling networkState every 5 ms. With range support, without this patch, networkState turned NETWORK_IDLE at the first back-off, 60 ms into the load, and stayed there while the fetch restarted twice, and progress fired 3 times. With it, it turns NETWORK_LOADING at each restart, 14.5 s and 28.6 s into the load, and NETWORK_IDLE with a suspend event when the restarted fetch backs off again 40 ms later, and progress fires once; with the suspend steps queued at the cancellation instead of the end of the response, as now, the same happens at 13.1 s and 27.1 s, 15 to 40 ms apart. `./mach test-wpt --release --processes 6 --timeout-multiplier 2` of html/semantics/embedded-content/media-elements, the-video-element, and html/canvas/element/manual/drawing-images-to-the-canvas and imagebitmap (475 tests) with the series up to the last patch: no new failure; the unexpected results (media_fragment_seek, autoplay-default-permissions-policy, load-removes-queued-error-event) also occur on ohos-main. Re-run with the whole series after the second review: the range case takes 3 requests and 163.2 MB with no seeking event, and the paused case 2 requests, 266.5 MB and a peak of 426 MiB; `./mach test-wpt --release --processes 6 --timeout-multiplier 2` of media-elements, the-video-element and drawing-images-to-the-canvas (449 tests): no new failure; track-cues-seeking timed out in 1 of 13 isolated runs both with the series and on ohos-main, and video_loop_base passed 3 of 3 isolated runs either way. `./mach check --ohos` passes.
+AI-assisted: Yes (agent session; written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../html/embedded_content/htmlmediaelement.rs | 84 +++++++++++++++++--
+ 1 file changed, 75 insertions(+), 9 deletions(-)
+
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 0cfe320e43f..a108e992526 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -1622,7 +1622,10 @@ impl HTMLMediaElement {
+         .referrer_policy(referrer_policy_for_element(self.upcast()));
+ 
+         let mut current_fetch_context = self.current_fetch_context.borrow_mut();
++        let mut resumes_suspended_download = false;
+         if let Some(ref mut current_fetch_context) = *current_fetch_context {
++            resumes_suspended_download = offset.is_some() &&
++                current_fetch_context.cancel_reason() == &Some(CancelReason::Backoff);
+             current_fetch_context.cancel(CancelReason::Abort);
+         }
+ 
+@@ -1636,6 +1639,13 @@ impl HTMLMediaElement {
+ 
+         self.owner_document().fetch_background(request, listener);
+ 
++        // <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
++        // > If and when downloading of the resource resumes, the user agent must queue a media
++        // > element task given the media element to set the networkState to NETWORK_LOADING.
++        if resumes_suspended_download {
++            self.queue_media_element_task_to_set_network_state(NetworkState::Loading, None);
++        }
++
+         // Since we cancelled the previous fetch, from now on the media element
+         // will only receive response data from the new fetch that's been
+         // initiated. This means the player can resume operation, since all subsequent data
+@@ -2050,6 +2060,50 @@ impl HTMLMediaElement {
+             }));
+     }
+ 
++    /// Queue a media element task given the media element to set its networkState, and to fire an
++    /// event named `event` at it, if any.
++    fn queue_media_element_task_to_set_network_state(
++        &self,
++        network_state: NetworkState,
++        event: Option<Atom>,
++    ) {
++        let this = Trusted::new(self);
++        let generation_id = self.generation_id.get();
++
++        self.owner_global()
++            .task_manager()
++            .media_element_task_source()
++            .queue(task!(set_network_state: move |cx| {
++                let this = this.root();
++                if generation_id != this.generation_id.get() {
++                    return;
++                }
++
++                this.set_network_state(network_state);
++                if let Some(event) = event {
++                    this.upcast::<EventTarget>().fire_event(cx, event);
++                }
++            }));
++    }
++
++    /// Cancels the current fetch because the player has enough data, to restart it once the player
++    /// needs more.
++    fn suspend_download(&self, current_fetch_context: &mut HTMLMediaElementFetchContext) {
++        if current_fetch_context.cancel_reason().is_some() {
++            return;
++        }
++        current_fetch_context.cancel(CancelReason::Backoff);
++
++        // <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
++        // > When a media element's download has been suspended, the user agent must queue a media
++        // > element task given the media element to set the networkState to NETWORK_IDLE and fire
++        // > an event named suspend at the element.
++        self.queue_media_element_task_to_set_network_state(
++            NetworkState::Idle,
++            Some(atom!("suspend")),
++        );
++    }
++
+     /// Appends a promise to the list of pending play promises.
+     fn push_pending_play_promise(&self, promise: &RootedPromise) {
+         self.pending_play_promises
+@@ -2987,11 +3041,10 @@ impl HTMLMediaElement {
+                 let mut data_source = current_fetch_context.data_source().borrow_mut();
+                 data_source.set_locked(false);
+                 data_source.process_into_player_from_queue(self.player.borrow().as_ref().unwrap())
+-            }
++            } &&
++            e == PlayerError::EnoughData
+         {
+-            if e == PlayerError::EnoughData {
+-                current_fetch_context.back_off();
+-            }
++            current_fetch_context.back_off(self);
+         }
+     }
+ 
+@@ -4181,9 +4234,9 @@ impl HTMLMediaElementFetchContext {
+     /// cancelled, to restart where the player stopped once it needs data again. Any other fetch
+     /// continues, since it would restart at the start of the resource, and up to
+     /// `MAX_QUEUED_BYTES` of its data are queued until the player needs data again.
+-    fn back_off(&mut self) {
++    fn back_off(&mut self, element: &HTMLMediaElement) {
+         if self.is_seekable {
+-            self.cancel(CancelReason::Backoff);
++            element.suspend_download(self);
+         } else {
+             self.data_source.borrow().set_locked(true);
+         }
+@@ -4337,7 +4390,7 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
+             // fetch that delivered all of its bytes is not restarted at the end of the resource.
+             if current_fetch_context.player_has_enough_data() && current_fetch_context.is_seekable()
+             {
+-                current_fetch_context.cancel(CancelReason::Backoff);
++                element.suspend_download(current_fetch_context);
+                 return;
+             }
+ 
+@@ -4364,7 +4417,7 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
+                     .process_into_player_from_queue(element.player.borrow().as_ref().unwrap())
+             } {
+                 if e == PlayerError::EnoughData {
+-                    current_fetch_context.back_off();
++                    current_fetch_context.back_off(&element);
+                 }
+                 return;
+             }
+@@ -4373,7 +4426,7 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
+             // capped, at the cost of fetching a resource without range support from its start
+             // again.
+             if current_fetch_context.data_source().borrow().queued_bytes() > MAX_QUEUED_BYTES {
+-                current_fetch_context.cancel(CancelReason::Backoff);
++                element.suspend_download(current_fetch_context);
+                 return;
+             }
+         }
+@@ -4397,6 +4450,19 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
+     ) {
+         let element = self.element.root();
+ 
++        let backed_off = element
++            .current_fetch_context
++            .borrow()
++            .as_ref()
++            .is_some_and(|context| context.cancel_reason() == &Some(CancelReason::Backoff));
++
++        // A fetch that was cancelled because the player had enough data restarts once the player
++        // needs more, so its download is suspended rather than complete.
++        if backed_off {
++            network_listener::submit_timing(cx, &self, &status, &timing);
++            return;
++        }
++
+         // <https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list>
+         if status.is_ok() && self.fetched_content_length != 0 {
+             // => "Once the entire media resource has been fetched..."

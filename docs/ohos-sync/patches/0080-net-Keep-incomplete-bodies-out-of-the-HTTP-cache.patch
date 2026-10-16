@@ -1,0 +1,770 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 16 Oct 2026 19:53:49 +0000
+Subject: [PATCH] net: Keep incomplete bodies out of the HTTP cache
+
+The HTTP cache stores a response when its headers arrive and shares its
+body with the fetch that receives it. When the body failed with an error
+other than a cancellation, net still marked it as done, so the cache
+kept the truncated body as a complete response and could answer later
+requests with it. A cancelled body was emptied and marked as done before
+the response was marked as aborted, so a lookup in between could answer
+with an empty body, and a range cut from a stored response did not share
+its aborted flag. A fetch that waited for a body still being received
+got the incomplete body when the receiving fetch was aborted, and waited
+forever when that fetch ended in a network error of its own, such as a
+failed integrity check, because then only responses with an empty body
+were woken up. And the cache never removed the entries of aborted
+fetches, so every cancelled fetch left one more unusable entry in the
+list of responses for its URL; media elements cancel a fetch on every
+seek.
+
+Mark the response as aborted when its body fails or is cancelled, before
+the body is replaced. Constructing a response from the cache, or
+refreshing it after a 304, checks the flag while holding the body,
+ranges cut from a stored response share its flag, and the refresh skips
+aborted responses. When the receiving fetch ends, wake every fetch that
+waits for a complete or aborted body, whatever its status; one that
+found the response by a cache lookup and whose body was aborted now
+fetches from the network instead, or fails if it is only-if-cached. A
+fetch that waits for the body through the refresh of a 304 is unchanged:
+it still ends with an empty body when the receiving fetch is aborted.
+Remove the entries of aborted fetches that nobody waits for when their
+fetch ends and whenever a response is stored for the same URL, and the
+URL once it has no entries left. The fetch that receives a failed body
+still gets it as before, and only the cache reads the aborted flag of a
+response.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: unit tests that ranges cut from a stored response share its
+aborted flag, that revalidation skips aborted responses, and that the
+cache removes aborted entries when it stores a response unless a fetch
+waits for them; fetch tests that a truncated response is neither stored
+nor served, that a cancelled fetch leaves neither an entry nor its URL
+in the cache, that a fetch waiting for an aborted response fetches it
+from the network, and that one waiting for a response whose fetch failed
+its integrity check is woken up. `CancellationListener::cancel` is now
+public, and the cache has test-only counts of stored responses and of
+waiting fetches.
+
+Validation: `./mach test-unit -p servo-net`: 403 tests pass. Each new test fails when its part of the fix is reverted: without the shared flag, a range keeps a flag of its own; without the skip, revalidation uses the aborted response; without the network fallback, the waiting fetch delivers the empty body of the aborted one; without waking every waiting fetch, the one waiting for the response that failed its integrity check never ends; without removing the URL, a cancelled fetch leaves it in the cache; and, checked on the first revision, the truncated response is stored and served without the aborted flag on errors, the aborted entries stay without their removal when a fetch ends or when a response is stored, and a waited-for entry is removed without the check for waiting fetches. Holding the body while checking the flag closes a race that no deterministic test reproduces. Playing, reloading and playing again a 90 s, 42 MB video as in the previous patch, VmRSS after the first play / at the end: 311/378, 328/388 and 329/389 MiB with both patches, 323/384 and 314/383 with the previous one alone, no measurable difference. `./mach test-wpt --release --processes 6 --timeout-multiplier 2` of fetch/http-cache, fetch/range, fetch/api/basic and xhr: all 619 tests as expected; html/semantics/embedded-content/media-elements as in the previous patch.
+AI-assisted: Yes (agent session; written and tested by the agent, reworked after a review by another agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/net/fetch/methods.rs     |   4 +-
+ components/net/http_cache.rs        | 110 +++++++-----
+ components/net/http_loader.rs       |  32 +++-
+ components/net/tests/http_cache.rs  |  96 +++++++++++
+ components/net/tests/http_loader.rs | 254 +++++++++++++++++++++++++++-
+ components/shared/net/response.rs   |   3 +
+ 6 files changed, 448 insertions(+), 51 deletions(-)
+
+diff --git a/components/net/fetch/methods.rs b/components/net/fetch/methods.rs
+index b61532234b6..4ab5cbab236 100644
+--- a/components/net/fetch/methods.rs
++++ b/components/net/fetch/methods.rs
+@@ -124,7 +124,7 @@ impl CancellationListener {
+         self.cancelled.load(Ordering::Relaxed)
+     }
+ 
+-    pub(crate) fn cancel(&self) {
++    pub fn cancel(&self) {
+         self.cancelled.store(true, Ordering::Relaxed)
+     }
+ }
+@@ -900,7 +900,7 @@ pub async fn main_fetch(
+     context
+         .state
+         .http_cache
+-        .update_awaiting_consumers(request, &response)
++        .update_awaiting_consumers(request)
+         .await;
+ 
+     // Steps 25-27.
+diff --git a/components/net/http_cache.rs b/components/net/http_cache.rs
+index 8d4a31c8c3d..9fcd323eb06 100644
+--- a/components/net/http_cache.rs
++++ b/components/net/http_cache.rs
+@@ -157,6 +157,12 @@ impl CachedResource {
+     pub(crate) fn is_done(&self) -> bool {
+         self.body.lock().is_done()
+     }
++
++    /// Whether the fetch of this resource was aborted and nobody waits for its body anymore,
++    /// so that it can be removed.
++    fn is_abandoned(&self) -> bool {
++        self.aborted.load(Ordering::Acquire) && self.awaiting_body.lock().is_empty()
++    }
+ }
+ 
+ #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+@@ -603,19 +609,23 @@ fn create_cached_response(
+     done_chan: &mut DoneChannel,
+ ) -> Option<CachedResponse> {
+     debug!("creating a cached response for {:?}", request.url());
++    // A fetch marks its response as aborted before it replaces an incomplete body, so check the
++    // flag while holding the body.
++    let body = cached_resource.body.lock();
+     if cached_resource.aborted.load(Ordering::Acquire) {
+         return None;
+     }
+-    let resource_timing = ResourceFetchTiming::new(request.timing_type());
+-    let mut response = Response::new(cached_resource.metadata.final_url.clone(), resource_timing);
+-    response.headers = cached_headers.clone();
+-    response.body = cached_resource.body.clone();
+-    if let ResponseBody::Receiving(_) = *cached_resource.body.lock() {
++    if let ResponseBody::Receiving(_) = *body {
+         debug!("existing body is in progress");
+         let (done_sender, done_receiver) = unbounded();
+         *done_chan = Some((done_sender.clone(), done_receiver));
+         cached_resource.awaiting_body.lock().push(done_sender);
+     }
++    drop(body);
++    let resource_timing = ResourceFetchTiming::new(request.timing_type());
++    let mut response = Response::new(cached_resource.metadata.final_url.clone(), resource_timing);
++    response.headers = cached_headers.clone();
++    response.body = cached_resource.body.clone();
+     response
+         .location_url
+         .clone_from(&cached_resource.location_url);
+@@ -671,7 +681,7 @@ fn create_resource_with_bytes_from_resource(
+     CachedResource {
+         request_headers: resource.request_headers.clone(),
+         body: Arc::new(ParkingLotMutex::new(ResponseBody::Done(bytes.to_owned()))),
+-        aborted: Arc::new(AtomicBool::new(false)),
++        aborted: resource.aborted.clone(),
+         awaiting_body: Arc::new(ParkingLotMutex::new(vec![])),
+         metadata: resource.metadata.clone(),
+         location_url: resource.location_url.clone(),
+@@ -971,7 +981,9 @@ pub fn refresh(
+ ) -> Option<Response> {
+     assert_eq!(response.status, StatusCode::NOT_MODIFIED);
+ 
+-    let cached_resource = cached_resources.iter_mut().next()?;
++    let cached_resource = cached_resources
++        .iter_mut()
++        .find(|resource| !resource.aborted.load(Ordering::Acquire))?;
+ 
+     let mut constructed_response = if let Some(range_spec) = request.headers.typed_get::<Range>() {
+         handle_range_request(request, &[cached_resource], &range_spec, done_chan)
+@@ -981,9 +993,15 @@ pub fn refresh(
+         // If the body is not receiving data, set the done_chan back to None.
+         // Otherwise, create a new dedicated channel to update the consumer.
+         // The response constructed here will replace the 304 one from the network.
+-        let in_progress_channel = match &*cached_resource.body.lock() {
+-            ResponseBody::Receiving(..) => Some(unbounded()),
+-            ResponseBody::Empty | ResponseBody::Done(..) => None,
++        let in_progress_channel = {
++            let body = cached_resource.body.lock();
++            if cached_resource.aborted.load(Ordering::Acquire) {
++                return None;
++            }
++            match &*body {
++                ResponseBody::Receiving(..) => Some(unbounded()),
++                ResponseBody::Empty | ResponseBody::Done(..) => None,
++            }
+         };
+         match in_progress_channel {
+             Some((done_sender, done_receiver)) => {
+@@ -1053,8 +1071,9 @@ fn resolve_location_url(
+ impl HttpCache {
+     /// Wake-up consumers of cached resources
+     /// whose response body was still receiving data when the resource was constructed,
+-    /// and whose response has now either been completed or cancelled.
+-    pub(crate) async fn update_awaiting_consumers(&self, request: &Request, response: &Response) {
++    /// and whose response has now either been completed or aborted.
++    /// Then remove the resources of aborted fetches that nobody waits for.
++    pub(crate) async fn update_awaiting_consumers(&self, request: &Request) {
+         let entry_key = CacheKey::new(request);
+ 
+         let cached_resources = match self.entries.get(&entry_key) {
+@@ -1062,41 +1081,32 @@ impl HttpCache {
+             Some(resources) => resources,
+         };
+ 
+-        let actual_response = response.actual_response();
+-
+-        // Ensure we only wake-up consumers of relevant resources,
+-        // ie we don't want to wake-up 200 awaiting consumers with a 206.
+-        let lock = cached_resources.read().await;
+-        let relevant_cached_resources = lock.iter().filter(|resource| {
+-            if actual_response.is_network_error() {
+-                return *resource.body.lock() == ResponseBody::Empty;
+-            }
+-            resource.status == actual_response.status
+-        });
+-
+-        for cached_resource in relevant_cached_resources {
+-            let mut awaiting_consumers = cached_resource.awaiting_body.lock();
+-            if awaiting_consumers.is_empty() {
+-                continue;
+-            }
+-            let to_send = if cached_resource.aborted.load(Ordering::Acquire) {
+-                // In the case of an aborted fetch,
+-                // wake-up all awaiting consumers.
+-                // Each will then start a new network request.
+-                // TODO: Wake-up only one consumer, and make it the producer on which others wait.
+-                Data::Cancelled
+-            } else {
+-                match *cached_resource.body.lock() {
+-                    ResponseBody::Done(_) | ResponseBody::Empty => Data::Done,
+-                    ResponseBody::Receiving(_) => {
+-                        continue;
+-                    },
++        let mut lock = cached_resources.write().await;
++        for cached_resource in lock.iter() {
++            let to_send = {
++                let body = cached_resource.body.lock();
++                if cached_resource.aborted.load(Ordering::Acquire) {
++                    // In the case of an aborted fetch,
++                    // wake-up all awaiting consumers.
++                    // Each will then start a new network request.
++                    // TODO: Wake-up only one consumer, and make it the producer on which others wait.
++                    Data::Cancelled
++                } else if let ResponseBody::Receiving(_) = *body {
++                    continue;
++                } else {
++                    Data::Done
+                 }
+             };
+-            for done_sender in awaiting_consumers.drain(..) {
++            for done_sender in cached_resource.awaiting_body.lock().drain(..) {
+                 let _ = done_sender.send(to_send.clone());
+             }
+         }
++        lock.retain(|resource| !resource.is_abandoned());
++        if lock.is_empty() {
++            self.entries.remove_if(&entry_key, |entry| {
++                std::sync::Arc::ptr_eq(entry, &cached_resources)
++            });
++        }
+     }
+ 
+     /// Returns descriptors for cache entries currently stored in this cache.
+@@ -1156,6 +1166,21 @@ impl HttpCache {
+         }
+     }
+ 
++    /// The number of fetches that wait for the body of a response stored for the URL of
++    /// `request`.
++    #[cfg(feature = "test-util")]
++    pub async fn awaiting_consumer_count(&self, request: &Request) -> usize {
++        match self.entries.get(&CacheKey::new(request)) {
++            Some(entry) => entry
++                .read()
++                .await
++                .iter()
++                .map(|resource| resource.awaiting_body.lock().len())
++                .sum(),
++            None => 0,
++        }
++    }
++
+     /// Invalidate cache entries referenced by Location/Content-Location headers.
+     pub(crate) async fn invalidate_related_urls(
+         &self,
+@@ -1273,6 +1298,7 @@ impl<'a> CachedResourcesOrGuard<'a> {
+ 
+         match self {
+             CachedResourcesOrGuard::Value(mut owned_rw_lock_write_guard) => {
++                owned_rw_lock_write_guard.retain(|resource| !resource.is_abandoned());
+                 owned_rw_lock_write_guard.push(entry_resource);
+             },
+             CachedResourcesOrGuard::Guard(placeholder_guard) => {
+diff --git a/components/net/http_loader.rs b/components/net/http_loader.rs
+index 1f288f790d3..50c891a15ab 100644
+--- a/components/net/http_loader.rs
++++ b/components/net/http_loader.rs
+@@ -1666,7 +1666,16 @@ async fn http_network_or_cache_fetch(
+         // we must wait for it to finish in case it is still receiving from the network.
+         // Note: this means only the fetch from which the original network response originated
+         // will be able to stream it; all others receive a cached response in one chunk.
+-        wait_for_inflight_requests(done_chan, &mut response).await;
++        // If that fetch was aborted, the body is incomplete, so fetch from the network instead.
++        if !wait_for_inflight_requests(done_chan, &mut response).await {
++            if http_fetch_params.request.cache_mode == CacheMode::OnlyIfCached {
++                return Response::network_error(NetworkError::CacheError);
++            }
++            response = Some(
++                http_network_fetch(http_fetch_params, include_credentials, done_chan, context)
++                    .await,
++            );
++        }
+     }
+ 
+     let http_request = &mut http_fetch_params.request;
+@@ -1958,9 +1967,13 @@ fn spawn_stale_while_revalidate(
+     });
+ }
+ 
+-/// Wait for a cached response from channel.
++/// Wait for a cached response from channel, and return whether its body is complete.
+ /// Happens when a fetch gets a cache hit, and the resource is pending completion from the network.
+-async fn wait_for_inflight_requests(done_chan: &mut DoneChannel, response: &mut Option<Response>) {
++async fn wait_for_inflight_requests(
++    done_chan: &mut DoneChannel,
++    response: &mut Option<Response>,
++) -> bool {
++    let mut complete = true;
+     if let Some(ref mut ch) = *done_chan {
+         // The cache constructed a response with a body of ResponseBody::Receiving.
+         // We wait for the response in the cache to "finish",
+@@ -1972,7 +1985,8 @@ async fn wait_for_inflight_requests(done_chan: &mut DoneChannel, response: &mut
+                 Some(Data::ContentLength(_)) | Some(Data::Payload(_)) | Some(Data::Error(_)) => {},
+                 Some(Data::Done) => break, // Return the full response as if it was initially cached as such.
+                 Some(Data::Cancelled) => {
+-                    // The response was cancelled while the fetch was ongoing.
++                    // The fetch that receives the body was aborted.
++                    complete = false;
+                     break;
+                 },
+                 None => panic!("HTTP cache should always send Done or Cancelled"),
+@@ -1981,6 +1995,7 @@ async fn wait_for_inflight_requests(done_chan: &mut DoneChannel, response: &mut
+     }
+     // Set done_chan back to None, it's cache-related usefulness ends here.
+     *done_chan = None;
++    complete
+ }
+ 
+ /// <https://fetch.spec.whatwg.org/#cross-origin-resource-policy-check>
+@@ -2393,13 +2408,18 @@ async fn http_network_fetch(
+     };
+     *response_body.lock() = ResponseBody::Receiving(body);
+     let response_body2 = response_body.clone();
++    let aborted = response.aborted.clone();
++    let aborted2 = response.aborted.clone();
+ 
+     spawn_task(
+         response_stream
+             .into_body()
+             .try_fold(response_body, move |response_body_accumulator, chunk| {
+                 if cancellation_listener.cancelled() {
+-                    *response_body_accumulator.lock() = ResponseBody::Done(vec![]);
++                    let mut body = response_body_accumulator.lock();
++                    aborted.store(true, Ordering::Release);
++                    *body = ResponseBody::Done(vec![]);
++                    drop(body);
+                     let _ = done_sender.send(Data::Cancelled);
+                     return future::ready(Err(std::io::Error::new(
+                         std::io::ErrorKind::Interrupted,
+@@ -2443,6 +2463,8 @@ async fn http_network_fetch(
+                 future::ready(Ok(()))
+             })
+             .map_err(move |error| {
++                // The body is incomplete, so keep the HTTP cache from using it.
++                aborted2.store(true, Ordering::Release);
+                 if let std::io::ErrorKind::InvalidData = error.kind() {
+                     debug!("Content decompression error for {:?}", url2);
+                     let _ = done_sender3.send(Data::Error(NetworkError::DecompressionError));
+diff --git a/components/net/tests/http_cache.rs b/components/net/tests/http_cache.rs
+index e6f6d15334a..28a6c7a2301 100644
+--- a/components/net/tests/http_cache.rs
++++ b/components/net/tests/http_cache.rs
+@@ -2,6 +2,8 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
++use std::sync::atomic::Ordering;
++
+ use http::header::{
+     CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, EXPIRES, HeaderName,
+     HeaderValue, RANGE,
+@@ -501,3 +503,97 @@ async fn test_media_responses_are_stored_only_if_complete_and_small() {
+     );
+     assert!(is_stored(&other(None), ok, &[], LIMIT + 1).await);
+ }
++
++fn build_cacheable_response(request: &Request, body: ResponseBody) -> Response {
++    let timing = ResourceFetchTiming::new(ResourceTimingType::Resource);
++    let mut response = Response::new(request.current_url(), timing);
++    response
++        .headers
++        .insert(CACHE_CONTROL, HeaderValue::from_static("max-age=3600"));
++    *response.body.lock() = body;
++    response
++}
++
++#[tokio::test]
++async fn test_aborted_responses_are_removed_when_storing() {
++    let request = build_request_with_range(Destination::None, None);
++    let build_response =
++        |body: &[u8]| build_cacheable_response(&request, ResponseBody::Done(body.to_vec()));
++    let cache = HttpCache::new(HttpCacheAssignment::Public);
++
++    let aborted_response = build_response(b"aborted");
++    cache.store(&request, &aborted_response).await;
++    aborted_response.aborted.store(true, Ordering::Release);
++    cache.store(&request, &build_response(b"complete")).await;
++
++    assert_eq!(cache.stored_response_count(&request).await, 1);
++    let cached_response = cache.construct_response(&request, &mut None).await.unwrap();
++    assert_eq!(
++        *cached_response.body.lock(),
++        ResponseBody::Done(b"complete".to_vec())
++    );
++}
++
++#[tokio::test]
++async fn test_aborted_responses_are_kept_while_consumers_wait_for_them() {
++    let request = build_request_with_range(Destination::None, None);
++    let cache = HttpCache::new(HttpCacheAssignment::Public);
++
++    let aborted_response = build_cacheable_response(&request, ResponseBody::Receiving(vec![]));
++    cache.store(&request, &aborted_response).await;
++    let mut done_chan = None;
++    assert!(
++        cache
++            .construct_response(&request, &mut done_chan)
++            .await
++            .is_some()
++    );
++    assert!(done_chan.is_some());
++    aborted_response.aborted.store(true, Ordering::Release);
++
++    let response = build_cacheable_response(&request, ResponseBody::Done(b"complete".to_vec()));
++    cache.store(&request, &response).await;
++    assert_eq!(cache.stored_response_count(&request).await, 2);
++}
++
++#[tokio::test]
++async fn test_ranges_of_a_stored_response_share_its_aborted_flag() {
++    let request = build_request_with_range(Destination::None, Some("bytes=2-"));
++    let response = build_cacheable_response(&request, ResponseBody::Done(b"0123456789".to_vec()));
++    let cache = HttpCache::new(HttpCacheAssignment::Public);
++    cache.store(&request, &response).await;
++
++    let range_response = cache.construct_response(&request, &mut None).await.unwrap();
++    assert_eq!(
++        *range_response.body.lock(),
++        ResponseBody::Done(b"23456789".to_vec())
++    );
++    response.aborted.store(true, Ordering::Release);
++    assert!(range_response.aborted.load(Ordering::Acquire));
++}
++
++#[tokio::test]
++async fn test_refresh_skips_aborted_responses() {
++    let request = build_request_with_range(Destination::None, None);
++    let cache = HttpCache::new(HttpCacheAssignment::Public);
++    let aborted_response = build_cacheable_response(&request, ResponseBody::Done(vec![]));
++    cache.store(&request, &aborted_response).await;
++    let response = build_cacheable_response(&request, ResponseBody::Done(b"complete".to_vec()));
++    cache.store(&request, &response).await;
++    aborted_response.aborted.store(true, Ordering::Release);
++
++    let mut not_modified = build_cacheable_response(&request, ResponseBody::Empty);
++    not_modified.status = StatusCode::NOT_MODIFIED.into();
++    let mut resources = cache.get_or_guard(CacheKey::new(&request)).await;
++    let refreshed_response = refresh(
++        &request,
++        not_modified,
++        &mut None,
++        resources.try_as_mut().unwrap(),
++    )
++    .unwrap();
++    assert_eq!(
++        *refreshed_response.body.lock(),
++        ResponseBody::Done(b"complete".to_vec())
++    );
++}
+diff --git a/components/net/tests/http_loader.rs b/components/net/tests/http_loader.rs
+index 510534e6ff6..afc382f86ea 100644
+--- a/components/net/tests/http_loader.rs
++++ b/components/net/tests/http_loader.rs
+@@ -6,6 +6,7 @@ use std::collections::HashMap;
+ use std::io::Write;
+ use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::task::Poll;
+ use std::time::{Duration, Instant};
+ 
+ use content_security_policy as csp;
+@@ -18,6 +19,7 @@ use devtools_traits::{
+ use embedder_traits::AuthenticationResponse;
+ use flate2::Compression;
+ use flate2::write::{GzEncoder, ZlibEncoder};
++use futures::stream;
+ use headers::authorization::Basic;
+ use headers::{
+     Authorization, ContentLength, Date, HeaderMapExt, Host, StrictTransportSecurity, UserAgent,
+@@ -26,11 +28,13 @@ use http::header::{self, HeaderMap, HeaderValue, WWW_AUTHENTICATE};
+ use http::uri::Authority;
+ use http::{HeaderName, Method, StatusCode};
+ use http_body_util::combinators::BoxBody;
+-use hyper::body::{Body, Bytes, Incoming};
++use http_body_util::{BodyExt, StreamBody};
++use hyper::body::{Body, Bytes, Frame, Incoming};
+ use hyper::{Request as HyperRequest, Response as HyperResponse};
++use net::async_runtime::spawn_task;
+ use net::cookie::ServoCookie;
+ use net::cookie_storage::CookieStorage;
+-use net::fetch::methods::{self, FetchContext};
++use net::fetch::methods::{self, CancellationListener, FetchContext};
+ use net::http_loader::{determine_requests_referrer, serialize_origin};
+ use net::resource_thread::AuthCacheEntry;
+ use net::test::DECODER_BUFFER_SIZE;
+@@ -2268,3 +2272,249 @@ fn test_small_media_response_is_stored() {
+ 
+     let _ = server.close();
+ }
++
++fn build_cacheable_request(url: &UrlWithBlobClaim) -> Request {
++    RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
++        .method(Method::GET)
++        .destination(Destination::Document)
++        .origin(url.clone().origin())
++        .pipeline_id(Some(TEST_PIPELINE_ID))
++        .policy_container(Default::default())
++        .build()
++}
++
++fn stored_response_count(context: &FetchContext, request: &Request) -> usize {
++    spawn_blocking_task(context.state.http_cache.stored_response_count(request))
++}
++
++#[test]
++fn test_truncated_response_is_not_served_from_cache() {
++    let request_count = Arc::new(AtomicUsize::new(0));
++    let request_count_clone = request_count.clone();
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            request_count_clone.fetch_add(1, Ordering::SeqCst);
++            response.headers_mut().insert(
++                header::CACHE_CONTROL,
++                HeaderValue::from_static("max-age=3600"),
++            );
++            // Send part of the body, let the server flush it, then end the body before its
++            // length, which makes the server close the connection.
++            response
++                .headers_mut()
++                .insert(header::CONTENT_LENGTH, HeaderValue::from_static("100"));
++            let mut polls = 0;
++            let chunks = stream::poll_fn(move |context| {
++                polls += 1;
++                match polls {
++                    1 => Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"truncated"))))),
++                    2 => {
++                        context.waker().wake_by_ref();
++                        Poll::Pending
++                    },
++                    _ => Poll::Ready(None),
++                }
++            });
++            *response.body_mut() = StreamBody::new(chunks).boxed();
++        };
++    let (server, url) = make_server(handler);
++    let mut context = new_fetch_context(None, None);
++
++    let response = fetch_with_context(build_cacheable_request(&url), &mut context);
++    assert_eq!(
++        *response.actual_response().body.lock(),
++        ResponseBody::Done(b"truncated".to_vec())
++    );
++    assert_eq!(
++        stored_response_count(&context, &build_cacheable_request(&url)),
++        0
++    );
++
++    let response = fetch_with_context(build_cacheable_request(&url), &mut context);
++    assert!(matches!(response.cache_state, CacheState::None));
++    assert_eq!(request_count.load(Ordering::SeqCst), 2);
++
++    let _ = server.close();
++}
++
++#[test]
++fn test_cancelled_response_is_removed_from_cache() {
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            response.headers_mut().insert(
++                header::CACHE_CONTROL,
++                HeaderValue::from_static("max-age=3600"),
++            );
++            let chunks = stream::repeat_with(|| Ok(Frame::data(Bytes::from_static(&[0; 1024]))));
++            *response.body_mut() = StreamBody::new(chunks).boxed();
++        };
++    let (server, url) = make_server(handler);
++    let context = new_fetch_context(None, None);
++
++    /// Cancels the fetch once the response headers arrive.
++    struct CancellingTarget {
++        cancellation_listener: Arc<CancellationListener>,
++        sender: Option<tokio::sync::oneshot::Sender<()>>,
++    }
++    impl FetchTaskTarget for CancellingTarget {
++        fn process_request_body(&mut self, _: &Request) {}
++        fn process_response(&mut self, _: &Request, _: &Response) {
++            self.cancellation_listener.cancel();
++        }
++        fn process_response_chunk(&mut self, _: &Request, _: Bytes) {}
++        fn process_response_eof(&mut self, _: &Request, _: &Response) {
++            let _ = self.sender.take().unwrap().send(());
++        }
++        fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
++        fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
++    }
++
++    let (sender, receiver) = tokio::sync::oneshot::channel();
++    let mut target = CancellingTarget {
++        cancellation_listener: context.cancellation_listener.clone(),
++        sender: Some(sender),
++    };
++    let request = build_cacheable_request(&url);
++    spawn_blocking_task(async {
++        methods::fetch(request, &mut target, &context).await;
++        receiver.await.unwrap()
++    });
++
++    assert_eq!(
++        stored_response_count(&context, &build_cacheable_request(&url)),
++        0
++    );
++    assert_eq!(context.state.http_cache.len(), 0);
++
++    let _ = server.close();
++}
++
++/// Start `request` with `context` in the background, and return a receiver for its response and
++/// the number of body bytes it delivers.
++fn start_fetch(
++    request: Request,
++    context: FetchContext,
++) -> tokio::sync::oneshot::Receiver<(Response, usize)> {
++    let (sender, receiver) = tokio::sync::oneshot::channel();
++    let mut target = BodyLengthCollector {
++        sender: Some(sender),
++        length: 0,
++    };
++    spawn_task(async move {
++        methods::fetch(request, &mut target, &context).await;
++    });
++    receiver
++}
++
++/// Wait until `condition` holds, for at most ten seconds.
++fn wait_until(condition: impl Fn() -> bool) {
++    let deadline = Instant::now() + Duration::from_secs(10);
++    while !condition() {
++        assert!(Instant::now() < deadline, "timed out");
++        std::thread::sleep(Duration::from_millis(10));
++    }
++}
++
++/// Wait for the end of a fetch started with `start_fetch`, for at most ten seconds.
++fn wait_for_fetch(
++    mut receiver: tokio::sync::oneshot::Receiver<(Response, usize)>,
++) -> (Response, usize) {
++    let deadline = Instant::now() + Duration::from_secs(10);
++    loop {
++        if let Ok(result) = receiver.try_recv() {
++            return result;
++        }
++        assert!(Instant::now() < deadline, "the fetch did not end");
++        std::thread::sleep(Duration::from_millis(10));
++    }
++}
++
++fn awaiting_consumer_count(context: &FetchContext, request: &Request) -> usize {
++    spawn_blocking_task(context.state.http_cache.awaiting_consumer_count(request))
++}
++
++/// A cacheable server whose first response sends `comp`, then `lete` once the returned sender
++/// fires; later responses send `complete` at once.
++fn make_held_server() -> (
++    net::test_util::Server,
++    UrlWithBlobClaim,
++    tokio::sync::oneshot::Sender<()>,
++    Arc<AtomicUsize>,
++) {
++    let (release_sender, release) = tokio::sync::oneshot::channel::<()>();
++    let release = Mutex::new(Some(release));
++    let request_count = Arc::new(AtomicUsize::new(0));
++    let request_count_clone = request_count.clone();
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            request_count_clone.fetch_add(1, Ordering::SeqCst);
++            response.headers_mut().insert(
++                header::CACHE_CONTROL,
++                HeaderValue::from_static("max-age=3600"),
++            );
++            *response.body_mut() = match release.lock().take() {
++                Some(release) => {
++                    let first = stream::iter([Ok(Frame::data(Bytes::from_static(b"comp")))]);
++                    let last = stream::once(async move {
++                        let _ = release.await;
++                        Ok(Frame::data(Bytes::from_static(b"lete")))
++                    });
++                    StreamBody::new(futures::StreamExt::chain(first, last)).boxed()
++                },
++                None => make_body(b"complete".to_vec()),
++            };
++        };
++    let (server, url) = make_server(handler);
++    (server, url, release_sender, request_count)
++}
++
++#[test]
++fn test_fetch_waiting_for_an_aborted_response_uses_the_network() {
++    let (server, url, release, request_count) = make_held_server();
++    let context = new_fetch_context(None, None);
++    let mut waiting_context = context.clone();
++    waiting_context.cancellation_listener = Arc::new(Default::default());
++    let request = build_cacheable_request(&url);
++
++    let _first_fetch = start_fetch(build_cacheable_request(&url), context.clone());
++    wait_until(|| stored_response_count(&context, &request) == 1);
++    let waiting_fetch = start_fetch(build_cacheable_request(&url), waiting_context);
++    wait_until(|| awaiting_consumer_count(&context, &request) == 1);
++    context.cancellation_listener.cancel();
++    let _ = release.send(());
++
++    let (response, body_length) = wait_for_fetch(waiting_fetch);
++    assert_eq!(body_length, b"complete".len());
++    assert!(matches!(response.cache_state, CacheState::None));
++    assert_eq!(request_count.load(Ordering::SeqCst), 2);
++
++    let _ = server.close();
++}
++
++#[test]
++fn test_fetch_waiting_for_a_response_whose_fetch_failed_is_woken_up() {
++    let (server, url, release, request_count) = make_held_server();
++    let context = new_fetch_context(None, None);
++    let request = build_cacheable_request(&url);
++    let mut request_with_wrong_integrity = build_cacheable_request(&url);
++    request_with_wrong_integrity.integrity_metadata =
++        "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned();
++
++    let failing_fetch = start_fetch(request_with_wrong_integrity, context.clone());
++    wait_until(|| stored_response_count(&context, &request) == 1);
++    let waiting_fetch = start_fetch(build_cacheable_request(&url), context.clone());
++    wait_until(|| awaiting_consumer_count(&context, &request) == 1);
++    let _ = release.send(());
++
++    let (response, _) = wait_for_fetch(failing_fetch);
++    assert!(response.is_network_error());
++    let (response, body_length) = wait_for_fetch(waiting_fetch);
++    assert_eq!(body_length, b"complete".len());
++    assert!(matches!(response.cache_state, CacheState::Local));
++    assert_eq!(request_count.load(Ordering::SeqCst), 1);
++
++    let _ = server.close();
++}
+diff --git a/components/shared/net/response.rs b/components/shared/net/response.rs
+index 074a49cb81b..38d1cc702eb 100644
+--- a/components/shared/net/response.rs
++++ b/components/shared/net/response.rs
+@@ -123,6 +123,9 @@ pub struct Response {
+     /// whether or not to try to return the internal_response when asked for actual_response
+     pub return_internal: bool,
+     /// <https://fetch.spec.whatwg.org/#concept-response-aborted>
++    ///
++    /// Also set when the body failed before its end. The HTTP cache shares this flag with the
++    /// responses it stores, and never uses one whose flag is set, since its body is incomplete.
+     #[conditional_malloc_size_of]
+     pub aborted: Arc<AtomicBool>,
+     /// track network metrics

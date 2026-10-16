@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 16 Oct 2026 20:45:41 +0000
+Subject: [PATCH] script: Fix the inverted error check for the waiting event of
+ media
+
+When the ready state of a media element drops from HAVE_FUTURE_DATA or
+more to HAVE_CURRENT_DATA or less while it was potentially playing, the
+spec asks to fire `timeupdate` and `waiting`, unless playback has
+ended, has stopped due to errors, or is paused for user interaction or
+for in-band content. The check for errors was inverted, and since a
+potentially playing element has no error, the events never fired.
+
+Today, the ready state drops while playing in two places, and both now
+fire the events in some cases:
+- At the end of the media resource. Playback has ended there, except
+  for a resource of infinite duration, where the position stays below
+  the duration: such an element now fires `timeupdate` and `waiting`
+  after `ended`. The next patch makes it end playback.
+- In the media element load algorithm, which resets the ready state
+  while the network state is still NETWORK_LOADING or NETWORK_IDLE. So
+  load() on a playing element, and the playlist pattern
+  `media.src = next; media.play()`, now fire `timeupdate` and `waiting`
+  after `emptied`, as the spec asks; Blink and Gecko don't.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: no test covers these events yet; see Validation.
+
+Validation: host release builds (`./mach build --release`) of ohos-main and of ohos-main with the two previous patches, this one and the next, and a page that calls load() on a playing `<video>`: `abort`, `emptied`, `timeupdate` and `loadstart` without the patches, `abort`, `emptied`, `timeupdate`, `waiting`, `timeupdate` and `loadstart` with them; the same on a HiHope DAYU200 (OpenHarmony 7.0, API 26) with a headless release build (`./mach build --ohos --release --headless-binary`). With this patch but without the next one, an `<audio>` playing an Ogg file served chunked without a length at 8 kB/s, whose duration is Infinity, fired `ended`, `timeupdate` and `waiting`, and stayed unpaused. For the WPT runs, see the previous patch.
+AI-assisted: Yes (agent session; fixed and tested by the agent on Linux and on the device)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/html/embedded_content/htmlmediaelement.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index af310433f14..603169966b3 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -1132,7 +1132,7 @@ impl HTMLMediaElement {
+                 // > to fire an event named waiting at the element.
+                 if was_potentially_playing &&
+                     !self.ended_playback(LoopCondition::Included) &&
+-                    !self.error.get().is_none() &&
++                    self.error.get().is_none() &&
+                     !self.is_paused_for_user_interaction() &&
+                     !self.is_paused_for_in_band_content()
+                 {

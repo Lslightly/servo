@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 16 Oct 2026 21:02:52 +0000
+Subject: [PATCH] script: Keep the origin of a media resource when its fetch
+ restarts
+
+Every fetch of a media element started out origin-clean, until the
+headers of its response arrived. A fetch that restarts the fetch of the
+same media resource, after a seek or once the player needs data again,
+therefore made a video that was fetched in no-cors mode from another
+origin count as origin-clean for as long as the server took to answer,
+so that drawing it to a canvas or into an ImageBitmap did not taint
+them.
+
+Start such a fetch with the origin-clean flag of the fetch that it
+replaces, and keep the flag false once a response of the resource was
+not CORS-same-origin. A new resource selection still starts with a
+fresh flag.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: a new WPT test draws a video from another origin, fetched
+without CORS, to a canvas while it seeks, from a server that delays
+its answer to a range request that starts past byte 0.
+
+Validation: the new test fails in 3 of 3 runs without this patch, where getImageData returns the pixels of the video while it seeks, and passes in 3 of 3 with it. drawing-images-to-the-canvas and imagebitmap (43 tests): on ohos-main only the new test fails, and all pass with the series. `./mach test-wpt --release --processes 6 --timeout-multiplier 2` of html/semantics/embedded-content/media-elements, the-video-element, and html/canvas/element/manual/drawing-images-to-the-canvas and imagebitmap (475 tests) with the series up to the last patch: no new failure; the unexpected results (media_fragment_seek, autoplay-default-permissions-policy, load-removes-queued-error-event) also occur on ohos-main. `./mach check --ohos` passes.
+AI-assisted: Yes (agent session; written and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../html/embedded_content/htmlmediaelement.rs | 13 +++++-
+ tests/wpt/meta/MANIFEST.json                  | 13 ++++++
+ .../drawimage_video_crossorigin_seek.sub.html | 44 +++++++++++++++++++
+ .../resources/delayed-range.py                | 26 +++++++++++
+ 4 files changed, 94 insertions(+), 2 deletions(-)
+ create mode 100644 tests/wpt/tests/html/canvas/element/manual/drawing-images-to-the-canvas/drawimage_video_crossorigin_seek.sub.html
+ create mode 100644 tests/wpt/tests/html/canvas/element/manual/drawing-images-to-the-canvas/resources/delayed-range.py
+
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index a108e992526..0c9fb09027f 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -1623,15 +1623,22 @@ impl HTMLMediaElement {
+ 
+         let mut current_fetch_context = self.current_fetch_context.borrow_mut();
+         let mut resumes_suspended_download = false;
++        // A fetch that restarts the fetch of the same media resource, after a seek or once the
++        // player needs data again, is no more origin-clean than the media data fetched so far.
++        let mut origin_clean = true;
+         if let Some(ref mut current_fetch_context) = *current_fetch_context {
+             resumes_suspended_download = offset.is_some() &&
+                 current_fetch_context.cancel_reason() == &Some(CancelReason::Backoff);
++            if offset.is_some() {
++                origin_clean = current_fetch_context.origin_is_clean();
++            }
+             current_fetch_context.cancel(CancelReason::Abort);
+         }
+ 
+         *current_fetch_context = Some(HTMLMediaElementFetchContext::new(
+             request.id,
+             offset.unwrap_or(0),
++            origin_clean,
+             global.core_resource_thread(),
+         ));
+         let listener =
+@@ -4185,6 +4192,7 @@ impl HTMLMediaElementFetchContext {
+     fn new(
+         request_id: RequestId,
+         offset: u64,
++        origin_clean: bool,
+         core_resource_thread: CoreResourceThread,
+     ) -> HTMLMediaElementFetchContext {
+         HTMLMediaElementFetchContext {
+@@ -4192,7 +4200,7 @@ impl HTMLMediaElementFetchContext {
+             cancel_reason: None,
+             is_seekable: false,
+             player_has_enough_data: false,
+-            origin_clean: true,
++            origin_clean,
+             data_source: RefCell::new(BufferedDataSource::new(offset)),
+             fetch_controller: FetchController::new(request_id, false, core_resource_thread),
+         }
+@@ -4318,7 +4326,8 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
+ 
+         if let Some(ref mut current_fetch_context) = *element.current_fetch_context.borrow_mut() {
+             current_fetch_context.set_seekable(is_seekable);
+-            current_fetch_context.set_origin_clean(origin_clean);
++            current_fetch_context
++                .set_origin_clean(current_fetch_context.origin_is_clean() && origin_clean);
+         }
+ 
+         if let Some(metadata) = metadata.as_ref() &&
+diff --git a/tests/wpt/meta/MANIFEST.json b/tests/wpt/meta/MANIFEST.json
+index 0f1d8e9811e..73e7f7501ac 100644
+--- a/tests/wpt/meta/MANIFEST.json
++++ b/tests/wpt/meta/MANIFEST.json
+@@ -555105,6 +555105,12 @@
+           "19ffcc39c96aecdd212a9f8ca4023e62c91dff2b",
+           []
+          ]
++        },
++        "resources": {
++         "delayed-range.py": [
++          "73c910f1f33097fdad4c41e9ac47c937491d5063",
++          []
++         ]
+         }
+        },
+        "drawing-paths-to-the-canvas": {
+@@ -1281719,6 +1281725,13 @@
+           null,
+           {}
+          ]
++        ],
++        "drawimage_video_crossorigin_seek.sub.html": [
++         "da87c2916ef9ff0b8bd703ac616c9dcf0a56effe",
++         [
++          null,
++          {}
++         ]
+         ]
+        },
+        "drawing-paths-to-the-canvas": {
+diff --git a/tests/wpt/tests/html/canvas/element/manual/drawing-images-to-the-canvas/drawimage_video_crossorigin_seek.sub.html b/tests/wpt/tests/html/canvas/element/manual/drawing-images-to-the-canvas/drawimage_video_crossorigin_seek.sub.html
+new file mode 100644
+index 00000000000..da87c2916ef
+--- /dev/null
++++ b/tests/wpt/tests/html/canvas/element/manual/drawing-images-to-the-canvas/drawimage_video_crossorigin_seek.sub.html
+@@ -0,0 +1,44 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<title>A video from another origin taints the canvas while it seeks</title>
++<link rel="help" href="https://html.spec.whatwg.org/multipage/#the-image-argument-is-not-origin-clean">
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script src="/common/media.js"></script>
++<body>
++<script>
++  function assert_taints(video, description) {
++    const context = document.createElement("canvas").getContext("2d");
++    context.drawImage(video, 0, 0);
++    assert_throws_dom("SecurityError", () => context.getImageData(0, 0, 1, 1), description);
++  }
++
++  promise_test(async t => {
++    const video = document.createElement("video");
++    video.muted = true;
++    // With preload=metadata, a seek fetches the media data that it needs, rather than finding it
++    // in a download of the whole resource.
++    video.preload = "metadata";
++    video.src = "http://{{hosts[][www]}}:{{ports[http][0]}}/html/canvas/element/manual/" +
++      "drawing-images-to-the-canvas/resources/delayed-range.py?name=" + getVideoURI("counting");
++    document.body.appendChild(video);
++    t.add_cleanup(() => video.remove());
++
++    await video.play();
++    video.pause();
++    assert_taints(video, "before seeking");
++
++    const seeked = new Promise(resolve => video.addEventListener("seeked", resolve));
++    let seeking = true;
++    seeked.then(() => seeking = false);
++    // The server delays its answer to a request for the media data at the new position.
++    video.currentTime = 5;
++    while (seeking) {
++      if (video.readyState >= video.HAVE_CURRENT_DATA) {
++        assert_taints(video, "while seeking");
++      }
++      await new Promise(resolve => t.step_timeout(resolve, 100));
++    }
++    assert_taints(video, "after seeking");
++  }, "Can't get pixels of a canvas with a non-CORS cross-origin video drawn while it seeks");
++</script>
+diff --git a/tests/wpt/tests/html/canvas/element/manual/drawing-images-to-the-canvas/resources/delayed-range.py b/tests/wpt/tests/html/canvas/element/manual/drawing-images-to-the-canvas/resources/delayed-range.py
+new file mode 100644
+index 00000000000..73c910f1f33
+--- /dev/null
++++ b/tests/wpt/tests/html/canvas/element/manual/drawing-images-to-the-canvas/resources/delayed-range.py
+@@ -0,0 +1,26 @@
++import os
++import re
++import time
++
++
++def main(request, response):
++    name = os.path.basename(request.GET.first(b"name").decode())
++    with open(os.path.join(request.doc_root, "media", name), "rb") as f:
++        data = f.read()
++
++    headers = [
++        (b"Content-Type", b"video/" + name.rsplit(".", 1)[1].encode()),
++        (b"Accept-Ranges", b"bytes"),
++    ]
++
++    range_header = request.headers.get(b"range")
++    if not range_header:
++        return 200, headers, data
++
++    start = int(re.match(r"bytes=(\d*)-", range_header.decode()).group(1) or 0)
++    if start > 0:
++        # Delay the answer to a request in the middle of the resource, like the one that a seek
++        # makes, so that the media element waits for the headers of the response for a while.
++        time.sleep(float(request.GET.first(b"delay", b"2")))
++    headers.append((b"Content-Range", f"bytes {start}-{len(data) - 1}/{len(data)}".encode()))
++    return 206, headers, data[start:]

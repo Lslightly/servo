@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 18 Oct 2026 09:12:31 +0000
+Subject: [PATCH] servoshell: Drop an unmet lint expectation of the embedded
+ app
+
+`App::update_user_interface_state` expected `unused_variables` unless
+both the `tracing` and `tracing-hitrace` features are enabled, since
+`state` was only read for a hitrace marker. Since c73bea970da (#48393)
+it is also read for `memory_output` in every configuration, so the
+expectation is never fulfilled, and an OpenHarmony or Android build
+with `RUSTFLAGS="-D warnings"` fails with
+`unfulfilled_lint_expectations`. CI builds those platforms without
+`-D warnings`, so it went unnoticed. Remove the expectation.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: no test; it removes a lint attribute.
+
+Validation: `RUSTFLAGS="-D warnings" ./mach build --locked --ohos
+--profile checked-release` fails with the unfulfilled expectation
+without this patch and builds with it.
+
+AI-assisted: Yes (agent session; found with the local CI checks)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/servoshell/egl/app.rs | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/ports/servoshell/egl/app.rs b/ports/servoshell/egl/app.rs
+index 61b036e934f..116c53dd49d 100644
+--- a/ports/servoshell/egl/app.rs
++++ b/ports/servoshell/egl/app.rs
+@@ -80,10 +80,6 @@ impl PlatformWindow for EmbeddedPlatformWindow {
+         false
+     }
+ 
+-    #[cfg_attr(
+-        not(all(feature = "tracing", feature = "tracing-hitrace")),
+-        expect(unused_variables)
+-    )]
+     fn update_user_interface_state(
+         &self,
+         state: &RunningAppState,

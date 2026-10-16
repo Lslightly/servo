@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 16 Oct 2026 21:11:36 +0000
+Subject: [PATCH] script: Don't pause the player of a media element that is
+ potentially playing
+
+update_media_state() asks the player to play when the media element is
+potentially playing and the player is paused, and otherwise pauses a
+playing player. So it also paused the player when the element was
+potentially playing and the player was playing already: play() on a
+playing element paused the media while `paused` stayed false, and so
+did a change of the ready state while playing. This came with
+servo/servo#41027, which made the method skip requests that don't
+change the state of the player.
+
+Pause the player only when the element is not potentially playing.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: a new test, playing-the-media-resource/play-while-playing.html, which times out without this patch.
+
+Validation: host release builds (`./mach build --release`) of ohos-main and of ohos-main with this patch and the three that follow it, a muted `<video>` playing movie_5.mp4 that calls play() again 1.5 s after the first play(): without the patches, `currentTime` went from 1.00 to 1.40 in the next 2 s and stayed there; with them, to 3.00. A HiHope DAYU200 (OpenHarmony 7.0, API 26) with headless release builds (`./mach build --ohos --release --headless-binary`): from 1.19 to 1.19 without, from 1.01 to 3.02 with. For the WPT runs, see the next patch.
+AI-assisted: Yes (agent session; found and fixed by the agent during review rework)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../html/embedded_content/htmlmediaelement.rs |  6 ++--
+ tests/wpt/meta/MANIFEST.json                  |  7 +++++
+ .../play-while-playing.html                   | 31 +++++++++++++++++++
+ 3 files changed, 42 insertions(+), 2 deletions(-)
+ create mode 100644 tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/play-while-playing.html
+
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 0c9fb09027f..8abe4635d25 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -564,7 +564,8 @@ impl HTMLMediaElement {
+             .as_ref()
+             .is_some_and(|player| !player.lock().unwrap().paused());
+ 
+-        if self.is_potentially_playing() && !is_playing {
++        let is_potentially_playing = self.is_potentially_playing();
++        if is_potentially_playing && !is_playing {
+             if let Some(ref player) = *self.player.borrow() {
+                 let player = player.lock().unwrap();
+ 
+@@ -578,7 +579,8 @@ impl HTMLMediaElement {
+                     error!("Could not play media: {error:?}");
+                 }
+             }
+-        } else if is_playing &&
++        } else if !is_potentially_playing &&
++            is_playing &&
+             let Some(ref player) = *self.player.borrow() &&
+             let Err(error) = player.lock().unwrap().pause()
+         {
+diff --git a/tests/wpt/meta/MANIFEST.json b/tests/wpt/meta/MANIFEST.json
+index 73e7f7501ac..91b06a9378b 100644
+--- a/tests/wpt/meta/MANIFEST.json
++++ b/tests/wpt/meta/MANIFEST.json
+@@ -1315907,6 +1315907,13 @@
+           {}
+          ]
+         ],
++        "play-while-playing.html": [
++         "dc9b270a409de5a083a965fd50f005912789ee0a",
++         [
++          null,
++          {}
++         ]
++        ],
+         "playbackRate.html": [
+          "d8e14b5fc176d18a90f627c4bb85d8386d29c5db",
+          [
+diff --git a/tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/play-while-playing.html b/tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/play-while-playing.html
+new file mode 100644
+index 00000000000..dc9b270a409
+--- /dev/null
++++ b/tests/wpt/tests/html/semantics/embedded-content/media-elements/playing-the-media-resource/play-while-playing.html
+@@ -0,0 +1,31 @@
++<!DOCTYPE html>
++<meta charset="utf-8">
++<title>play() on a playing media element keeps it playing</title>
++<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#dom-media-play">
++<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#internal-play-steps">
++<script src="/resources/testharness.js"></script>
++<script src="/resources/testharnessreport.js"></script>
++<script src="/common/media.js"></script>
++<body>
++<script>
++promise_test(async t => {
++  const video = document.createElement("video");
++  video.muted = true;
++  document.body.appendChild(video);
++  t.add_cleanup(() => {
++    video.removeAttribute("src");
++    video.load();
++    video.remove();
++  });
++  video.src = getVideoURI("/media/test-1s");
++  const ended = new Promise(resolve => video.addEventListener("ended", resolve, { once: true }));
++  await video.play();
++
++  await video.play();
++  assert_false(video.paused, "paused after the second play()");
++  await ended;
++  assert_true(video.ended, "ended");
++  assert_equals(video.currentTime, video.duration, "currentTime");
++}, "play() on a playing video keeps it playing to its end");
++</script>
++</body>

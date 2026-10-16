@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 16 Oct 2026 21:13:40 +0000
+Subject: [PATCH] script: Set the duration of an infinite media stream when it
+ ends
+
+When the media engine can't determine the duration of a media resource,
+for example for a stream without a length, the duration of the media
+element is positive Infinity. When such a stream ended, the current
+playback position stayed below the duration, so the element never
+ended playback: it fired `ended` without `pause`, `paused` stayed false
+and `ended` false. Since the previous patch, it also fired `timeupdate`
+and `waiting` after `ended`, as the ready state dropped while it was
+potentially playing.
+
+The HTML spec describes what happens instead in "offsets into the media
+resource":
+
+> If an "infinite" stream ends for some reason, then the duration would
+> change from positive Infinity to the time of the last frame or sample
+> in the stream, and the durationchange event would be fired.
+
+So when the stream ends while the duration is positive Infinity, set the
+duration to the current playback position, which is the time of the
+last frame or sample the media engine reported, and queue a
+`durationchange` event, before running the steps for reaching the end.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: no WPT test streams a resource of unknown length; see Validation.
+
+Validation: host release builds (`./mach build --release`) of ohos-main with the three previous patches, with and without this one, and an `<audio>` playing sound_5.oga of WPT served chunked without a length at 8 kB/s, whose duration is Infinity until the end: without this patch, `ended`, `timeupdate` and `waiting` fired, and `paused` and `ended` stayed false; with it, `durationchange` to 5.01 s, `timeupdate`, `pause` and `ended` fired, and `paused` and `ended` are true. On a HiHope DAYU200 (OpenHarmony 7.0, API 26), AVPlayer reports a finite duration for the same Ogg and MP3 streams, which end the same way with and without this patch. For the WPT runs, see the patch that raises the ready state again after the end.
+AI-assisted: Yes (agent session; implemented and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../dom/html/embedded_content/htmlmediaelement.rs      | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 603169966b3..86fbbd69d44 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -2677,7 +2677,15 @@ impl HTMLMediaElement {
+         match self.direction_of_playback() {
+             PlaybackDirection::Forwards => {
+                 let duration = self.duration.get();
+-                if duration.is_finite() && self.current_playback_position.get() < duration {
++                let position = self.current_playback_position.get();
++                if duration == f64::INFINITY {
++                    // > If an "infinite" stream ends for some reason, then the duration would
++                    // > change from positive Infinity to the time of the last frame or sample in
++                    // > the stream, and the durationchange event would be fired.
++                    // <https://html.spec.whatwg.org/multipage/#offsets-into-the-media-resource>
++                    self.duration.set(position);
++                    self.queue_media_element_task_to_fire_event(atom!("durationchange"));
++                } else if duration.is_finite() && position < duration {
+                     self.playback_position_changed(cx, duration);
+                 }
+                 self.end_of_playback_in_forwards_direction(cx)

@@ -102,6 +102,19 @@ those scripts (they need network access). `check_stack.py` runs each with
 76. `docs: record patches 68 to 76 in the stack manifest` — B · none · watch: -
 77. `media (ohos): Slide the playback buffer with the reads of AVPlayer` — B · manual · watch: components/media/player/lib.rs components/script/dom/html/embedded_content/htmlmediaelement.rs
 78. `docs: record patches 77 to 78 in the stack manifest` — B · none · watch: -
+79. `net: Do not keep media bodies that the HTTP cache cannot serve` — B · CI · watch: components/shared/net/request.rs
+80. `net: Keep incomplete bodies out of the HTTP cache` — B · CI · watch: -
+81. `script: Resume a backed-off media fetch at the next byte instead of seeking` — B · manual · watch: components/media/backends/gstreamer/player.rs components/media/backends/gstreamer/source.rs
+82. `script: Keep queueing a media fetch without range support when the player is full` — B · manual · watch: components/media/backends/gstreamer/player.rs
+83. `script: Treat a media fetch that backed off as a suspended download` — B · manual · watch: -
+84. `script: Keep the origin of a media resource when its fetch restarts` — B · CI · watch: components/script/dom/canvas/imagebitmap.rs components/script/dom/canvas/canvas_context.rs
+85. `gstreamer: Keep the offset of the source when it declines a seek` — B · CI · watch: -
+86. `script: Don't pause the player of a media element that is potentially playing` — B · CI · watch: -
+87. `script: Raise the ready state again when a seek leaves the end of the media` — B · CI · watch: components/media/backends/gstreamer/player.rs components/media/backends/ohos/player.rs
+88. `script: Fix the inverted error check for the waiting event of media` — B · manual · watch: -
+89. `script: Set the duration of an infinite media stream when it ends` — B · manual · watch: -
+90. `servoshell: Drop an unmet lint expectation of the embedded app` — B · manual · watch: -
+91. `docs: record patches 79 to 91 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

@@ -1,0 +1,493 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Fri, 16 Oct 2026 19:25:31 +0000
+Subject: [PATCH] net: Do not keep media bodies that the HTTP cache cannot
+ serve
+
+Media elements fetch with `Range: bytes=N-`. The HTTP cache stored every
+cacheable response to them that ran to its end, whatever its range or
+size, as one more entry in the list of responses for the URL. A stored
+partial response only answers a later range request that it covers, and
+every load starts at byte 0, so the responses that a media backend
+fetches from the middle of a resource, after a seek or to refill its
+buffer, are rarely used. They stayed in memory, another copy on every
+load, in a cache that is bounded by the number of URLs rather than by
+size. Besides that, net kept the body of every response until its fetch
+ended, so a long video sat whole in memory while it played.
+
+For audio and video requests, store a 200 only if its Content-Length is
+at most 8 MiB, and a 206 only if its Content-Range runs from byte 0 to
+the end of a resource of at most 8 MiB and its Content-Length, if any, is
+at most 8 MiB too; in both cases only without Content-Encoding, so that
+this is the size of the body that net keeps. Other statuses, such as
+redirects, follow the usual rules. A small video is then still answered
+from the cache when the page is reloaded. The copies of a resource are
+now bounded in size but not in number: a second element or a
+revalidation can still add another copy of up to 8 MiB.
+
+Do not keep the body of the other media responses at all. One function
+decides both whether the cache may store a media response and whether
+net keeps its body, so the cache never stores a body that was not kept.
+Consumers get the body in chunks; the kept copy is only read by the
+cache, by subresource integrity checks and by preloads, so it is still
+kept for requests with integrity metadata and for preloads. Devtools
+collects its own copy.
+
+RFC 9111 never requires a cache to store a response, so this is a
+storage decision that any cache may make, not a deviation.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: unit tests of the storage rules for media responses, and fetch
+tests of a video of 8 MiB + 1 byte (neither kept nor stored) and of a
+small one (answered from the cache on the second fetch).
+
+Validation: Linux, headless release builds of ohos-main with the GStreamer backend, with and without this patch, playing a 90 s, 42 MB video from a local server with range support that sends ETag, Last-Modified and `Cache-Control: public, max-age=86400`; VmRSS of servoshell in MiB, two revisions of this patch that decide the same for all responses of these runs. Played once: 355 without, 314 and 329 with this patch. Played, reloaded and played again (after the first play / at the end): 351/442 and 356/455 without, 312/371 without this patch and with the cache disabled, 323/384 and 314/383 with this patch. A 2.8 MB video is answered from the cache after a reload if its first load ran to the end: in one of two runs the server got no request for it after the reload; in the other, the startup seek of GStreamer cancelled the first load. `./mach test-unit -p servo-net`: 395 tests pass; checked on the first revision, the new tests fail without the check in the cache (the large video is then stored with an empty body and served from it), and the fetch test of the large video fails when net keeps its body. `./mach test-wpt --release --processes 6 --timeout-multiplier 2` with both patches: fetch/http-cache, fetch/range, fetch/api/basic and xhr, all 619 tests as expected; html/semantics/embedded-content/media-elements, run with the first revision of both patches, all as expected but four that behave the same with ohos-main when rerun three times alone: autoplay-default-permissions-policy.https.sub.html passes where a timeout is expected, media_fragment_seek.html fails a subtest every time, load-removes-queued-error-event.html crashes intermittently (1 of 3 runs with, 2 of 3 without the patches) and seek-to-max-value.htm passes every time.
+AI-assisted: Yes (agent session; written, tested and measured by the agent, reworked after a review by another agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/net/http_cache.rs        |  51 ++++++++-
+ components/net/http_loader.rs       |  19 +++-
+ components/net/tests/http_cache.rs  | 156 +++++++++++++++++++++++++++-
+ components/net/tests/http_loader.rs | 110 +++++++++++++++++++-
+ 4 files changed, 327 insertions(+), 9 deletions(-)
+
+diff --git a/components/net/http_cache.rs b/components/net/http_cache.rs
+index a84e0c794e1..8d4a31c8c3d 100644
+--- a/components/net/http_cache.rs
++++ b/components/net/http_cache.rs
+@@ -13,14 +13,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::{Duration, SystemTime};
+ 
+ use headers::{
+-    CacheControl, ContentRange, Expires, HeaderMapExt, LastModified, Pragma, Range, Vary,
++    CacheControl, ContentLength, ContentRange, Expires, HeaderMapExt, LastModified, Pragma, Range,
++    Vary,
+ };
+ use http::{HeaderMap, Method, StatusCode, header};
+ use log::{debug, error, info};
+ use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+ use malloc_size_of_derive::MallocSizeOf;
+ use net_traits::http_status::HttpStatus;
+-use net_traits::request::{CacheMode, Request};
++use net_traits::request::{CacheMode, Destination, Request};
+ use net_traits::response::{Response, ResponseBody};
+ use net_traits::{CacheEntryDescriptor, Metadata, ResourceFetchTiming};
+ use parking_lot::Mutex as ParkingLotMutex;
+@@ -385,6 +386,40 @@ fn response_is_cacheable(metadata: &Metadata) -> bool {
+     is_cacheable
+ }
+ 
++/// The largest response to an audio or video request that the cache stores.
++const MAX_STORED_MEDIA_RESPONSE_SIZE: u64 = 8 * 1024 * 1024;
++
++/// Whether the cache may store `response` to `request` under its rules for audio and video. Net
++/// only keeps the body of a media response that these rules let the cache store.
++///
++/// Media elements request `bytes=N-` ranges and start every load at byte 0, so a stored partial
++/// response is rarely used. A 200 or 206 to a media request is only stored if it holds the whole
++/// resource, if its size is at most 8 MiB, as given by Content-Length or, for a 206, by
++/// Content-Range and any Content-Length, and if it has no Content-Encoding, so that this is the
++/// size of the body that net keeps. Other statuses follow the usual rules.
++pub(crate) fn may_store_media_response(request: &Request, response: &Response) -> bool {
++    if !matches!(request.destination, Destination::Audio | Destination::Video) {
++        return true;
++    }
++    let headers = &response.headers;
++    let content_length = headers.typed_get::<ContentLength>().map(|length| length.0);
++    let size = if response.status == StatusCode::OK {
++        content_length
++    } else if response.status == StatusCode::PARTIAL_CONTENT {
++        let content_range = headers.typed_get::<ContentRange>();
++        match content_range.map(|range| (range.bytes_range(), range.bytes_len())) {
++            Some((Some((0, last)), Some(length))) if last.checked_add(1) == Some(length) => {
++                Some(length.max(content_length.unwrap_or(0)))
++            },
++            _ => None,
++        }
++    } else {
++        return true;
++    };
++    !headers.contains_key(header::CONTENT_ENCODING) &&
++        size.is_some_and(|size| size <= MAX_STORED_MEDIA_RESPONSE_SIZE)
++}
++
+ /// Calculating Age
+ /// <https://tools.ietf.org/html/rfc7234#section-4.2.3>
+ fn calculate_response_age(response: &Response) -> ApproxDuration {
+@@ -1112,6 +1147,15 @@ impl HttpCache {
+             .map(|cached| cached.validation_status)
+     }
+ 
++    /// The number of responses stored for the URL of `request`.
++    #[cfg(feature = "test-util")]
++    pub async fn stored_response_count(&self, request: &Request) -> usize {
++        match self.entries.get(&CacheKey::new(request)) {
++            Some(entry) => entry.read().await.len(),
++            None => 0,
++        }
++    }
++
+     /// Invalidate cache entries referenced by Location/Content-Location headers.
+     pub(crate) async fn invalidate_related_urls(
+         &self,
+@@ -1200,6 +1244,9 @@ impl<'a> CachedResourcesOrGuard<'a> {
+         if !response_is_cacheable(&metadata) {
+             return;
+         }
++        if !may_store_media_response(request, response) {
++            return;
++        }
+         let expiry = get_response_expiry(response);
+         let stale_while_revalidate = get_stale_while_revalidate(&response.headers);
+         let cacheable_metadata = CachedMetadata {
+diff --git a/components/net/http_loader.rs b/components/net/http_loader.rs
+index 2507283ae56..1f288f790d3 100644
+--- a/components/net/http_loader.rs
++++ b/components/net/http_loader.rs
+@@ -93,7 +93,7 @@ use crate::fetch::methods::{Data, DoneChannel, FetchContext, Target, fetch, main
+ use crate::hsts::HstsList;
+ use crate::http_cache::{
+     CacheKey, CachedResourcesOrGuard, HttpCache, ValidationStatus, construct_response,
+-    invalidate_cached_resources, refresh,
++    invalidate_cached_resources, may_store_media_response, refresh,
+ };
+ use crate::resource_thread::{AuthCache, AuthCacheEntry};
+ use crate::websocket_loader::start_websocket;
+@@ -2380,7 +2380,18 @@ async fn http_network_fetch(
+     }
+     .min(pref!(network_max_content_length) as usize);
+     let _ = done_sender.send(Data::ContentLength(prealloc_size));
+-    *response_body.lock() = ResponseBody::Receiving(Vec::with_capacity(prealloc_size));
++
++    // Consumers get the body in chunks. The copy kept here is only read by the HTTP cache,
++    // subresource integrity checks and preloads, so do not keep media that none of them reads.
++    let keep_body = may_store_media_response(request, &response) ||
++        !request.integrity_metadata.is_empty() ||
++        request.preload_id.is_some();
++    let body = if keep_body {
++        Vec::with_capacity(prealloc_size)
++    } else {
++        Vec::new()
++    };
++    *response_body.lock() = ResponseBody::Receiving(body);
+     let response_body2 = response_body.clone();
+ 
+     spawn_task(
+@@ -2396,7 +2407,9 @@ async fn http_network_fetch(
+                     )));
+                 }
+                 if let ResponseBody::Receiving(ref mut body) = *response_body_accumulator.lock() {
+-                    body.extend_from_slice(&chunk);
++                    if keep_body {
++                        body.extend_from_slice(&chunk);
++                    }
+                     let _ = done_sender.send(Data::Payload(chunk));
+                 }
+                 future::ready(Ok(response_body_accumulator))
+diff --git a/components/net/tests/http_cache.rs b/components/net/tests/http_cache.rs
+index 4147348e72c..e6f6d15334a 100644
+--- a/components/net/tests/http_cache.rs
++++ b/components/net/tests/http_cache.rs
+@@ -2,11 +2,14 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-use http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, EXPIRES, HeaderValue, RANGE};
++use http::header::{
++    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, EXPIRES, HeaderName,
++    HeaderValue, RANGE,
++};
+ use http::{HeaderMap, StatusCode};
+ use net::http_cache::{CacheKey, HttpCache, HttpCacheAssignment, ValidationStatus, refresh};
+ use net_traits::blob_url_store::UrlWithBlobClaim;
+-use net_traits::request::{Referrer, RequestBuilder};
++use net_traits::request::{Destination, Referrer, Request, RequestBuilder};
+ use net_traits::response::{Response, ResponseBody};
+ use net_traits::{ResourceFetchTiming, ResourceTimingType};
+ use servo_base::id::TEST_PIPELINE_ID;
+@@ -349,3 +352,152 @@ async fn http_cache_do_not_evict_unfinished_requests() {
+     println!("cache {:?}", cache);
+     assert!(result.is_some());
+ }
++
++fn build_request_with_range(destination: Destination, range: Option<&str>) -> Request {
++    let url = ServoUrl::parse("https://servo.org/video.mp4").unwrap();
++    let mut headers = HeaderMap::new();
++    if let Some(range) = range {
++        headers.insert(RANGE, HeaderValue::from_str(range).unwrap());
++    }
++    RequestBuilder::new(
++        None,
++        UrlWithBlobClaim::new(url.clone(), None),
++        Referrer::NoReferrer,
++    )
++    .pipeline_id(Some(TEST_PIPELINE_ID))
++    .origin(url.origin())
++    .destination(destination)
++    .headers(headers)
++    .build()
++}
++
++/// Store a cacheable response to `request` with `status`, `headers` and a body of `body_length`
++/// bytes in an empty cache, and return whether the cache kept it.
++async fn is_stored(
++    request: &Request,
++    status: StatusCode,
++    headers: &[(HeaderName, String)],
++    body_length: usize,
++) -> bool {
++    let timing = ResourceFetchTiming::new(ResourceTimingType::Resource);
++    let mut response = Response::new(request.current_url(), timing);
++    response.status = status.into();
++    response
++        .headers
++        .insert(CACHE_CONTROL, HeaderValue::from_static("max-age=3600"));
++    for (name, value) in headers {
++        response
++            .headers
++            .insert(name.clone(), HeaderValue::from_str(value).unwrap());
++    }
++    *response.body.lock() = ResponseBody::Done(vec![0; body_length]);
++    let cache = HttpCache::new(HttpCacheAssignment::Public);
++    cache.store(request, &response).await;
++    cache.stored_response_count(request).await == 1
++}
++
++#[tokio::test]
++async fn test_media_responses_are_stored_only_if_complete_and_small() {
++    const LIMIT: usize = 8 * 1024 * 1024;
++    let video = |range| build_request_with_range(Destination::Video, range);
++    let audio = |range| build_request_with_range(Destination::Audio, range);
++    let length = |length: usize| (CONTENT_LENGTH, length.to_string());
++    let range = |range: &str| (CONTENT_RANGE, range.to_owned());
++    let ok = StatusCode::OK;
++    let partial = StatusCode::PARTIAL_CONTENT;
++
++    assert!(is_stored(&video(None), ok, &[length(10)], 10).await);
++    assert!(is_stored(&video(Some("bytes=0-")), ok, &[length(10)], 10).await);
++    assert!(
++        is_stored(
++            &video(Some("bytes=0-")),
++            partial,
++            &[length(10), range("bytes 0-9/10")],
++            10
++        )
++        .await
++    );
++    assert!(
++        is_stored(&video(Some("bytes=5-")), ok, &[length(10)], 10).await,
++        "a 200 holds the whole resource, whatever range was requested"
++    );
++    assert!(is_stored(&audio(None), ok, &[length(LIMIT)], LIMIT).await);
++    assert!(
++        is_stored(
++            &video(Some("bytes=0-")),
++            partial,
++            &[range("bytes 0-9/10")],
++            10
++        )
++        .await,
++        "Content-Range gives the size of a 206"
++    );
++    assert!(
++        is_stored(&video(None), StatusCode::NOT_FOUND, &[], 10).await,
++        "statuses other than 200 and 206 follow the usual rules"
++    );
++
++    assert!(!is_stored(&audio(None), ok, &[length(LIMIT + 1)], LIMIT + 1).await);
++    assert!(
++        !is_stored(&video(None), ok, &[], 10).await,
++        "the length of a chunked response is not known up front"
++    );
++    assert!(
++        !is_stored(
++            &video(None),
++            ok,
++            &[length(10), (CONTENT_ENCODING, "gzip".to_owned())],
++            10
++        )
++        .await,
++        "Content-Length is not the length of a decoded body"
++    );
++    assert!(
++        !is_stored(
++            &video(Some("bytes=5-")),
++            partial,
++            &[length(5), range("bytes 5-9/10")],
++            5
++        )
++        .await
++    );
++    assert!(
++        !is_stored(
++            &video(Some("bytes=0-")),
++            partial,
++            &[length(5), range("bytes 0-4/10")],
++            5
++        )
++        .await
++    );
++    assert!(
++        !is_stored(
++            &video(Some("bytes=0-")),
++            partial,
++            &[length(10), range("bytes 0-9/*")],
++            10
++        )
++        .await
++    );
++    assert!(
++        !is_stored(
++            &video(Some("bytes=0-")),
++            partial,
++            &[range(&format!("bytes 0-{LIMIT}/{}", LIMIT + 1))],
++            LIMIT + 1
++        )
++        .await
++    );
++
++    let other = |range| build_request_with_range(Destination::None, range);
++    assert!(
++        is_stored(
++            &other(Some("bytes=5-")),
++            partial,
++            &[length(5), range("bytes 5-9/10")],
++            5
++        )
++        .await
++    );
++    assert!(is_stored(&other(None), ok, &[], LIMIT + 1).await);
++}
+diff --git a/components/net/tests/http_loader.rs b/components/net/tests/http_loader.rs
+index 191452f8fee..510534e6ff6 100644
+--- a/components/net/tests/http_loader.rs
++++ b/components/net/tests/http_loader.rs
+@@ -30,7 +30,7 @@ use hyper::body::{Body, Bytes, Incoming};
+ use hyper::{Request as HyperRequest, Response as HyperResponse};
+ use net::cookie::ServoCookie;
+ use net::cookie_storage::CookieStorage;
+-use net::fetch::methods::{self};
++use net::fetch::methods::{self, FetchContext};
+ use net::http_loader::{determine_requests_referrer, serialize_origin};
+ use net::resource_thread::AuthCacheEntry;
+ use net::test::DECODER_BUFFER_SIZE;
+@@ -40,7 +40,7 @@ use net_traits::request::{
+     CredentialsMode, Destination, Referrer, Request, RequestBuilder, RequestMode,
+     TraversableForUserPrompts, create_request_body_with_content,
+ };
+-use net_traits::response::{Response, ResponseBody};
++use net_traits::response::{CacheState, Response, ResponseBody};
+ use net_traits::{CookieSource, FetchTaskTarget, NetworkError, ReferrerPolicy, get_current_locale};
+ use parking_lot::{Mutex, RwLock};
+ use servo_base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
+@@ -2162,3 +2162,109 @@ fn test_stale_while_revalidate_serves_cached_and_revalidates_in_background() {
+ 
+     let _ = server.close();
+ }
++
++/// Collects the response and the number of body bytes that a fetch delivers.
++struct BodyLengthCollector {
++    sender: Option<tokio::sync::oneshot::Sender<(Response, usize)>>,
++    length: usize,
++}
++
++impl FetchTaskTarget for BodyLengthCollector {
++    fn process_request_body(&mut self, _: &Request) {}
++    fn process_response(&mut self, _: &Request, _: &Response) {}
++    fn process_response_chunk(&mut self, _: &Request, chunk: Bytes) {
++        self.length += chunk.len();
++    }
++    fn process_response_eof(&mut self, _: &Request, response: &Response) {
++        let _ = self
++            .sender
++            .take()
++            .unwrap()
++            .send((response.clone(), self.length));
++    }
++    fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
++    fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
++}
++
++/// Fetch `url` the way a video element starts a load, and return the response and the number of
++/// body bytes delivered.
++fn fetch_video(url: &UrlWithBlobClaim, context: &mut FetchContext) -> (Response, usize) {
++    let mut headers = HeaderMap::new();
++    headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
++    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
++        .destination(Destination::Video)
++        .headers(headers)
++        .origin(url.clone().origin())
++        .pipeline_id(Some(TEST_PIPELINE_ID))
++        .policy_container(Default::default())
++        .build();
++    let (sender, receiver) = tokio::sync::oneshot::channel();
++    let mut target = BodyLengthCollector {
++        sender: Some(sender),
++        length: 0,
++    };
++    spawn_blocking_task(async move {
++        methods::fetch(request, &mut target, context).await;
++        receiver.await.unwrap()
++    })
++}
++
++#[test]
++fn test_large_media_response_is_neither_kept_nor_stored() {
++    const LENGTH: usize = 8 * 1024 * 1024 + 1;
++    let request_count = Arc::new(AtomicUsize::new(0));
++    let request_count_clone = request_count.clone();
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            request_count_clone.fetch_add(1, Ordering::SeqCst);
++            response.headers_mut().insert(
++                header::CACHE_CONTROL,
++                HeaderValue::from_static("max-age=3600"),
++            );
++            *response.body_mut() = make_body(vec![0; LENGTH]);
++        };
++    let (server, url) = make_server(handler);
++    let mut context = new_fetch_context(None, None);
++
++    for expected_request_count in 1..=2 {
++        let (response, body_length) = fetch_video(&url, &mut context);
++        assert_eq!(body_length, LENGTH);
++        assert!(matches!(
++            &*response.actual_response().body.lock(),
++            ResponseBody::Done(body) if body.is_empty()
++        ));
++        assert_eq!(request_count.load(Ordering::SeqCst), expected_request_count);
++    }
++
++    let _ = server.close();
++}
++
++#[test]
++fn test_small_media_response_is_stored() {
++    let request_count = Arc::new(AtomicUsize::new(0));
++    let request_count_clone = request_count.clone();
++    let handler =
++        move |_: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            request_count_clone.fetch_add(1, Ordering::SeqCst);
++            response.headers_mut().insert(
++                header::CACHE_CONTROL,
++                HeaderValue::from_static("max-age=3600"),
++            );
++            *response.body_mut() = make_body(b"video".to_vec());
++        };
++    let (server, url) = make_server(handler);
++    let mut context = new_fetch_context(None, None);
++
++    let (response, body_length) = fetch_video(&url, &mut context);
++    assert_eq!(body_length, 5);
++    assert!(matches!(response.cache_state, CacheState::None));
++
++    let (response, body_length) = fetch_video(&url, &mut context);
++    assert_eq!(body_length, 5);
++    assert!(matches!(response.cache_state, CacheState::Local));
++    assert_eq!(request_count.load(Ordering::SeqCst), 1);
++
++    let _ = server.close();
++}
