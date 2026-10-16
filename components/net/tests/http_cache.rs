@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::sync::atomic::Ordering;
+
 use http::header::{
     CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, EXPIRES, HeaderName,
     HeaderValue, RANGE,
@@ -500,4 +502,98 @@ async fn test_media_responses_are_stored_only_if_complete_and_small() {
         .await
     );
     assert!(is_stored(&other(None), ok, &[], LIMIT + 1).await);
+}
+
+fn build_cacheable_response(request: &Request, body: ResponseBody) -> Response {
+    let timing = ResourceFetchTiming::new(ResourceTimingType::Resource);
+    let mut response = Response::new(request.current_url(), timing);
+    response
+        .headers
+        .insert(CACHE_CONTROL, HeaderValue::from_static("max-age=3600"));
+    *response.body.lock() = body;
+    response
+}
+
+#[tokio::test]
+async fn test_aborted_responses_are_removed_when_storing() {
+    let request = build_request_with_range(Destination::None, None);
+    let build_response =
+        |body: &[u8]| build_cacheable_response(&request, ResponseBody::Done(body.to_vec()));
+    let cache = HttpCache::new(HttpCacheAssignment::Public);
+
+    let aborted_response = build_response(b"aborted");
+    cache.store(&request, &aborted_response).await;
+    aborted_response.aborted.store(true, Ordering::Release);
+    cache.store(&request, &build_response(b"complete")).await;
+
+    assert_eq!(cache.stored_response_count(&request).await, 1);
+    let cached_response = cache.construct_response(&request, &mut None).await.unwrap();
+    assert_eq!(
+        *cached_response.body.lock(),
+        ResponseBody::Done(b"complete".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn test_aborted_responses_are_kept_while_consumers_wait_for_them() {
+    let request = build_request_with_range(Destination::None, None);
+    let cache = HttpCache::new(HttpCacheAssignment::Public);
+
+    let aborted_response = build_cacheable_response(&request, ResponseBody::Receiving(vec![]));
+    cache.store(&request, &aborted_response).await;
+    let mut done_chan = None;
+    assert!(
+        cache
+            .construct_response(&request, &mut done_chan)
+            .await
+            .is_some()
+    );
+    assert!(done_chan.is_some());
+    aborted_response.aborted.store(true, Ordering::Release);
+
+    let response = build_cacheable_response(&request, ResponseBody::Done(b"complete".to_vec()));
+    cache.store(&request, &response).await;
+    assert_eq!(cache.stored_response_count(&request).await, 2);
+}
+
+#[tokio::test]
+async fn test_ranges_of_a_stored_response_share_its_aborted_flag() {
+    let request = build_request_with_range(Destination::None, Some("bytes=2-"));
+    let response = build_cacheable_response(&request, ResponseBody::Done(b"0123456789".to_vec()));
+    let cache = HttpCache::new(HttpCacheAssignment::Public);
+    cache.store(&request, &response).await;
+
+    let range_response = cache.construct_response(&request, &mut None).await.unwrap();
+    assert_eq!(
+        *range_response.body.lock(),
+        ResponseBody::Done(b"23456789".to_vec())
+    );
+    response.aborted.store(true, Ordering::Release);
+    assert!(range_response.aborted.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn test_refresh_skips_aborted_responses() {
+    let request = build_request_with_range(Destination::None, None);
+    let cache = HttpCache::new(HttpCacheAssignment::Public);
+    let aborted_response = build_cacheable_response(&request, ResponseBody::Done(vec![]));
+    cache.store(&request, &aborted_response).await;
+    let response = build_cacheable_response(&request, ResponseBody::Done(b"complete".to_vec()));
+    cache.store(&request, &response).await;
+    aborted_response.aborted.store(true, Ordering::Release);
+
+    let mut not_modified = build_cacheable_response(&request, ResponseBody::Empty);
+    not_modified.status = StatusCode::NOT_MODIFIED.into();
+    let mut resources = cache.get_or_guard(CacheKey::new(&request)).await;
+    let refreshed_response = refresh(
+        &request,
+        not_modified,
+        &mut None,
+        resources.try_as_mut().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        *refreshed_response.body.lock(),
+        ResponseBody::Done(b"complete".to_vec())
+    );
 }

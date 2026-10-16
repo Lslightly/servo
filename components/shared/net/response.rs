@@ -123,6 +123,9 @@ pub struct Response {
     /// whether or not to try to return the internal_response when asked for actual_response
     pub return_internal: bool,
     /// <https://fetch.spec.whatwg.org/#concept-response-aborted>
+    ///
+    /// Also set when the body failed before its end. The HTTP cache shares this flag with the
+    /// responses it stores, and never uses one whose flag is set, since its body is incomplete.
     #[conditional_malloc_size_of]
     pub aborted: Arc<AtomicBool>,
     /// track network metrics
