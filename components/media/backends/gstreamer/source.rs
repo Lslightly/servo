@@ -36,7 +36,8 @@ mod imp {
     #[derive(Debug, Default)]
     struct Position {
         offset: u64,
-        requested_offset: u64,
+        /// The offset of a seek that waits for the media element to restart its fetch.
+        requested_offset: Option<u64>,
     }
 
     // The actual data structure that stores our values. This is not accessible
@@ -73,17 +74,12 @@ mod imp {
         pub fn set_seek_offset<O: IsA<gstreamer::Object>>(&self, parent: &O, offset: u64) -> bool {
             let mut pos = self.position.lock().unwrap();
 
-            if pos.offset == offset || pos.requested_offset != 0 {
+            if pos.offset == offset || pos.requested_offset.is_some() {
                 false
             } else {
                 self.seeking.store(true, Ordering::Relaxed);
-                pos.requested_offset = offset;
-                gstreamer::debug!(
-                    self.cat,
-                    obj = parent,
-                    "seeking to offset: {}",
-                    pos.requested_offset
-                );
+                pos.requested_offset = Some(offset);
+                gstreamer::debug!(self.cat, obj = parent, "seeking to offset: {}", offset);
 
                 true
             }
@@ -99,8 +95,9 @@ mod imp {
             }
 
             let mut pos = self.position.lock().unwrap();
-            pos.offset = pos.requested_offset;
-            pos.requested_offset = 0;
+            if let Some(offset) = pos.requested_offset.take() {
+                pos.offset = offset;
+            }
         }
 
         pub fn push_buffer<O: IsA<gstreamer::Object>>(
@@ -438,4 +435,36 @@ pub fn register_servo_src() -> Result<(), glib::BoolError> {
         gstreamer::Rank::NONE,
         ServoSrc::static_type(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declined_seek_keeps_the_offset() {
+        gstreamer::init().unwrap();
+        register_servo_src().unwrap();
+        let src = gstreamer::ElementFactory::make("servosrc")
+            .build()
+            .unwrap()
+            .downcast::<ServoSrc>()
+            .unwrap();
+
+        // The source is not started, so the buffer is flushed, but it moves the offset all the same.
+        let _ = src.push_buffer(vec![0; 100]);
+        assert!(!src.set_seek_offset(100));
+        src.set_seek_done();
+        assert!(!src.set_seek_offset(100));
+
+        assert!(src.set_seek_offset(0));
+        src.set_seek_done();
+        assert!(!src.set_seek_offset(0));
+
+        // A seek that is declined because another one waits leaves the waiting one alone.
+        assert!(src.set_seek_offset(200));
+        assert!(!src.set_seek_offset(300));
+        src.set_seek_done();
+        assert!(!src.set_seek_offset(200));
+    }
 }
