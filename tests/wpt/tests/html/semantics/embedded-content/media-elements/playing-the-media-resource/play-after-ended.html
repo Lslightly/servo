@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>play() after playback has ended plays the media resource again from the start</title>
+<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#dom-media-play">
+<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#internal-play-steps">
+<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#dom-media-seek">
+<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#reaches-the-end">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script src="/common/media.js"></script>
+<body>
+<script>
+// Once playback has ended, play() seeks to the earliest possible position, so playback starts
+// again, reaches the end again and fires ended again.
+
+function create_media(t, tagName) {
+  const media = document.createElement(tagName);
+  media.muted = true;
+  document.body.appendChild(media);
+  t.add_cleanup(() => {
+    media.removeAttribute("src");
+    media.load();
+    media.remove();
+  });
+  return media;
+}
+
+function play_after_ended_test(tagName, src) {
+  promise_test(async t => {
+    const media = create_media(t, tagName);
+    media.src = src;
+
+    let ended = new Promise(resolve => media.addEventListener("ended", resolve, { once: true }));
+    await media.play();
+    await ended;
+    assert_true(media.ended, "ended after the first playback");
+    assert_equals(media.currentTime, media.duration, "currentTime after the first playback");
+    assert_greater_than(media.seekable.length, 0,
+                        "seekable ranges after the first playback, to seek back to the start");
+
+    const events = [];
+    let timeAtSeeked, endedAtSeeked;
+    for (const type of ["play", "seeking", "seeked", "playing", "pause", "ended"]) {
+      media.addEventListener(type, () => events.push(type));
+    }
+    media.addEventListener("seeked", () => {
+      timeAtSeeked = media.currentTime;
+      endedAtSeeked = media.ended;
+    }, { once: true });
+
+    ended = new Promise(resolve => media.addEventListener("ended", resolve, { once: true }));
+    await media.play();
+    assert_false(media.paused, "paused once the play() promise resolved");
+    await ended;
+
+    assert_less_than(timeAtSeeked, media.duration, "currentTime at seeked");
+    assert_false(endedAtSeeked, "ended at seeked");
+    for (const type of ["play", "seeking", "seeked", "playing"]) {
+      assert_true(events.includes(type), `${type} fired`);
+    }
+    assert_array_equals(events.slice(-2), ["pause", "ended"], "last events");
+    assert_true(media.ended, "ended after playing again");
+    assert_true(media.paused, "paused after playing again");
+    assert_equals(media.currentTime, media.duration, "currentTime after playing again");
+  }, `${tagName}: play() after playback has ended plays again and fires ended again`);
+}
+
+play_after_ended_test("video", getVideoURI("/media/test-1s"));
+play_after_ended_test("audio", getAudioURI("/media/sound_0"));
+</script>
+</body>

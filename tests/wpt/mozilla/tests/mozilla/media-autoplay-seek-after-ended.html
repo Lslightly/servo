@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Seeking back after an autoplay video has ended doesn't play it again</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script src="/common/media.js"></script>
+<body>
+<script>
+// The can autoplay flag stays true when playback ends by itself, and the spec allows, but doesn't
+// require, the autoplay steps to run again once the ready state reaches HAVE_ENOUGH_DATA after a
+// seek back. Servo doesn't run them, so that seeking back in an ended handler doesn't loop forever.
+promise_test(async t => {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.autoplay = true;
+  document.body.appendChild(video);
+  t.add_cleanup(() => {
+    video.removeAttribute("src");
+    video.load();
+    video.remove();
+  });
+  const events = [];
+  const seeked = new Promise(resolve => {
+    video.addEventListener("ended", () => {
+      for (const type of ["play", "playing"]) {
+        video.addEventListener(type, () => events.push(type));
+      }
+      video.addEventListener("seeked", resolve, { once: true });
+      video.currentTime = 0;
+    }, { once: true });
+  });
+  video.src = getVideoURI("/media/test-1s");
+  await seeked;
+  await new Promise(resolve => t.step_timeout(resolve, 500));
+
+  assert_array_equals(events, [], "events after seeking back");
+  assert_true(video.paused, "paused after seeking back");
+  assert_false(video.ended, "ended after seeking back");
+}, "Seeking back after an autoplay video has ended doesn't play it again");
+</script>
+</body>

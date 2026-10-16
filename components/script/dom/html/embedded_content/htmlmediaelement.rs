@@ -3104,12 +3104,24 @@ impl HTMLMediaElement {
         );
     }
 
-    fn playback_seek_done(&self, cx: &JSContext, position: f64) {
+    fn playback_seek_done(&self, cx: &mut JSContext, position: f64) {
         // If the seek was initiated by script or by the user agent itself continue with the
         // following steps, otherwise abort.
         let delta = (position - self.current_seek_position.get()).abs();
         if !self.seeking.get() || delta > SEEK_POSITION_THRESHOLD {
             return;
+        }
+
+        // Reaching the end of the media resource lowered the ready state to HAVE_CURRENT_DATA, which
+        // blocks the element. Once the media engine completed a seek back from there, data at the
+        // new position is available, so raise the ready state to HAVE_FUTURE_DATA. That reflects no
+        // measured buffer level, and HAVE_ENOUGH_DATA, at which the element could autoplay again,
+        // waits until playback starts.
+        if self.ready_state.get() == ReadyState::HaveCurrentData &&
+            !self.ended_playback(LoopCondition::Ignored) &&
+            !self.in_error_state()
+        {
+            self.change_ready_state(cx, ReadyState::HaveFutureData);
         }
 
         // <https://html.spec.whatwg.org/multipage/#dom-media-seek>
@@ -3133,7 +3145,10 @@ impl HTMLMediaElement {
             },
             PlaybackState::Playing => {
                 media_session_playback_state = MediaSessionPlaybackState::Playing;
-                if self.ready_state.get() == ReadyState::HaveMetadata {
+                if matches!(
+                    self.ready_state.get(),
+                    ReadyState::HaveMetadata | ReadyState::HaveFutureData
+                ) {
                     self.change_ready_state(cx, ReadyState::HaveEnoughData);
                 }
             },
