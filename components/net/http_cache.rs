@@ -157,6 +157,12 @@ impl CachedResource {
     pub(crate) fn is_done(&self) -> bool {
         self.body.lock().is_done()
     }
+
+    /// Whether the fetch of this resource was aborted and nobody waits for its body anymore,
+    /// so that it can be removed.
+    fn is_abandoned(&self) -> bool {
+        self.aborted.load(Ordering::Acquire) && self.awaiting_body.lock().is_empty()
+    }
 }
 
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -603,19 +609,23 @@ fn create_cached_response(
     done_chan: &mut DoneChannel,
 ) -> Option<CachedResponse> {
     debug!("creating a cached response for {:?}", request.url());
+    // A fetch marks its response as aborted before it replaces an incomplete body, so check the
+    // flag while holding the body.
+    let body = cached_resource.body.lock();
     if cached_resource.aborted.load(Ordering::Acquire) {
         return None;
     }
-    let resource_timing = ResourceFetchTiming::new(request.timing_type());
-    let mut response = Response::new(cached_resource.metadata.final_url.clone(), resource_timing);
-    response.headers = cached_headers.clone();
-    response.body = cached_resource.body.clone();
-    if let ResponseBody::Receiving(_) = *cached_resource.body.lock() {
+    if let ResponseBody::Receiving(_) = *body {
         debug!("existing body is in progress");
         let (done_sender, done_receiver) = unbounded();
         *done_chan = Some((done_sender.clone(), done_receiver));
         cached_resource.awaiting_body.lock().push(done_sender);
     }
+    drop(body);
+    let resource_timing = ResourceFetchTiming::new(request.timing_type());
+    let mut response = Response::new(cached_resource.metadata.final_url.clone(), resource_timing);
+    response.headers = cached_headers.clone();
+    response.body = cached_resource.body.clone();
     response
         .location_url
         .clone_from(&cached_resource.location_url);
@@ -671,7 +681,7 @@ fn create_resource_with_bytes_from_resource(
     CachedResource {
         request_headers: resource.request_headers.clone(),
         body: Arc::new(ParkingLotMutex::new(ResponseBody::Done(bytes.to_owned()))),
-        aborted: Arc::new(AtomicBool::new(false)),
+        aborted: resource.aborted.clone(),
         awaiting_body: Arc::new(ParkingLotMutex::new(vec![])),
         metadata: resource.metadata.clone(),
         location_url: resource.location_url.clone(),
@@ -971,7 +981,9 @@ pub fn refresh(
 ) -> Option<Response> {
     assert_eq!(response.status, StatusCode::NOT_MODIFIED);
 
-    let cached_resource = cached_resources.iter_mut().next()?;
+    let cached_resource = cached_resources
+        .iter_mut()
+        .find(|resource| !resource.aborted.load(Ordering::Acquire))?;
 
     let mut constructed_response = if let Some(range_spec) = request.headers.typed_get::<Range>() {
         handle_range_request(request, &[cached_resource], &range_spec, done_chan)
@@ -981,9 +993,15 @@ pub fn refresh(
         // If the body is not receiving data, set the done_chan back to None.
         // Otherwise, create a new dedicated channel to update the consumer.
         // The response constructed here will replace the 304 one from the network.
-        let in_progress_channel = match &*cached_resource.body.lock() {
-            ResponseBody::Receiving(..) => Some(unbounded()),
-            ResponseBody::Empty | ResponseBody::Done(..) => None,
+        let in_progress_channel = {
+            let body = cached_resource.body.lock();
+            if cached_resource.aborted.load(Ordering::Acquire) {
+                return None;
+            }
+            match &*body {
+                ResponseBody::Receiving(..) => Some(unbounded()),
+                ResponseBody::Empty | ResponseBody::Done(..) => None,
+            }
         };
         match in_progress_channel {
             Some((done_sender, done_receiver)) => {
@@ -1053,8 +1071,9 @@ fn resolve_location_url(
 impl HttpCache {
     /// Wake-up consumers of cached resources
     /// whose response body was still receiving data when the resource was constructed,
-    /// and whose response has now either been completed or cancelled.
-    pub(crate) async fn update_awaiting_consumers(&self, request: &Request, response: &Response) {
+    /// and whose response has now either been completed or aborted.
+    /// Then remove the resources of aborted fetches that nobody waits for.
+    pub(crate) async fn update_awaiting_consumers(&self, request: &Request) {
         let entry_key = CacheKey::new(request);
 
         let cached_resources = match self.entries.get(&entry_key) {
@@ -1062,40 +1081,31 @@ impl HttpCache {
             Some(resources) => resources,
         };
 
-        let actual_response = response.actual_response();
-
-        // Ensure we only wake-up consumers of relevant resources,
-        // ie we don't want to wake-up 200 awaiting consumers with a 206.
-        let lock = cached_resources.read().await;
-        let relevant_cached_resources = lock.iter().filter(|resource| {
-            if actual_response.is_network_error() {
-                return *resource.body.lock() == ResponseBody::Empty;
-            }
-            resource.status == actual_response.status
-        });
-
-        for cached_resource in relevant_cached_resources {
-            let mut awaiting_consumers = cached_resource.awaiting_body.lock();
-            if awaiting_consumers.is_empty() {
-                continue;
-            }
-            let to_send = if cached_resource.aborted.load(Ordering::Acquire) {
-                // In the case of an aborted fetch,
-                // wake-up all awaiting consumers.
-                // Each will then start a new network request.
-                // TODO: Wake-up only one consumer, and make it the producer on which others wait.
-                Data::Cancelled
-            } else {
-                match *cached_resource.body.lock() {
-                    ResponseBody::Done(_) | ResponseBody::Empty => Data::Done,
-                    ResponseBody::Receiving(_) => {
-                        continue;
-                    },
+        let mut lock = cached_resources.write().await;
+        for cached_resource in lock.iter() {
+            let to_send = {
+                let body = cached_resource.body.lock();
+                if cached_resource.aborted.load(Ordering::Acquire) {
+                    // In the case of an aborted fetch,
+                    // wake-up all awaiting consumers.
+                    // Each will then start a new network request.
+                    // TODO: Wake-up only one consumer, and make it the producer on which others wait.
+                    Data::Cancelled
+                } else if let ResponseBody::Receiving(_) = *body {
+                    continue;
+                } else {
+                    Data::Done
                 }
             };
-            for done_sender in awaiting_consumers.drain(..) {
+            for done_sender in cached_resource.awaiting_body.lock().drain(..) {
                 let _ = done_sender.send(to_send.clone());
             }
+        }
+        lock.retain(|resource| !resource.is_abandoned());
+        if lock.is_empty() {
+            self.entries.remove_if(&entry_key, |entry| {
+                std::sync::Arc::ptr_eq(entry, &cached_resources)
+            });
         }
     }
 
@@ -1152,6 +1162,21 @@ impl HttpCache {
     pub async fn stored_response_count(&self, request: &Request) -> usize {
         match self.entries.get(&CacheKey::new(request)) {
             Some(entry) => entry.read().await.len(),
+            None => 0,
+        }
+    }
+
+    /// The number of fetches that wait for the body of a response stored for the URL of
+    /// `request`.
+    #[cfg(feature = "test-util")]
+    pub async fn awaiting_consumer_count(&self, request: &Request) -> usize {
+        match self.entries.get(&CacheKey::new(request)) {
+            Some(entry) => entry
+                .read()
+                .await
+                .iter()
+                .map(|resource| resource.awaiting_body.lock().len())
+                .sum(),
             None => 0,
         }
     }
@@ -1273,6 +1298,7 @@ impl<'a> CachedResourcesOrGuard<'a> {
 
         match self {
             CachedResourcesOrGuard::Value(mut owned_rw_lock_write_guard) => {
+                owned_rw_lock_write_guard.retain(|resource| !resource.is_abandoned());
                 owned_rw_lock_write_guard.push(entry_resource);
             },
             CachedResourcesOrGuard::Guard(placeholder_guard) => {

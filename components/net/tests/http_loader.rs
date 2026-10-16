@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use content_security_policy as csp;
@@ -18,6 +19,7 @@ use devtools_traits::{
 use embedder_traits::AuthenticationResponse;
 use flate2::Compression;
 use flate2::write::{GzEncoder, ZlibEncoder};
+use futures::stream;
 use headers::authorization::Basic;
 use headers::{
     Authorization, ContentLength, Date, HeaderMapExt, Host, StrictTransportSecurity, UserAgent,
@@ -26,11 +28,13 @@ use http::header::{self, HeaderMap, HeaderValue, WWW_AUTHENTICATE};
 use http::uri::Authority;
 use http::{HeaderName, Method, StatusCode};
 use http_body_util::combinators::BoxBody;
-use hyper::body::{Body, Bytes, Incoming};
+use http_body_util::{BodyExt, StreamBody};
+use hyper::body::{Body, Bytes, Frame, Incoming};
 use hyper::{Request as HyperRequest, Response as HyperResponse};
+use net::async_runtime::spawn_task;
 use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
-use net::fetch::methods::{self, FetchContext};
+use net::fetch::methods::{self, CancellationListener, FetchContext};
 use net::http_loader::{determine_requests_referrer, serialize_origin};
 use net::resource_thread::AuthCacheEntry;
 use net::test::DECODER_BUFFER_SIZE;
@@ -2263,6 +2267,252 @@ fn test_small_media_response_is_stored() {
 
     let (response, body_length) = fetch_video(&url, &mut context);
     assert_eq!(body_length, 5);
+    assert!(matches!(response.cache_state, CacheState::Local));
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+    let _ = server.close();
+}
+
+fn build_cacheable_request(url: &UrlWithBlobClaim) -> Request {
+    RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+        .method(Method::GET)
+        .destination(Destination::Document)
+        .origin(url.clone().origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .build()
+}
+
+fn stored_response_count(context: &FetchContext, request: &Request) -> usize {
+    spawn_blocking_task(context.state.http_cache.stored_response_count(request))
+}
+
+#[test]
+fn test_truncated_response_is_not_served_from_cache() {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_clone = request_count.clone();
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            request_count_clone.fetch_add(1, Ordering::SeqCst);
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("max-age=3600"),
+            );
+            // Send part of the body, let the server flush it, then end the body before its
+            // length, which makes the server close the connection.
+            response
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from_static("100"));
+            let mut polls = 0;
+            let chunks = stream::poll_fn(move |context| {
+                polls += 1;
+                match polls {
+                    1 => Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"truncated"))))),
+                    2 => {
+                        context.waker().wake_by_ref();
+                        Poll::Pending
+                    },
+                    _ => Poll::Ready(None),
+                }
+            });
+            *response.body_mut() = StreamBody::new(chunks).boxed();
+        };
+    let (server, url) = make_server(handler);
+    let mut context = new_fetch_context(None, None);
+
+    let response = fetch_with_context(build_cacheable_request(&url), &mut context);
+    assert_eq!(
+        *response.actual_response().body.lock(),
+        ResponseBody::Done(b"truncated".to_vec())
+    );
+    assert_eq!(
+        stored_response_count(&context, &build_cacheable_request(&url)),
+        0
+    );
+
+    let response = fetch_with_context(build_cacheable_request(&url), &mut context);
+    assert!(matches!(response.cache_state, CacheState::None));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+    let _ = server.close();
+}
+
+#[test]
+fn test_cancelled_response_is_removed_from_cache() {
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("max-age=3600"),
+            );
+            let chunks = stream::repeat_with(|| Ok(Frame::data(Bytes::from_static(&[0; 1024]))));
+            *response.body_mut() = StreamBody::new(chunks).boxed();
+        };
+    let (server, url) = make_server(handler);
+    let context = new_fetch_context(None, None);
+
+    /// Cancels the fetch once the response headers arrive.
+    struct CancellingTarget {
+        cancellation_listener: Arc<CancellationListener>,
+        sender: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+    impl FetchTaskTarget for CancellingTarget {
+        fn process_request_body(&mut self, _: &Request) {}
+        fn process_response(&mut self, _: &Request, _: &Response) {
+            self.cancellation_listener.cancel();
+        }
+        fn process_response_chunk(&mut self, _: &Request, _: Bytes) {}
+        fn process_response_eof(&mut self, _: &Request, _: &Response) {
+            let _ = self.sender.take().unwrap().send(());
+        }
+        fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
+        fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
+    }
+
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut target = CancellingTarget {
+        cancellation_listener: context.cancellation_listener.clone(),
+        sender: Some(sender),
+    };
+    let request = build_cacheable_request(&url);
+    spawn_blocking_task(async {
+        methods::fetch(request, &mut target, &context).await;
+        receiver.await.unwrap()
+    });
+
+    assert_eq!(
+        stored_response_count(&context, &build_cacheable_request(&url)),
+        0
+    );
+    assert_eq!(context.state.http_cache.len(), 0);
+
+    let _ = server.close();
+}
+
+/// Start `request` with `context` in the background, and return a receiver for its response and
+/// the number of body bytes it delivers.
+fn start_fetch(
+    request: Request,
+    context: FetchContext,
+) -> tokio::sync::oneshot::Receiver<(Response, usize)> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut target = BodyLengthCollector {
+        sender: Some(sender),
+        length: 0,
+    };
+    spawn_task(async move {
+        methods::fetch(request, &mut target, &context).await;
+    });
+    receiver
+}
+
+/// Wait until `condition` holds, for at most ten seconds.
+fn wait_until(condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Wait for the end of a fetch started with `start_fetch`, for at most ten seconds.
+fn wait_for_fetch(
+    mut receiver: tokio::sync::oneshot::Receiver<(Response, usize)>,
+) -> (Response, usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(result) = receiver.try_recv() {
+            return result;
+        }
+        assert!(Instant::now() < deadline, "the fetch did not end");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn awaiting_consumer_count(context: &FetchContext, request: &Request) -> usize {
+    spawn_blocking_task(context.state.http_cache.awaiting_consumer_count(request))
+}
+
+/// A cacheable server whose first response sends `comp`, then `lete` once the returned sender
+/// fires; later responses send `complete` at once.
+fn make_held_server() -> (
+    net::test_util::Server,
+    UrlWithBlobClaim,
+    tokio::sync::oneshot::Sender<()>,
+    Arc<AtomicUsize>,
+) {
+    let (release_sender, release) = tokio::sync::oneshot::channel::<()>();
+    let release = Mutex::new(Some(release));
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_clone = request_count.clone();
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            request_count_clone.fetch_add(1, Ordering::SeqCst);
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("max-age=3600"),
+            );
+            *response.body_mut() = match release.lock().take() {
+                Some(release) => {
+                    let first = stream::iter([Ok(Frame::data(Bytes::from_static(b"comp")))]);
+                    let last = stream::once(async move {
+                        let _ = release.await;
+                        Ok(Frame::data(Bytes::from_static(b"lete")))
+                    });
+                    StreamBody::new(futures::StreamExt::chain(first, last)).boxed()
+                },
+                None => make_body(b"complete".to_vec()),
+            };
+        };
+    let (server, url) = make_server(handler);
+    (server, url, release_sender, request_count)
+}
+
+#[test]
+fn test_fetch_waiting_for_an_aborted_response_uses_the_network() {
+    let (server, url, release, request_count) = make_held_server();
+    let context = new_fetch_context(None, None);
+    let mut waiting_context = context.clone();
+    waiting_context.cancellation_listener = Arc::new(Default::default());
+    let request = build_cacheable_request(&url);
+
+    let _first_fetch = start_fetch(build_cacheable_request(&url), context.clone());
+    wait_until(|| stored_response_count(&context, &request) == 1);
+    let waiting_fetch = start_fetch(build_cacheable_request(&url), waiting_context);
+    wait_until(|| awaiting_consumer_count(&context, &request) == 1);
+    context.cancellation_listener.cancel();
+    let _ = release.send(());
+
+    let (response, body_length) = wait_for_fetch(waiting_fetch);
+    assert_eq!(body_length, b"complete".len());
+    assert!(matches!(response.cache_state, CacheState::None));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+    let _ = server.close();
+}
+
+#[test]
+fn test_fetch_waiting_for_a_response_whose_fetch_failed_is_woken_up() {
+    let (server, url, release, request_count) = make_held_server();
+    let context = new_fetch_context(None, None);
+    let request = build_cacheable_request(&url);
+    let mut request_with_wrong_integrity = build_cacheable_request(&url);
+    request_with_wrong_integrity.integrity_metadata =
+        "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned();
+
+    let failing_fetch = start_fetch(request_with_wrong_integrity, context.clone());
+    wait_until(|| stored_response_count(&context, &request) == 1);
+    let waiting_fetch = start_fetch(build_cacheable_request(&url), context.clone());
+    wait_until(|| awaiting_consumer_count(&context, &request) == 1);
+    let _ = release.send(());
+
+    let (response, _) = wait_for_fetch(failing_fetch);
+    assert!(response.is_network_error());
+    let (response, body_length) = wait_for_fetch(waiting_fetch);
+    assert_eq!(body_length, b"complete".len());
     assert!(matches!(response.cache_state, CacheState::Local));
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
 

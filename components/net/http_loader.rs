@@ -1666,7 +1666,16 @@ async fn http_network_or_cache_fetch(
         // we must wait for it to finish in case it is still receiving from the network.
         // Note: this means only the fetch from which the original network response originated
         // will be able to stream it; all others receive a cached response in one chunk.
-        wait_for_inflight_requests(done_chan, &mut response).await;
+        // If that fetch was aborted, the body is incomplete, so fetch from the network instead.
+        if !wait_for_inflight_requests(done_chan, &mut response).await {
+            if http_fetch_params.request.cache_mode == CacheMode::OnlyIfCached {
+                return Response::network_error(NetworkError::CacheError);
+            }
+            response = Some(
+                http_network_fetch(http_fetch_params, include_credentials, done_chan, context)
+                    .await,
+            );
+        }
     }
 
     let http_request = &mut http_fetch_params.request;
@@ -1958,9 +1967,13 @@ fn spawn_stale_while_revalidate(
     });
 }
 
-/// Wait for a cached response from channel.
+/// Wait for a cached response from channel, and return whether its body is complete.
 /// Happens when a fetch gets a cache hit, and the resource is pending completion from the network.
-async fn wait_for_inflight_requests(done_chan: &mut DoneChannel, response: &mut Option<Response>) {
+async fn wait_for_inflight_requests(
+    done_chan: &mut DoneChannel,
+    response: &mut Option<Response>,
+) -> bool {
+    let mut complete = true;
     if let Some(ref mut ch) = *done_chan {
         // The cache constructed a response with a body of ResponseBody::Receiving.
         // We wait for the response in the cache to "finish",
@@ -1972,7 +1985,8 @@ async fn wait_for_inflight_requests(done_chan: &mut DoneChannel, response: &mut 
                 Some(Data::ContentLength(_)) | Some(Data::Payload(_)) | Some(Data::Error(_)) => {},
                 Some(Data::Done) => break, // Return the full response as if it was initially cached as such.
                 Some(Data::Cancelled) => {
-                    // The response was cancelled while the fetch was ongoing.
+                    // The fetch that receives the body was aborted.
+                    complete = false;
                     break;
                 },
                 None => panic!("HTTP cache should always send Done or Cancelled"),
@@ -1981,6 +1995,7 @@ async fn wait_for_inflight_requests(done_chan: &mut DoneChannel, response: &mut 
     }
     // Set done_chan back to None, it's cache-related usefulness ends here.
     *done_chan = None;
+    complete
 }
 
 /// <https://fetch.spec.whatwg.org/#cross-origin-resource-policy-check>
@@ -2393,13 +2408,18 @@ async fn http_network_fetch(
     };
     *response_body.lock() = ResponseBody::Receiving(body);
     let response_body2 = response_body.clone();
+    let aborted = response.aborted.clone();
+    let aborted2 = response.aborted.clone();
 
     spawn_task(
         response_stream
             .into_body()
             .try_fold(response_body, move |response_body_accumulator, chunk| {
                 if cancellation_listener.cancelled() {
-                    *response_body_accumulator.lock() = ResponseBody::Done(vec![]);
+                    let mut body = response_body_accumulator.lock();
+                    aborted.store(true, Ordering::Release);
+                    *body = ResponseBody::Done(vec![]);
+                    drop(body);
                     let _ = done_sender.send(Data::Cancelled);
                     return future::ready(Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
@@ -2443,6 +2463,8 @@ async fn http_network_fetch(
                 future::ready(Ok(()))
             })
             .map_err(move |error| {
+                // The body is incomplete, so keep the HTTP cache from using it.
+                aborted2.store(true, Ordering::Release);
                 if let std::io::ErrorKind::InvalidData = error.kind() {
                     debug!("Content decompression error for {:?}", url2);
                     let _ = done_sender3.send(Data::Error(NetworkError::DecompressionError));

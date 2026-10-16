@@ -124,7 +124,7 @@ impl CancellationListener {
         self.cancelled.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn cancel(&self) {
+    pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed)
     }
 }
@@ -900,7 +900,7 @@ pub async fn main_fetch(
     context
         .state
         .http_cache
-        .update_awaiting_consumers(request, &response)
+        .update_awaiting_consumers(request)
         .await;
 
     // Steps 25-27.
