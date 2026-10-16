@@ -37,7 +37,7 @@ sizeof_checker!(size_div, HTMLDivElement, 312);
 sizeof_checker!(size_span, HTMLSpanElement, 312);
 sizeof_checker!(size_htmlscript, HTMLScriptElement, 464);
 sizeof_checker!(size_htmlimage, HTMLImageElement, 544);
-sizeof_checker!(size_htmlvideo, HTMLVideoElement, 1216);
+sizeof_checker!(size_htmlvideo, HTMLVideoElement, 1224);
 sizeof_checker!(size_text, Text, 168);
 sizeof_checker!(size_characterdata, CharacterData, 168);
 sizeof_checker!(size_contentattributedata, ContentAttributeData, 72);
