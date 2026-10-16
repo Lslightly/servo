@@ -121,6 +121,10 @@ static MEDIA_CONTROL_JS: &str = include_str!("../../../resources/media-controls.
 /// instead of strict equality. (Unit is second)
 const SEEK_POSITION_THRESHOLD: f64 = 0.5;
 
+/// The most bytes that a fetch queues for a player that has enough data, before the fetch is
+/// cancelled to be restarted once the player needs data again.
+const MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
+
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 #[derive(JSTraceable, MallocSizeOf)]
 enum SrcObject {
@@ -2985,12 +2989,8 @@ impl HTMLMediaElement {
                 data_source.process_into_player_from_queue(self.player.borrow().as_ref().unwrap())
             }
         {
-            // If we are pushing too much data and we know that we can
-            // restart the download later from where we left, we cancel
-            // the current request. Otherwise, we continue the request
-            // assuming that we may drop some frames.
             if e == PlayerError::EnoughData {
-                current_fetch_context.cancel(CancelReason::Backoff);
+                current_fetch_context.back_off();
             }
         }
     }
@@ -2999,7 +2999,8 @@ impl HTMLMediaElement {
         // The media engine signals that the source has enough data and asks us to stop pushing bytes
         // to avoid excessive buffer queueing, so we cancel the ongoing fetch request with its next
         // chunk if we are able to restart it from where we left. Otherwise, we continue the current
-        // fetch request, assuming that some frames will be dropped.
+        // fetch request: we queue the data that the media engine refuses until it needs more, while
+        // a media engine that accepts data it cannot hold, like the OpenHarmony one, drops it.
         if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() {
             current_fetch_context.set_player_has_enough_data(true);
         }
@@ -3998,7 +3999,7 @@ enum Resource {
 
 #[derive(Debug, MallocSizeOf, PartialEq)]
 enum DataBuffer {
-    Payload(Vec<u8>),
+    Payload(Bytes),
     EndOfStream,
 }
 
@@ -4011,6 +4012,8 @@ struct BufferedDataSource {
     locked: Cell<bool>,
     /// Temporary storage for incoming data.
     buffers: VecDeque<DataBuffer>,
+    /// The number of bytes in `buffers`.
+    queued_bytes: usize,
     /// The offset in the media resource of the next byte that the player has not accepted yet.
     position: u64,
 }
@@ -4020,12 +4023,17 @@ impl BufferedDataSource {
         BufferedDataSource {
             locked: Cell::new(true),
             buffers: VecDeque::default(),
+            queued_bytes: 0,
             position,
         }
     }
 
     fn position(&self) -> u64 {
         self.position
+    }
+
+    fn queued_bytes(&self) -> usize {
+        self.queued_bytes
     }
 
     fn set_locked(&self, locked: bool) {
@@ -4039,6 +4047,9 @@ impl BufferedDataSource {
             "The media backend not expects any further data after end of stream"
         );
 
+        if let DataBuffer::Payload(ref payload) = buffer {
+            self.queued_bytes += payload.len();
+        }
         self.buffers.push_back(buffer);
     }
 
@@ -4054,12 +4065,14 @@ impl BufferedDataSource {
         while let Some(buffer) = self.buffers.pop_front() {
             match buffer {
                 DataBuffer::Payload(payload) => {
-                    let length = payload.len() as u64;
-                    let result = player.lock().unwrap().push_data(payload);
-                    // A payload refused with EnoughData has to be fetched again, while the player
-                    // moves past one that it failed to push.
-                    if result != Err(PlayerError::EnoughData) {
-                        self.position += length;
+                    let result = player.lock().unwrap().push_data(payload.to_vec());
+                    // A payload refused with EnoughData is kept until the player needs data again,
+                    // while the player moves past one that it failed to push.
+                    if result == Err(PlayerError::EnoughData) {
+                        self.buffers.push_front(DataBuffer::Payload(payload));
+                    } else {
+                        self.queued_bytes -= payload.len();
+                        self.position += payload.len() as u64;
                     }
                     if let Err(error) = result {
                         warn!("Could not push input data to player: {error:?}");
@@ -4081,6 +4094,7 @@ impl BufferedDataSource {
     fn reset(&mut self) {
         self.locked.set(true);
         self.buffers.clear();
+        self.queued_bytes = 0;
     }
 }
 
@@ -4161,6 +4175,18 @@ impl HTMLMediaElementFetchContext {
 
     fn data_source(&self) -> &RefCell<BufferedDataSource> {
         &self.data_source
+    }
+
+    /// Stops pushing data to a player that refused it because it has enough. A seekable fetch is
+    /// cancelled, to restart where the player stopped once it needs data again. Any other fetch
+    /// continues, since it would restart at the start of the resource, and up to
+    /// `MAX_QUEUED_BYTES` of its data are queued until the player needs data again.
+    fn back_off(&mut self) {
+        if self.is_seekable {
+            self.cancel(CancelReason::Backoff);
+        } else {
+            self.data_source.borrow().set_locked(true);
+        }
     }
 
     fn cancel(&mut self, reason: CancelReason) {
@@ -4333,17 +4359,21 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
 
             if let Err(e) = {
                 let mut data_source = current_fetch_context.data_source().borrow_mut();
-                data_source.add_buffer_to_queue(DataBuffer::Payload(payload.to_vec()));
+                data_source.add_buffer_to_queue(DataBuffer::Payload(payload));
                 data_source
                     .process_into_player_from_queue(element.player.borrow().as_ref().unwrap())
             } {
-                // If we are pushing too much data and we know that we can
-                // restart the download later from where we left, we cancel
-                // the current request. Otherwise, we continue the request
-                // assuming that we may drop some frames.
                 if e == PlayerError::EnoughData {
-                    current_fetch_context.cancel(CancelReason::Backoff);
+                    current_fetch_context.back_off();
                 }
+                return;
+            }
+
+            // Until a fetch can be suspended, the data queued for a player that has enough is
+            // capped, at the cost of fetching a resource without range support from its start
+            // again.
+            if current_fetch_context.data_source().borrow().queued_bytes() > MAX_QUEUED_BYTES {
+                current_fetch_context.cancel(CancelReason::Backoff);
                 return;
             }
         }
