@@ -901,25 +901,21 @@ impl GStreamerPlayer {
                                     let _ = notify!(observer__, PlayerEvent::EnoughData);
                                 })
                                 .seek_data(move |_, offset| {
-                                    let (ret, ack_channel) = if servosrc_.set_seek_offset(offset) {
-                                        let _ = notify!(
-                                            observer___,
-                                            PlayerEvent::SeekData(
-                                                offset,
-                                                seek_channel.lock().unwrap().sender()
-                                            )
-                                        );
-                                        let (ret, ack_channel) =
-                                            seek_channel.lock().unwrap()._await();
-                                        (ret, Some(ack_channel))
-                                    } else {
-                                        (true, None)
-                                    };
+                                    if !servosrc_.set_seek_offset(offset) {
+                                        return true;
+                                    }
+
+                                    let _ = notify!(
+                                        observer___,
+                                        PlayerEvent::SeekData(
+                                            offset,
+                                            seek_channel.lock().unwrap().sender()
+                                        )
+                                    );
+                                    let (ret, ack_channel) = seek_channel.lock().unwrap()._await();
 
                                     servosrc_.set_seek_done();
-                                    if let Some(ack_channel) = ack_channel {
-                                        ack_channel.send(()).unwrap();
-                                    }
+                                    ack_channel.send(()).unwrap();
                                     ret
                                 })
                                 .build(),
