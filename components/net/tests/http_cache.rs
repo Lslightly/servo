@@ -2,11 +2,14 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, EXPIRES, HeaderValue, RANGE};
+use http::header::{
+    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, EXPIRES, HeaderName,
+    HeaderValue, RANGE,
+};
 use http::{HeaderMap, StatusCode};
 use net::http_cache::{CacheKey, HttpCache, HttpCacheAssignment, ValidationStatus, refresh};
 use net_traits::blob_url_store::UrlWithBlobClaim;
-use net_traits::request::{Referrer, RequestBuilder};
+use net_traits::request::{Destination, Referrer, Request, RequestBuilder};
 use net_traits::response::{Response, ResponseBody};
 use net_traits::{ResourceFetchTiming, ResourceTimingType};
 use servo_base::id::TEST_PIPELINE_ID;
@@ -348,4 +351,153 @@ async fn http_cache_do_not_evict_unfinished_requests() {
         .await;
     println!("cache {:?}", cache);
     assert!(result.is_some());
+}
+
+fn build_request_with_range(destination: Destination, range: Option<&str>) -> Request {
+    let url = ServoUrl::parse("https://servo.org/video.mp4").unwrap();
+    let mut headers = HeaderMap::new();
+    if let Some(range) = range {
+        headers.insert(RANGE, HeaderValue::from_str(range).unwrap());
+    }
+    RequestBuilder::new(
+        None,
+        UrlWithBlobClaim::new(url.clone(), None),
+        Referrer::NoReferrer,
+    )
+    .pipeline_id(Some(TEST_PIPELINE_ID))
+    .origin(url.origin())
+    .destination(destination)
+    .headers(headers)
+    .build()
+}
+
+/// Store a cacheable response to `request` with `status`, `headers` and a body of `body_length`
+/// bytes in an empty cache, and return whether the cache kept it.
+async fn is_stored(
+    request: &Request,
+    status: StatusCode,
+    headers: &[(HeaderName, String)],
+    body_length: usize,
+) -> bool {
+    let timing = ResourceFetchTiming::new(ResourceTimingType::Resource);
+    let mut response = Response::new(request.current_url(), timing);
+    response.status = status.into();
+    response
+        .headers
+        .insert(CACHE_CONTROL, HeaderValue::from_static("max-age=3600"));
+    for (name, value) in headers {
+        response
+            .headers
+            .insert(name.clone(), HeaderValue::from_str(value).unwrap());
+    }
+    *response.body.lock() = ResponseBody::Done(vec![0; body_length]);
+    let cache = HttpCache::new(HttpCacheAssignment::Public);
+    cache.store(request, &response).await;
+    cache.stored_response_count(request).await == 1
+}
+
+#[tokio::test]
+async fn test_media_responses_are_stored_only_if_complete_and_small() {
+    const LIMIT: usize = 8 * 1024 * 1024;
+    let video = |range| build_request_with_range(Destination::Video, range);
+    let audio = |range| build_request_with_range(Destination::Audio, range);
+    let length = |length: usize| (CONTENT_LENGTH, length.to_string());
+    let range = |range: &str| (CONTENT_RANGE, range.to_owned());
+    let ok = StatusCode::OK;
+    let partial = StatusCode::PARTIAL_CONTENT;
+
+    assert!(is_stored(&video(None), ok, &[length(10)], 10).await);
+    assert!(is_stored(&video(Some("bytes=0-")), ok, &[length(10)], 10).await);
+    assert!(
+        is_stored(
+            &video(Some("bytes=0-")),
+            partial,
+            &[length(10), range("bytes 0-9/10")],
+            10
+        )
+        .await
+    );
+    assert!(
+        is_stored(&video(Some("bytes=5-")), ok, &[length(10)], 10).await,
+        "a 200 holds the whole resource, whatever range was requested"
+    );
+    assert!(is_stored(&audio(None), ok, &[length(LIMIT)], LIMIT).await);
+    assert!(
+        is_stored(
+            &video(Some("bytes=0-")),
+            partial,
+            &[range("bytes 0-9/10")],
+            10
+        )
+        .await,
+        "Content-Range gives the size of a 206"
+    );
+    assert!(
+        is_stored(&video(None), StatusCode::NOT_FOUND, &[], 10).await,
+        "statuses other than 200 and 206 follow the usual rules"
+    );
+
+    assert!(!is_stored(&audio(None), ok, &[length(LIMIT + 1)], LIMIT + 1).await);
+    assert!(
+        !is_stored(&video(None), ok, &[], 10).await,
+        "the length of a chunked response is not known up front"
+    );
+    assert!(
+        !is_stored(
+            &video(None),
+            ok,
+            &[length(10), (CONTENT_ENCODING, "gzip".to_owned())],
+            10
+        )
+        .await,
+        "Content-Length is not the length of a decoded body"
+    );
+    assert!(
+        !is_stored(
+            &video(Some("bytes=5-")),
+            partial,
+            &[length(5), range("bytes 5-9/10")],
+            5
+        )
+        .await
+    );
+    assert!(
+        !is_stored(
+            &video(Some("bytes=0-")),
+            partial,
+            &[length(5), range("bytes 0-4/10")],
+            5
+        )
+        .await
+    );
+    assert!(
+        !is_stored(
+            &video(Some("bytes=0-")),
+            partial,
+            &[length(10), range("bytes 0-9/*")],
+            10
+        )
+        .await
+    );
+    assert!(
+        !is_stored(
+            &video(Some("bytes=0-")),
+            partial,
+            &[range(&format!("bytes 0-{LIMIT}/{}", LIMIT + 1))],
+            LIMIT + 1
+        )
+        .await
+    );
+
+    let other = |range| build_request_with_range(Destination::None, range);
+    assert!(
+        is_stored(
+            &other(Some("bytes=5-")),
+            partial,
+            &[length(5), range("bytes 5-9/10")],
+            5
+        )
+        .await
+    );
+    assert!(is_stored(&other(None), ok, &[], LIMIT + 1).await);
 }

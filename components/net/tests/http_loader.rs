@@ -30,7 +30,7 @@ use hyper::body::{Body, Bytes, Incoming};
 use hyper::{Request as HyperRequest, Response as HyperResponse};
 use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
-use net::fetch::methods::{self};
+use net::fetch::methods::{self, FetchContext};
 use net::http_loader::{determine_requests_referrer, serialize_origin};
 use net::resource_thread::AuthCacheEntry;
 use net::test::DECODER_BUFFER_SIZE;
@@ -40,7 +40,7 @@ use net_traits::request::{
     CredentialsMode, Destination, Referrer, Request, RequestBuilder, RequestMode,
     TraversableForUserPrompts, create_request_body_with_content,
 };
-use net_traits::response::{Response, ResponseBody};
+use net_traits::response::{CacheState, Response, ResponseBody};
 use net_traits::{CookieSource, FetchTaskTarget, NetworkError, ReferrerPolicy, get_current_locale};
 use parking_lot::{Mutex, RwLock};
 use servo_base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
@@ -2159,6 +2159,112 @@ fn test_stale_while_revalidate_serves_cached_and_revalidates_in_background() {
         2,
         "exactly one background revalidation should have hit the server"
     );
+
+    let _ = server.close();
+}
+
+/// Collects the response and the number of body bytes that a fetch delivers.
+struct BodyLengthCollector {
+    sender: Option<tokio::sync::oneshot::Sender<(Response, usize)>>,
+    length: usize,
+}
+
+impl FetchTaskTarget for BodyLengthCollector {
+    fn process_request_body(&mut self, _: &Request) {}
+    fn process_response(&mut self, _: &Request, _: &Response) {}
+    fn process_response_chunk(&mut self, _: &Request, chunk: Bytes) {
+        self.length += chunk.len();
+    }
+    fn process_response_eof(&mut self, _: &Request, response: &Response) {
+        let _ = self
+            .sender
+            .take()
+            .unwrap()
+            .send((response.clone(), self.length));
+    }
+    fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
+    fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
+}
+
+/// Fetch `url` the way a video element starts a load, and return the response and the number of
+/// body bytes delivered.
+fn fetch_video(url: &UrlWithBlobClaim, context: &mut FetchContext) -> (Response, usize) {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
+    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+        .destination(Destination::Video)
+        .headers(headers)
+        .origin(url.clone().origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .build();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut target = BodyLengthCollector {
+        sender: Some(sender),
+        length: 0,
+    };
+    spawn_blocking_task(async move {
+        methods::fetch(request, &mut target, context).await;
+        receiver.await.unwrap()
+    })
+}
+
+#[test]
+fn test_large_media_response_is_neither_kept_nor_stored() {
+    const LENGTH: usize = 8 * 1024 * 1024 + 1;
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_clone = request_count.clone();
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            request_count_clone.fetch_add(1, Ordering::SeqCst);
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("max-age=3600"),
+            );
+            *response.body_mut() = make_body(vec![0; LENGTH]);
+        };
+    let (server, url) = make_server(handler);
+    let mut context = new_fetch_context(None, None);
+
+    for expected_request_count in 1..=2 {
+        let (response, body_length) = fetch_video(&url, &mut context);
+        assert_eq!(body_length, LENGTH);
+        assert!(matches!(
+            &*response.actual_response().body.lock(),
+            ResponseBody::Done(body) if body.is_empty()
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), expected_request_count);
+    }
+
+    let _ = server.close();
+}
+
+#[test]
+fn test_small_media_response_is_stored() {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_clone = request_count.clone();
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            request_count_clone.fetch_add(1, Ordering::SeqCst);
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("max-age=3600"),
+            );
+            *response.body_mut() = make_body(b"video".to_vec());
+        };
+    let (server, url) = make_server(handler);
+    let mut context = new_fetch_context(None, None);
+
+    let (response, body_length) = fetch_video(&url, &mut context);
+    assert_eq!(body_length, 5);
+    assert!(matches!(response.cache_state, CacheState::None));
+
+    let (response, body_length) = fetch_video(&url, &mut context);
+    assert_eq!(body_length, 5);
+    assert!(matches!(response.cache_state, CacheState::Local));
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
 
     let _ = server.close();
 }
