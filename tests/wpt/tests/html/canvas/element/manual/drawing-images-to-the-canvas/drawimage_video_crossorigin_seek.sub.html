@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>A video from another origin taints the canvas while it seeks</title>
+<link rel="help" href="https://html.spec.whatwg.org/multipage/#the-image-argument-is-not-origin-clean">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script src="/common/media.js"></script>
+<body>
+<script>
+  function assert_taints(video, description) {
+    const context = document.createElement("canvas").getContext("2d");
+    context.drawImage(video, 0, 0);
+    assert_throws_dom("SecurityError", () => context.getImageData(0, 0, 1, 1), description);
+  }
+
+  promise_test(async t => {
+    const video = document.createElement("video");
+    video.muted = true;
+    // With preload=metadata, a seek fetches the media data that it needs, rather than finding it
+    // in a download of the whole resource.
+    video.preload = "metadata";
+    video.src = "http://{{hosts[][www]}}:{{ports[http][0]}}/html/canvas/element/manual/" +
+      "drawing-images-to-the-canvas/resources/delayed-range.py?name=" + getVideoURI("counting");
+    document.body.appendChild(video);
+    t.add_cleanup(() => video.remove());
+
+    await video.play();
+    video.pause();
+    assert_taints(video, "before seeking");
+
+    const seeked = new Promise(resolve => video.addEventListener("seeked", resolve));
+    let seeking = true;
+    seeked.then(() => seeking = false);
+    // The server delays its answer to a request for the media data at the new position.
+    video.currentTime = 5;
+    while (seeking) {
+      if (video.readyState >= video.HAVE_CURRENT_DATA) {
+        assert_taints(video, "while seeking");
+      }
+      await new Promise(resolve => t.step_timeout(resolve, 100));
+    }
+    assert_taints(video, "after seeking");
+  }, "Can't get pixels of a canvas with a non-CORS cross-origin video drawn while it seeks");
+</script>

@@ -1623,15 +1623,22 @@ impl HTMLMediaElement {
 
         let mut current_fetch_context = self.current_fetch_context.borrow_mut();
         let mut resumes_suspended_download = false;
+        // A fetch that restarts the fetch of the same media resource, after a seek or once the
+        // player needs data again, is no more origin-clean than the media data fetched so far.
+        let mut origin_clean = true;
         if let Some(ref mut current_fetch_context) = *current_fetch_context {
             resumes_suspended_download = offset.is_some() &&
                 current_fetch_context.cancel_reason() == &Some(CancelReason::Backoff);
+            if offset.is_some() {
+                origin_clean = current_fetch_context.origin_is_clean();
+            }
             current_fetch_context.cancel(CancelReason::Abort);
         }
 
         *current_fetch_context = Some(HTMLMediaElementFetchContext::new(
             request.id,
             offset.unwrap_or(0),
+            origin_clean,
             global.core_resource_thread(),
         ));
         let listener =
@@ -4185,6 +4192,7 @@ impl HTMLMediaElementFetchContext {
     fn new(
         request_id: RequestId,
         offset: u64,
+        origin_clean: bool,
         core_resource_thread: CoreResourceThread,
     ) -> HTMLMediaElementFetchContext {
         HTMLMediaElementFetchContext {
@@ -4192,7 +4200,7 @@ impl HTMLMediaElementFetchContext {
             cancel_reason: None,
             is_seekable: false,
             player_has_enough_data: false,
-            origin_clean: true,
+            origin_clean,
             data_source: RefCell::new(BufferedDataSource::new(offset)),
             fetch_controller: FetchController::new(request_id, false, core_resource_thread),
         }
@@ -4318,7 +4326,8 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
 
         if let Some(ref mut current_fetch_context) = *element.current_fetch_context.borrow_mut() {
             current_fetch_context.set_seekable(is_seekable);
-            current_fetch_context.set_origin_clean(origin_clean);
+            current_fetch_context
+                .set_origin_clean(current_fetch_context.origin_is_clean() && origin_clean);
         }
 
         if let Some(metadata) = metadata.as_ref() &&

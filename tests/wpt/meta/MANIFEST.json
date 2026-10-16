@@ -555105,6 +555105,12 @@
           "19ffcc39c96aecdd212a9f8ca4023e62c91dff2b",
           []
          ]
+        },
+        "resources": {
+         "delayed-range.py": [
+          "73c910f1f33097fdad4c41e9ac47c937491d5063",
+          []
+         ]
         }
        },
        "drawing-paths-to-the-canvas": {
@@ -1281715,6 +1281721,13 @@
         ],
         "drawimage_svg_image_with_foreign_object_does_not_taint.html": [
          "f29b2bf5a8a7eb45c22306faaf5028428e28cf9b",
+         [
+          null,
+          {}
+         ]
+        ],
+        "drawimage_video_crossorigin_seek.sub.html": [
+         "da87c2916ef9ff0b8bd703ac616c9dcf0a56effe",
          [
           null,
           {}
