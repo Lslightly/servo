@@ -1624,6 +1624,7 @@ impl HTMLMediaElement {
 
         *current_fetch_context = Some(HTMLMediaElementFetchContext::new(
             request.id,
+            offset.unwrap_or(0),
             global.core_resource_thread(),
         ));
         let listener =
@@ -2945,25 +2946,36 @@ impl HTMLMediaElement {
         }
     }
 
-    fn playback_need_data(&self) {
-        // The media engine signals that the source needs more data. If we already have a valid
-        // fetch request, we do nothing. Otherwise, if we have no request and the previous request
-        // was cancelled because we got an EnoughData event, we restart fetching where we left.
-        if let Some(ref current_fetch_context) = *self.current_fetch_context.borrow() &&
-            let Some(reason) = current_fetch_context.cancel_reason()
-        {
-            // XXX(ferjm) Ideally we should just create a fetch request from
-            // where we left. But keeping track of the exact next byte that the
-            // media backend expects is not the easiest task, so I'm simply
-            // seeking to the current playback position for now which will create
-            // a new fetch request for the last rendered frame.
-            if *reason == CancelReason::Backoff {
-                self.seek(
-                    self.current_playback_position.get(),
-                    /* approximate_for_speed */ false,
-                );
+    fn playback_need_data(&self, cx: &JSContext) {
+        // The media engine signals that the source needs more data. If the current fetch request
+        // was cancelled because the media engine had enough data, we restart it where the media
+        // engine stopped accepting data. Otherwise, we push the data that is queued for it.
+        let restart_position = match *self.current_fetch_context.borrow() {
+            Some(ref current_fetch_context) => match current_fetch_context.cancel_reason() {
+                Some(CancelReason::Backoff) => {
+                    Some(current_fetch_context.data_source().borrow().position())
+                },
+                Some(_) => return,
+                None => None,
+            },
+            None => None,
+        };
+
+        if let Some(position) = restart_position {
+            // The restarted fetch continues at the next byte that the player expects, so the
+            // player needs neither a seek nor a NeedData event before it accepts the data.
+            self.fetch_request(cx, Some(position), None);
+            if let Some(ref current_fetch_context) = *self.current_fetch_context.borrow() {
+                current_fetch_context
+                    .data_source()
+                    .borrow()
+                    .set_locked(false);
             }
             return;
+        }
+
+        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() {
+            current_fetch_context.set_player_has_enough_data(false);
         }
 
         if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() &&
@@ -2985,13 +2997,11 @@ impl HTMLMediaElement {
 
     fn playback_enough_data(&self) {
         // The media engine signals that the source has enough data and asks us to stop pushing bytes
-        // to avoid excessive buffer queueing, so we cancel the ongoing fetch request if we are able
-        // to restart it from where we left. Otherwise, we continue the current fetch request,
-        // assuming that some frames will be dropped.
-        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() &&
-            current_fetch_context.is_seekable()
-        {
-            current_fetch_context.cancel(CancelReason::Backoff);
+        // to avoid excessive buffer queueing, so we cancel the ongoing fetch request with its next
+        // chunk if we are able to restart it from where we left. Otherwise, we continue the current
+        // fetch request, assuming that some frames will be dropped.
+        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() {
+            current_fetch_context.set_player_has_enough_data(true);
         }
     }
 
@@ -4001,14 +4011,21 @@ struct BufferedDataSource {
     locked: Cell<bool>,
     /// Temporary storage for incoming data.
     buffers: VecDeque<DataBuffer>,
+    /// The offset in the media resource of the next byte that the player has not accepted yet.
+    position: u64,
 }
 
 impl BufferedDataSource {
-    fn new() -> BufferedDataSource {
+    fn new(position: u64) -> BufferedDataSource {
         BufferedDataSource {
             locked: Cell::new(true),
             buffers: VecDeque::default(),
+            position,
         }
+    }
+
+    fn position(&self) -> u64 {
+        self.position
     }
 
     fn set_locked(&self, locked: bool) {
@@ -4037,7 +4054,14 @@ impl BufferedDataSource {
         while let Some(buffer) = self.buffers.pop_front() {
             match buffer {
                 DataBuffer::Payload(payload) => {
-                    if let Err(error) = player.lock().unwrap().push_data(payload) {
+                    let length = payload.len() as u64;
+                    let result = player.lock().unwrap().push_data(payload);
+                    // A payload refused with EnoughData has to be fetched again, while the player
+                    // moves past one that it failed to push.
+                    if result != Err(PlayerError::EnoughData) {
+                        self.position += length;
+                    }
+                    if let Err(error) = result {
                         warn!("Could not push input data to player: {error:?}");
                         return Err(error);
                     }
@@ -4079,6 +4103,8 @@ pub(crate) struct HTMLMediaElementFetchContext {
     cancel_reason: Option<CancelReason>,
     /// Indicates whether the fetched stream is seekable.
     is_seekable: bool,
+    /// Whether the player signalled that it has enough data, and has not asked for more since.
+    player_has_enough_data: bool,
     /// Indicates whether the fetched stream is origin clean.
     origin_clean: bool,
     /// The buffered data source which to be processed by media backend.
@@ -4091,14 +4117,16 @@ pub(crate) struct HTMLMediaElementFetchContext {
 impl HTMLMediaElementFetchContext {
     fn new(
         request_id: RequestId,
+        offset: u64,
         core_resource_thread: CoreResourceThread,
     ) -> HTMLMediaElementFetchContext {
         HTMLMediaElementFetchContext {
             request_id,
             cancel_reason: None,
             is_seekable: false,
+            player_has_enough_data: false,
             origin_clean: true,
-            data_source: RefCell::new(BufferedDataSource::new()),
+            data_source: RefCell::new(BufferedDataSource::new(offset)),
             fetch_controller: FetchController::new(request_id, false, core_resource_thread),
         }
     }
@@ -4113,6 +4141,14 @@ impl HTMLMediaElementFetchContext {
 
     fn set_seekable(&mut self, seekable: bool) {
         self.is_seekable = seekable;
+    }
+
+    fn player_has_enough_data(&self) -> bool {
+        self.player_has_enough_data
+    }
+
+    fn set_player_has_enough_data(&mut self, enough_data: bool) {
+        self.player_has_enough_data = enough_data;
     }
 
     fn origin_is_clean(&self) -> bool {
@@ -4255,6 +4291,12 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
     }
 
     fn process_response_chunk(&mut self, _: &mut JSContext, _: RequestId, chunk: Bytes) {
+        // An empty chunk, like the last frame of an HTTP/2 body, must not cancel a fetch that has
+        // delivered all of its bytes.
+        if chunk.is_empty() {
+            return;
+        }
+
         let element = self.element.root();
 
         self.fetched_content_length += chunk.len() as u64;
@@ -4262,6 +4304,14 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
         // If an error was received previously, we skip processing the payload.
         if let Some(ref mut current_fetch_context) = *element.current_fetch_context.borrow_mut() {
             if let Some(CancelReason::Backoff) = current_fetch_context.cancel_reason() {
+                return;
+            }
+
+            // Cancelling with the next chunk rather than on the EnoughData event makes sure that a
+            // fetch that delivered all of its bytes is not restarted at the end of the resource.
+            if current_fetch_context.player_has_enough_data() && current_fetch_context.is_seekable()
+            {
+                current_fetch_context.cancel(CancelReason::Backoff);
                 return;
             }
 
@@ -4516,7 +4566,7 @@ impl HTMLMediaElementEventHandler {
             PlayerEvent::MetadataUpdated(ref metadata) => {
                 element.playback_metadata_updated(cx, metadata)
             },
-            PlayerEvent::NeedData => element.playback_need_data(),
+            PlayerEvent::NeedData => element.playback_need_data(cx),
             PlayerEvent::PositionChanged(position) => {
                 element.playback_position_changed(cx, position)
             },
