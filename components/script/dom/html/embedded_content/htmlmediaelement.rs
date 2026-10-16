@@ -1132,7 +1132,7 @@ impl HTMLMediaElement {
                 // > to fire an event named waiting at the element.
                 if was_potentially_playing &&
                     !self.ended_playback(LoopCondition::Included) &&
-                    !self.error.get().is_none() &&
+                    self.error.get().is_none() &&
                     !self.is_paused_for_user_interaction() &&
                     !self.is_paused_for_in_band_content()
                 {
