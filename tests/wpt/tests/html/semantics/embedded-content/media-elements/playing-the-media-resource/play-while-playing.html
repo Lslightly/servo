@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>play() on a playing media element keeps it playing</title>
+<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#dom-media-play">
+<link rel="help" href="https://html.spec.whatwg.org/multipage/media.html#internal-play-steps">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script src="/common/media.js"></script>
+<body>
+<script>
+promise_test(async t => {
+  const video = document.createElement("video");
+  video.muted = true;
+  document.body.appendChild(video);
+  t.add_cleanup(() => {
+    video.removeAttribute("src");
+    video.load();
+    video.remove();
+  });
+  video.src = getVideoURI("/media/test-1s");
+  const ended = new Promise(resolve => video.addEventListener("ended", resolve, { once: true }));
+  await video.play();
+
+  await video.play();
+  assert_false(video.paused, "paused after the second play()");
+  await ended;
+  assert_true(video.ended, "ended");
+  assert_equals(video.currentTime, video.duration, "currentTime");
+}, "play() on a playing video keeps it playing to its end");
+</script>
+</body>
