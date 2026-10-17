@@ -3069,8 +3069,7 @@ impl HTMLMediaElement {
         // The media engine signals that the source has enough data and asks us to stop pushing bytes
         // to avoid excessive buffer queueing, so we cancel the ongoing fetch request with its next
         // chunk if we are able to restart it from where we left. Otherwise, we continue the current
-        // fetch request: we queue the data that the media engine refuses until it needs more, while
-        // a media engine that accepts data it cannot hold, like the OpenHarmony one, drops it.
+        // fetch request and queue the data that the media engine refuses until it needs more.
         if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() {
             current_fetch_context.set_player_has_enough_data(true);
         }
@@ -4160,7 +4159,9 @@ impl BufferedDataSource {
                         self.position += payload.len() as u64;
                     }
                     if let Err(error) = result {
-                        warn!("Could not push input data to player: {error:?}");
+                        if error != PlayerError::EnoughData {
+                            warn!("Could not push input data to player: {error:?}");
+                        }
                         return Err(error);
                     }
                 },

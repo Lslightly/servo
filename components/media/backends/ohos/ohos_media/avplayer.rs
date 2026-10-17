@@ -162,16 +162,11 @@ impl OhosPlayer {
         }
     }
 
-    pub fn push_data(&self, data: Vec<u8>) {
-        if let Some(inner_source) = &self.media_data_source {
-            inner_source.push_data(data);
-        }
-    }
-
-    pub fn set_seekable(&self, seekable: bool) {
-        if let Some(inner_source) = &self.media_data_source {
-            inner_source.set_seekable(seekable);
-        }
+    /// Returns false if the data source is full and did not take any of the bytes.
+    pub fn push_data(&self, data: Vec<u8>) -> bool {
+        self.media_data_source
+            .as_ref()
+            .is_none_or(|inner_source| inner_source.push_data(data))
     }
 
     pub fn play(&self) {
