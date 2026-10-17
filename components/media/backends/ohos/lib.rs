@@ -136,7 +136,6 @@ impl Backend for OhosBackend {
 
         player.setup_error_event();
         player.setup_info_event();
-        player.setup_data_source();
         Arc::new(Mutex::new(player))
     }
 

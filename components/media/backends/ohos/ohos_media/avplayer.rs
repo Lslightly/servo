@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use libc::pollfd;
 use log::{debug, warn};
@@ -31,6 +31,7 @@ use ohos_window_sys::native_window::{
     OH_NativeWindow_GetBufferHandleFromNative, OH_NativeWindow_NativeObjectReference,
     OH_NativeWindow_NativeObjectUnreference,
 };
+use servo_media_cache::MediaReader;
 
 #[cfg(not(sdk_api_21))]
 use crate::ohos_media::dummy_source::MediaSourceWrapper;
@@ -60,12 +61,16 @@ pub struct FrameInfo {
 pub struct OhosPlayer {
     native_image: Option<*mut OH_NativeImage>,
     ohos_av_player: *mut OH_AVPlayer,
+    /// Dropped with the wrapper, once AVPlayer is released, which waits for the running reads.
     media_data_source: Option<MediaSourceWrapper>,
     event_info_callback_closure: Option<*mut Box<dyn Fn(AVPlayerOnInfoType, *mut OH_AVFormat)>>,
     error_callback_closure: Option<*mut Box<dyn Fn(i32, String)>>,
     frame_available_listener_id: Option<usize>,
     native_window: Option<*mut OHNativeWindow>,
-    has_set_source_size: bool,
+    /// Whether the media element reported the metadata of the media resource, after which a
+    /// length that is still unknown makes the data source a live stream.
+    has_metadata: bool,
+    has_set_data_source: bool,
     /// Whether the player renders video, in which case it only prepares once its window is set.
     has_video_output: bool,
     has_prepared: bool,
@@ -85,7 +90,8 @@ impl OhosPlayer {
             error_callback_closure: None,
             frame_available_listener_id: None,
             native_window: None,
-            has_set_source_size: false,
+            has_metadata: false,
+            has_set_data_source: false,
             has_video_output,
             has_prepared: false,
             volume: 1.0,
@@ -129,17 +135,6 @@ impl OhosPlayer {
         }
     }
 
-    /// The first step of initialization process, after this avplayer will
-    /// become initialized. Kickstart the initialize process.
-    fn setup_data_source(&mut self) {
-        let Some(ref mut source) = self.media_data_source else {
-            warn!("Error Source not initialized!");
-            return;
-        };
-        debug!("Setting up data source");
-        source.set_data_src(self.ohos_av_player);
-    }
-
     pub fn set_volume(&mut self, volume: f64) {
         unsafe {
             OH_AVPlayer_SetVolume(self.ohos_av_player, volume as f32, volume as f32);
@@ -151,22 +146,42 @@ impl OhosPlayer {
         self.volume
     }
 
-    pub fn set_source(&mut self, source: MediaSourceWrapper) {
-        // Todo: Should think of better way to change the way the data is given.
-        self.media_data_source = Some(source);
-    }
-
-    pub fn end_of_stream(&self) {
-        if let Some(source) = &self.media_data_source {
-            source.end_of_stream();
+    /// Makes AVPlayer read the media resource from `reader`. Returns false if it already has a
+    /// data source, which AVPlayer cannot change.
+    pub fn set_reader(&mut self, reader: Arc<MediaReader>) -> bool {
+        if self.media_data_source.is_some() {
+            return false;
         }
+        self.media_data_source = Some(MediaSourceWrapper::new(reader));
+        self.setup_data_source(None);
+        true
     }
 
-    /// Returns false if the data source is full and did not take any of the bytes.
-    pub fn push_data(&self, data: Vec<u8>) -> bool {
-        self.media_data_source
-            .as_ref()
-            .is_none_or(|inner_source| inner_source.push_data(data))
+    /// Called once the media element knows the metadata of the media resource, with its length if
+    /// it is known. AVPlayer derives whether the resource is seekable from its size.
+    pub fn metadata_known(&mut self, length: Option<u64>) {
+        self.has_metadata = true;
+        self.setup_data_source(length);
+    }
+
+    /// The first step of initialization process, after this avplayer will become initialized.
+    /// AVPlayer reads the size of the data source only now, and treats one without a size as a
+    /// live stream, so wait for the length of the media resource, or for its metadata if the
+    /// length is unknown.
+    fn setup_data_source(&mut self, size: Option<u64>) {
+        if self.has_set_data_source {
+            return;
+        }
+        let Some(source) = &mut self.media_data_source else {
+            return;
+        };
+        let size = size.or_else(|| source.length());
+        if size.is_none() && !self.has_metadata {
+            return;
+        }
+        debug!("Setting up data source of size {size:?}");
+        source.set_data_src(self.ohos_av_player, size);
+        self.has_set_data_source = true;
     }
 
     pub fn play(&self) {
@@ -249,11 +264,16 @@ impl OhosPlayer {
     }
 
     /// Releases AVPlayer, which then calls no more callbacks. Releasing waits for the running
-    /// callbacks and calls the info callback, and both can lock `this`, so `this` must not be
-    /// locked by the caller.
+    /// callbacks and reads, so the reads that wait for data are ended first. It also calls the
+    /// info callback, and both can lock `this`, so `this` must not be locked by the caller.
     pub fn release(this: &Mutex<Self>) {
-        let ohos_av_player =
-            std::mem::replace(&mut this.lock().unwrap().ohos_av_player, ptr::null_mut());
+        let ohos_av_player = {
+            let mut player = this.lock().unwrap();
+            if let Some(source) = &player.media_data_source {
+                source.release();
+            }
+            std::mem::replace(&mut player.ohos_av_player, ptr::null_mut())
+        };
         if !ohos_av_player.is_null() {
             debug!("OH_AVPlayer_Release!");
             unsafe {
@@ -266,20 +286,6 @@ impl OhosPlayer {
         unsafe {
             debug!("OH_AVPlayer Prepare Called!");
             OH_AVPlayer_Prepare(self.ohos_av_player);
-        }
-    }
-
-    // For AVPlayer only call SetSource after SetInputSize to avoid being recognized as live stream.
-    pub fn set_input_size(&mut self, size: u64) {
-        if let Some(inner_source) = &mut self.media_data_source {
-            debug!("Setting up data source size: {}", size);
-            inner_source.set_input_size(size as usize);
-            // Only set once when first time initialized
-            if !self.has_set_source_size {
-                debug!("Setup data Source");
-                self.setup_data_source();
-                self.has_set_source_size = true;
-            }
         }
     }
 
