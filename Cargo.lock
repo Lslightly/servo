@@ -9595,6 +9595,7 @@ dependencies = [
  "servo-layout-api",
  "servo-malloc-size-of",
  "servo-media",
+ "servo-media-cache",
  "servo-media-thread",
  "servo-metrics",
  "servo-net-traits",
