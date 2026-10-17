@@ -183,7 +183,7 @@ use crate::dom::html::htmlheadelement::HTMLHeadElement;
 use crate::dom::html::htmlhtmlelement::HTMLHtmlElement;
 use crate::dom::html::htmliframeelement::HTMLIFrameElement;
 use crate::dom::html::htmlimageelement::HTMLImageElement;
-use crate::dom::html::htmlmediaelement::HTMLMediaElement;
+use crate::dom::html::htmlmediaelement::{HTMLMediaElement, MediaElementWeakRef};
 use crate::dom::html::htmlscriptelement::{HTMLScriptElement, ScriptResult, TracedScriptResult};
 use crate::dom::html::htmltitleelement::HTMLTitleElement;
 use crate::dom::htmldetailselement::DetailsNameGroups;
@@ -621,6 +621,8 @@ pub(crate) struct Document {
     /// where `id` needs to match any of the registered ShadowRoots
     /// hosting the media controls UI.
     media_controls: DomRefCell<HashMap<String, Dom<ShadowRoot>>>,
+    /// The media elements that suspended their fetch, some of which may have resumed it since.
+    media_elements_with_suspended_fetch: DomRefCell<Vec<MediaElementWeakRef>>,
     /// A set of dirty HTML canvas elements that need their WebRender images updated the
     /// next time the rendering is updated.
     dirty_canvases: DomRefCell<Vec<Dom<HTMLCanvasElement>>>,
@@ -1180,6 +1182,7 @@ impl Document {
                 self.window().suspend(cx);
             }
             media.suspend(&client_context_id);
+            self.cancel_suspended_media_fetches();
             return;
         }
 
@@ -3095,6 +3098,7 @@ impl Document {
         self.deferred_scripts.clear();
 
         let global = self.window.as_global_scope();
+        self.cancel_suspended_media_fetches();
         let loads_cancelled = global.fetch_group_mut().terminate(global);
         let event_sources_canceled = global.close_event_sources();
 
@@ -3363,6 +3367,27 @@ impl Document {
             did_have_these_media_controls,
             "Trying to unregister unknown media controls"
         );
+    }
+
+    pub(crate) fn register_media_element_with_suspended_fetch(&self, element: &HTMLMediaElement) {
+        let mut elements = self.media_elements_with_suspended_fetch.borrow_mut();
+        // `element` registers while it borrows its fetch context, so it is compared first, which
+        // keeps `has_suspended_fetch` from borrowing that context again.
+        elements.retain(|registered| {
+            registered.root().is_some_and(|registered| {
+                *registered != *element && registered.has_suspended_fetch()
+            })
+        });
+        elements.push(MediaElementWeakRef::new(element));
+    }
+
+    /// Cancels the suspended fetches of media elements, which restart once their player needs
+    /// data again, so that a document that nothing might resume them in holds no connections.
+    pub(crate) fn cancel_suspended_media_fetches(&self) {
+        let elements = std::mem::take(&mut *self.media_elements_with_suspended_fetch.borrow_mut());
+        for element in elements.iter().filter_map(MediaElementWeakRef::root) {
+            element.cancel_suspended_fetch();
+        }
     }
 
     pub(crate) fn mark_canvas_as_dirty(&self, canvas: &Dom<HTMLCanvasElement>) {
@@ -4391,6 +4416,7 @@ impl Document {
             shadow_roots: Default::default(),
             shadow_roots_styles_changed: Cell::new(false),
             media_controls: DomRefCell::new(HashMap::new()),
+            media_elements_with_suspended_fetch: Default::default(),
             dirty_canvases: DomRefCell::new(Default::default()),
             has_pending_animated_image_update: Cell::new(false),
             selection: MutNullableDom::new(None),
