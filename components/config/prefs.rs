@@ -349,6 +349,10 @@ pub struct Preferences {
     pub layout_parallelism_job_size_minimum: u64,
     /// feature: MathML | #49078 | Web/MathML
     pub mathml_core_enabled: bool,
+    /// How long a media element keeps the fetch of a media resource with range support
+    /// suspended while its player has enough data, before it cancels the fetch to restart it
+    /// once the player needs data again, in milliseconds.
+    pub media_fetch_suspension_timeout_ms: u64,
     /// Enable hardware acceleration for video playback.
     pub media_glvideo_enabled: bool,
     /// Enable a non-standard event handler for verifying behavior of media elements during tests.
@@ -592,6 +596,7 @@ impl Preferences {
             layout_parallelism_job_count_minimum: 4,
             layout_parallelism_job_size_minimum: 16,
             mathml_core_enabled: false,
+            media_fetch_suspension_timeout_ms: 30000,
             media_glvideo_enabled: false,
             media_testing_enabled: false,
             network_connection_timeout: 15,
