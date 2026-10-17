@@ -44,7 +44,6 @@ use rustc_hash::FxBuildHasher;
 pub(crate) use script_bindings::trace::*;
 
 use crate::dom::bindings::refcounted::TrustedPromise;
-use crate::dom::html::htmlmediaelement::HTMLMediaElementFetchContext;
 use crate::dom::srcset::SourceSet;
 use crate::dom::windowproxy::WindowProxyHandler;
 use crate::event_loop::script_thread::IncompleteParserContexts;
@@ -271,5 +270,4 @@ unsafe_no_jsmanaged_fields!(TrustedPromise);
 
 unsafe_no_jsmanaged_fields!(WindowProxyHandler);
 unsafe_no_jsmanaged_fields!(SourceSet);
-unsafe_no_jsmanaged_fields!(HTMLMediaElementFetchContext);
 unsafe_no_jsmanaged_fields!(StreamConsumer);

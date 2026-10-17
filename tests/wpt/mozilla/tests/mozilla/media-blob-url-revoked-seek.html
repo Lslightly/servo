@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>A media element seeks far into a blob after its blob URL is revoked</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script src="/common/media.js"></script>
+<body>
+<script>
+// Servo fetches the parts of a media resource as it needs them, so a seek far from what was loaded
+// may fetch the blob again. The request keeps the blob alive, so revoking its URL, or the blob URL
+// that srcObject uses internally, must not fail such a fetch.
+async function seekFar(t, setSource) {
+  const blob = await fetch(getVideoURI("/media/movie_300")).then(response => response.blob());
+  const video = document.createElement("video");
+  video.muted = true;
+  video.preload = "metadata";
+  document.body.appendChild(video);
+  t.add_cleanup(() => {
+    video.removeAttribute("src");
+    video.srcObject = null;
+    video.load();
+    video.remove();
+  });
+  const watcher = new EventWatcher(t, video, ["loadedmetadata", "seeked", "error"]);
+  const url = setSource(video, blob);
+  await watcher.wait_for("loadedmetadata");
+  if (url) {
+    URL.revokeObjectURL(url);
+  }
+  for (const time of [225, 75, 150]) {
+    video.currentTime = time;
+    await watcher.wait_for("seeked");
+  }
+  assert_equals(video.error, null, "error");
+}
+
+promise_test(async t => {
+  await seekFar(t, (video, blob) => {
+    const url = URL.createObjectURL(blob);
+    video.src = url;
+    return url;
+  });
+}, "Seeking far into a blob whose URL was revoked after loadedmetadata");
+
+promise_test(async t => {
+  await seekFar(t, (video, blob) => {
+    video.srcObject = blob;
+  });
+}, "Seeking far into a blob that is the srcObject");
+</script>
+</body>

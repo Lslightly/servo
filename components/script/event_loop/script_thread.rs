@@ -3279,7 +3279,7 @@ impl ScriptThread {
                 parser.abort(cx, AbortReason::PipelineExited);
             }
 
-            document.cancel_suspended_media_fetches();
+            document.close_media_readers();
 
             if !document.window_detached() {
                 debug!("{pipeline_id}: Shutting down layout");
