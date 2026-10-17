@@ -59,6 +59,7 @@ mod resources;
 pub(crate) mod headless;
 
 use std::cell::RefCell;
+use std::ffi::c_char;
 use std::mem::MaybeUninit;
 use std::os::raw::c_void;
 use std::path::PathBuf;
@@ -76,7 +77,9 @@ use napi_derive_ohos::napi;
 use napi_ohos::bindgen_prelude::{Function, JsObjectValue, Object};
 use napi_ohos::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_ohos::{Env, JsString, JsValue};
-use ohos_abilitykit_sys::runtime::application_context;
+use ohos_abilitykit_sys::runtime::{
+    AbilityRuntimeErrorCode, AbilityRuntimeResult, application_context,
+};
 use ohos_ime::{
     AttachOptions, CreateImeProxyError, CreateTextEditorProxyError, Ime, ImeProxy, KeyboardStatus,
     RawTextEditorProxy,
@@ -183,6 +186,7 @@ pub(crate) fn get_raw_window_handle(
 #[derive(Debug)]
 struct NativeValues {
     cache_dir: String,
+    temp_dir: Result<String, AbilityRuntimeErrorCode>,
     #[expect(dead_code)]
     display_density: f32,
     device_type: ohos_deviceinfo::OhosDeviceType,
@@ -204,26 +208,32 @@ fn get_display_density() -> f32 {
     density
 }
 
+/// Gets a directory of the application with one of the getters of the application context.
+fn get_application_dir(
+    getter: unsafe extern "C" fn(*mut c_char, i32, *mut i32) -> AbilityRuntimeResult,
+) -> Result<String, AbilityRuntimeErrorCode> {
+    const BUFFER_SIZE: i32 = 100;
+    let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE as usize);
+    let mut write_length = 0;
+    // SAFETY: the getters of the application context write at most `BUFFER_SIZE` bytes to the
+    // buffer and the length they wrote to `write_length`, which is clamped to the buffer anyway.
+    unsafe {
+        getter(buffer.as_mut_ptr().cast(), BUFFER_SIZE, &mut write_length)?;
+        buffer.set_len(write_length.clamp(0, BUFFER_SIZE) as usize);
+    }
+    Ok(String::from_utf8(buffer).expect("UTF-8"))
+}
+
 /// Gets the resource and cache directory from the native c methods.
 fn get_native_values() -> NativeValues {
-    let cache_dir = {
-        const BUFFER_SIZE: i32 = 100;
-        let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE as usize);
-        let mut write_length = 0;
-        unsafe {
-            application_context::OH_AbilityRuntime_ApplicationContextGetCacheDir(
-                buffer.as_mut_ptr().cast(),
-                BUFFER_SIZE,
-                &mut write_length,
-            )
-            .expect("Call to cache dir failed");
-            buffer.set_len(write_length as usize);
-            String::from_utf8(buffer).expect("UTF-8")
-        }
-    };
-
     NativeValues {
-        cache_dir,
+        cache_dir: get_application_dir(
+            application_context::OH_AbilityRuntime_ApplicationContextGetCacheDir,
+        )
+        .expect("Call to cache dir failed"),
+        temp_dir: get_application_dir(
+            application_context::OH_AbilityRuntime_ApplicationContextGetTempDir,
+        ),
         display_density: get_display_density(),
         device_type: ohos_deviceinfo::get_device_type(),
         os_full_name: String::from(ohos_deviceinfo::get_os_full_name().unwrap_or("Undefined")),
@@ -301,6 +311,14 @@ fn init_app(
 
     if native_values.device_type == ohos_deviceinfo::OhosDeviceType::Phone {
         preferences.set_value("viewport_meta_enabled", PrefValue::Bool(true));
+    }
+
+    // The application sandbox has no system temporary directory.
+    if preferences.media_cache_directory.is_empty() {
+        match native_values.temp_dir {
+            Ok(temp_dir) => preferences.media_cache_directory = temp_dir,
+            Err(error) => warn!("Could not get the temporary directory: {error:?}"),
+        }
     }
 
     if servoshell_preferences.log_to_file {

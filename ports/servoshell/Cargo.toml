@@ -117,7 +117,7 @@ hilog = { workspace = true }
 ipc-channel = { workspace = true, features = ["force-inprocess"] }
 napi-derive-ohos = { workspace = true }
 napi-ohos = { workspace = true }
-ohos-abilitykit-sys = { workspace = true, features = ["api-14"] }
+ohos-abilitykit-sys = { workspace = true, features = ["api-16"] }
 ohos-deviceinfo = { workspace = true }
 ohos-ime = { workspace = true }
 ohos-ime-sys = { workspace = true }
