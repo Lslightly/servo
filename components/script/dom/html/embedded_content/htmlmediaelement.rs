@@ -304,6 +304,12 @@ pub(crate) struct HTMLMediaElement {
     origin_clean: Cell<bool>,
     /// Whether playback was requested since the media element load algorithm last ran.
     playback_requested: Cell<bool>,
+    /// Whether the media data processing steps ran their failure or fatal steps for the current
+    /// player, whose later errors must not run them again.
+    media_data_failed: Cell<bool>,
+    /// Whether the element opened a reader for the current player. Once the element closed it,
+    /// the reads of the player fail, and its errors are no errors of the media data.
+    player_has_reader: Cell<bool>,
     /// Media controls id.
     /// In order to workaround the lack of privileged JS context, we secure the
     /// the access to the "privileged" document.servoGetMediaControls(id) API by
@@ -474,6 +480,8 @@ impl HTMLMediaElement {
             last_reader_id: Cell::new(0),
             origin_clean: Cell::new(true),
             playback_requested: Cell::new(false),
+            media_data_failed: Cell::new(false),
+            player_has_reader: Cell::new(false),
             media_controls_id: DomRefCell::new(None),
             did_perform_automatic_track_selection: Default::default(),
             position_when_time_marches_on_ran: Default::default(),
@@ -1668,6 +1676,7 @@ impl HTMLMediaElement {
         reader.set_observer(Box::new(move |event| {
             observer_tasks.queue(move |cx, element| element.handle_reader_event(cx, id, event));
         }));
+        self.player_has_reader.set(true);
 
         let pulls = self.player.borrow().as_ref().is_some_and(|player| {
             player
@@ -2547,6 +2556,8 @@ impl HTMLMediaElement {
     /// => "If the media data can be fetched but is found by inspection to be in an unsupported
     /// format, or can otherwise not be rendered at all"
     fn media_data_processing_failure_steps(&self, cx: &JSContext) {
+        self.media_data_failed.set(true);
+
         // Step 1. The user agent should cancel the fetching process.
         self.close_media_reader();
 
@@ -2621,6 +2632,7 @@ impl HTMLMediaElement {
     /// => "If the connection is interrupted after some media data has been received..."
     /// => "If the media data is corrupted"
     fn media_data_processing_fatal_steps(&self, cx: &mut JSContext, error: u16) {
+        self.media_data_failed.set(true);
         *self.source_children_pointer.borrow_mut() = None;
         self.current_source_child.set(None);
 
@@ -2900,6 +2912,8 @@ impl HTMLMediaElement {
         };
 
         *self.player.borrow_mut() = Some(player);
+        self.media_data_failed.set(false);
+        self.player_has_reader.set(false);
 
         let task_source = self
             .owner_global()
@@ -3101,8 +3115,13 @@ impl HTMLMediaElement {
 
         // If we have already flagged an error condition while processing
         // the network response, we should silently skip any observable
-        // errors originating while decoding the erroneous response.
-        if self.in_error_state() {
+        // errors originating while decoding the erroneous response. The error of the
+        // failure steps is set in a task, which may not have run yet. A player whose reader the
+        // element closed fails because of that.
+        if self.in_error_state() ||
+            self.media_data_failed.get() ||
+            (self.player_has_reader.get() && !self.has_media_reader())
+        {
             return;
         }
 
