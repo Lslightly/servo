@@ -3065,9 +3065,13 @@ impl Document {
         let loads_cancelled = global.fetch_group_mut().terminate(global);
         let event_sources_canceled = global.close_event_sources();
         // The media cache fetches for media elements outside the fetch group. When the document is
-        // navigated away from, a download in progress is cancelled once it is unloaded.
-        let media_downloads_cancelled =
-            matches!(reason, AbortReason::Navigate) && self.has_media_download_in_progress();
+        // navigated away from, a download in progress is cancelled once it is unloaded; stopping
+        // or reopening the document cancels it now.
+        let media_downloads_cancelled = match reason {
+            AbortReason::Navigate => self.has_media_download_in_progress(),
+            AbortReason::StopLoading | AbortReason::DocumentOpen => self.abort_media_downloads(),
+            AbortReason::Destroy | AbortReason::PipelineExited => false,
+        };
 
         if loads_cancelled || event_sources_canceled || media_downloads_cancelled {
             // If any loads were canceled.
@@ -3363,6 +3367,22 @@ impl Document {
             .any(|element| {
                 element.has_media_reader() && element.network_state() == NetworkState::Loading
             })
+    }
+
+    /// Cancels the downloads in progress of the media elements, which then run the steps for a
+    /// fetching process aborted by the user. Returns whether there were any.
+    fn abort_media_downloads(&self) -> bool {
+        let elements: Vec<_> = self
+            .media_elements_with_reader
+            .borrow()
+            .iter()
+            .filter_map(MediaElementWeakRef::root)
+            .collect();
+        let mut aborted = false;
+        for element in elements {
+            aborted |= element.abort_media_download();
+        }
+        aborted
     }
 
     /// Tells the media cache how much of their media resource the media elements need, which

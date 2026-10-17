@@ -2554,6 +2554,69 @@ impl HTMLMediaElement {
         self.resource_selection_algorithm_failure_steps(cx);
     }
 
+    /// Cancels a download of the media resource in progress, as aborting the document does, and
+    /// queues the rest of the steps for a fetching process aborted by the user. Returns whether
+    /// there was such a download.
+    pub(crate) fn abort_media_download(&self) -> bool {
+        if !self.has_media_reader() || self.network_state.get() != NetworkState::Loading {
+            return false;
+        }
+
+        // Step 1. The user agent should cancel the fetching process.
+        self.close_media_reader();
+
+        let this = Trusted::new(self);
+        let generation_id = self.generation_id.get();
+        self.owner_global()
+            .task_manager()
+            .media_element_task_source()
+            .queue(task!(media_fetching_aborted: move |cx| {
+                let this = this.root();
+                if generation_id == this.generation_id.get() && !this.in_error_state() {
+                    this.media_data_fetching_aborted_steps(cx);
+                }
+            }));
+        true
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list>
+    /// => "If the media data fetching process is aborted by the user", after the fetching process
+    /// was cancelled.
+    fn media_data_fetching_aborted_steps(&self, cx: &mut JSContext) {
+        *self.source_children_pointer.borrow_mut() = None;
+        self.current_source_child.set(None);
+
+        // Step 2. Set the error attribute to the result of creating a MediaError with
+        // MEDIA_ERR_ABORTED.
+        self.set_error(Some(&*MediaError::new(
+            cx,
+            &self.owner_window(),
+            MEDIA_ERR_ABORTED,
+        )));
+
+        // Step 3. Fire an event named abort at the media element.
+        self.upcast::<EventTarget>().fire_event(cx, atom!("abort"));
+
+        // Step 4. If the media element's readyState attribute has a value equal to HAVE_NOTHING,
+        // set the element's networkState attribute to the NETWORK_EMPTY value, set the element's
+        // show poster flag to true, and fire an event named emptied at the element. Otherwise,
+        // set the element's networkState attribute to the NETWORK_IDLE value.
+        if self.ready_state.get() == ReadyState::HaveNothing {
+            self.set_network_state(NetworkState::Empty);
+            self.show_poster.set(true);
+            self.upcast::<EventTarget>()
+                .fire_event(cx, atom!("emptied"));
+        } else {
+            self.set_network_state(NetworkState::Idle);
+        }
+
+        // Step 5. Set the element's delaying-the-load-event flag to false. This stops delaying
+        // the load event.
+        self.delay_load_event(cx, false);
+
+        // Step 6. Abort the overall resource selection algorithm.
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list>
     /// => "If the connection is interrupted after some media data has been received..."
     /// => "If the media data is corrupted"
