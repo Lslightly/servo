@@ -1676,6 +1676,9 @@ impl HTMLMediaElement {
         reader.set_observer(Box::new(move |event| {
             observer_tasks.queue(move |cx, element| element.handle_reader_event(cx, id, event));
         }));
+        // A player that reads from the reader may render the media data before the metadata
+        // event of a resource that the cache holds already reaches the element.
+        self.origin_clean.set(!reader.cors_tainted());
         self.player_has_reader.set(true);
 
         let pulls = self.player.borrow().as_ref().is_some_and(|player| {
@@ -1702,7 +1705,6 @@ impl HTMLMediaElement {
             stall_check_pending: false,
             stalled: false,
         }));
-        self.origin_clean.set(true);
         document.register_media_element_with_reader(self);
         self.update_reader_activity();
         self.update_keep_alive();

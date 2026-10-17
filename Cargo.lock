@@ -9094,6 +9094,7 @@ dependencies = [
  "servo-base",
  "servo-media",
  "servo-media-audio",
+ "servo-media-cache",
  "servo-media-player",
  "servo-media-streams",
  "servo-media-traits",

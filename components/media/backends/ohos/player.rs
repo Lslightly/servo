@@ -20,18 +20,15 @@ use ohos_media_sys::avplayer_base::{
     OH_PLAYER_SEEK_POSITION, OH_PLAYER_STATE, OH_PLAYER_STATE_CHANGE_REASON,
     OH_PLAYER_VIDEO_HEIGHT, OH_PLAYER_VIDEO_WIDTH, OH_PLAYER_VOLUME,
 };
-use servo_base::generic_channel::{GenericCallback, GenericReceiver, channel};
+use servo_base::generic_channel::GenericCallback;
 use servo_media::{BackendMsg, ClientContextId, MediaInstance, MediaInstanceError};
+use servo_media_cache::MediaReader;
 use servo_media_player::metadata::Metadata;
 use servo_media_player::video::{self, Buffer, VideoFrame, VideoFrameData};
-use servo_media_player::{PlaybackState, Player, PlayerEvent, SeekLock, SeekLockMsg};
+use servo_media_player::{PlaybackState, Player, PlayerEvent};
 use yuv::yuv_nv12_to_bgra;
 
 use crate::ohos_media::avplayer::OhosPlayer as OhosPlayerInner;
-#[cfg(not(sdk_api_21))]
-use crate::ohos_media::dummy_source::MediaSourceWrapper;
-#[cfg(sdk_api_21)]
-use crate::ohos_media::source::MediaSourceWrapper;
 
 // Height of decoded video frame from AVPlayer is padded to multiples of this value by the codec.
 // https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/video-decoding
@@ -74,12 +71,6 @@ pub struct OhosAvPlayer {
     /// Whether AVPlayer reported an error, after which its info events are ignored: the player
     /// can still change state, for example to paused, which must not raise the ready state.
     errored: Arc<AtomicBool>,
-    /// Whether this player is being dropped, after which the media element no longer answers
-    /// SeekData events.
-    released: Arc<AtomicBool>,
-    /// The sender of the channel on which reads wait for the media element to answer a SeekData
-    /// event.
-    seek_lock: Option<SeekLock>,
 }
 
 // Procedure for setting up AVPlayer, state change condition:
@@ -130,8 +121,6 @@ impl OhosAvPlayer {
             }))),
             state_manager: Arc::new(Mutex::new(StateManager::new())),
             errored: Arc::new(AtomicBool::new(false)),
-            released: Arc::new(AtomicBool::new(false)),
-            seek_lock: None,
         }
     }
 
@@ -359,99 +348,11 @@ impl OhosAvPlayer {
                     .send(PlayerEvent::Error(format!("{error_code}: {message}")));
             });
     }
-
-    pub fn setup_data_source(&mut self) {
-        let sender_clone = self.event_sender.clone();
-        let sender_clone_clone = self.event_sender.clone();
-        let need_data_sender = self.event_sender.clone();
-        let released_clone = self.released.clone();
-        let seek_channel = SeekChannel::new();
-        self.seek_lock = Some(seek_channel.sender());
-        let seek_channel = Arc::new(Mutex::new(seek_channel));
-        let seekdata_send_closure = move |pos: u64, answered: &dyn Fn(bool)| {
-            // Checking whether the player is released under the lock that waiting holds makes sure
-            // that the answer that releasing sends reaches the only restart that can still wait.
-            let seek_channel = seek_channel.lock().unwrap();
-            if released_clone.load(Ordering::SeqCst) {
-                return;
-            }
-            let _ = sender_clone
-                .lock()
-                .unwrap()
-                .send(PlayerEvent::SeekData(pos, seek_channel.sender()));
-            let (ret, ack_channel) = seek_channel.wait();
-            drop(seek_channel);
-            // The media element waits for the acknowledgement before it can push the bytes of the
-            // restarted fetch.
-            answered(ret);
-            debug!("Seek Initiated! :{}", pos);
-            let _ = sender_clone.lock().unwrap().send(PlayerEvent::NeedData);
-            let _ = ack_channel.send(());
-        };
-
-        let source = MediaSourceWrapper::builder()
-            .set_enough_data(move || {
-                let _ = sender_clone_clone
-                    .lock()
-                    .unwrap()
-                    .send(PlayerEvent::EnoughData);
-            })
-            .set_need_data(move || {
-                let _ = need_data_sender.lock().unwrap().send(PlayerEvent::NeedData);
-            })
-            .set_seek_data(seekdata_send_closure)
-            .build();
-
-        self.player_inner.lock().unwrap().set_source(source);
-        // To kickstart the first need data event.
-        let _ = self
-            .event_sender
-            .lock()
-            .unwrap()
-            .send(PlayerEvent::NeedData);
-    }
-}
-
-struct SeekChannel {
-    sender: SeekLock,
-    recv: GenericReceiver<SeekLockMsg>,
-}
-
-impl SeekChannel {
-    fn new() -> Self {
-        let (sender, recv) = channel::<SeekLockMsg>().expect("Couldn't create IPC channel");
-        Self {
-            sender: SeekLock {
-                lock_channel: sender,
-            },
-            recv,
-        }
-    }
-    fn sender(&self) -> SeekLock {
-        self.sender.clone()
-    }
-    fn wait(&self) -> SeekLockMsg {
-        self.recv.recv().unwrap()
-    }
 }
 
 impl Drop for OhosAvPlayer {
     fn drop(&mut self) {
         debug!("Ohos Dropping");
-        // A restart of the fetch that waits for the answer to its SeekData event would wait
-        // forever, as the media element ignores the events of a player it dropped, so answer it
-        // here.
-        self.released.store(true, Ordering::SeqCst);
-        if let Some(seek_lock) = &self.seek_lock {
-            match channel() {
-                Some((ack_sender, _)) => {
-                    let _ = seek_lock.lock_channel.send((false, ack_sender));
-                },
-                None => {
-                    warn!("Could not answer a pending SeekData event before releasing AVPlayer")
-                },
-            }
-        }
         OhosPlayerInner::release(&self.player_inner);
         let (sender, _) = std::sync::mpsc::channel::<()>();
         let _ = self
@@ -542,12 +443,31 @@ impl Player for OhosAvPlayer {
     fn set_input_size(&self, size: u64) -> Result<(), servo_media::player::PlayerError> {
         debug!("SetInputSize: {}", size);
 
-        self.player_inner.lock().unwrap().set_input_size(size);
+        self.player_inner.lock().unwrap().metadata_known(Some(size));
+        Ok(())
+    }
+
+    fn set_data_source(
+        &self,
+        source: Arc<MediaReader>,
+    ) -> Result<(), servo_media::player::PlayerError> {
+        if !cfg!(sdk_api_21) {
+            return Err(servo_media::player::PlayerError::NotSupported);
+        }
+        if !self.player_inner.lock().unwrap().set_reader(source) {
+            return Err(servo_media::player::PlayerError::Backend(
+                "AVPlayer already has a data source".to_owned(),
+            ));
+        }
         Ok(())
     }
 
     fn set_seekable(&self, seekable: bool) -> Result<(), servo_media::player::PlayerError> {
         debug!("SetSeekable: {}", seekable);
+        // AVPlayer derives whether the resource is seekable from the size of the data source, so
+        // this only says that the media element knows the metadata of the media resource. It calls
+        // `set_input_size` first if the length is known.
+        self.player_inner.lock().unwrap().metadata_known(None);
         Ok(())
     }
 
@@ -568,16 +488,16 @@ impl Player for OhosAvPlayer {
         Ok(())
     }
 
-    fn push_data(&self, data: Vec<u8>) -> Result<(), servo_media::player::PlayerError> {
-        if !self.player_inner.lock().unwrap().push_data(data) {
-            return Err(servo_media::player::PlayerError::EnoughData);
+    fn push_data(&self, _data: Vec<u8>) -> Result<(), servo_media::player::PlayerError> {
+        // AVPlayer reads from its data source instead, which needs API 21.
+        if cfg!(sdk_api_21) {
+            return Err(servo_media::player::PlayerError::NotSupported);
         }
         Ok(())
     }
 
     fn end_of_stream(&self) -> Result<(), servo_media::player::PlayerError> {
         debug!("Player: Current Request End of Stream reached!");
-        self.player_inner.lock().unwrap().end_of_stream();
         Ok(())
     }
 
