@@ -198,10 +198,11 @@ impl OhosAvPlayer {
                                 let _ = sender_clone.lock().unwrap().send(PlayerEvent::EndOfStream);
                             },
                             AVPlayerState::AV_ERROR => {
-                                errored_clone.store(true, Ordering::SeqCst);
-                                let _ = sender_clone.lock().unwrap().send(PlayerEvent::Error(
-                                    "AVPlayer entered its error state".to_owned(),
-                                ));
+                                if !errored_clone.swap(true, Ordering::SeqCst) {
+                                    let _ = sender_clone.lock().unwrap().send(PlayerEvent::Error(
+                                        "AVPlayer entered its error state".to_owned(),
+                                    ));
+                                }
                             },
                             AVPlayerState::AV_RELEASED => {},
                             _ => {
@@ -336,12 +337,15 @@ impl OhosAvPlayer {
             .connect_error_callback(move |error_code, message| {
                 // AVPlayer also reports operations it does not permit, such as a playback speed for
                 // media it treats as a live stream, or an audio interruption, which don't end
-                // playback. A failure that does also moves AVPlayer to its error state.
+                // playback. A failure that does also moves AVPlayer to its error state, and only
+                // the first of the two reaches the media element.
                 if error_code == OH_AVErrCode::AV_ERR_OPERATE_NOT_PERMIT.0 as i32 {
                     warn!("AVPlayer did not permit an operation: {}", message);
                     return;
                 }
-                errored_clone.store(true, Ordering::SeqCst);
+                if errored_clone.swap(true, Ordering::SeqCst) {
+                    return;
+                }
                 let _ = sender_clone
                     .lock()
                     .unwrap()
