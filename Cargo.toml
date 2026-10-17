@@ -354,6 +354,7 @@ servo-default-resources = { version = "=0.7.0", path = "components/default-resou
 servo-geometry = { version = "=0.7.0", path = "components/geometry" }
 servo-media = { version = "=0.7.0", path = "components/media/servo-media" }
 servo-media-audio = { version = "=0.7.0", path = "components/media/audio" }
+servo-media-cache = { version = "=0.7.0", path = "components/media/cache" }
 servo-media-auto = { version = "=0.7.0", path = "components/media/backends/auto" }
 servo-media-derive = { version = "=0.7.0", path = "components/media/servo-media-derive" }
 servo-media-dummy = { version = "=0.7.0", path = "components/media/backends/dummy" }

@@ -330,6 +330,28 @@ pub struct Preferences {
     pub layout_variable_fonts_enabled: bool,
     // feature: CSS writing modes | #2560 | Web/CSS/Guides/Writing_modes
     pub layout_writing_mode_enabled: bool,
+    /// The directory of the temporary file of the media cache, or empty for the system temporary
+    /// directory.
+    pub media_cache_directory: String,
+    /// The size of the temporary file in which the media cache of a content process keeps
+    /// media resources, in MiB.
+    pub media_cache_file_budget_mb: u64,
+    /// The memory budget of the media cache when its temporary file cannot be created, in MiB.
+    pub media_cache_memory_fallback_mb: u64,
+    /// The largest media resource, in KiB, that the media cache keeps in memory instead of its
+    /// temporary file. Applies to resources of known length only.
+    pub media_cache_memory_resource_limit_kb: u64,
+    /// How much media the media cache loads ahead of a player, in seconds of playback.
+    pub media_cache_readahead_seconds: u64,
+    /// How long a media resource that no player uses any more stays available for reuse, in
+    /// seconds.
+    pub media_cache_reuse_seconds: u64,
+    /// The media cache resumes a suspended fetch once less than this is loaded ahead of a player,
+    /// in seconds of playback.
+    pub media_cache_resume_seconds: u64,
+    /// How long the media cache keeps the fetch of a seekable media resource suspended before it
+    /// cancels it, in seconds.
+    pub media_cache_suspend_seconds: u64,
     /// How long a media element keeps the fetch of a media resource with range support
     /// suspended while its player has enough data, before it cancels the fetch to restart it
     /// once the player needs data again, in milliseconds.
@@ -571,6 +593,18 @@ impl Preferences {
             layout_unimplemented: false,
             layout_variable_fonts_enabled: false,
             layout_writing_mode_enabled: false,
+            media_cache_directory: String::new(),
+            media_cache_file_budget_mb: if cfg!(any(target_env = "ohos", target_os = "android")) {
+                128
+            } else {
+                512
+            },
+            media_cache_memory_fallback_mb: 32,
+            media_cache_memory_resource_limit_kb: 8192,
+            media_cache_readahead_seconds: 30,
+            media_cache_reuse_seconds: 300,
+            media_cache_resume_seconds: 10,
+            media_cache_suspend_seconds: 30,
             media_fetch_suspension_timeout_ms: 30000,
             media_glvideo_enabled: false,
             media_testing_enabled: false,

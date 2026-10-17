@@ -8966,6 +8966,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "servo-media-cache"
+version = "0.7.0"
+dependencies = [
+ "bytes",
+ "log",
+ "parking_lot",
+ "servo-config",
+ "servo-malloc-size-of",
+ "tempfile",
+]
+
+[[package]]
 name = "servo-media-derive"
 version = "0.7.0"
 dependencies = [
@@ -9097,6 +9109,7 @@ dependencies = [
  "serde",
  "servo-base",
  "servo-malloc-size-of",
+ "servo-media-cache",
  "servo-media-streams",
  "servo-media-traits",
 ]
