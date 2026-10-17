@@ -117,6 +117,13 @@ static MEDIA_CONTROL_JS: &str = include_str!("../../../resources/media-controls.
 /// instead of strict equality. (Unit is second)
 const SEEK_POSITION_THRESHOLD: f64 = 0.5;
 
+/// <https://html.spec.whatwg.org/multipage/#media-element-stall-timeout>
+const STALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How often a media element that downloads checks whether it stalled. Checks at a fixed interval
+/// keep the order of the timers of all elements, which share an ordering identifier.
+const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The size of the chunks of media data that are pushed into a player.
 const PUSH_CHUNK_SIZE: usize = 64 * 1024;
 
@@ -1682,11 +1689,71 @@ impl HTMLMediaElement {
             metadata: None,
             activity: None,
             download_suspended: false,
+            last_progress: Instant::now(),
+            stall_check_pending: false,
+            stalled: false,
         });
         self.origin_clean.set(true);
         document.register_media_element_with_reader(self);
         self.update_reader_activity();
         self.update_keep_alive();
+        self.watch_for_stall();
+    }
+
+    /// Starts to wait for the media element stall timeout from now, as when data arrives.
+    fn watch_for_stall(&self) {
+        let id = {
+            let mut media_reader = self.media_reader.borrow_mut();
+            let Some(media_reader) = media_reader.as_mut() else {
+                return;
+            };
+            media_reader.last_progress = Instant::now();
+            media_reader.stalled = false;
+            if media_reader.stall_check_pending {
+                return;
+            }
+            media_reader.stall_check_pending = true;
+            media_reader.id
+        };
+        self.schedule_stall_check(id);
+    }
+
+    fn schedule_stall_check(&self, id: u32) {
+        let this = Trusted::new(self);
+        self.global().run_steps_after_a_timeout(
+            DOMString::from_static("media-element-stall"),
+            STALL_CHECK_INTERVAL.as_millis() as i64,
+            move |_, _| this.root().check_for_stall(id),
+        );
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
+    /// > When a media element that is actively attempting to obtain media data has failed to
+    /// > receive any data for a duration equal to the media element stall timeout, the user agent
+    /// > must queue a media element task given the media element to [...] fire an event named
+    /// > stalled at the element.
+    fn check_for_stall(&self, id: u32) {
+        let stalled = {
+            let mut media_reader = self.media_reader.borrow_mut();
+            let Some(media_reader) = media_reader.as_mut().filter(|reader| reader.id == id) else {
+                return;
+            };
+            media_reader.stall_check_pending = false;
+            if self.network_state.get() != NetworkState::Loading ||
+                media_reader.download_suspended ||
+                media_reader.stalled
+            {
+                return;
+            }
+            media_reader.stalled = media_reader.last_progress.elapsed() >= STALL_TIMEOUT;
+            media_reader.stall_check_pending = !media_reader.stalled;
+            media_reader.stalled
+        };
+        if stalled {
+            self.queue_media_element_task_to_fire_event(Atom::from("stalled"));
+        } else {
+            self.schedule_stall_check(id);
+        }
     }
 
     /// Stops reading the media resource from the media cache, which cancels the fetches that no
@@ -2226,6 +2293,7 @@ impl HTMLMediaElement {
     ///
     /// The reader reports progress at most every 350 ms.
     fn reader_progress(&self, cx: &mut JSContext) {
+        self.watch_for_stall();
         let download_suspended = self
             .media_reader
             .borrow()
@@ -2273,6 +2341,7 @@ impl HTMLMediaElement {
         if self.network_state.get() == NetworkState::Idle {
             self.set_network_state(NetworkState::Loading);
         }
+        self.watch_for_stall();
     }
 
     /// <https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list>
@@ -4376,6 +4445,12 @@ struct MediaResourceReader {
     activity: Option<ReaderActivity>,
     /// Whether the download is suspended or complete, while which no progress event fires.
     download_suspended: bool,
+    /// When data last arrived, or the download started or resumed.
+    last_progress: Instant,
+    /// Whether a check for a stalled download is scheduled.
+    stall_check_pending: bool,
+    /// Whether the element fired stalled since data last arrived.
+    stalled: bool,
 }
 
 /// Pushes the data of a reader into a player, as the player asks for it.
