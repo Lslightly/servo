@@ -84,7 +84,7 @@ use crate::dom::mediafragmentparser::MediaFragmentParser;
 use crate::dom::medialist::MediaList;
 use crate::dom::mediastream::MediaStream;
 use crate::dom::node::virtualmethods::VirtualMethods;
-use crate::dom::node::{Node, NodeDamage, NodeTraits, UnbindContext};
+use crate::dom::node::{BindContext, Node, NodeDamage, NodeTraits, UnbindContext};
 use crate::dom::promise::Promise;
 use crate::dom::rules_for_rendering::{
     RulesForUpdatingTheTextTrackRendering, ShouldResetRenderingControls,
@@ -1704,37 +1704,47 @@ impl HTMLMediaElement {
     }
 
     /// Tells the media cache how much of the media resource the element needs: what playback at
-    /// its bitrate needs while it plays, the metadata for preload=metadata until playback is
-    /// requested, and otherwise what the cache keeps for a paused reader, as when the document is
-    /// not fully active.
+    /// its bitrate needs while it plays or is paused in a document, the metadata for
+    /// preload=metadata until playback is requested, and nothing ahead while its document is not
+    /// fully active or while it is paused outside a document, which nothing might resume.
     pub(crate) fn update_reader_activity(&self) {
         let mut media_reader = self.media_reader.borrow_mut();
         let Some(media_reader) = media_reader.as_mut() else {
             return;
         };
-        let activity = if !self.owner_document().is_fully_active() {
-            ReaderActivity::Paused {
-                bytes_per_second: None,
-            }
+        let duration = self.duration.get();
+        let bytes_per_second = media_reader
+            .metadata
+            .and_then(|metadata| metadata.length)
+            .filter(|_| duration.is_finite() && duration > 0.)
+            .map(|length| length as f64 / duration);
+        let activity = if !self.owner_document().is_fully_active() ||
+            (self.paused.get() && !self.upcast::<Node>().is_connected())
+        {
+            ReaderActivity::Idle
         } else if !self.paused.get() {
-            let duration = self.duration.get();
-            let bytes_per_second = media_reader
-                .metadata
-                .and_then(|metadata| metadata.length)
-                .filter(|_| duration.is_finite() && duration > 0.)
-                .map(|length| length as f64 / duration);
             ReaderActivity::Playing { bytes_per_second }
         } else if self.Preload() == "metadata" && !self.playback_requested.get() && !self.Autoplay()
         {
             ReaderActivity::Metadata
         } else {
-            ReaderActivity::Paused {
-                bytes_per_second: None,
-            }
+            ReaderActivity::Paused { bytes_per_second }
         };
         if media_reader.activity != Some(activity) {
+            let was_held = matches!(
+                media_reader.activity,
+                Some(ReaderActivity::Idle | ReaderActivity::Metadata)
+            );
             media_reader.activity = Some(activity);
             media_reader.reader.set_activity(activity);
+            if was_held &&
+                media_reader
+                    .push
+                    .as_ref()
+                    .is_some_and(|push| push.needs_data)
+            {
+                self.queue_push_media_data(media_reader.id);
+            }
         }
     }
 
@@ -2320,7 +2330,20 @@ impl HTMLMediaElement {
             let Some(media_reader) = media_reader.as_mut().filter(|reader| reader.id == id) else {
                 return;
             };
-            if media_reader.metadata.is_none() {
+            // A pushed player asks for data to fill its own buffer, which the reader would fetch.
+            // No playback needs it yet once the player can play, for an idle reader, or has the
+            // first frame, for a reader of the metadata, unless it seeks.
+            let held = !self.seeking.get() &&
+                match media_reader.activity {
+                    Some(ReaderActivity::Idle) => {
+                        self.ready_state.get() == ReadyState::HaveEnoughData
+                    },
+                    Some(ReaderActivity::Metadata) => {
+                        self.ready_state.get() >= ReadyState::HaveCurrentData
+                    },
+                    _ => false,
+                };
+            if media_reader.metadata.is_none() || held {
                 return;
             }
             let Some(push) = media_reader.push.as_mut() else {
@@ -2330,17 +2353,19 @@ impl HTMLMediaElement {
         };
         match outcome {
             PushOutcome::Done => {},
-            PushOutcome::Yield => {
-                let this = Trusted::new(self);
-                self.owner_global()
-                    .task_manager()
-                    .media_element_task_source()
-                    .queue(task!(push_media_data: move |cx| {
-                        this.root().push_media_data(cx, id);
-                    }));
-            },
+            PushOutcome::Yield => self.queue_push_media_data(id),
             PushOutcome::Failed(error) => self.media_reader_failed(cx, id, error),
         }
+    }
+
+    fn queue_push_media_data(&self, id: u32) {
+        let this = Trusted::new(self);
+        self.owner_global()
+            .task_manager()
+            .media_element_task_source()
+            .queue(task!(push_media_data: move |cx| {
+                this.root().push_media_data(cx, id);
+            }));
     }
 
     /// Appends a promise to the list of pending play promises.
@@ -4185,9 +4210,17 @@ impl VirtualMethods for HTMLMediaElement {
         };
     }
 
+    fn bind_to_tree(&self, cx: &mut JSContext, context: &BindContext) {
+        self.super_type().unwrap().bind_to_tree(cx, context);
+
+        self.update_reader_activity();
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#playing-the-media-resource:remove-an-element-from-a-document>
     fn unbind_from_tree(&self, cx: &mut JSContext, context: &UnbindContext) {
         self.super_type().unwrap().unbind_from_tree(cx, context);
+
+        self.update_reader_activity();
 
         self.remove_controls(cx);
 
