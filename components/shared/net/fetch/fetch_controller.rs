@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use malloc_size_of_derive::MallocSizeOf;
+use servo_base::generic_channel::GenericCallback;
 
 use crate::request::RequestId;
 use crate::{CoreResourceThread, cancel_async_fetch, resume_async_fetch, suspend_async_fetch};
@@ -74,11 +75,14 @@ impl FetchController {
     /// ends with [`NetworkError::ConnectionFailure`](crate::NetworkError::ConnectionFailure),
     /// which cannot be told apart from a lost connection. A consumer that suspended a fetch
     /// should restart it after such an error, for example with a Range request for the rest.
-    pub fn suspend(&self) {
+    ///
+    /// `reply`, if any, receives whether net suspended the fetch: false if net ignored the
+    /// suspension. Nothing is sent if this controller no longer has a request.
+    pub fn suspend(&self, reply: Option<GenericCallback<bool>>) {
         if let (Some(request_id), Some(core_resource_thread)) =
             (self.request_id, &self.core_resource_thread)
         {
-            suspend_async_fetch(request_id, core_resource_thread);
+            suspend_async_fetch(request_id, reply, core_resource_thread);
         }
     }
 

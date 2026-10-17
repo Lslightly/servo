@@ -454,9 +454,12 @@ impl ResourceChannelManager {
                     cancellation_listener.cancel();
                 }
             },
-            CoreResourceMsg::Suspend(request_id) => {
-                if let Some(cancellation_listener) = self.cancellation_listener(request_id) {
-                    let _ = cancellation_listener.suspend();
+            CoreResourceMsg::Suspend(request_id, reply) => {
+                let suspended = self
+                    .cancellation_listener(request_id)
+                    .is_some_and(|cancellation_listener| cancellation_listener.suspend());
+                if let Some(reply) = reply {
+                    let _ = reply.send(suspended);
                 }
             },
             CoreResourceMsg::Resume(request_id) => {

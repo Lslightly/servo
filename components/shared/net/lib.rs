@@ -762,8 +762,9 @@ pub enum FetchChannels {
 pub enum CoreResourceMsg {
     Fetch(RequestBuilder, FetchChannels),
     Cancel(Vec<RequestId>),
-    /// Stop reading the response body of a request from the network until it is resumed.
-    Suspend(RequestId),
+    /// Stop reading the response body of a request from the network until it is resumed, and
+    /// send whether the request is suspended now to the callback, if any.
+    Suspend(RequestId, Option<GenericCallback<bool>>),
     /// Continue reading the response body of a suspended request.
     Resume(RequestId),
     /// Initiate a fetch in response to processing a redirection
@@ -890,7 +891,7 @@ impl CacheEntryDescriptor {
 #[expect(clippy::large_enum_variant)]
 enum ToFetchThreadMessage {
     Cancel(Vec<RequestId>, CoreResourceThread),
-    Suspend(RequestId, CoreResourceThread),
+    Suspend(RequestId, Option<GenericCallback<bool>>, CoreResourceThread),
     Resume(RequestId, CoreResourceThread),
     StartFetch(
         /* request_builder */ RequestBuilder,
@@ -1007,8 +1008,8 @@ impl FetchThread {
                     // during this time.
                     let _ = core_resource_thread.send(CoreResourceMsg::Cancel(request_ids));
                 },
-                Ok(ToFetchThreadMessage::Suspend(request_id, core_resource_thread)) => {
-                    let _ = core_resource_thread.send(CoreResourceMsg::Suspend(request_id));
+                Ok(ToFetchThreadMessage::Suspend(request_id, reply, core_resource_thread)) => {
+                    let _ = core_resource_thread.send(CoreResourceMsg::Suspend(request_id, reply));
                 },
                 Ok(ToFetchThreadMessage::Resume(request_id, core_resource_thread)) => {
                     let _ = core_resource_thread.send(CoreResourceMsg::Resume(request_id));
@@ -1088,9 +1089,14 @@ pub fn cancel_async_fetch(request_ids: Vec<RequestId>, core_resource_thread: &Co
 
 /// Instruct the resource thread to stop reading the response body of a request until
 /// [`resume_async_fetch`] is called. See [`fetch::fetch_controller::FetchController::suspend`].
-pub fn suspend_async_fetch(request_id: RequestId, core_resource_thread: &CoreResourceThread) {
+pub fn suspend_async_fetch(
+    request_id: RequestId,
+    reply: Option<GenericCallback<bool>>,
+    core_resource_thread: &CoreResourceThread,
+) {
     FetchThread::send_if_running(ToFetchThreadMessage::Suspend(
         request_id,
+        reply,
         core_resource_thread.clone(),
     ));
 }

@@ -56,7 +56,7 @@ use net_traits::{
 use parking_lot::{Mutex, RwLock};
 use profile_traits::mem::ProfilerChan as MemProfilerChan;
 use profile_traits::time::ProfilerChan;
-use servo_base::generic_channel;
+use servo_base::generic_channel::{self, GenericCallback};
 use servo_base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
 use servo_url::{ImmutableOrigin, ServoUrl};
 use url::Url;
@@ -3040,6 +3040,81 @@ fn test_fetch_waiting_for_a_suspended_response_uses_the_network() {
     let _ = server.server.close();
 }
 
+#[test]
+fn test_fetch_controller_reports_whether_a_fetch_was_suspended() {
+    let (time_sender, _time_receiver) = generic_channel::channel().unwrap();
+    let (memory_sender, _memory_receiver) = generic_channel::channel().unwrap();
+    let (resource_thread, _private_resource_thread) = new_core_resource_thread(
+        None,
+        ProfilerChan(Some(time_sender)),
+        MemProfilerChan(memory_sender),
+        create_generic_embedder_proxy(),
+        None,
+        CACertificates::Default,
+        false, /* ignore_certificate_errors */
+        Arc::new(ProtocolRegistry::with_internal_protocols()),
+    );
+    let suspend = |controller: &FetchController| {
+        let (reply, receiver) = GenericCallback::new_blocking().unwrap();
+        controller.suspend(Some(reply));
+        receiver.recv().unwrap()
+    };
+
+    let mut server = make_streaming_server(false, 3, STREAM_LENGTH, false);
+    let fetches: Vec<_> = (0..3)
+        .map(|_| {
+            let request = build_streaming_request(&server.url);
+            let controller = FetchController::new(request.id, false, resource_thread.clone());
+            let (sender, receiver) = unbounded();
+            fetch_async(
+                &resource_thread,
+                request,
+                None,
+                Box::new(move |message| {
+                    let _ = sender.send(message);
+                }),
+            );
+            loop {
+                match receiver.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    FetchResponseMsg::ProcessResponseChunk(..) => break,
+                    FetchResponseMsg::ProcessResponseEOF(..) => panic!("The body ended early"),
+                    _ => {},
+                }
+            }
+            (controller, receiver)
+        })
+        .collect();
+
+    // Two fetches to one origin are suspended, and a third is not.
+    assert!(suspend(&fetches[0].0));
+    assert!(suspend(&fetches[1].0));
+    assert!(!suspend(&fetches[2].0));
+
+    for (index, (controller, receiver)) in fetches.iter().enumerate() {
+        controller.resume();
+        server.release(index);
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(10)).unwrap() {
+                FetchResponseMsg::ProcessResponseEOF(_, result, _) => {
+                    assert!(result.is_ok(), "{result:?}");
+                    break;
+                },
+                _ => {},
+            }
+        }
+    }
+
+    // A fetch that ended is not suspended.
+    assert!(!suspend(&fetches[0].0));
+
+    let _ = server.server.close();
+    let (exit_sender, exit_receiver) = generic_channel::oneshot().unwrap();
+    resource_thread
+        .send(CoreResourceMsg::Exit(exit_sender))
+        .unwrap();
+    exit_receiver.recv().unwrap();
+}
+
 /// Fetch a `data:` URL through the fetch thread and `resource_thread`, and wait for its body.
 fn fetch_data_url(resource_thread: &CoreResourceThread) -> Vec<u8> {
     let url = UrlWithBlobClaim::new(ServoUrl::parse("data:,data").unwrap(), None);
@@ -3113,7 +3188,7 @@ fn test_fetch_controller_suspends_and_resumes_a_fetch() {
     while verifier.received < STREAM_CHUNK_SIZE {
         assert!(!receive(&mut verifier));
     }
-    controller.suspend();
+    controller.suspend(None);
     // Net handles messages from the fetch thread in order, so it handled the suspension once a
     // later fetch has ended.
     assert_eq!(fetch_data_url(&resource_thread), b"data");
@@ -3126,9 +3201,9 @@ fn test_fetch_controller_suspends_and_resumes_a_fetch() {
     assert!(verifier.is_intact(STREAM_LENGTH));
 
     // After the end, both do nothing: no message arrives and net keeps working.
-    controller.suspend();
+    controller.suspend(None);
     controller.resume();
-    controller.suspend();
+    controller.suspend(None);
     assert_eq!(fetch_data_url(&resource_thread), b"data");
     assert!(receiver.try_recv().is_err());
 
