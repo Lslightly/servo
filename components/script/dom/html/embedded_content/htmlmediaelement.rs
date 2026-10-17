@@ -293,9 +293,9 @@ pub(crate) struct HTMLMediaElement {
     #[ignore_malloc_size_of = "Defined in std::time"]
     next_timeupdate_event: Cell<Instant>,
     /// The reader of the media resource in the media cache, if the element reads one.
-    #[ignore_malloc_size_of = "The media cache measures the media data"]
+    #[ignore_malloc_size_of = "The media data is in the media cache, which is not reported yet"]
     #[no_trace]
-    media_reader: RefCell<Option<MediaResourceReader>>,
+    media_reader: DomRefCell<Option<Box<MediaResourceReader>>>,
     /// Identifies the reader that the element opened last.
     last_reader_id: Cell<u32>,
     /// Whether the media data is CORS-same-origin. Once a response for the current media resource
@@ -1691,7 +1691,7 @@ impl HTMLMediaElement {
             }));
         }
 
-        *self.media_reader.borrow_mut() = Some(MediaResourceReader {
+        *self.media_reader.borrow_mut() = Some(Box::new(MediaResourceReader {
             reader,
             id,
             push: (!pulls).then(PushAdapter::default),
@@ -1701,7 +1701,7 @@ impl HTMLMediaElement {
             last_progress: Instant::now(),
             stall_check_pending: false,
             stalled: false,
-        });
+        }));
         self.origin_clean.set(true);
         document.register_media_element_with_reader(self);
         self.update_reader_activity();
