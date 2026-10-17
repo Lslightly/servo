@@ -15,6 +15,7 @@ impl MediaSourceWrapper {
     pub fn builder() -> MediaSourceBuilder {
         MediaSourceBuilder {
             enough_data: None,
+            need_data: None,
             seek_data: None,
         }
     }
@@ -26,12 +27,9 @@ impl MediaSourceWrapper {
         // No-op for dummy source
     }
 
-    pub fn set_seekable(&self, _seekable: bool) {
+    pub fn push_data(&self, _data: Vec<u8>) -> bool {
         // No-op for dummy source
-    }
-
-    pub fn push_data(&self, _data: Vec<u8>) {
-        // No-op for dummy source
+        true
     }
 
     pub fn set_data_src(&mut self, _av_player: *mut ohos_media_sys::avplayer_base::OH_AVPlayer) {

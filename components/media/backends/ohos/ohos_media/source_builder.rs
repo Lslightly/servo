@@ -15,12 +15,19 @@ type SeekDataClosure = Arc<dyn Fn(u64, &dyn Fn(bool)) + Send + Sync>;
 
 pub struct MediaSourceBuilder {
     pub enough_data: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Asks the media element to push data again, continuing with the bytes that were refused.
+    pub need_data: Option<Box<dyn Fn() + Send + Sync>>,
     pub seek_data: Option<SeekDataClosure>,
 }
 
 impl MediaSourceBuilder {
     pub fn set_enough_data<F: Fn() + Send + Sync + Clone + 'static>(mut self, callback: F) -> Self {
         self.enough_data = Some(Box::new(callback));
+        self
+    }
+
+    pub fn set_need_data<F: Fn() + Send + Sync + Clone + 'static>(mut self, callback: F) -> Self {
+        self.need_data = Some(Box::new(callback));
         self
     }
 

@@ -26,6 +26,7 @@ impl MediaSourceWrapper {
     pub fn builder() -> MediaSourceBuilder {
         MediaSourceBuilder {
             enough_data: None,
+            need_data: None,
             seek_data: None,
         }
     }
@@ -33,7 +34,10 @@ impl MediaSourceWrapper {
 
 impl MediaSourceWrapper {
     pub fn new(source_cb: MediaSourceBuilder) -> Self {
-        let playback_buffer = Arc::new(Mutex::new(PlaybackBuffer::new(source_cb.enough_data)));
+        let playback_buffer = Arc::new(Mutex::new(PlaybackBuffer::new(
+            source_cb.enough_data,
+            source_cb.need_data,
+        )));
 
         let playback_buffer_clone = playback_buffer.clone();
 
@@ -127,10 +131,7 @@ impl MediaSourceWrapper {
         }
     }
 
-    pub fn set_seekable(&self, seekable: bool) {
-        self.playback_buffer.lock().unwrap().set_seekable(seekable);
-    }
-
+    /// Returns false if the playback buffer is full and did not take any of the bytes.
     pub fn push_data(&self, data: Vec<u8>) -> bool {
         let mut playback_buffer_lock = self.playback_buffer.lock().unwrap();
         playback_buffer_lock.push_buffer(&data)

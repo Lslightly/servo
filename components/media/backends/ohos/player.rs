@@ -367,6 +367,7 @@ impl OhosAvPlayer {
     pub fn setup_data_source(&mut self) {
         let sender_clone = self.event_sender.clone();
         let sender_clone_clone = self.event_sender.clone();
+        let need_data_sender = self.event_sender.clone();
         let released_clone = self.released.clone();
         let seek_channel = SeekChannel::new();
         self.seek_lock = Some(seek_channel.sender());
@@ -398,6 +399,9 @@ impl OhosAvPlayer {
                     .lock()
                     .unwrap()
                     .send(PlayerEvent::EnoughData);
+            })
+            .set_need_data(move || {
+                let _ = need_data_sender.lock().unwrap().send(PlayerEvent::NeedData);
             })
             .set_seek_data(seekdata_send_closure)
             .build();
@@ -548,7 +552,6 @@ impl Player for OhosAvPlayer {
 
     fn set_seekable(&self, seekable: bool) -> Result<(), servo_media::player::PlayerError> {
         debug!("SetSeekable: {}", seekable);
-        self.player_inner.lock().unwrap().set_seekable(seekable);
         Ok(())
     }
 
@@ -570,7 +573,9 @@ impl Player for OhosAvPlayer {
     }
 
     fn push_data(&self, data: Vec<u8>) -> Result<(), servo_media::player::PlayerError> {
-        self.player_inner.lock().unwrap().push_data(data);
+        if !self.player_inner.lock().unwrap().push_data(data) {
+            return Err(servo_media::player::PlayerError::EnoughData);
+        }
         Ok(())
     }
 
