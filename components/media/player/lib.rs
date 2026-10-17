@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 
 extern crate servo_media_streams as streams;
@@ -15,6 +16,7 @@ pub mod video;
 
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::{self, GenericSender};
+use servo_media_cache::MediaReader;
 use servo_media_traits::MediaInstance;
 use streams::registry::MediaStreamId;
 
@@ -45,6 +47,8 @@ pub enum PlayerError {
     SetStreamFailed,
     // Setting an audio or video track failed.
     SetTrackFailed,
+    /// The player does not support this way of getting media data.
+    NotSupported,
 }
 
 pub type SeekLockMsg = (bool, GenericSender<()>);
@@ -109,6 +113,11 @@ pub trait Player: Send + MediaInstance {
     fn set_volume(&self, volume: f64) -> Result<(), PlayerError>;
     fn volume(&self) -> f64;
     fn set_input_size(&self, size: u64) -> Result<(), PlayerError>;
+    /// Makes the player read the media data from the cache instead of having it pushed. Players
+    /// that cannot are fed through [`Player::push_data`].
+    fn set_data_source(&self, _source: Arc<MediaReader>) -> Result<(), PlayerError> {
+        Err(PlayerError::NotSupported)
+    }
     fn set_seekable(&self, seekable: bool) -> Result<(), PlayerError>;
     fn set_download_buffering_enabled(&self, enabled: bool) -> Result<(), PlayerError>;
     fn set_playback_rate(&self, playback_rate: f64) -> Result<(), PlayerError>;

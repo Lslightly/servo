@@ -203,6 +203,7 @@ class MachCommands(CommandBase):
             "servo-layout",
             "servo-layout-api",
             "servo",
+            "servo-media-cache",
             "servo-metrics",
             "servo-net",
             "servo-net-traits",
