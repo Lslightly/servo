@@ -25,7 +25,7 @@ use servo_url::ServoUrl;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::csp::GlobalCspReporting;
+use crate::dom::csp::{CspReporting, GlobalCspReporting};
 use crate::dom::element::{Element, cors_setting_for_element, referrer_policy_for_element};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmlmediaelement::{HTMLMediaElement, MediaElementTaskQueue};
@@ -36,31 +36,21 @@ use crate::fetch::fetch::{RequestWithGlobalScope, create_a_potential_cors_reques
 use crate::fetch::network_listener::{self, ResourceTimingListener};
 use crate::url::ensure_blob_referenced_by_url_is_kept_alive;
 
-/// Runs on a media element when the first fetch of a [`ScriptFetcher`] fails.
-pub(crate) type FetchFailureSteps = Box<dyn Fn(&mut JSContext, &HTMLMediaElement) + Send + Sync>;
-
 /// Fetches a media resource for the media cache on behalf of a media element, from any thread.
 /// The fetches report to the cache on the `FetchThread`, and queue tasks on the element only for
-/// what script does: CSP violation reports, resource timing entries, and the failure of the first
-/// fetch.
+/// what script does: CSP violation reports and resource timing entries.
 pub(crate) struct ScriptFetcher {
     /// The request that every fetch starts from, as the media element builds it.
     request: RequestBuilder,
     core_resource_thread: Mutex<CoreResourceThread>,
     element: Arc<ElementTasks>,
-    /// Whether no fetch was started yet.
-    first_fetch: AtomicBool,
 }
 
 impl ScriptFetcher {
     /// Builds the fetcher of `url` for `element`, as the resource fetch algorithm does. Returns
     /// None if the element has no player, which its tasks need.
     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
-    pub(crate) fn new(
-        element: &HTMLMediaElement,
-        url: ServoUrl,
-        first_fetch_failure_steps: FetchFailureSteps,
-    ) -> Option<Self> {
+    pub(crate) fn new(element: &HTMLMediaElement, url: ServoUrl) -> Option<Self> {
         let global = element.global();
         let tasks =
             element.task_queue(global.task_manager().networking_task_source().to_sendable())?;
@@ -90,13 +80,21 @@ impl ScriptFetcher {
         Some(Self {
             request,
             core_resource_thread: Mutex::new(global.core_resource_thread()),
-            element: Arc::new(ElementTasks {
-                tasks,
-                url,
-                first_fetch_failure_steps,
-            }),
-            first_fetch: AtomicBool::new(true),
+            element: Arc::new(ElementTasks { tasks, url }),
         })
+    }
+
+    /// Whether the Content Security Policy of the element's document blocks the requests of this
+    /// fetcher, which the media cache may not make when it holds the resource already. Reports
+    /// the violations.
+    pub(crate) fn is_blocked_by_csp(&self, cx: &mut JSContext, element: &HTMLMediaElement) -> bool {
+        let global = element.global();
+        global.get_csp_list().should_request_be_blocked(
+            cx,
+            &global,
+            &self.request,
+            Some(element.upcast()),
+        )
     }
 }
 
@@ -126,7 +124,6 @@ impl Fetcher for ScriptFetcher {
         let mut listener = ScriptFetchListener {
             fetch: fetch.clone(),
             element: self.element.clone(),
-            first: self.first_fetch.swap(false, Ordering::AcqRel),
             responded: false,
         };
         fetch_async(
@@ -143,7 +140,6 @@ impl Fetcher for ScriptFetcher {
 struct ElementTasks {
     tasks: MediaElementTaskQueue,
     url: ServoUrl,
-    first_fetch_failure_steps: FetchFailureSteps,
 }
 
 /// The state of one fetch, shared by its handle and by its listener on the `FetchThread`.
@@ -218,8 +214,6 @@ impl Drop for ScriptFetchHandle {
 struct ScriptFetchListener {
     fetch: Arc<ScriptFetch>,
     element: Arc<ElementTasks>,
-    /// Whether this is the first fetch of its fetcher.
-    first: bool,
     /// Whether the response was passed to the sink.
     responded: bool,
 }
@@ -306,19 +300,7 @@ impl ScriptFetchListener {
         }
     }
 
-    /// Ends a fetch that failed. If it is the first fetch of its fetcher and failed before its
-    /// response, the media data cannot be fetched at all, which the element learns even if the
-    /// cache recovers for other readers.
     fn fail(&mut self, error: FetchError) {
-        if self.fetch.is_ended() {
-            return;
-        }
-        if self.first && !self.responded {
-            let element_tasks = self.element.clone();
-            self.element.tasks.queue(move |cx, element| {
-                (element_tasks.first_fetch_failure_steps)(cx, element);
-            });
-        }
         self.fetch.end(Err(error));
     }
 

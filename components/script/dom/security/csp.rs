@@ -19,6 +19,7 @@ use js::context::JSContext;
 use js::realm::CurrentRealm;
 use js::rust::describe_scripted_caller;
 use log::warn;
+use net_traits::request::{ParserMetadata as NetParserMetadata, RequestBuilder};
 use servo_constellation_traits::{LoadData, LoadOrigin};
 use url::Url;
 
@@ -58,6 +59,13 @@ pub(crate) trait CspReporting {
         window: &Window,
         url: Url,
         self_origin: &url::Origin,
+    ) -> bool;
+    fn should_request_be_blocked(
+        &self,
+        cx: &mut JSContext,
+        global: &GlobalScope,
+        request: &RequestBuilder,
+        element: Option<&Element>,
     ) -> bool;
     fn should_elements_inline_type_behavior_be_blocked(
         &self,
@@ -246,6 +254,41 @@ impl CspReporting for Option<CspList> {
             .report_csp_violations(cx, violations, None, None);
 
         is_navigation_response_blocked == CheckResult::Blocked
+    }
+
+    /// <https://www.w3.org/TR/CSP/#should-block-request>, for a request that script checks before
+    /// it is fetched, as when a cache may serve it without a fetch.
+    fn should_request_be_blocked(
+        &self,
+        cx: &mut JSContext,
+        global: &GlobalScope,
+        request: &RequestBuilder,
+        element: Option<&Element>,
+    ) -> bool {
+        let Some(csp_list) = self else {
+            return false;
+        };
+        let url = request.url.url().into_url();
+        let request = Request {
+            url: url.clone(),
+            current_url: url,
+            origin: global.origin().immutable().clone().into_url_origin(),
+            redirect_count: 0,
+            destination: request.destination,
+            initiator: Initiator::None,
+            nonce: request.cryptographic_nonce_metadata.clone(),
+            integrity_metadata: request.integrity_metadata.clone(),
+            parser_metadata: match request.parser_metadata {
+                NetParserMetadata::ParserInserted => ParserMetadata::ParserInserted,
+                NetParserMetadata::NotParserInserted => ParserMetadata::NotParserInserted,
+                NetParserMetadata::Default => ParserMetadata::None,
+            },
+        };
+        let (result, violations) = csp_list.should_request_be_blocked(&request);
+
+        global.report_csp_violations(cx, violations, element, None);
+
+        result == CheckResult::Blocked
     }
 
     /// <https://www.w3.org/TR/CSP/#should-block-inline>

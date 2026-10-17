@@ -1337,7 +1337,7 @@ impl HTMLMediaElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-algorithm>
-    fn load_from_src_object(&self, cx: &JSContext) {
+    fn load_from_src_object(&self, cx: &mut JSContext) {
         self.load_state.set(LoadState::LoadingFromSrcObject);
 
         // Step 9.object.1. Set the currentSrc attribute to the empty string.
@@ -1352,7 +1352,7 @@ impl HTMLMediaElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-algorithm>
-    fn load_from_src_attribute(&self, cx: &JSContext, base_url: ServoUrl, src: &str) {
+    fn load_from_src_attribute(&self, cx: &mut JSContext, base_url: ServoUrl, src: &str) {
         self.load_state.set(LoadState::LoadingFromSrcAttribute);
 
         // Step 9.attribute.1. If the src attribute's value is the empty string, then end
@@ -1383,7 +1383,7 @@ impl HTMLMediaElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-algorithm>
-    fn load_from_source_child(&self, cx: &JSContext, source: &HTMLSourceElement) {
+    fn load_from_source_child(&self, cx: &mut JSContext, source: &HTMLSourceElement) {
         self.load_state.set(LoadState::LoadingFromSourceChild);
 
         // Step 9.children.1. Let pointer be a position defined by two adjacent nodes in the media
@@ -1603,7 +1603,7 @@ impl HTMLMediaElement {
     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>: opens a reader of
     /// the media resource at `url` in the media cache, which fetches it. The player reads from
     /// the reader, or the element pushes the data of the reader into the player.
-    fn open_media_reader(&self, cx: &JSContext, url: ServoUrl) {
+    fn open_media_reader(&self, cx: &mut JSContext, url: ServoUrl) {
         self.close_media_reader();
 
         let id = self.last_reader_id.get().wrapping_add(1);
@@ -1614,16 +1614,32 @@ impl HTMLMediaElement {
                 .media_element_task_source()
                 .to_sendable(),
         );
-        let fetcher = ScriptFetcher::new(
-            self,
-            url.clone(),
-            Box::new(move |cx, element| element.media_reader_failed(cx, id, ReaderError::Network)),
-        );
+        let fetcher = ScriptFetcher::new(self, url.clone());
         let (Some(tasks), Some(fetcher)) = (tasks, fetcher) else {
             error!("Missing media player");
             self.resource_selection_algorithm_failure_steps(cx);
             return;
         };
+
+        // The media cache may hold the resource already and serve it without a fetch, which would
+        // check the request against the Content Security Policy of the document, so the element
+        // checks it first. A blocked request fails as a blocked fetch does.
+        if fetcher.is_blocked_by_csp(cx, self) {
+            let this = Trusted::new(self);
+            let generation_id = self.generation_id.get();
+            self.owner_global()
+                .task_manager()
+                .media_element_task_source()
+                .queue(task!(media_request_blocked: move |cx| {
+                    let this = this.root();
+                    if generation_id == this.generation_id.get() && !this.in_error_state() {
+                        // => "If the media data cannot be fetched at all, due to network
+                        // errors, causing the user agent to give up trying to fetch the resource"
+                        this.media_data_processing_failure_steps(cx);
+                    }
+                }));
+            return;
+        }
 
         let document = self.owner_document();
         let origin = document.origin().immutable().clone();
@@ -1748,7 +1764,7 @@ impl HTMLMediaElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
-    fn resource_fetch_algorithm(&self, cx: &JSContext, resource: Resource) {
+    fn resource_fetch_algorithm(&self, cx: &mut JSContext, resource: Resource) {
         // Step 5.remote.1. Optionally, run the following substeps. This is the expected behavior
         // if the user agent intends to not attempt to fetch the resource until the user requests
         // it explicitly (e.g. as a way to implement the preload attribute's none keyword).
@@ -1847,7 +1863,7 @@ impl HTMLMediaElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
-    fn fetch_resource(&self, cx: &JSContext, resource: Resource) {
+    fn fetch_resource(&self, cx: &mut JSContext, resource: Resource) {
         if let Err(e) = self.create_media_player(&resource) {
             error!("Create media player error {:?}", e);
             self.resource_selection_algorithm_failure_steps(cx);
