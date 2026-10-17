@@ -6,7 +6,7 @@ use std::cell::{Cell, Ref, RefCell};
 use std::collections::VecDeque;
 use std::f64;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -109,6 +109,7 @@ use crate::fetch::fetch::{RequestWithGlobalScope, create_a_potential_cors_reques
 use crate::fetch::network_listener::{self, FetchResponseListener, ResourceTimingListener};
 use crate::realms::enter_auto_realm;
 use crate::runtime::job_queue::MicrotaskRunnable;
+use crate::tasks::task_source::SendableTaskSource;
 
 /// A CSS file to style the media controls.
 static MEDIA_CONTROL_CSS: &str = include_str!("../../../resources/media-controls.css");
@@ -2570,6 +2571,18 @@ impl HTMLMediaElement {
         self.video_renderer.lock().unwrap().set_poster_frame(image);
 
         self.upcast::<Node>().dirty(no_gc, NodeDamage::Other);
+    }
+
+    /// A queue of tasks on `task_source` for this element and its current player, if it has one.
+    #[expect(dead_code, reason = "Used from the next patch")]
+    pub(crate) fn task_queue(
+        &self,
+        task_source: SendableTaskSource,
+    ) -> Option<MediaElementTaskQueue> {
+        Some(MediaElementTaskQueue {
+            event_handler: Arc::downgrade(self.event_handler.borrow().as_ref()?),
+            task_source: Arc::new(Mutex::new(task_source)),
+        })
     }
 
     fn player_id(&self) -> Option<usize> {
@@ -5129,5 +5142,37 @@ impl Drop for HTMLMediaElementEventHandler {
         // script thread, which is guaranteed by ownership of the `event handler` in the IPC router
         // callback (queued task to the media element task source) and the media element itself.
         assert_in_script();
+    }
+}
+
+/// Queues tasks for a media element from any thread, without keeping the element alive. A task
+/// only runs while the element keeps the player that it had when the queue was made.
+#[derive(Clone)]
+#[expect(dead_code, reason = "Used from the next patch")]
+pub(crate) struct MediaElementTaskQueue {
+    event_handler: Weak<Mutex<HTMLMediaElementEventHandler>>,
+    task_source: Arc<Mutex<SendableTaskSource>>,
+}
+
+impl MediaElementTaskQueue {
+    #[expect(dead_code, reason = "Used from the next patch")]
+    pub(crate) fn queue<F>(&self, task: F)
+    where
+        F: FnOnce(&mut JSContext, &HTMLMediaElement) + Send + 'static,
+    {
+        let event_handler = self.event_handler.clone();
+        self.task_source
+            .lock()
+            .unwrap()
+            .queue(task!(media_element_task: move |cx| {
+                let Some(event_handler) = event_handler.upgrade() else {
+                    return;
+                };
+                let element = event_handler.lock().unwrap().element.root();
+                drop(event_handler);
+                if let Some(element) = element {
+                    task(cx, &element);
+                }
+            }));
     }
 }

@@ -139,6 +139,18 @@ impl UrlWithBlobClaim {
     pub fn url(&self) -> ServoUrl {
         self.url.clone()
     }
+
+    /// Claims the blob again, for one more request. A request ends the claim of its token once
+    /// it is done, so a claim that is kept for several requests hands each a new one, as sending
+    /// it to another process does.
+    pub fn with_new_token(&self) -> Self {
+        Self {
+            url: self.url.clone(),
+            token: self.token.as_ref().map(|guard| TokenSerializationGuard {
+                token: Arc::new(guard.token.refresh()),
+            }),
+        }
+    }
 }
 
 impl Deref for UrlWithBlobClaim {
