@@ -342,6 +342,9 @@ pub struct Preferences {
     pub network_enforce_tls_enabled: bool,
     pub network_enforce_tls_localhost: bool,
     pub network_enforce_tls_onion: bool,
+    /// How long a fetch may stay suspended, in milliseconds. A fetch suspended for longer
+    /// ends with a network error, so that it does not hold its connection forever.
+    pub network_fetch_suspend_timeout_ms: u64,
     pub network_http_cache_disabled: bool,
     /// The path to a disk cache file. Empty string disables the disk cache.
     pub network_http_disk_cache: String,
@@ -570,6 +573,7 @@ impl Preferences {
             network_enforce_tls_enabled: false,
             network_enforce_tls_localhost: false,
             network_enforce_tls_onion: false,
+            network_fetch_suspend_timeout_ms: 60000,
             network_http_cache_disabled: false,
             network_http_disk_cache: String::new(),
             network_http_disk_cache_size: 1024 * 1024 * 100, // Roughtly 100MB

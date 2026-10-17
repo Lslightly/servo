@@ -13,10 +13,10 @@ use futures::future::ready;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Bytes, Incoming};
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response as HyperResponse};
-use hyper_util::rt::tokio::TokioIo;
+use hyper_util::rt::tokio::{TokioExecutor, TokioIo};
 use net_traits::AsyncRuntime;
 use net_traits::blob_url_store::UrlWithBlobClaim;
 use rustls_pki_types::pem::PemObject;
@@ -176,6 +176,32 @@ where
         + Sync
         + 'static,
 {
+    make_tls_server(handler, vec![])
+}
+
+/// Like [`make_ssl_server`], but serves HTTP/2, negotiated with ALPN, and returns an `https`
+/// URL.
+pub fn make_h2_ssl_server<H>(handler: H) -> (Server, UrlWithBlobClaim)
+where
+    H: Fn(HyperRequest<Incoming>, &mut HyperResponse<BoxBody<Bytes, hyper::Error>>)
+        + Send
+        + Sync
+        + 'static,
+{
+    let (server, mut url) = make_tls_server(handler, vec![b"h2".to_vec()]);
+    url.as_mut_url().set_scheme("https").unwrap();
+    (server, url)
+}
+
+/// A TLS server that offers `alpn_protocols`, and serves HTTP/2 if the client chooses `h2`
+/// and HTTP/1.1 otherwise.
+fn make_tls_server<H>(handler: H, alpn_protocols: Vec<Vec<u8>>) -> (Server, UrlWithBlobClaim)
+where
+    H: Fn(HyperRequest<Incoming>, &mut HyperResponse<BoxBody<Bytes, hyper::Error>>)
+        + Send
+        + Sync
+        + 'static,
+{
     if !async_runtime_initialized() {
         let _ = &*ASYNC_RUNTIME;
     }
@@ -190,11 +216,12 @@ where
     let certificates = load_certificates_from_pem().expect("Invalid certificate");
     let key = load_private_key_from_file().expect("Invalid key");
 
-    let config = rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates.clone(), key)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
         .expect("Could not create rustls ServerConfig");
+    config.alpn_protocols = alpn_protocols;
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
     let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
@@ -214,25 +241,32 @@ where
             let handler = handler.clone();
             let acceptor = acceptor.clone();
 
-            let stream = match acceptor.accept(stream).await {
-                Ok(stream) => stream,
-                Err(_) => {
-                    eprintln!("Error handling TLS stream.");
-                    continue;
-                },
-            };
+            spawn_task(async move {
+                let stream = match acceptor.accept(stream).await {
+                    Ok(stream) => stream,
+                    Err(_) => {
+                        eprintln!("Error handling TLS stream.");
+                        return;
+                    },
+                };
 
-            let _ = http1::Builder::new()
-                .serve_connection(
-                    TokioIo::new(stream),
-                    service_fn(move |req: HyperRequest<Incoming>| {
-                        let mut response =
-                            HyperResponse::new(Empty::new().map_err(|_| unreachable!()).boxed());
-                        handler(req, &mut response);
-                        ready(Ok::<_, Infallible>(response))
-                    }),
-                )
-                .await;
+                let negotiated_http2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
+                let service = service_fn(move |req: HyperRequest<Incoming>| {
+                    let mut response =
+                        HyperResponse::new(Empty::new().map_err(|_| unreachable!()).boxed());
+                    handler(req, &mut response);
+                    ready(Ok::<_, Infallible>(response))
+                });
+                if negotiated_http2 {
+                    let _ = http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                } else {
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                }
+            });
         }
     };
 

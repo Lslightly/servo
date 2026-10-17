@@ -3,7 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::{io, mem, str};
 
 use base64::Engine as _;
@@ -41,9 +42,10 @@ use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::CallbackSetter;
 use servo_base::id::PipelineId;
-use servo_url::{Host, ServoUrl};
-use tokio::sync::Mutex as TokioMutex;
+use servo_config::pref;
+use servo_url::{Host, ImmutableOrigin, ServoUrl};
 use tokio::sync::mpsc::{UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender};
+use tokio::sync::{Mutex as TokioMutex, watch};
 
 use crate::connector::CACertificates;
 use crate::devtools::{
@@ -114,18 +116,186 @@ pub struct FetchContext {
     pub in_flight_keep_alive_records: SharedInflightKeepAliveRecords,
 }
 
+/// Whether the network may read the response body of a fetch.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum FetchFlowState {
+    #[default]
+    Running,
+    /// Reading the body is suspended until the fetch is resumed or cancelled.
+    Suspended,
+    Cancelled,
+}
+
+/// How many fetches to one origin may be suspended at once, per [`crate::http_loader::HttpState`].
+/// The fetches to an origin share an HTTP/2 connection, and every suspended stream keeps up to its
+/// stream window (2 MiB) of the connection window (5 MiB): three would stall the connection.
+const MAX_SUSPENDED_FETCHES_PER_ORIGIN: usize = 2;
+
+/// The number of suspended fetches per origin.
+#[derive(Default)]
+pub struct SuspendedFetches {
+    counts: Mutex<FxHashMap<ImmutableOrigin, usize>>,
+    /// Replaces the `network_fetch_suspend_timeout_ms` pref.
+    timeout: Option<Duration>,
+}
+
+impl SuspendedFetches {
+    /// Suspended fetches that end after `timeout` instead of the time that the
+    /// `network_fetch_suspend_timeout_ms` pref sets.
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            counts: Default::default(),
+            timeout: Some(timeout),
+        }
+    }
+
+    /// How long a fetch may stay suspended.
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+            .unwrap_or_else(|| Duration::from_millis(pref!(network_fetch_suspend_timeout_ms)))
+    }
+
+    fn try_acquire(self: &Arc<Self>, origin: &ImmutableOrigin) -> Option<SuspensionSlot> {
+        let mut counts = self.counts.lock();
+        let count = counts.entry(origin.clone()).or_default();
+        if *count >= MAX_SUSPENDED_FETCHES_PER_ORIGIN {
+            return None;
+        }
+        *count += 1;
+        Some(SuspensionSlot {
+            fetches: self.clone(),
+            origin: origin.clone(),
+        })
+    }
+}
+
+/// A suspended fetch counted in [`SuspendedFetches`] until this is dropped.
+struct SuspensionSlot {
+    fetches: Arc<SuspendedFetches>,
+    origin: ImmutableOrigin,
+}
+
+impl Drop for SuspensionSlot {
+    fn drop(&mut self) {
+        let mut counts = self.fetches.counts.lock();
+        if let Some(count) = counts.get_mut(&self.origin) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.origin);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct Suspension {
+    /// Identifies the network body that `budget` belongs to.
+    generation: u64,
+    /// Where a suspension is counted, while a body is read from the network.
+    budget: Option<(Arc<SuspendedFetches>, ImmutableOrigin)>,
+    /// Held while the fetch is suspended.
+    slot: Option<SuspensionSlot>,
+}
+
+/// Lets the resource thread cancel, suspend and resume a fetch.
+/// Only the HTTP network fetch honours suspension, while it reads the body.
 #[derive(Default)]
 pub struct CancellationListener {
-    cancelled: AtomicBool,
+    state: watch::Sender<FetchFlowState>,
+    suspension: Mutex<Suspension>,
 }
 
 impl CancellationListener {
     pub(crate) fn cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        *self.state.borrow() == FetchFlowState::Cancelled
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed)
+        self.state.send_replace(FetchFlowState::Cancelled);
+        self.suspension.lock().slot = None;
+    }
+
+    /// Suspend reading the body, and return whether the fetch is suspended now. A suspension is
+    /// ignored unless the body is being read from the network and fewer than
+    /// `MAX_SUSPENDED_FETCHES_PER_ORIGIN` fetches to its origin are suspended.
+    pub fn suspend(&self) -> bool {
+        let mut suspension = self.suspension.lock();
+        if suspension.slot.is_some() {
+            return true;
+        }
+        let Some(slot) = suspension
+            .budget
+            .as_ref()
+            .and_then(|(fetches, origin)| fetches.try_acquire(origin))
+        else {
+            return false;
+        };
+        let suspended = self.state.send_if_modified(|state| {
+            let running = *state == FetchFlowState::Running;
+            if running {
+                *state = FetchFlowState::Suspended;
+            }
+            running
+        });
+        if suspended {
+            suspension.slot = Some(slot);
+        }
+        suspended
+    }
+
+    pub fn resume(&self) {
+        let mut suspension = self.suspension.lock();
+        self.state.send_if_modified(|state| {
+            let suspended = *state == FetchFlowState::Suspended;
+            if suspended {
+                *state = FetchFlowState::Running;
+            }
+            suspended
+        });
+        suspension.slot = None;
+    }
+
+    /// A receiver that is notified whenever the fetch is cancelled, suspended or resumed.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<FetchFlowState> {
+        self.state.subscribe()
+    }
+
+    /// Allow suspending the fetch while a body is read from the network, counted in `fetches`
+    /// for `origin`. A fetch that is suspended already, such as across a redirect, is counted for
+    /// `origin` from now on, and resumed if `origin` has no place left. Returns what to pass to
+    /// [`Self::end_network_body`].
+    pub(crate) fn start_network_body(
+        &self,
+        fetches: Arc<SuspendedFetches>,
+        origin: ImmutableOrigin,
+    ) -> u64 {
+        let mut suspension = self.suspension.lock();
+        suspension.generation += 1;
+        if let Some(slot) = suspension.slot.take() {
+            drop(slot);
+            suspension.slot = fetches.try_acquire(&origin);
+            if suspension.slot.is_none() {
+                self.state.send_if_modified(|state| {
+                    let suspended = *state == FetchFlowState::Suspended;
+                    if suspended {
+                        *state = FetchFlowState::Running;
+                    }
+                    suspended
+                });
+            }
+        }
+        suspension.budget = Some((fetches, origin));
+        suspension.generation
+    }
+
+    /// The body that [`Self::start_network_body`] returned `generation` for has ended, so a
+    /// suspension no longer has an effect and releases its slot.
+    pub(crate) fn end_network_body(&self, generation: u64) {
+        let mut suspension = self.suspension.lock();
+        if suspension.generation == generation {
+            suspension.budget = None;
+            suspension.slot = None;
+        }
     }
 }
 

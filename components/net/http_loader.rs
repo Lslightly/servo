@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use async_recursion::async_recursion;
 use content_security_policy::percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use embedder_traits::{AuthenticationResponse, GenericEmbedderProxy};
-use futures::{TryFutureExt, TryStreamExt, future};
+use futures::{StreamExt, TryFutureExt, future};
 use headers::authorization::Basic;
 use headers::{
     AccessControlAllowCredentials, AccessControlAllowHeaders, AccessControlAllowMethods,
@@ -89,7 +89,9 @@ use crate::embedder::NetToEmbedderMsg;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::FetchParams;
 use crate::fetch::headers::{SecFetchDest, SecFetchMode, SecFetchSite, SecFetchUser};
-use crate::fetch::methods::{Data, DoneChannel, FetchContext, Target, fetch, main_fetch};
+use crate::fetch::methods::{
+    Data, DoneChannel, FetchContext, FetchFlowState, SuspendedFetches, Target, fetch, main_fetch,
+};
 use crate::hsts::HstsList;
 use crate::http_cache::{
     CacheKey, CachedResourcesOrGuard, HttpCache, ValidationStatus, construct_response,
@@ -124,6 +126,8 @@ pub struct HttpState {
     pub client: ServoClient,
     pub override_manager: CertificateErrorOverrideManager,
     pub embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    /// The fetches of this state that are suspended, which share its connections.
+    pub suspended_fetches: StdArc<SuspendedFetches>,
 }
 
 impl HttpState {
@@ -1652,7 +1656,11 @@ async fn http_network_or_cache_fetch(
                 if http_request.cache_mode != CacheMode::NoStore {
                     // Step 10.5.2 Store httpRequest and forwardResponse in httpCache, as per the
                     //             "Storing Responses in Caches" chapter of HTTP Caching.
-                    cache_guard.insert(http_request, forward_response);
+                    cache_guard.insert_from_network(
+                        http_request,
+                        forward_response,
+                        Some(&context.cancellation_listener),
+                    );
                 }
             }
             false
@@ -2367,12 +2375,8 @@ async fn http_network_fetch(
         )
     };
 
-    let done_sender2 = done_sender.clone();
-    let done_sender3 = done_sender.clone();
-    let timing_ptr2 = context.timing.clone();
-    let timing_ptr3 = context.timing.clone();
-    let url1 = request.url();
-    let url2 = url1.clone();
+    let timing = context.timing.clone();
+    let request_url = request.url();
 
     let prealloc_size: usize = if let Some(possible_length) = response_stream
         .headers()
@@ -2407,36 +2411,76 @@ async fn http_network_fetch(
         Vec::new()
     };
     *response_body.lock() = ResponseBody::Receiving(body);
-    let response_body2 = response_body.clone();
     let aborted = response.aborted.clone();
-    let aborted2 = response.aborted.clone();
+    let suspend_timeout = context.state.suspended_fetches.timeout();
+    let network_body = cancellation_listener
+        .start_network_body(context.state.suspended_fetches.clone(), url.origin());
 
-    spawn_task(
-        response_stream
-            .into_body()
-            .try_fold(response_body, move |response_body_accumulator, chunk| {
-                if cancellation_listener.cancelled() {
-                    let mut body = response_body_accumulator.lock();
-                    aborted.store(true, Ordering::Release);
-                    *body = ResponseBody::Done(vec![]);
-                    drop(body);
-                    let _ = done_sender.send(Data::Cancelled);
-                    return future::ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "Fetch aborted",
-                    )));
-                }
-                if let ResponseBody::Receiving(ref mut body) = *response_body_accumulator.lock() {
-                    if keep_body {
-                        body.extend_from_slice(&chunk);
+    spawn_task(async move {
+        let mut body_stream = response_stream.into_body();
+        let mut flow_state = cancellation_listener.subscribe();
+        let mut suspended_until = None;
+        let mut suspended_too_long = false;
+        let result = loop {
+            // While suspended, do not poll the body: what is not read is held back
+            // by TCP or HTTP/2 flow control, and the body continues with the next byte.
+            let state = *flow_state.borrow_and_update();
+            let cancelled = match state {
+                FetchFlowState::Cancelled => true,
+                FetchFlowState::Suspended => {
+                    let deadline = *suspended_until
+                        .get_or_insert_with(|| tokio::time::Instant::now() + suspend_timeout);
+                    match tokio::time::timeout_at(deadline, flow_state.changed()).await {
+                        Ok(Ok(())) => continue,
+                        // Nobody can resume the fetch once the listener is gone.
+                        Ok(Err(_)) => true,
+                        Err(_) => {
+                            suspended_too_long = true;
+                            break Err(std::io::Error::other("Fetch suspended for too long"));
+                        },
                     }
-                    let _ = done_sender.send(Data::Payload(chunk));
-                }
-                future::ready(Ok(response_body_accumulator))
-            })
-            .and_then(move |complete_response_body| {
-                debug!("successfully finished response for {:?}", url1);
-                let mut body = complete_response_body.lock();
+                },
+                FetchFlowState::Running => {
+                    suspended_until = None;
+                    false
+                },
+            };
+            if cancelled {
+                let mut body = response_body.lock();
+                aborted.store(true, Ordering::Release);
+                *body = ResponseBody::Done(vec![]);
+                drop(body);
+                let _ = done_sender.send(Data::Cancelled);
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "Fetch aborted",
+                ));
+            }
+            let chunk = tokio::select! {
+                biased;
+                Ok(()) = flow_state.changed() => continue,
+                chunk = body_stream.next() => chunk,
+            };
+            match chunk {
+                Some(Ok(chunk)) => {
+                    if let ResponseBody::Receiving(ref mut body) = *response_body.lock() {
+                        if keep_body {
+                            body.extend_from_slice(&chunk);
+                        }
+                        let _ = done_sender.send(Data::Payload(chunk));
+                    }
+                },
+                Some(Err(error)) => break Err(error),
+                None => break Ok(()),
+            }
+        };
+
+        cancellation_listener.end_network_body(network_body);
+
+        match result {
+            Ok(()) => {
+                debug!("successfully finished response for {:?}", request_url);
+                let mut body = response_body.lock();
                 let mut completed_body = match *body {
                     ResponseBody::Receiving(ref mut body) => std::mem::take(body),
                     _ => vec![],
@@ -2458,31 +2502,35 @@ async fn http_network_fetch(
                     &devtools_request,
                     devtools_chan,
                 );
-                timing_ptr2.set_attribute(ResourceAttribute::ResponseEnd);
-                let _ = done_sender2.send(Data::Done);
-                future::ready(Ok(()))
-            })
-            .map_err(move |error| {
+                timing.set_attribute(ResourceAttribute::ResponseEnd);
+                let _ = done_sender.send(Data::Done);
+            },
+            Err(error) => {
                 // The body is incomplete, so keep the HTTP cache from using it.
-                aborted2.store(true, Ordering::Release);
+                aborted.store(true, Ordering::Release);
                 if let std::io::ErrorKind::InvalidData = error.kind() {
-                    debug!("Content decompression error for {:?}", url2);
-                    let _ = done_sender3.send(Data::Error(NetworkError::DecompressionError));
-                    let mut body = response_body2.lock();
+                    debug!("Content decompression error for {:?}", request_url);
+                    let _ = done_sender.send(Data::Error(NetworkError::DecompressionError));
+                    let mut body = response_body.lock();
 
                     *body = ResponseBody::Done(vec![]);
                 }
-                debug!("finished response for {:?}", url2);
-                let mut body = response_body2.lock();
+                if suspended_too_long {
+                    debug!("Fetch suspended for too long: {:?}", request_url);
+                    let _ = done_sender.send(Data::Error(NetworkError::ConnectionFailure));
+                }
+                debug!("finished response for {:?}", request_url);
+                let mut body = response_body.lock();
                 let completed_body = match *body {
                     ResponseBody::Receiving(ref mut body) => std::mem::take(body),
                     _ => vec![],
                 };
                 *body = ResponseBody::Done(completed_body);
-                timing_ptr3.set_attribute(ResourceAttribute::ResponseEnd);
-                let _ = done_sender3.send(Data::Done);
-            }),
-    );
+                timing.set_attribute(ResourceAttribute::ResponseEnd);
+                let _ = done_sender.send(Data::Done);
+            },
+        }
+    });
 
     // TODO these substeps aren't possible yet
     // Substep 1

@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
@@ -32,29 +32,39 @@ use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Body, Bytes, Frame, Incoming};
 use hyper::{Request as HyperRequest, Response as HyperResponse};
 use net::async_runtime::spawn_task;
+use net::connector::CACertificates;
 use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
-use net::fetch::methods::{self, CancellationListener, FetchContext};
+use net::fetch::methods::{self, CancellationListener, FetchContext, SuspendedFetches};
 use net::http_loader::{determine_requests_referrer, serialize_origin};
-use net::resource_thread::AuthCacheEntry;
+use net::protocols::ProtocolRegistry;
+use net::resource_thread::{AuthCacheEntry, new_core_resource_thread};
 use net::test::DECODER_BUFFER_SIZE;
+use net::test_util::make_h2_ssl_server;
 use net_traits::blob_url_store::UrlWithBlobClaim;
+use net_traits::fetch::fetch_controller::FetchController;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{
     CredentialsMode, Destination, Referrer, Request, RequestBuilder, RequestMode,
     TraversableForUserPrompts, create_request_body_with_content,
 };
 use net_traits::response::{CacheState, Response, ResponseBody};
-use net_traits::{CookieSource, FetchTaskTarget, NetworkError, ReferrerPolicy, get_current_locale};
+use net_traits::{
+    CookieSource, CoreResourceMsg, CoreResourceThread, FetchResponseMsg, FetchTaskTarget,
+    NetworkError, ReferrerPolicy, fetch_async, get_current_locale,
+};
 use parking_lot::{Mutex, RwLock};
+use profile_traits::mem::ProfilerChan as MemProfilerChan;
+use profile_traits::time::ProfilerChan;
+use servo_base::generic_channel;
 use servo_base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
 use servo_url::{ImmutableOrigin, ServoUrl};
 use url::Url;
 
 use crate::{
-    create_generic_embedder_proxy_and_receiver, fetch, fetch_with_context, make_body, make_server,
-    make_ssl_server, mock_origin, new_fetch_context, receive_credential_prompt_msgs,
-    replace_host_table, spawn_blocking_task,
+    create_generic_embedder_proxy, create_generic_embedder_proxy_and_receiver, create_http_state,
+    fetch, fetch_with_context, make_body, make_server, make_ssl_server, mock_origin,
+    new_fetch_context, receive_credential_prompt_msgs, replace_host_table, spawn_blocking_task,
 };
 
 fn assert_cookie_for_domain(
@@ -2418,9 +2428,7 @@ fn wait_until(condition: impl Fn() -> bool) {
 }
 
 /// Wait for the end of a fetch started with `start_fetch`, for at most ten seconds.
-fn wait_for_fetch(
-    mut receiver: tokio::sync::oneshot::Receiver<(Response, usize)>,
-) -> (Response, usize) {
+fn wait_for_fetch<T>(mut receiver: tokio::sync::oneshot::Receiver<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(result) = receiver.try_recv() {
@@ -2517,4 +2525,617 @@ fn test_fetch_waiting_for_a_response_whose_fetch_failed_is_woken_up() {
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
 
     let _ = server.close();
+}
+
+const STREAM_CHUNK_SIZE: usize = 64 * 1024;
+const STREAM_LENGTH: usize = 64 * 1024 * 1024;
+
+/// Chunk `index` of the bodies that the streaming servers send. Every chunk differs, so a lost,
+/// duplicated or reordered chunk does not compare equal.
+fn stream_chunk(index: usize) -> Bytes {
+    let mut chunk = vec![index as u8; STREAM_CHUNK_SIZE];
+    chunk[..8].copy_from_slice(&(index as u64).to_le_bytes());
+    Bytes::from(chunk)
+}
+
+/// A body of `length` bytes: the first chunk, then the others once `release` fires. `sent`
+/// counts the bytes handed to the connection.
+fn streaming_body(
+    length: usize,
+    release: tokio::sync::oneshot::Receiver<()>,
+    sent: Arc<AtomicUsize>,
+) -> impl futures::Stream<Item = Result<Frame<Bytes>, hyper::Error>> {
+    use futures::StreamExt;
+    let rest = stream::once(release).flat_map(move |_| stream::iter(1..length / STREAM_CHUNK_SIZE));
+    stream::iter([0]).chain(rest).map(move |index| {
+        sent.fetch_add(STREAM_CHUNK_SIZE, Ordering::SeqCst);
+        Ok(Frame::data(stream_chunk(index)))
+    })
+}
+
+struct StreamingServer {
+    server: net::test_util::Server,
+    url: UrlWithBlobClaim,
+    /// For each request, in the order they arrive: lets the server send the body after its first
+    /// chunk.
+    releases: Vec<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// For each request: the number of body bytes the server has handed to its connection.
+    sent: Vec<Arc<AtomicUsize>>,
+    /// Whether the last request came over HTTP/2.
+    used_http2: Arc<AtomicBool>,
+}
+
+impl StreamingServer {
+    fn release(&mut self, request: usize) {
+        let _ = self.releases[request].take().unwrap().send(());
+    }
+
+    fn sent(&self, request: usize) -> usize {
+        self.sent[request].load(Ordering::SeqCst)
+    }
+}
+
+/// A server for `requests` requests to one URL, which answers each with a body of `length` bytes.
+/// It sends the first chunk, then waits for `StreamingServer::release`, then sends the rest as
+/// fast as the client reads it. If `cacheable`, the HTTP cache may store the responses.
+fn make_streaming_server(
+    http2: bool,
+    requests: usize,
+    length: usize,
+    cacheable: bool,
+) -> StreamingServer {
+    let (releases, release_receivers): (Vec<_>, Vec<_>) = (0..requests)
+        .map(|_| {
+            let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+            (Some(sender), Some(receiver))
+        })
+        .unzip();
+    let release_receivers = Mutex::new(release_receivers);
+    let sent: Vec<_> = (0..requests)
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect();
+    let sent_clone = sent.clone();
+    let next_request = AtomicUsize::new(0);
+    let used_http2 = Arc::new(AtomicBool::new(false));
+    let used_http2_clone = used_http2.clone();
+    let handler =
+        move |request: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            used_http2_clone.store(request.version() == http::Version::HTTP_2, Ordering::SeqCst);
+            let index = next_request.fetch_add(1, Ordering::SeqCst);
+            response
+                .headers_mut()
+                .typed_insert(ContentLength(length as u64));
+            if cacheable {
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("max-age=3600"),
+                );
+            }
+            let release = release_receivers
+                .lock()
+                .get_mut(index)
+                .and_then(Option::take)
+                .expect("more requests than expected");
+            *response.body_mut() =
+                StreamBody::new(streaming_body(length, release, sent_clone[index].clone())).boxed();
+        };
+    let (server, url) = if http2 {
+        make_h2_ssl_server(handler)
+    } else {
+        make_server(handler)
+    };
+    StreamingServer {
+        server,
+        url,
+        releases,
+        sent,
+        used_http2,
+    }
+}
+
+/// A server for one HTTP/1.1 request, which announces `STREAM_LENGTH` bytes and sends the first
+/// chunk, then waits for the returned sender, sends the next `chunks - 1` chunks and closes the
+/// connection. The flag is set once the connection is closed.
+fn make_closing_server(
+    chunks: usize,
+) -> (
+    UrlWithBlobClaim,
+    std::sync::mpsc::Sender<()>,
+    Arc<AtomicBool>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = ServoUrl::parse(&format!(
+        "http://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    ))
+    .unwrap();
+    let (release_sender, release) = std::sync::mpsc::channel();
+    let closed = Arc::new(AtomicBool::new(false));
+    let closed_clone = closed.clone();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut buffer = [0; 1024];
+            let length = stream.read(&mut buffer).unwrap();
+            assert!(length > 0);
+            request.extend_from_slice(&buffer[..length]);
+        }
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {STREAM_LENGTH}\r\n\r\n"
+        )
+        .unwrap();
+        stream.write_all(&stream_chunk(0)).unwrap();
+        release.recv().unwrap();
+        for index in 1..chunks {
+            stream.write_all(&stream_chunk(index)).unwrap();
+        }
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
+        closed_clone.store(true, Ordering::SeqCst);
+    });
+    (UrlWithBlobClaim::new(url, None), release_sender, closed)
+}
+
+fn new_streaming_fetch_context(server: &StreamingServer) -> FetchContext {
+    let context = new_fetch_context(None, None);
+    for certificate in server.server.certificates.iter().flatten() {
+        context.state.override_manager.add_override(certificate);
+    }
+    context
+}
+
+/// A context for another fetch with the same HTTP state, with a listener of its own.
+fn with_new_listener(context: &FetchContext) -> FetchContext {
+    let mut context = context.clone();
+    context.cancellation_listener = Arc::new(Default::default());
+    context
+}
+
+fn build_streaming_request(url: &UrlWithBlobClaim) -> RequestBuilder {
+    RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+        .destination(Destination::Video)
+        .origin(url.clone().origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+}
+
+/// Compares a body with what the streaming servers send.
+#[derive(Default)]
+struct StreamVerifier {
+    received: usize,
+    mismatch: bool,
+}
+
+impl StreamVerifier {
+    fn verify(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            let offset = self.received % STREAM_CHUNK_SIZE;
+            let length = data.len().min(STREAM_CHUNK_SIZE - offset);
+            let expected = stream_chunk(self.received / STREAM_CHUNK_SIZE);
+            self.mismatch |= data[..length] != expected[offset..offset + length];
+            data = &data[length..];
+            self.received += length;
+        }
+    }
+
+    /// Whether the body arrived whole and intact.
+    fn is_intact(&self, length: usize) -> bool {
+        self.received == length && !self.mismatch
+    }
+}
+
+/// Verifies the body of a fetch from a streaming server, and publishes how many bytes arrived
+/// so far.
+struct StreamCollector {
+    sender: Option<tokio::sync::oneshot::Sender<(Response, StreamVerifier)>>,
+    verifier: Option<StreamVerifier>,
+    received: Arc<AtomicUsize>,
+}
+
+impl FetchTaskTarget for StreamCollector {
+    fn process_request_body(&mut self, _: &Request) {}
+    fn process_response(&mut self, _: &Request, _: &Response) {}
+    fn process_response_chunk(&mut self, _: &Request, chunk: Bytes) {
+        let verifier = self.verifier.as_mut().unwrap();
+        verifier.verify(&chunk);
+        self.received.store(verifier.received, Ordering::SeqCst);
+    }
+    fn process_response_eof(&mut self, _: &Request, response: &Response) {
+        let _ = self
+            .sender
+            .take()
+            .unwrap()
+            .send((response.clone(), self.verifier.take().unwrap()));
+    }
+    fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
+    fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
+}
+
+/// A fetch started with `start_streaming_fetch`.
+struct StreamingFetch {
+    listener: Arc<CancellationListener>,
+    /// The number of body bytes received so far.
+    received: Arc<AtomicUsize>,
+    end: tokio::sync::oneshot::Receiver<(Response, StreamVerifier)>,
+}
+
+impl StreamingFetch {
+    fn received(&self) -> usize {
+        self.received.load(Ordering::SeqCst)
+    }
+
+    /// Wait for the first chunk of the body.
+    fn wait_for_first_chunk(&self) {
+        wait_until(|| self.received() == STREAM_CHUNK_SIZE);
+    }
+
+    /// Wait for the end of the fetch, and return its response and what arrived of the body.
+    fn wait_for_end(self) -> (Response, StreamVerifier) {
+        wait_for_fetch(self.end)
+    }
+}
+
+/// Start a fetch of `url` in the background, the way a video element does.
+fn start_streaming_fetch(url: &UrlWithBlobClaim, context: FetchContext) -> StreamingFetch {
+    let (sender, end) = tokio::sync::oneshot::channel();
+    let received = Arc::new(AtomicUsize::new(0));
+    let listener = context.cancellation_listener.clone();
+    let mut target = StreamCollector {
+        sender: Some(sender),
+        verifier: Some(StreamVerifier::default()),
+        received: received.clone(),
+    };
+    let request = build_streaming_request(url).build();
+    spawn_task(async move {
+        methods::fetch(request, &mut target, &context).await;
+    });
+    StreamingFetch {
+        listener,
+        received,
+        end,
+    }
+}
+
+/// Wait until `count` has not changed for half a second, and return it.
+fn wait_for_plateau(count: &AtomicUsize) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = count.load(Ordering::SeqCst);
+    let mut unchanged_since = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_millis(20));
+        let current = count.load(Ordering::SeqCst);
+        if current != last {
+            last = current;
+            unchanged_since = Instant::now();
+        } else if unchanged_since.elapsed() >= Duration::from_millis(500) {
+            return current;
+        }
+        assert!(Instant::now() < deadline, "the server kept sending");
+    }
+}
+
+fn check_suspended_fetch_holds_back_the_server(http2: bool) {
+    let mut server = make_streaming_server(http2, 1, STREAM_LENGTH, false);
+    let fetch = start_streaming_fetch(&server.url, new_streaming_fetch_context(&server));
+
+    fetch.wait_for_first_chunk();
+    assert!(fetch.listener.suspend());
+    assert!(fetch.listener.suspend());
+    server.release(0);
+    let held = wait_for_plateau(&server.sent[0]);
+    // Over HTTP/1.1, what the kernel buffers depends on the host; HTTP/2 holds the stream window.
+    let bound = if http2 {
+        STREAM_LENGTH / 4
+    } else {
+        STREAM_LENGTH
+    };
+    assert!(
+        held < bound,
+        "the server sent {held} bytes while the fetch was suspended"
+    );
+    assert_eq!(fetch.received(), STREAM_CHUNK_SIZE);
+
+    fetch.listener.resume();
+    fetch.listener.resume();
+    let listener = fetch.listener.clone();
+    let (response, body) = fetch.wait_for_end();
+    assert!(!response.is_network_error());
+    assert!(!response.aborted.load(Ordering::SeqCst));
+    assert!(body.is_intact(STREAM_LENGTH));
+    assert_eq!(server.sent(0), STREAM_LENGTH);
+    assert_eq!(server.used_http2.load(Ordering::SeqCst), http2);
+    assert!(!listener.suspend());
+
+    let _ = server.server.close();
+}
+
+#[test]
+fn test_suspended_fetch_holds_back_the_server_until_resumed() {
+    check_suspended_fetch_holds_back_the_server(false);
+}
+
+#[test]
+fn test_suspended_http2_fetch_holds_back_the_server_until_resumed() {
+    check_suspended_fetch_holds_back_the_server(true);
+}
+
+#[test]
+fn test_cancelling_a_suspended_fetch_ends_it() {
+    let mut server = make_streaming_server(false, 1, STREAM_LENGTH, false);
+    let fetch = start_streaming_fetch(&server.url, new_streaming_fetch_context(&server));
+
+    fetch.wait_for_first_chunk();
+    assert!(fetch.listener.suspend());
+    server.release(0);
+    assert!(wait_for_plateau(&server.sent[0]) < STREAM_LENGTH);
+
+    let cancelled_at = Instant::now();
+    fetch.listener.cancel();
+    let (response, body) = fetch.wait_for_end();
+    assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+    assert!(response.aborted.load(Ordering::SeqCst));
+    assert_eq!(body.received, STREAM_CHUNK_SIZE);
+
+    let _ = server.server.close();
+}
+
+#[test]
+fn test_cancelling_a_fetch_that_waits_for_the_network_ends_it() {
+    // The server is never released, so it sends nothing after the first chunk.
+    let server = make_streaming_server(false, 1, STREAM_LENGTH, false);
+    let fetch = start_streaming_fetch(&server.url, new_streaming_fetch_context(&server));
+
+    fetch.wait_for_first_chunk();
+    let cancelled_at = Instant::now();
+    fetch.listener.cancel();
+    let (response, body) = fetch.wait_for_end();
+    assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+    assert!(response.aborted.load(Ordering::SeqCst));
+    assert_eq!(body.received, STREAM_CHUNK_SIZE);
+
+    let _ = server.server.close();
+}
+
+#[test]
+fn test_fetch_whose_connection_closes_while_suspended_ends_when_resumed() {
+    let chunks = 2;
+    let (url, release, closed) = make_closing_server(chunks);
+    let fetch = start_streaming_fetch(&url, new_fetch_context(None, None));
+
+    fetch.wait_for_first_chunk();
+    assert!(fetch.listener.suspend());
+    release.send(()).unwrap();
+    wait_until(|| closed.load(Ordering::SeqCst));
+    assert_eq!(fetch.received(), STREAM_CHUNK_SIZE);
+
+    fetch.listener.resume();
+    let (response, body) = fetch.wait_for_end();
+    assert!(response.aborted.load(Ordering::SeqCst));
+    assert!(!body.mismatch);
+    assert_eq!(body.received, chunks * STREAM_CHUNK_SIZE);
+}
+
+#[test]
+fn test_fetch_suspended_for_too_long_ends_with_a_network_error() {
+    let mut server = make_streaming_server(false, 3, STREAM_LENGTH, false);
+    let mut context = new_streaming_fetch_context(&server);
+    let mut state = create_http_state(None);
+    state.suspended_fetches = Arc::new(SuspendedFetches::with_timeout(Duration::from_millis(300)));
+    context.state = Arc::new(state);
+    let fetches: Vec<_> = (0..2)
+        .map(|_| {
+            let fetch = start_streaming_fetch(&server.url, with_new_listener(&context));
+            fetch.wait_for_first_chunk();
+            fetch
+        })
+        .collect();
+
+    let suspended_at = Instant::now();
+    for (index, fetch) in fetches.iter().enumerate() {
+        assert!(fetch.listener.suspend());
+        server.release(index);
+    }
+    for fetch in fetches {
+        let (response, body) = fetch.wait_for_end();
+        assert_eq!(
+            response.get_network_error(),
+            Some(&NetworkError::ConnectionFailure)
+        );
+        assert_eq!(body.received, STREAM_CHUNK_SIZE);
+    }
+    let elapsed = suspended_at.elapsed();
+    assert!(elapsed >= Duration::from_millis(300));
+    assert!(elapsed < Duration::from_secs(5));
+
+    // The fetches that ended gave up their places among the suspended fetches of the origin.
+    let fetch = start_streaming_fetch(&server.url, with_new_listener(&context));
+    fetch.wait_for_first_chunk();
+    assert!(fetch.listener.suspend());
+    fetch.listener.cancel();
+    let _ = fetch.wait_for_end();
+
+    let _ = server.server.close();
+}
+
+#[test]
+fn test_at_most_two_fetches_per_origin_are_suspended() {
+    let mut server = make_streaming_server(false, 5, STREAM_LENGTH, false);
+    let context = new_streaming_fetch_context(&server);
+    let start = |server: &StreamingServer| {
+        let fetch = start_streaming_fetch(&server.url, with_new_listener(&context));
+        fetch.wait_for_first_chunk();
+        fetch
+    };
+    let first = start(&server);
+    let second = start(&server);
+    let third = start(&server);
+
+    assert!(first.listener.suspend());
+    assert!(second.listener.suspend());
+    assert!(!third.listener.suspend());
+    for index in 0..3 {
+        server.release(index);
+    }
+    let (_, body) = third.wait_for_end();
+    assert!(body.is_intact(STREAM_LENGTH));
+    assert!(wait_for_plateau(&server.sent[0]) < STREAM_LENGTH);
+    assert!(wait_for_plateau(&server.sent[1]) < STREAM_LENGTH);
+
+    // Cancelling and resuming give up the places of the suspended fetches.
+    first.listener.cancel();
+    second.listener.resume();
+    let fourth = start(&server);
+    let fifth = start(&server);
+    assert!(fourth.listener.suspend());
+    assert!(fifth.listener.suspend());
+
+    let (response, _) = first.wait_for_end();
+    assert!(response.aborted.load(Ordering::SeqCst));
+    let (_, body) = second.wait_for_end();
+    assert!(body.is_intact(STREAM_LENGTH));
+    for fetch in [fourth, fifth] {
+        fetch.listener.cancel();
+        let _ = fetch.wait_for_end();
+    }
+
+    let _ = server.server.close();
+}
+
+#[test]
+fn test_fetch_waiting_for_a_suspended_response_uses_the_network() {
+    // Small enough for the HTTP cache to store the response to a video request.
+    let length = 16 * STREAM_CHUNK_SIZE;
+    let mut server = make_streaming_server(false, 3, length, true);
+    let context = new_streaming_fetch_context(&server);
+    let request = build_streaming_request(&server.url).build();
+    let producer = start_streaming_fetch(&server.url, context.clone());
+    producer.wait_for_first_chunk();
+    assert_eq!(stored_response_count(&context, &request), 1);
+
+    // A fetch that waits for the stored body when its producer is suspended...
+    let waiting = start_streaming_fetch(&server.url, with_new_listener(&context));
+    wait_until(|| awaiting_consumer_count(&context, &request) == 1);
+    assert!(producer.listener.suspend());
+    server.release(1);
+    let (response, body) = waiting.wait_for_end();
+    assert!(matches!(response.cache_state, CacheState::None));
+    assert!(body.is_intact(length));
+
+    // ...and one that starts while the producer is suspended, go to the network.
+    let later = start_streaming_fetch(&server.url, with_new_listener(&context));
+    server.release(2);
+    let (response, body) = later.wait_for_end();
+    assert!(matches!(response.cache_state, CacheState::None));
+    assert!(body.is_intact(length));
+    assert_eq!(server.sent(1), length);
+    assert_eq!(server.sent(2), length);
+
+    producer.listener.resume();
+    server.release(0);
+    let (_, body) = producer.wait_for_end();
+    assert!(body.is_intact(length));
+
+    let _ = server.server.close();
+}
+
+/// Fetch a `data:` URL through the fetch thread and `resource_thread`, and wait for its body.
+fn fetch_data_url(resource_thread: &CoreResourceThread) -> Vec<u8> {
+    let url = UrlWithBlobClaim::new(ServoUrl::parse("data:,data").unwrap(), None);
+    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .policy_container(Default::default());
+    let (sender, receiver) = unbounded();
+    fetch_async(
+        resource_thread,
+        request,
+        None,
+        Box::new(move |message| {
+            let _ = sender.send(message);
+        }),
+    );
+    let mut body = Vec::new();
+    loop {
+        match receiver.recv_timeout(Duration::from_secs(10)).unwrap() {
+            FetchResponseMsg::ProcessResponseChunk(_, chunk) => body.extend_from_slice(&chunk),
+            FetchResponseMsg::ProcessResponseEOF(_, result, _) => {
+                assert!(result.is_ok(), "{result:?}");
+                return body;
+            },
+            _ => {},
+        }
+    }
+}
+
+#[test]
+fn test_fetch_controller_suspends_and_resumes_a_fetch() {
+    let (time_sender, _time_receiver) = generic_channel::channel().unwrap();
+    let (memory_sender, _memory_receiver) = generic_channel::channel().unwrap();
+    let (resource_thread, _private_resource_thread) = new_core_resource_thread(
+        None,
+        ProfilerChan(Some(time_sender)),
+        MemProfilerChan(memory_sender),
+        create_generic_embedder_proxy(),
+        None,
+        CACertificates::Default,
+        false, /* ignore_certificate_errors */
+        Arc::new(ProtocolRegistry::with_internal_protocols()),
+    );
+
+    let mut server = make_streaming_server(false, 1, STREAM_LENGTH, false);
+    let request = build_streaming_request(&server.url);
+    let controller = FetchController::new(request.id, false, resource_thread.clone());
+    let (sender, receiver) = unbounded();
+    fetch_async(
+        &resource_thread,
+        request,
+        None,
+        Box::new(move |message| {
+            let _ = sender.send(message);
+        }),
+    );
+
+    let mut verifier = StreamVerifier::default();
+    let receive = |verifier: &mut StreamVerifier| loop {
+        match receiver.recv_timeout(Duration::from_secs(10)).unwrap() {
+            FetchResponseMsg::ProcessResponseChunk(_, chunk) => {
+                verifier.verify(&chunk);
+                return false;
+            },
+            FetchResponseMsg::ProcessResponseEOF(_, result, _) => {
+                assert!(result.is_ok());
+                return true;
+            },
+            _ => {},
+        }
+    };
+    while verifier.received < STREAM_CHUNK_SIZE {
+        assert!(!receive(&mut verifier));
+    }
+    controller.suspend();
+    // Net handles messages from the fetch thread in order, so it handled the suspension once a
+    // later fetch has ended.
+    assert_eq!(fetch_data_url(&resource_thread), b"data");
+    server.release(0);
+    assert!(wait_for_plateau(&server.sent[0]) < STREAM_LENGTH);
+    assert_eq!(verifier.received, STREAM_CHUNK_SIZE);
+
+    controller.resume();
+    while !receive(&mut verifier) {}
+    assert!(verifier.is_intact(STREAM_LENGTH));
+
+    // After the end, both do nothing: no message arrives and net keeps working.
+    controller.suspend();
+    controller.resume();
+    controller.suspend();
+    assert_eq!(fetch_data_url(&resource_thread), b"data");
+    assert!(receiver.try_recv().is_err());
+
+    let _ = server.server.close();
+    let (exit_sender, exit_receiver) = generic_channel::oneshot().unwrap();
+    resource_thread
+        .send(CoreResourceMsg::Exit(exit_sender))
+        .unwrap();
+    exit_receiver.recv().unwrap();
 }

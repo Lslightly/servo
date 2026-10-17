@@ -4208,8 +4208,8 @@ pub(crate) struct HTMLMediaElementFetchContext {
     origin_clean: bool,
     /// The buffered data source which to be processed by media backend.
     data_source: RefCell<BufferedDataSource>,
-    /// Fetch controller. Allows cancelling the current fetch request by
-    /// manually calling its .cancel() method or automatically on Drop.
+    /// Fetch controller. Allows aborting the current fetch request with its abort()
+    /// method. Dropping it does not cancel the fetch.
     fetch_controller: FetchController,
 }
 

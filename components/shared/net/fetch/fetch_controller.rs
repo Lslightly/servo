@@ -5,7 +5,7 @@
 use malloc_size_of_derive::MallocSizeOf;
 
 use crate::request::RequestId;
-use crate::{CoreResourceThread, cancel_async_fetch};
+use crate::{CoreResourceThread, cancel_async_fetch, resume_async_fetch, suspend_async_fetch};
 
 /// <https://fetch.spec.whatwg.org/#fetch-controller-state>
 #[derive(Default, MallocSizeOf, PartialEq)]
@@ -60,6 +60,34 @@ impl FetchController {
                 // we don't actually care if the other side heard.
                 cancel_async_fetch(vec![request_id], core_resource_thread);
             }
+        }
+    }
+
+    /// Ask to stop reading the response body until [`Self::resume`] is called, so that flow
+    /// control holds back the server. Data that was already received is still delivered.
+    ///
+    /// This is advisory, so the body may keep arriving: net ignores it when the body is not
+    /// being read from the network (cache hits, other schemes, after the end), and when two
+    /// fetches to the origin of the request are suspended already.
+    ///
+    /// A fetch that stays suspended for longer than the `network_fetch_suspend_timeout_ms` pref
+    /// ends with [`NetworkError::ConnectionFailure`](crate::NetworkError::ConnectionFailure),
+    /// which cannot be told apart from a lost connection. A consumer that suspended a fetch
+    /// should restart it after such an error, for example with a Range request for the rest.
+    pub fn suspend(&self) {
+        if let (Some(request_id), Some(core_resource_thread)) =
+            (self.request_id, &self.core_resource_thread)
+        {
+            suspend_async_fetch(request_id, core_resource_thread);
+        }
+    }
+
+    /// Continue reading a response body that [`Self::suspend`] stopped.
+    pub fn resume(&self) {
+        if let (Some(request_id), Some(core_resource_thread)) =
+            (self.request_id, &self.core_resource_thread)
+        {
+            resume_async_fetch(request_id, core_resource_thread);
         }
     }
 

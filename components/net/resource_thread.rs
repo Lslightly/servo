@@ -226,6 +226,7 @@ fn create_http_states(
         )),
         override_manager,
         embedder_proxy: embedder_proxy.clone(),
+        suspended_fetches: Default::default(),
     };
 
     let override_manager = CertificateErrorOverrideManager::new();
@@ -242,6 +243,7 @@ fn create_http_states(
         )),
         override_manager,
         embedder_proxy,
+        suspended_fetches: Default::default(),
     };
 
     (Arc::new(http_state), Arc::new(private_http_state))
@@ -450,6 +452,16 @@ impl ResourceChannelManager {
                     .filter_map(|request_id| self.cancellation_listener(request_id))
                 {
                     cancellation_listener.cancel();
+                }
+            },
+            CoreResourceMsg::Suspend(request_id) => {
+                if let Some(cancellation_listener) = self.cancellation_listener(request_id) {
+                    let _ = cancellation_listener.suspend();
+                }
+            },
+            CoreResourceMsg::Resume(request_id) => {
+                if let Some(cancellation_listener) = self.cancellation_listener(request_id) {
+                    cancellation_listener.resume();
                 }
             },
             CoreResourceMsg::DeleteCookiesForSites(sites, sender) => {

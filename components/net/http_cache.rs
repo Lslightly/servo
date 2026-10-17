@@ -32,10 +32,11 @@ use servo_arc::Arc;
 use servo_config::pref;
 use servo_url::ServoUrl;
 use tokio::sync::mpsc::{UnboundedSender as TokioSender, unbounded_channel as unbounded};
-use tokio::sync::{OwnedRwLockWriteGuard, RwLock as TokioRwLock};
+use tokio::sync::{OwnedRwLockWriteGuard, RwLock as TokioRwLock, watch};
 
+use crate::async_runtime::spawn_task;
 use crate::disk_cache::DiskCache;
-use crate::fetch::methods::{Data, DoneChannel};
+use crate::fetch::methods::{CancellationListener, Data, DoneChannel, FetchFlowState};
 
 /// A duration in seconds.
 ///
@@ -141,6 +142,10 @@ pub struct CachedResource {
     #[conditional_malloc_size_of]
     #[serde(skip)]
     awaiting_body: Arc<ParkingLotMutex<Vec<TokioSender<Data>>>>,
+    /// The state of the fetch that reads the body from the network, if it is not done.
+    #[ignore_malloc_size_of = "Channel"]
+    #[serde(skip)]
+    producer_state: Option<watch::Receiver<FetchFlowState>>,
     metadata: CachedMetadata,
     location_url: Option<Result<ServoUrl, String>>,
     status: HttpStatus,
@@ -162,6 +167,26 @@ impl CachedResource {
     /// so that it can be removed.
     fn is_abandoned(&self) -> bool {
         self.aborted.load(Ordering::Acquire) && self.awaiting_body.lock().is_empty()
+    }
+
+    /// Wait for the body, which is still being received, through `done_sender`. A suspended
+    /// fetch may not receive it for a long time, so treat its suspension like an abort: send
+    /// [`Data::Cancelled`], and the waiting fetch goes to the network instead.
+    fn add_awaiting_body(&self, done_sender: TokioSender<Data>) {
+        self.awaiting_body.lock().push(done_sender.clone());
+        let Some(mut producer_state) = self.producer_state.clone() else {
+            return;
+        };
+        spawn_task(async move {
+            tokio::select! {
+                suspended = producer_state.wait_for(|state| *state == FetchFlowState::Suspended) => {
+                    if suspended.is_ok() {
+                        let _ = done_sender.send(Data::Cancelled);
+                    }
+                },
+                _ = done_sender.closed() => {},
+            }
+        });
     }
 }
 
@@ -619,7 +644,7 @@ fn create_cached_response(
         debug!("existing body is in progress");
         let (done_sender, done_receiver) = unbounded();
         *done_chan = Some((done_sender.clone(), done_receiver));
-        cached_resource.awaiting_body.lock().push(done_sender);
+        cached_resource.add_awaiting_body(done_sender);
     }
     drop(body);
     let resource_timing = ResourceFetchTiming::new(request.timing_type());
@@ -683,6 +708,7 @@ fn create_resource_with_bytes_from_resource(
         body: Arc::new(ParkingLotMutex::new(ResponseBody::Done(bytes.to_owned()))),
         aborted: resource.aborted.clone(),
         awaiting_body: Arc::new(ParkingLotMutex::new(vec![])),
+        producer_state: None,
         metadata: resource.metadata.clone(),
         location_url: resource.location_url.clone(),
         status: StatusCode::PARTIAL_CONTENT.into(),
@@ -1006,7 +1032,7 @@ pub fn refresh(
         match in_progress_channel {
             Some((done_sender, done_receiver)) => {
                 *done_chan = Some((done_sender.clone(), done_receiver));
-                cached_resource.awaiting_body.lock().push(done_sender);
+                cached_resource.add_awaiting_body(done_sender);
             },
             None => *done_chan = None,
         }
@@ -1246,6 +1272,17 @@ pub enum CachedResourcesOrGuard<'a> {
 impl<'a> CachedResourcesOrGuard<'a> {
     /// Insert into the cache according to http spec
     pub fn insert(self, request: &Request, response: &Response) {
+        self.insert_from_network(request, response, None);
+    }
+
+    /// Like [`Self::insert`], for a response whose body the fetch with `producer` is still
+    /// reading from the network.
+    pub(crate) fn insert_from_network(
+        self,
+        request: &Request,
+        response: &Response,
+        producer: Option<&CancellationListener>,
+    ) {
         if pref!(network_http_cache_disabled) {
             return;
         }
@@ -1286,6 +1323,7 @@ impl<'a> CachedResourcesOrGuard<'a> {
             body: response.body.clone(),
             aborted: response.aborted.clone(),
             awaiting_body: Arc::new(ParkingLotMutex::new(vec![])),
+            producer_state: producer.map(CancellationListener::subscribe),
             metadata: cacheable_metadata,
             location_url: response.location_url.clone(),
             status: response.status.clone(),
