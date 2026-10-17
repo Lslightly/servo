@@ -1017,6 +1017,10 @@ impl HTMLMediaElement {
                 .set(self.current_playback_position.get());
         }
 
+        if !self.upcast::<Node>().is_connected() {
+            self.cancel_suspended_fetch();
+        }
+
         self.update_media_state();
     }
 
@@ -2110,6 +2114,31 @@ impl HTMLMediaElement {
         }
     }
 
+    /// Cancels the current fetch if it is suspended, to restart it once the player needs data
+    /// again, for when nothing might resume it.
+    pub(crate) fn cancel_suspended_fetch(&self) {
+        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() &&
+            current_fetch_context.is_suspended()
+        {
+            self.cancel_to_restart(current_fetch_context);
+        }
+    }
+
+    pub(crate) fn has_suspended_fetch(&self) -> bool {
+        self.current_fetch_context
+            .borrow()
+            .as_ref()
+            .is_some_and(HTMLMediaElementFetchContext::is_suspended)
+    }
+
+    /// Whether the fetch may be suspended rather than cancelled when the player has enough data.
+    /// Nothing might resume the fetch of an element that is paused outside a document, or in a
+    /// document that is not fully active.
+    fn may_suspend_fetch(&self) -> bool {
+        self.owner_document().is_fully_active() &&
+            (self.upcast::<Node>().is_connected() || !self.Paused())
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
     /// > When a media element's download has been suspended, the user agent must queue a media
     /// > element task given the media element to set the networkState to NETWORK_IDLE and fire
@@ -2145,6 +2174,8 @@ impl HTMLMediaElement {
             return;
         };
         current_fetch_context.suspend(Some(reply));
+        self.owner_document()
+            .register_media_element_with_suspended_fetch(self);
     }
 
     /// Backs off as a fetch that cannot be suspended does, for a fetch that net did not suspend.
@@ -4530,7 +4561,7 @@ impl HTMLMediaElementFetchContext {
             return;
         }
         self.data_source.borrow().set_locked(true);
-        if self.from_network {
+        if self.from_network && element.may_suspend_fetch() {
             element.suspend_fetch(self);
         } else if self.is_seekable {
             element.cancel_to_restart(self);
@@ -4549,6 +4580,7 @@ impl HTMLMediaElementFetchContext {
     /// Marks the response as complete, which also ends a suspension.
     fn end(&mut self) {
         self.suspension = None;
+        self.fetch_controller.ignore();
     }
 
     fn cancel(&mut self, reason: CancelReason) {
@@ -4563,6 +4595,16 @@ impl HTMLMediaElementFetchContext {
 
     fn cancel_reason(&self) -> &Option<CancelReason> {
         &self.cancel_reason
+    }
+}
+
+impl Drop for HTMLMediaElementFetchContext {
+    fn drop(&mut self) {
+        // Nothing else cancels a fetch that is still running, and a suspended one holds its
+        // connection until net gives up on it.
+        if self.cancel_reason.is_none() {
+            self.fetch_controller.abort();
+        }
     }
 }
 
