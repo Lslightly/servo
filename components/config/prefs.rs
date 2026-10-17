@@ -352,10 +352,6 @@ pub struct Preferences {
     /// How long the media cache keeps the fetch of a seekable media resource suspended before it
     /// cancels it, in seconds.
     pub media_cache_suspend_seconds: u64,
-    /// How long a media element keeps the fetch of a media resource with range support
-    /// suspended while its player has enough data, before it cancels the fetch to restart it
-    /// once the player needs data again, in milliseconds.
-    pub media_fetch_suspension_timeout_ms: u64,
     /// Enable hardware acceleration for video playback.
     pub media_glvideo_enabled: bool,
     /// Enable a non-standard event handler for verifying behavior of media elements during tests.
@@ -605,7 +601,6 @@ impl Preferences {
             media_cache_reuse_seconds: 300,
             media_cache_resume_seconds: 10,
             media_cache_suspend_seconds: 30,
-            media_fetch_suspension_timeout_ms: 30000,
             media_glvideo_enabled: false,
             media_testing_enabled: false,
             network_connection_timeout: 15,

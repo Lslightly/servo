@@ -9,20 +9,14 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use dom_struct::dom_struct;
 use embedder_traits::{MediaPositionState, MediaSessionEvent, MediaSessionPlaybackState};
-use headers::{ContentLength, ContentRange, HeaderMapExt, Range as RangeHeader};
 use html5ever::{LocalName, Prefix, local_name};
-use http::StatusCode;
-use http::header::{CONTENT_ENCODING, HeaderMap};
 use js::context::{JSContext, NoGC};
 use js::realm::CurrentRealm;
 use layout_api::MediaFrame;
-use net_traits::fetch::fetch_controller::FetchController;
-use net_traits::request::{Destination, RequestId};
-use net_traits::{CoreResourceThread, FetchMetadata, Metadata, NetworkError, ResourceFetchTiming};
+use net_traits::request::CorsSettings;
 use pixels::RasterImage;
 use script_bindings::assert::assert_in_script;
 use script_bindings::cell::DomRefCell;
@@ -30,14 +24,19 @@ use script_bindings::codegen::InheritTypes::{
     ElementTypeId, HTMLElementTypeId, HTMLMediaElementTypeId, NodeTypeId,
 };
 use script_bindings::weakref::WeakRef;
-use servo_base::generic_channel::{self, GenericCallback};
+use servo_base::generic_channel;
 use servo_config::pref;
 use servo_media::player::audio::AudioRenderer;
 use servo_media::player::video::{VideoFrame, VideoFrameRenderer};
 use servo_media::player::{PlaybackState, Player, PlayerError, PlayerEvent, SeekLock, StreamType};
 use servo_media::{ClientContextId, ServoMedia, SupportsMediaType};
-use servo_url::ServoUrl;
+use servo_media_cache::{
+    CorsMode, MediaCache, MediaReader, ReadResult, ReaderActivity, ReaderError, ReaderEvent,
+    ResourceKey,
+};
+use servo_url::{ImmutableOrigin, ServoUrl};
 use stylo_atoms::Atom;
+use url::Position;
 use uuid::Uuid;
 
 use crate::dom::audio::audiotrack::AudioTrack;
@@ -66,7 +65,6 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom, UnrootedDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::blob::Blob;
-use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::document::Document;
 use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{
@@ -75,8 +73,8 @@ use crate::dom::element::{
 };
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
-use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::embedded_content::media_elements::media_frame_renderer::MediaFrameRenderer;
+use crate::dom::html::embedded_content::media_elements::script_fetcher::ScriptFetcher;
 use crate::dom::html::htmlaudioelement::HTMLAudioElement;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlsourceelement::HTMLSourceElement;
@@ -87,7 +85,6 @@ use crate::dom::medialist::MediaList;
 use crate::dom::mediastream::MediaStream;
 use crate::dom::node::virtualmethods::VirtualMethods;
 use crate::dom::node::{Node, NodeDamage, NodeTraits, UnbindContext};
-use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::promise::Promise;
 use crate::dom::rules_for_rendering::{
     RulesForUpdatingTheTextTrackRendering, ShouldResetRenderingControls,
@@ -102,11 +99,9 @@ use crate::dom::trackevent::TrackEvent;
 use crate::dom::url::URL;
 use crate::dom::videotrack::VideoTrack;
 use crate::dom::videotracklist::VideoTrackList;
-use crate::dom::{RootedPromise, TracedPromise, referrer_policy_for_element};
+use crate::dom::{RootedPromise, TracedPromise};
 use crate::event_loop::document_loader::{LoadBlocker, LoadType};
 use crate::event_loop::script_thread::ScriptThread;
-use crate::fetch::fetch::{RequestWithGlobalScope, create_a_potential_cors_request};
-use crate::fetch::network_listener::{self, FetchResponseListener, ResourceTimingListener};
 use crate::realms::enter_auto_realm;
 use crate::runtime::job_queue::MicrotaskRunnable;
 use crate::tasks::task_source::SendableTaskSource;
@@ -122,10 +117,12 @@ static MEDIA_CONTROL_JS: &str = include_str!("../../../resources/media-controls.
 /// instead of strict equality. (Unit is second)
 const SEEK_POSITION_THRESHOLD: f64 = 0.5;
 
-/// The most bytes that a fetch queues for a player that has enough data, before the fetch is
-/// cancelled to be restarted once the player needs data again. A suspended fetch only queues the
-/// data that was in flight, unless net does not suspend it.
-const MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
+/// The size of the chunks of media data that are pushed into a player.
+const PUSH_CHUNK_SIZE: usize = 64 * 1024;
+
+/// The most bytes that one task pushes into a player, so that pushing data that the media cache
+/// holds already does not keep the script thread busy for long.
+const MAX_BYTES_PUSHED_PER_TASK: usize = 1024 * 1024;
 
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 #[derive(JSTraceable, MallocSizeOf)]
@@ -277,10 +274,6 @@ pub(crate) struct HTMLMediaElement {
     /// URL of the media resource, if any.
     #[no_trace]
     resource_url: DomRefCell<Option<ServoUrl>>,
-    /// URL of the media resource, if the resource is set through the src_object attribute and it
-    /// is a blob.
-    #[no_trace]
-    blob_url: DomRefCell<Option<ServoUrl>>,
     /// <https://html.spec.whatwg.org/multipage/#dom-media-played>
     played: DomRefCell<TimeRangesContainer>,
     // https://html.spec.whatwg.org/multipage/#dom-media-audiotracks
@@ -292,8 +285,18 @@ pub(crate) struct HTMLMediaElement {
     /// Time of last timeupdate notification.
     #[ignore_malloc_size_of = "Defined in std::time"]
     next_timeupdate_event: Cell<Instant>,
-    /// Latest fetch request context.
-    current_fetch_context: RefCell<Option<HTMLMediaElementFetchContext>>,
+    /// The reader of the media resource in the media cache, if the element reads one.
+    #[ignore_malloc_size_of = "The media cache measures the media data"]
+    #[no_trace]
+    media_reader: RefCell<Option<MediaResourceReader>>,
+    /// Identifies the reader that the element opened last.
+    last_reader_id: Cell<u32>,
+    /// Whether the media data is CORS-same-origin. Once a response for the current media resource
+    /// was CORS-cross-origin, it stays false until the resource fetch algorithm runs again.
+    /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
+    origin_clean: Cell<bool>,
+    /// Whether playback was requested since the media element load algorithm last ran.
+    playback_requested: Cell<bool>,
     /// Media controls id.
     /// In order to workaround the lack of privileged JS context, we secure the
     /// the access to the "privileged" document.servoGetMediaControls(id) API by
@@ -455,13 +458,15 @@ impl HTMLMediaElement {
             seeking: Cell::new(false),
             current_seek_position: Cell::new(f64::NAN),
             resource_url: DomRefCell::new(None),
-            blob_url: DomRefCell::new(None),
             played: DomRefCell::new(TimeRangesContainer::default()),
             audio_tracks_list: Default::default(),
             video_tracks_list: Default::default(),
             text_tracks_list: Default::default(),
             next_timeupdate_event: Cell::new(Instant::now() + Duration::from_millis(250)),
-            current_fetch_context: RefCell::new(None),
+            media_reader: Default::default(),
+            last_reader_id: Cell::new(0),
+            origin_clean: Cell::new(true),
+            playback_requested: Cell::new(false),
             media_controls_id: DomRefCell::new(None),
             did_perform_automatic_track_selection: Default::default(),
             position_when_time_marches_on_ran: Default::default(),
@@ -481,7 +486,11 @@ impl HTMLMediaElement {
 
     fn set_paused(&self, paused: bool) {
         self.paused.set(paused);
+        if !paused {
+            self.playback_requested.set(true);
+        }
         self.update_keep_alive();
+        self.update_reader_activity();
     }
 
     fn set_seeking(&self, seeking: bool) {
@@ -501,9 +510,9 @@ impl HTMLMediaElement {
 
     /// Whether the element may still play audio or fire events without script acting on it, as
     /// in other browsers: while it delays the load event (resource selection and loading up to
-    /// HAVE_CURRENT_DATA), and, with a resource and no error, while it seeks, or, until it has
-    /// ended playback, while it plays (also while waiting for data) or is eligible for autoplay.
-    /// While a fetch is in progress, the fetch listener keeps the element alive anyway.
+    /// HAVE_CURRENT_DATA), and, with a resource and no error, while it downloads the resource or
+    /// seeks, or, until it has ended playback, while it plays (also while waiting for data) or is
+    /// eligible for autoplay.
     fn has_pending_activity(&self) -> bool {
         if self.delaying_the_load_event_flag.borrow().is_some() {
             return true;
@@ -516,7 +525,10 @@ impl HTMLMediaElement {
         {
             return false;
         }
-        if self.seeking.get() {
+        if self.seeking.get() ||
+            (self.network_state.get() == NetworkState::Loading &&
+                self.media_reader.borrow().is_some())
+        {
             return true;
         }
         if self.ended_playback(LoopCondition::Included) {
@@ -1016,10 +1028,6 @@ impl HTMLMediaElement {
             // Step 2.4. Set the official playback position to the current playback position.
             self.official_playback_position
                 .set(self.current_playback_position.get());
-        }
-
-        if !self.upcast::<Node>().is_connected() {
-            self.cancel_suspended_fetch();
         }
 
         self.update_media_state();
@@ -1591,83 +1599,126 @@ impl HTMLMediaElement {
         }
     }
 
-    fn fetch_request(&self, cx: &JSContext, offset: Option<u64>, seek_lock: Option<SeekLock>) {
-        if self.resource_url.borrow().is_none() && self.blob_url.borrow().is_none() {
-            error!("Missing request url");
-            if let Some(seek_lock) = seek_lock {
-                seek_lock.unlock(/* successful seek */ false);
-            }
+    /// Steps 5.remote.2 to 5.remote.8 of
+    /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>: opens a reader of
+    /// the media resource at `url` in the media cache, which fetches it. The player reads from
+    /// the reader, or the element pushes the data of the reader into the player.
+    fn open_media_reader(&self, cx: &JSContext, url: ServoUrl) {
+        self.close_media_reader();
+
+        let id = self.last_reader_id.get().wrapping_add(1);
+        self.last_reader_id.set(id);
+        let tasks = self.task_queue(
+            self.owner_global()
+                .task_manager()
+                .media_element_task_source()
+                .to_sendable(),
+        );
+        let fetcher = ScriptFetcher::new(
+            self,
+            url.clone(),
+            Box::new(move |cx, element| element.media_reader_failed(cx, id, ReaderError::Network)),
+        );
+        let (Some(tasks), Some(fetcher)) = (tasks, fetcher) else {
+            error!("Missing media player");
             self.resource_selection_algorithm_failure_steps(cx);
             return;
-        }
+        };
 
         let document = self.owner_document();
-        let destination = match self.media_type_id() {
-            HTMLMediaElementTypeId::HTMLAudioElement => Destination::Audio,
-            HTMLMediaElementTypeId::HTMLVideoElement => Destination::Video,
+        let origin = document.origin().immutable().clone();
+        let key = ResourceKey {
+            url: url.as_url()[..Position::AfterQuery].to_owned(),
+            cors_mode: match cors_setting_for_element(self.upcast()) {
+                None => CorsMode::NoCors,
+                Some(CorsSettings::Anonymous) => CorsMode::Anonymous,
+                Some(CorsSettings::UseCredentials) => CorsMode::UseCredentials,
+            },
+            // Every opaque origin serializes as "null", but is only the same as itself.
+            origin: match origin {
+                ImmutableOrigin::Opaque(_) => format!("{origin:?}"),
+                ImmutableOrigin::Tuple(..) => origin.ascii_serialization().into_owned(),
+            },
         };
-        let mut headers = HeaderMap::new();
-        if let Ok(range_header_value) = RangeHeader::bytes(offset.unwrap_or(0)..) {
-            headers.typed_insert(range_header_value);
+        let reader = Arc::new(MediaCache::get().open(key, Arc::new(fetcher)));
+        let observer_tasks = tasks.clone();
+        reader.set_observer(Box::new(move |event| {
+            observer_tasks.queue(move |cx, element| element.handle_reader_event(cx, id, event));
+        }));
+
+        let pulls = self.player.borrow().as_ref().is_some_and(|player| {
+            player
+                .lock()
+                .unwrap()
+                .set_data_source(reader.clone())
+                .is_ok()
+        });
+        if !pulls {
+            reader.set_waker(Box::new(move || {
+                tasks.queue(move |cx, element| element.push_media_data(cx, id));
+            }));
         }
-        let url = match self.resource_url.borrow().as_ref() {
-            Some(url) => url.clone(),
-            None => self.blob_url.borrow().as_ref().unwrap().clone(),
+
+        *self.media_reader.borrow_mut() = Some(MediaResourceReader {
+            reader,
+            id,
+            push: (!pulls).then(PushAdapter::default),
+            metadata: None,
+            activity: None,
+            download_suspended: false,
+        });
+        self.origin_clean.set(true);
+        document.register_media_element_with_reader(self);
+        self.update_reader_activity();
+        self.update_keep_alive();
+    }
+
+    /// Stops reading the media resource from the media cache, which cancels the fetches that no
+    /// other reader needs. Later reads of a player that holds the reader fail.
+    pub(crate) fn close_media_reader(&self) {
+        let Some(media_reader) = self.media_reader.borrow_mut().take() else {
+            return;
         };
+        media_reader.reader.close();
+        self.update_keep_alive();
+    }
 
-        let cors_setting = cors_setting_for_element(self.upcast());
-        let global = self.global();
-        let request = create_a_potential_cors_request(
-            Some(document.webview_id()),
-            url.clone(),
-            destination,
-            cors_setting,
-            None,
-            global.get_referrer(),
-        )
-        .with_global_scope(&global)
-        .headers(headers)
-        .referrer_policy(referrer_policy_for_element(self.upcast()));
+    pub(crate) fn has_media_reader(&self) -> bool {
+        self.media_reader.borrow().is_some()
+    }
 
-        let mut current_fetch_context = self.current_fetch_context.borrow_mut();
-        let mut resumes_suspended_download = false;
-        // A fetch that restarts the fetch of the same media resource, after a seek or once the
-        // player needs data again, is no more origin-clean than the media data fetched so far.
-        let mut origin_clean = true;
-        if let Some(ref mut current_fetch_context) = *current_fetch_context {
-            resumes_suspended_download = offset.is_some() &&
-                (current_fetch_context.cancel_reason() == &Some(CancelReason::Backoff) ||
-                    current_fetch_context.is_download_suspended());
-            if offset.is_some() {
-                origin_clean = current_fetch_context.origin_is_clean();
+    /// Tells the media cache how much of the media resource the element needs: what playback at
+    /// its bitrate needs while it plays, the metadata for preload=metadata until playback is
+    /// requested, and otherwise what the cache keeps for a paused reader, as when the document is
+    /// not fully active.
+    pub(crate) fn update_reader_activity(&self) {
+        let mut media_reader = self.media_reader.borrow_mut();
+        let Some(media_reader) = media_reader.as_mut() else {
+            return;
+        };
+        let activity = if !self.owner_document().is_fully_active() {
+            ReaderActivity::Paused {
+                bytes_per_second: None,
             }
-            current_fetch_context.cancel(CancelReason::Abort);
-        }
-
-        *current_fetch_context = Some(HTMLMediaElementFetchContext::new(
-            request.id,
-            offset.unwrap_or(0),
-            origin_clean,
-            global.core_resource_thread(),
-        ));
-        let listener =
-            HTMLMediaElementFetchListener::new(self, request.id, url, offset.unwrap_or(0));
-
-        self.owner_document().fetch_background(request, listener);
-
-        // <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
-        // > If and when downloading of the resource resumes, the user agent must queue a media
-        // > element task given the media element to set the networkState to NETWORK_LOADING.
-        if resumes_suspended_download {
-            self.queue_media_element_task_to_set_network_state(NetworkState::Loading, None);
-        }
-
-        // Since we cancelled the previous fetch, from now on the media element
-        // will only receive response data from the new fetch that's been
-        // initiated. This means the player can resume operation, since all subsequent data
-        // pushes will originate from the new seek offset.
-        if let Some(seek_lock) = seek_lock {
-            seek_lock.unlock(/* successful seek */ true);
+        } else if !self.paused.get() {
+            let duration = self.duration.get();
+            let bytes_per_second = media_reader
+                .metadata
+                .and_then(|metadata| metadata.length)
+                .filter(|_| duration.is_finite() && duration > 0.)
+                .map(|length| length as f64 / duration);
+            ReaderActivity::Playing { bytes_per_second }
+        } else if self.Preload() == "metadata" && !self.playback_requested.get() && !self.Autoplay()
+        {
+            ReaderActivity::Metadata
+        } else {
+            ReaderActivity::Paused {
+                bytes_per_second: None,
+            }
+        };
+        if media_reader.activity != Some(activity) {
+            media_reader.activity = Some(activity);
+            media_reader.reader.set_activity(activity);
         }
     }
 
@@ -1813,19 +1864,20 @@ impl HTMLMediaElement {
         // Step 5. Run the appropriate steps from the following list:
         match resource {
             Resource::Url(url) => {
-                *self.resource_url.borrow_mut() = Some(url);
+                *self.resource_url.borrow_mut() = Some(url.clone());
 
                 // Steps 5.remote.2-5.remote.8
-                self.fetch_request(cx, None, None);
+                self.open_media_reader(cx, url);
             },
             Resource::Object => {
                 if let Some(ref src_object) = *self.src_object.borrow() {
                     match src_object {
                         SrcObject::Blob(blob) => {
                             let blob_url = URL::CreateObjectURL(&self.global(), blob);
-                            *self.blob_url.borrow_mut() =
-                                Some(ServoUrl::parse(&blob_url.str()).expect("infallible"));
-                            self.fetch_request(cx, None, None);
+                            let url = ServoUrl::parse(&blob_url.str()).expect("infallible");
+                            // The fetcher claims the blob, so the URL is not needed any more.
+                            self.open_media_reader(cx, url);
+                            URL::RevokeObjectURL(&self.global(), blob_url);
                         },
                         SrcObject::MediaStream(stream) => {
                             let tracks = &*stream.get_tracks();
@@ -1948,6 +2000,7 @@ impl HTMLMediaElement {
         // Reset the flag that signals whether loadeddata was ever fired for
         // this invokation of the load algorithm.
         self.fired_loadeddata_event.set(false);
+        self.playback_requested.set(false);
 
         // TODO Step 1. Set this element's is currently stalled to false.
 
@@ -1994,9 +2047,7 @@ impl HTMLMediaElement {
 
             // Step 7.2. If a fetching process is in progress for the media element, the user agent
             // should stop it.
-            if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() {
-                current_fetch_context.cancel(CancelReason::Abort);
-            }
+            self.close_media_reader();
 
             // TODO Step 7.3. If the media element's assigned media provider object is a MediaSource
             // object, then detach it.
@@ -2076,217 +2127,204 @@ impl HTMLMediaElement {
             }));
     }
 
-    /// Queue a media element task given the media element to set its networkState, and to fire an
-    /// event named `event` at it, if any.
-    fn queue_media_element_task_to_set_network_state(
-        &self,
-        network_state: NetworkState,
-        event: Option<Atom>,
-    ) {
-        let this = Trusted::new(self);
-        let generation_id = self.generation_id.get();
-
-        self.owner_global()
-            .task_manager()
-            .media_element_task_source()
-            .queue(task!(set_network_state: move |cx| {
-                let this = this.root();
-                if generation_id != this.generation_id.get() {
-                    return;
-                }
-
-                this.set_network_state(network_state);
-                if let Some(event) = event {
-                    this.upcast::<EventTarget>().fire_event(cx, event);
-                }
-            }));
-    }
-
-    /// Cancels the current fetch because the player has enough data, to restart it once the player
-    /// needs more.
-    fn cancel_to_restart(&self, current_fetch_context: &mut HTMLMediaElementFetchContext) {
-        if current_fetch_context.cancel_reason().is_some() {
-            return;
-        }
-        let download_suspended = current_fetch_context.is_download_suspended();
-        current_fetch_context.cancel(CancelReason::Backoff);
-        if !download_suspended {
-            self.queue_download_suspended_steps();
-        }
-    }
-
-    /// Cancels the current fetch if it is suspended, to restart it once the player needs data
-    /// again, for when nothing might resume it.
-    pub(crate) fn cancel_suspended_fetch(&self) {
-        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() &&
-            current_fetch_context.is_suspended()
-        {
-            self.cancel_to_restart(current_fetch_context);
-        }
-    }
-
-    pub(crate) fn has_suspended_fetch(&self) -> bool {
-        self.current_fetch_context
+    fn reads_from(&self, id: u32) -> bool {
+        self.media_reader
             .borrow()
             .as_ref()
-            .is_some_and(HTMLMediaElementFetchContext::is_suspended)
+            .is_some_and(|media_reader| media_reader.id == id)
     }
 
-    /// Whether the fetch may be suspended rather than cancelled when the player has enough data.
-    /// Nothing might resume the fetch of an element that is paused outside a document, or in a
-    /// document that is not fully active.
-    fn may_suspend_fetch(&self) -> bool {
-        self.owner_document().is_fully_active() &&
-            (self.upcast::<Node>().is_connected() || !self.Paused())
+    /// Handles an event of the reader `id`, in a media element task.
+    fn handle_reader_event(&self, cx: &mut JSContext, id: u32, event: ReaderEvent) {
+        if !self.reads_from(id) {
+            return;
+        }
+        match event {
+            ReaderEvent::Metadata {
+                length,
+                seekable,
+                cors_tainted,
+            } => self.reader_metadata_available(cx, id, length, seekable, cors_tainted),
+            ReaderEvent::Progress => self.reader_progress(cx),
+            ReaderEvent::DownloadSuspended => self.reader_download_suspended(cx),
+            ReaderEvent::DownloadResumed => self.reader_download_resumed(),
+            ReaderEvent::Complete => self.reader_complete(cx, id),
+            ReaderEvent::Error(error) => self.media_reader_failed(cx, id, error),
+        }
+    }
+
+    /// The reader learned the length of the media resource and whether it is seekable from a
+    /// response, which, if it was CORS-cross-origin, taints the media data.
+    fn reader_metadata_available(
+        &self,
+        cx: &mut JSContext,
+        id: u32,
+        length: Option<u64>,
+        seekable: bool,
+        cors_tainted: bool,
+    ) {
+        if cors_tainted {
+            self.origin_clean.set(false);
+        }
+        let metadata = ReaderMetadata { length, seekable };
+        let previous = self
+            .media_reader
+            .borrow_mut()
+            .as_mut()
+            .and_then(|media_reader| media_reader.metadata.replace(metadata));
+        // The reader reports the metadata again once it learns the length of a resource of unknown
+        // length. The OpenHarmony player takes the size and seekability of the resource once, when
+        // it gets the first of them, so the size goes first.
+        if let Some(ref player) = *self.player.borrow() {
+            let player = player.lock().unwrap();
+            if let Some(length) = length &&
+                previous.is_none_or(|previous| previous.length != Some(length)) &&
+                let Err(error) = player.set_input_size(length)
+            {
+                warn!("Could not set player input size {error:?}");
+            }
+            if previous.is_none_or(|previous| previous.seekable != seekable) &&
+                let Err(error) = player.set_seekable(seekable)
+            {
+                warn!("Could not set player seekable {error:?}");
+            }
+        }
+        self.update_reader_activity();
+        self.push_media_data(cx, id);
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
+    /// > While the load is not suspended (see below), every 350ms (±200ms) or for every byte
+    /// > received, whichever is least frequent, queue a media element task given the media
+    /// > element to [...] fire an event named progress at the element.
+    ///
+    /// The reader reports progress at most every 350 ms.
+    fn reader_progress(&self, cx: &mut JSContext) {
+        let download_suspended = self
+            .media_reader
+            .borrow()
+            .as_ref()
+            .is_none_or(|media_reader| media_reader.download_suspended);
+        if !download_suspended {
+            self.upcast::<EventTarget>()
+                .fire_event(cx, atom!("progress"));
+        }
     }
 
     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
     /// > When a media element's download has been suspended, the user agent must queue a media
     /// > element task given the media element to set the networkState to NETWORK_IDLE and fire
     /// > an event named suspend at the element.
-    fn queue_download_suspended_steps(&self) {
-        self.queue_media_element_task_to_set_network_state(
-            NetworkState::Idle,
-            Some(atom!("suspend")),
-        );
-    }
-
-    /// Asks net to suspend the current fetch. Net answers whether it did: it ignores a suspension
-    /// when it does not read the body from the network, or when it keeps enough fetches to the
-    /// origin suspended already.
-    fn suspend_fetch(&self, current_fetch_context: &mut HTMLMediaElementFetchContext) {
-        let suspension = current_fetch_context.start_suspension();
-        let request_id = current_fetch_context.request_id();
-        let this = Trusted::new(self);
-        let task_source = self
-            .owner_global()
-            .task_manager()
-            .media_element_task_source()
-            .to_sendable();
-        let Ok(reply) = GenericCallback::new(move |suspended: Result<bool, _>| {
-            let this = this.clone();
-            let suspended = suspended.unwrap_or(false);
-            task_source.queue(task!(media_fetch_suspension_answered: move || {
-                this.root()
-                    .fetch_suspension_answered(request_id, suspension, suspended);
-            }));
-        }) else {
-            self.fetch_suspension_declined(current_fetch_context);
-            return;
-        };
-        current_fetch_context.suspend(Some(reply));
-        self.owner_document()
-            .register_media_element_with_suspended_fetch(self);
-    }
-
-    /// Backs off as a fetch that cannot be suspended does, for a fetch that net did not suspend.
-    fn fetch_suspension_declined(&self, current_fetch_context: &mut HTMLMediaElementFetchContext) {
-        current_fetch_context.decline_suspension();
-        if current_fetch_context.is_seekable() {
-            self.cancel_to_restart(current_fetch_context);
-        }
-    }
-
-    /// Handles net's answer to the suspension `suspension` of the fetch `request_id`. A fetch that
-    /// net did not suspend backs off as one that cannot be suspended does. A suspended fetch with
-    /// range support is cancelled after `media_fetch_suspension_timeout_ms`, which frees its
-    /// connection, to restart where the player stopped once it needs data again.
-    fn fetch_suspension_answered(&self, request_id: RequestId, suspension: u32, suspended: bool) {
-        let mut current_fetch_context = self.current_fetch_context.borrow_mut();
-        let Some(ref mut current_fetch_context) = *current_fetch_context else {
-            return;
-        };
-        if current_fetch_context.request_id() != request_id ||
-            current_fetch_context.pending_suspension() != Some(suspension)
-        {
-            return;
-        }
-        if !suspended {
-            self.fetch_suspension_declined(current_fetch_context);
-            return;
-        }
-        current_fetch_context.confirm_suspension();
-        self.queue_download_suspended_steps();
-
-        // A fetch without range support would restart at the start of the resource, so it stays
-        // suspended, until net gives up on it.
-        if !current_fetch_context.is_seekable() {
-            return;
-        }
-        let this = Trusted::new(self);
-        self.global().run_steps_after_a_timeout(
-            DOMString::from_static("media-fetch-suspension"),
-            pref!(media_fetch_suspension_timeout_ms)
-                .try_into()
-                .unwrap_or(i64::MAX),
-            move |_, _| {
-                let this = this.root();
-                if let Some(ref mut current_fetch_context) =
-                    *this.current_fetch_context.borrow_mut() &&
-                    current_fetch_context.request_id() == request_id &&
-                    current_fetch_context.download_suspension() == Some(suspension)
-                {
-                    this.cancel_to_restart(current_fetch_context);
-                }
+    fn reader_download_suspended(&self, cx: &mut JSContext) {
+        let waits_for_playback = match self.media_reader.borrow_mut().as_mut() {
+            Some(media_reader) => {
+                media_reader.download_suspended = true;
+                media_reader.activity == Some(ReaderActivity::Metadata)
             },
-        );
+            None => false,
+        };
+        // > When a user agent decides to completely suspend a download, e.g., if it is waiting
+        // > until the user starts playback before downloading any further content, the user agent
+        // > must queue a media element task given the media element to set the element's
+        // > delaying-the-load-event flag to false.
+        if waits_for_playback {
+            self.delay_load_event(cx, false);
+        }
+        if self.network_state.get() == NetworkState::Loading {
+            self.set_network_state(NetworkState::Idle);
+            self.upcast::<EventTarget>()
+                .fire_event(cx, atom!("suspend"));
+        }
     }
 
-    /// Restarts the fetch at `position`, the next byte that the player expects, so the player
-    /// needs neither a seek nor a NeedData event before it accepts the data. If the resource
-    /// has no bytes there, ends the stream instead. `interrupted` tells whether the fetch restarts
-    /// one whose response ended early after a suspension.
-    fn restart_fetch_at(&self, cx: &JSContext, position: u64, interrupted: bool) {
-        let resource_length = self
-            .current_fetch_context
-            .borrow()
-            .as_ref()
-            .and_then(HTMLMediaElementFetchContext::resource_length);
-        if resource_length.is_some_and(|length| position >= length) {
-            // => "Once the entire media resource has been fetched..."
-            if let Some(ref player) = *self.player.borrow() &&
-                let Err(error) = player.lock().unwrap().end_of_stream()
-            {
-                warn!("Could not signal EOS to player: {error:?}");
-            }
-            self.queue_media_element_task_to_fire_event(atom!("progress"));
-            self.queue_media_element_task_to_set_network_state(
-                NetworkState::Idle,
-                Some(atom!("suspend")),
-            );
+    /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
+    /// > If and when downloading of the resource resumes, the user agent must queue a media
+    /// > element task given the media element to set the networkState to NETWORK_LOADING.
+    fn reader_download_resumed(&self) {
+        if let Some(media_reader) = self.media_reader.borrow_mut().as_mut() {
+            media_reader.download_suspended = false;
+        }
+        if self.network_state.get() == NetworkState::Idle {
+            self.set_network_state(NetworkState::Loading);
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list>
+    /// => "Once the entire media resource has been fetched (but potentially before any of it has
+    /// been decoded)"
+    fn reader_complete(&self, cx: &mut JSContext, id: u32) {
+        if let Some(media_reader) = self.media_reader.borrow_mut().as_mut() {
+            media_reader.download_suspended = true;
+        }
+
+        // Step 1. Fire an event named progress at the media element.
+        self.upcast::<EventTarget>()
+            .fire_event(cx, atom!("progress"));
+        if !self.reads_from(id) {
             return;
         }
-        self.fetch_request(cx, Some(position), None);
-        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() {
-            current_fetch_context
-                .data_source()
-                .borrow()
-                .set_locked(false);
-            current_fetch_context.set_interrupted(interrupted);
+
+        // Step 2. Set the networkState to NETWORK_IDLE and fire an event named suspend at the
+        // media element. A download that was suspended before it completed did so already.
+        if self.network_state.get() == NetworkState::Loading {
+            self.set_network_state(NetworkState::Idle);
+            self.upcast::<EventTarget>()
+                .fire_event(cx, atom!("suspend"));
         }
     }
 
-    /// Restarts a fetch whose response ended early after it was suspended, which happens when the
-    /// connection was closed while the fetch was idle, at the byte where the player stopped: at
-    /// once if the player accepts data, or else once it needs data again. `download_suspended`
-    /// tells whether the fetch was a suspended download when its response ended.
-    fn restart_interrupted_fetch(&self, cx: &JSContext, download_suspended: bool) {
-        let position = {
-            let mut current_fetch_context = self.current_fetch_context.borrow_mut();
-            let Some(ref mut current_fetch_context) = *current_fetch_context else {
+    /// <https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list>
+    /// Runs the steps for when the reader `id` gave up on fetching the media resource. As in other
+    /// browsers, media data counts as received once the media engine has the metadata.
+    fn media_reader_failed(&self, cx: &mut JSContext, id: u32, error: ReaderError) {
+        if !self.reads_from(id) || self.in_error_state() {
+            return;
+        }
+        if error == ReaderError::Network && self.ready_state.get() == ReadyState::HaveNothing {
+            // => "If the media data cannot be fetched at all, due to network errors, causing the
+            // user agent to give up trying to fetch the resource"
+            self.media_data_processing_failure_steps(cx);
+        } else {
+            // => "If the connection is interrupted after some media data has been received,
+            // causing the user agent to give up trying to fetch the resource"
+            // A resource that changed between two responses is treated the same way.
+            self.media_data_processing_fatal_steps(cx, MEDIA_ERR_NETWORK);
+        }
+    }
+
+    /// Pushes the data of the reader `id` into a player that asked for it, from where the player
+    /// stopped, until it has enough, the reader has no data there yet, or the stream ends. The
+    /// player gets the metadata of the resource before its first data.
+    fn push_media_data(&self, cx: &mut JSContext, id: u32) {
+        let Some(player) = self.player.borrow().clone() else {
+            return;
+        };
+        let outcome = {
+            let mut media_reader = self.media_reader.borrow_mut();
+            let Some(media_reader) = media_reader.as_mut().filter(|reader| reader.id == id) else {
                 return;
             };
-            if current_fetch_context.data_source().borrow().is_locked() {
-                current_fetch_context.cancel(CancelReason::Backoff);
-                current_fetch_context.set_interrupted(true);
-                if !download_suspended {
-                    self.queue_download_suspended_steps();
-                }
+            if media_reader.metadata.is_none() {
                 return;
             }
-            current_fetch_context.data_source().borrow().position()
+            let Some(push) = media_reader.push.as_mut() else {
+                return;
+            };
+            push.push(&media_reader.reader, &player)
         };
-        self.restart_fetch_at(cx, position, true);
+        match outcome {
+            PushOutcome::Done => {},
+            PushOutcome::Yield => {
+                let this = Trusted::new(self);
+                self.owner_global()
+                    .task_manager()
+                    .media_element_task_source()
+                    .queue(task!(push_media_data: move |cx| {
+                        this.root().push_media_data(cx, id);
+                    }));
+            },
+            PushOutcome::Failed(error) => self.media_reader_failed(cx, id, error),
+        }
     }
 
     /// Appends a promise to the list of pending play promises.
@@ -2400,9 +2438,7 @@ impl HTMLMediaElement {
     /// format, or can otherwise not be rendered at all"
     fn media_data_processing_failure_steps(&self, cx: &JSContext) {
         // Step 1. The user agent should cancel the fetching process.
-        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() {
-            current_fetch_context.cancel(CancelReason::Error);
-        }
+        self.close_media_reader();
 
         // Step 2. Abort this subalgorithm, returning to the resource selection algorithm.
         self.resource_selection_algorithm_failure_steps(cx);
@@ -2416,9 +2452,7 @@ impl HTMLMediaElement {
         self.current_source_child.set(None);
 
         // Step 1. The user agent should cancel the fetching process.
-        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() {
-            current_fetch_context.cancel(CancelReason::Error);
-        }
+        self.close_media_reader();
 
         // Step 2. Set the error attribute to the result of creating a MediaError with
         // MEDIA_ERR_NETWORK/MEDIA_ERR_DECODE.
@@ -2574,7 +2608,6 @@ impl HTMLMediaElement {
     }
 
     /// A queue of tasks on `task_source` for this element and its current player, if it has one.
-    #[expect(dead_code, reason = "Used from the next patch")]
     pub(crate) fn task_queue(
         &self,
         task_source: SendableTaskSource,
@@ -2711,6 +2744,8 @@ impl HTMLMediaElement {
     }
 
     fn reset_media_player(&self, no_gc: &NoGC) {
+        self.close_media_reader();
+
         if self.player.borrow().is_none() {
             return;
         }
@@ -3085,6 +3120,7 @@ impl HTMLMediaElement {
                 .map_or(f64::INFINITY, |duration| duration.as_secs_f64()),
         );
         self.queue_media_element_task_to_fire_event(atom!("durationchange"));
+        self.update_reader_activity();
 
         // Step 5. For video elements, set the videoWidth and videoHeight attributes, and queue a
         // media element task given the media element to fire an event named resize at the media
@@ -3161,6 +3197,7 @@ impl HTMLMediaElement {
         }
 
         self.duration.set(duration);
+        self.update_reader_activity();
 
         // When the length of the media resource changes to a known value (e.g. from being unknown
         // to known, or from a previously established length to a new length), the user agent must
@@ -3209,58 +3246,52 @@ impl HTMLMediaElement {
         }
     }
 
-    fn playback_need_data(&self, cx: &JSContext) {
-        // The media engine signals that the source needs more data. If the current fetch request
-        // was cancelled because the media engine had enough data, we restart it where the media
-        // engine stopped accepting data. Otherwise, we resume it if it is suspended, and push the
-        // data that is queued for it.
-        let restart = match *self.current_fetch_context.borrow() {
-            Some(ref current_fetch_context) => match current_fetch_context.cancel_reason() {
-                Some(CancelReason::Backoff) => Some((
-                    current_fetch_context.data_source().borrow().position(),
-                    current_fetch_context.interrupted(),
-                )),
-                Some(_) => return,
-                None => None,
-            },
-            None => None,
+    /// The player asks for data, which the element pushes from where the player stopped.
+    fn playback_need_data(&self, cx: &mut JSContext) {
+        let id = {
+            let mut media_reader = self.media_reader.borrow_mut();
+            let Some(media_reader) = media_reader.as_mut() else {
+                return;
+            };
+            let Some(push) = media_reader.push.as_mut() else {
+                return;
+            };
+            push.needs_data = true;
+            media_reader.id
         };
+        self.push_media_data(cx, id);
+    }
 
-        if let Some((position, interrupted)) = restart {
-            self.restart_fetch_at(cx, position, interrupted);
-            return;
-        }
-
-        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() {
-            current_fetch_context.set_player_has_enough_data(false);
-            // <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
-            // > If and when downloading of the resource resumes, the user agent must queue a media
-            // > element task given the media element to set the networkState to NETWORK_LOADING.
-            if current_fetch_context.resume() {
-                self.queue_media_element_task_to_set_network_state(NetworkState::Loading, None);
-            }
-        }
-
-        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() &&
-            let Err(e) = {
-                let mut data_source = current_fetch_context.data_source().borrow_mut();
-                data_source.set_locked(false);
-                data_source.process_into_player_from_queue(self.player.borrow().as_ref().unwrap())
-            } &&
-            e == PlayerError::EnoughData
+    /// The player has enough data, until it asks for more.
+    fn playback_enough_data(&self) {
+        if let Some(push) = self
+            .media_reader
+            .borrow_mut()
+            .as_mut()
+            .and_then(|media_reader| media_reader.push.as_mut())
         {
-            current_fetch_context.back_off(self);
+            push.needs_data = false;
         }
     }
 
-    fn playback_enough_data(&self) {
-        // The media engine signals that the source has enough data and asks us to stop pushing bytes
-        // to avoid excessive buffer queueing, so we back off with the next chunk of the ongoing
-        // fetch request if we are able to restart it from where we left. Otherwise, we queue the
-        // data that the media engine refuses until it needs more.
-        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() {
-            current_fetch_context.set_player_has_enough_data(true);
-        }
+    /// The player seeks to the byte `offset` of the media resource, and asks for data from there
+    /// once it is ready.
+    fn playback_seek_data(&self, offset: u64, seek_lock: SeekLock) {
+        let seeked = match self
+            .media_reader
+            .borrow_mut()
+            .as_mut()
+            .and_then(|media_reader| media_reader.push.as_mut())
+        {
+            Some(push) => {
+                push.position = offset;
+                push.needs_data = false;
+                push.ended = false;
+                true
+            },
+            None => false,
+        };
+        seek_lock.unlock(seeked);
     }
 
     fn playback_position_changed(&self, cx: &mut JSContext, position: f64) {
@@ -3505,9 +3536,7 @@ impl HTMLMediaElement {
             // Update the media data with the contents
             // of response's unsafe response obtained in this fashion.
             // Response can be CORS-same-origin or CORS-cross-origin;
-            if let Some(ref current_fetch_context) = *self.current_fetch_context.borrow() {
-                return current_fetch_context.origin_is_clean();
-            }
+            return self.origin_clean.get();
         }
 
         true
@@ -4128,11 +4157,13 @@ impl VirtualMethods for HTMLMediaElement {
                     self.resume_suspended_load(cx);
                 }
                 self.update_keep_alive();
+                self.update_reader_activity();
             },
             local_name!("preload") => {
                 if self.Preload() != "none" {
                     self.resume_suspended_load(cx);
                 }
+                self.update_reader_activity();
             },
             _ => (),
         };
@@ -4162,6 +4193,13 @@ impl VirtualMethods for HTMLMediaElement {
             old_doc.unregister_media_element_with_pending_activity(self);
             self.owner_document()
                 .register_media_element_with_pending_activity(self);
+        }
+
+        if self.has_media_reader() {
+            old_doc.unregister_media_element_with_reader(self);
+            self.owner_document()
+                .register_media_element_with_reader(self);
+            self.update_reader_activity();
         }
 
         // Note that media control id should be adopting between documents so "privileged"
@@ -4269,785 +4307,85 @@ enum Resource {
     Url(ServoUrl),
 }
 
-#[derive(Debug, MallocSizeOf, PartialEq)]
-enum DataBuffer {
-    Payload(Bytes),
-    EndOfStream,
+/// What a reader of the media cache reported about the media resource.
+#[derive(Clone, Copy, PartialEq)]
+struct ReaderMetadata {
+    length: Option<u64>,
+    seekable: bool,
 }
 
-#[derive(MallocSizeOf)]
-struct BufferedDataSource {
-    /// During initial setup and seeking (including clearing the buffer queue
-    /// and resetting the end-of-stream state), the data source should be locked and
-    /// any request for processing should be ignored until the media player informs us
-    /// via the NeedData event that it is ready to accept incoming data.
-    locked: Cell<bool>,
-    /// Temporary storage for incoming data.
-    buffers: VecDeque<DataBuffer>,
-    /// The number of bytes in `buffers`.
-    queued_bytes: usize,
+/// The reader of the media resource of a media element in the media cache.
+struct MediaResourceReader {
+    reader: Arc<MediaReader>,
+    /// Identifies the reader among those that the element opened.
+    id: u32,
+    /// Pushes the media data into a player that does not read it from the reader itself.
+    push: Option<PushAdapter>,
+    /// The metadata of the resource, once the reader reported it.
+    metadata: Option<ReaderMetadata>,
+    /// The activity that the reader was told last.
+    activity: Option<ReaderActivity>,
+    /// Whether the download is suspended or complete, while which no progress event fires.
+    download_suspended: bool,
+}
+
+/// Pushes the data of a reader into a player, as the player asks for it.
+#[derive(Default)]
+struct PushAdapter {
     /// The offset in the media resource of the next byte that the player has not accepted yet.
     position: u64,
+    /// Whether the player asked for data, and has not had enough since.
+    needs_data: bool,
+    /// Whether the end of the stream was pushed.
+    ended: bool,
 }
 
-impl BufferedDataSource {
-    fn new(position: u64) -> BufferedDataSource {
-        BufferedDataSource {
-            locked: Cell::new(true),
-            buffers: VecDeque::default(),
-            queued_bytes: 0,
-            position,
-        }
-    }
+enum PushOutcome {
+    /// The player has enough data, the stream ended, or the reader calls its waker once it has
+    /// data at the position.
+    Done,
+    /// The task pushed as much as one task may, and the next one continues.
+    Yield,
+    Failed(ReaderError),
+}
 
-    fn position(&self) -> u64 {
-        self.position
-    }
-
-    fn queued_bytes(&self) -> usize {
-        self.queued_bytes
-    }
-
-    fn set_locked(&self, locked: bool) {
-        self.locked.set(locked)
-    }
-
-    fn is_locked(&self) -> bool {
-        self.locked.get()
-    }
-
-    fn add_buffer_to_queue(&mut self, buffer: DataBuffer) {
-        debug_assert_ne!(
-            self.buffers.back(),
-            Some(&DataBuffer::EndOfStream),
-            "The media backend not expects any further data after end of stream"
-        );
-
-        if let DataBuffer::Payload(ref payload) = buffer {
-            self.queued_bytes += payload.len();
-        }
-        self.buffers.push_back(buffer);
-    }
-
-    fn process_into_player_from_queue(
-        &mut self,
-        player: &Arc<Mutex<dyn Player>>,
-    ) -> Result<(), PlayerError> {
-        // Early out if any request for processing should be ignored.
-        if self.locked.get() {
-            return Ok(());
-        }
-
-        while let Some(buffer) = self.buffers.pop_front() {
-            match buffer {
-                DataBuffer::Payload(payload) => {
-                    let result = player.lock().unwrap().push_data(payload.to_vec());
-                    // A payload refused with EnoughData is kept until the player needs data again,
-                    // while the player moves past one that it failed to push.
-                    if result == Err(PlayerError::EnoughData) {
-                        self.buffers.push_front(DataBuffer::Payload(payload));
-                    } else {
-                        self.queued_bytes -= payload.len();
-                        self.position += payload.len() as u64;
-                    }
-                    if let Err(error) = result {
-                        if error != PlayerError::EnoughData {
+impl PushAdapter {
+    fn push(&mut self, reader: &MediaReader, player: &Arc<Mutex<dyn Player>>) -> PushOutcome {
+        let mut pushed = 0;
+        while self.needs_data && !self.ended {
+            if pushed >= MAX_BYTES_PUSHED_PER_TASK {
+                return PushOutcome::Yield;
+            }
+            let mut chunk = vec![0; PUSH_CHUNK_SIZE];
+            match reader.read_at(self.position, &mut chunk) {
+                ReadResult::Data(0) | ReadResult::Pending => break,
+                ReadResult::Data(length) => {
+                    chunk.truncate(length);
+                    match player.lock().unwrap().push_data(chunk) {
+                        Ok(()) => {
+                            self.position += length as u64;
+                            pushed += length;
+                        },
+                        // The player gets the same bytes once it needs data again.
+                        Err(PlayerError::EnoughData) => self.needs_data = false,
+                        // The player moves past bytes that it failed to take.
+                        Err(error) => {
                             warn!("Could not push input data to player: {error:?}");
-                        }
-                        return Err(error);
+                            self.position += length as u64;
+                            break;
+                        },
                     }
                 },
-                DataBuffer::EndOfStream => {
+                ReadResult::EndOfStream => {
+                    self.ended = true;
                     if let Err(error) = player.lock().unwrap().end_of_stream() {
                         warn!("Could not signal EOS to player: {error:?}");
-                        return Err(error);
                     }
                 },
+                ReadResult::Error(error) => return PushOutcome::Failed(error),
             }
         }
-
-        Ok(())
-    }
-
-    fn reset(&mut self) {
-        self.locked.set(true);
-        self.buffers.clear();
-        self.queued_bytes = 0;
-    }
-}
-
-/// A suspension of a fetch that net was asked for.
-#[derive(MallocSizeOf)]
-struct Suspension {
-    /// Identifies the suspension among those of the fetch.
-    id: u32,
-    /// Whether net answered that it suspended the fetch.
-    suspended: bool,
-}
-
-/// Indicates the reason why a fetch request was cancelled.
-#[derive(Debug, MallocSizeOf, PartialEq)]
-enum CancelReason {
-    /// We were asked to stop pushing data to the player.
-    Backoff,
-    /// An error ocurred while fetching the media data.
-    Error,
-    /// The fetching process is aborted by the user.
-    Abort,
-}
-
-#[derive(MallocSizeOf)]
-pub(crate) struct HTMLMediaElementFetchContext {
-    /// The fetch request id.
-    request_id: RequestId,
-    /// Some if the request has been cancelled.
-    cancel_reason: Option<CancelReason>,
-    /// Indicates whether the fetched stream is seekable.
-    is_seekable: bool,
-    /// Whether the player signalled that it has enough data, and has not asked for more since.
-    player_has_enough_data: bool,
-    /// Indicates whether the fetched stream is origin clean.
-    origin_clean: bool,
-    /// Whether the response is read from the network, where suspending the fetch holds back the
-    /// server.
-    from_network: bool,
-    /// The suspension of the fetch that net was asked for, if any.
-    suspension: Option<Suspension>,
-    /// The number of suspensions of the fetch, which identifies the last one.
-    suspensions: u32,
-    /// Whether net ever suspended the fetch.
-    was_suspended: bool,
-    /// Whether the fetch restarts, or was cancelled to restart, a fetch whose response ended early
-    /// after a suspension, and delivered no data since.
-    interrupted: bool,
-    /// The length of the media resource, if it is known.
-    resource_length: Option<u64>,
-    /// The buffered data source which to be processed by media backend.
-    data_source: RefCell<BufferedDataSource>,
-    /// Fetch controller. Allows aborting the current fetch request with its abort()
-    /// method. Dropping it does not cancel the fetch.
-    fetch_controller: FetchController,
-}
-
-impl HTMLMediaElementFetchContext {
-    fn new(
-        request_id: RequestId,
-        offset: u64,
-        origin_clean: bool,
-        core_resource_thread: CoreResourceThread,
-    ) -> HTMLMediaElementFetchContext {
-        HTMLMediaElementFetchContext {
-            request_id,
-            cancel_reason: None,
-            is_seekable: false,
-            player_has_enough_data: false,
-            origin_clean,
-            from_network: false,
-            suspension: None,
-            suspensions: 0,
-            was_suspended: false,
-            interrupted: false,
-            resource_length: None,
-            data_source: RefCell::new(BufferedDataSource::new(offset)),
-            fetch_controller: FetchController::new(request_id, false, core_resource_thread),
-        }
-    }
-
-    fn request_id(&self) -> RequestId {
-        self.request_id
-    }
-
-    fn is_seekable(&self) -> bool {
-        self.is_seekable
-    }
-
-    fn set_seekable(&mut self, seekable: bool) {
-        self.is_seekable = seekable;
-    }
-
-    fn player_has_enough_data(&self) -> bool {
-        self.player_has_enough_data
-    }
-
-    fn set_player_has_enough_data(&mut self, enough_data: bool) {
-        self.player_has_enough_data = enough_data;
-    }
-
-    fn origin_is_clean(&self) -> bool {
-        self.origin_clean
-    }
-
-    fn set_origin_clean(&mut self, origin_clean: bool) {
-        self.origin_clean = origin_clean;
-    }
-
-    fn data_source(&self) -> &RefCell<BufferedDataSource> {
-        &self.data_source
-    }
-
-    fn set_from_network(&mut self, from_network: bool) {
-        self.from_network = from_network;
-    }
-
-    fn is_suspended(&self) -> bool {
-        self.suspension.is_some()
-    }
-
-    /// Whether net suspended the fetch, which is then a suspended download.
-    fn is_download_suspended(&self) -> bool {
-        self.suspension
-            .as_ref()
-            .is_some_and(|suspension| suspension.suspended)
-    }
-
-    /// The suspension that awaits net's answer, if any.
-    fn pending_suspension(&self) -> Option<u32> {
-        self.suspension
-            .as_ref()
-            .filter(|suspension| !suspension.suspended)
-            .map(|suspension| suspension.id)
-    }
-
-    /// The suspension that net confirmed, if any.
-    fn download_suspension(&self) -> Option<u32> {
-        self.suspension
-            .as_ref()
-            .filter(|suspension| suspension.suspended)
-            .map(|suspension| suspension.id)
-    }
-
-    fn start_suspension(&mut self) -> u32 {
-        self.suspensions += 1;
-        self.suspension = Some(Suspension {
-            id: self.suspensions,
-            suspended: false,
-        });
-        self.suspensions
-    }
-
-    fn suspend(&self, reply: Option<GenericCallback<bool>>) {
-        self.fetch_controller.suspend(reply);
-    }
-
-    fn confirm_suspension(&mut self) {
-        if let Some(ref mut suspension) = self.suspension {
-            suspension.suspended = true;
-            self.was_suspended = true;
-        }
-    }
-
-    /// Ends a suspension that net did not answer with success. The answer may have been lost, so
-    /// the fetch is resumed in case net suspended it.
-    fn decline_suspension(&mut self) {
-        self.suspension = None;
-        self.fetch_controller.resume();
-    }
-
-    fn was_suspended(&self) -> bool {
-        self.was_suspended
-    }
-
-    fn interrupted(&self) -> bool {
-        self.interrupted
-    }
-
-    fn set_interrupted(&mut self, interrupted: bool) {
-        self.interrupted = interrupted;
-    }
-
-    fn resource_length(&self) -> Option<u64> {
-        self.resource_length
-    }
-
-    fn set_resource_length(&mut self, resource_length: Option<u64>) {
-        self.resource_length = resource_length;
-    }
-
-    /// Stops pushing data to a player that refused it because it has enough, and queues what still
-    /// arrives until the player needs data again. A fetch from the network is suspended, which
-    /// holds back the server. Otherwise, or if net does not suspend it, a seekable fetch is
-    /// cancelled, to restart where the player stopped once it needs data again, and any other
-    /// fetch continues, since it would restart at the start of the resource. Up to
-    /// `MAX_QUEUED_BYTES` are queued.
-    fn back_off(&mut self, element: &HTMLMediaElement) {
-        if self.cancel_reason.is_some() || self.is_suspended() {
-            return;
-        }
-        self.data_source.borrow().set_locked(true);
-        if self.from_network && element.may_suspend_fetch() {
-            element.suspend_fetch(self);
-        } else if self.is_seekable {
-            element.cancel_to_restart(self);
-        }
-    }
-
-    /// Resumes a suspended fetch. Returns whether it was a suspended download.
-    fn resume(&mut self) -> bool {
-        let Some(suspension) = self.suspension.take() else {
-            return false;
-        };
-        self.fetch_controller.resume();
-        suspension.suspended
-    }
-
-    /// Marks the response as complete, which also ends a suspension.
-    fn end(&mut self) {
-        self.suspension = None;
-        self.fetch_controller.ignore();
-    }
-
-    fn cancel(&mut self, reason: CancelReason) {
-        if self.cancel_reason.is_some() {
-            return;
-        }
-        self.cancel_reason = Some(reason);
-        self.suspension = None;
-        self.data_source.borrow_mut().reset();
-        self.fetch_controller.abort();
-    }
-
-    fn cancel_reason(&self) -> &Option<CancelReason> {
-        &self.cancel_reason
-    }
-}
-
-impl Drop for HTMLMediaElementFetchContext {
-    fn drop(&mut self) {
-        // Nothing else cancels a fetch that is still running, and a suspended one holds its
-        // connection until net gives up on it.
-        if self.cancel_reason.is_none() {
-            self.fetch_controller.abort();
-        }
-    }
-}
-
-struct HTMLMediaElementFetchListener {
-    /// The element that initiated the request.
-    element: Trusted<HTMLMediaElement>,
-    /// The generation of the media element when this fetch started.
-    generation_id: u32,
-    /// The fetch request id.
-    request_id: RequestId,
-    /// Time of last progress notification.
-    next_progress_event: Instant,
-    /// Url for the resource.
-    url: ServoUrl,
-    /// Expected content length of the media asset being fetched or played.
-    expected_content_length: Option<u64>,
-    /// The length of the response body, if it is known.
-    expected_body_length: Option<u64>,
-    /// Actual content length of the media asset was fetched.
-    fetched_content_length: u64,
-    /// Discarded content length from the network for the ongoing
-    /// request if range requests are not supported. Seek requests set it
-    /// to the required position (in bytes).
-    content_length_to_discard: u64,
-    /// The offset in the media resource at which the request starts.
-    offset: u64,
-    /// Whether the server answered that the resource has no bytes at `offset`.
-    range_not_satisfiable: bool,
-}
-
-impl FetchResponseListener for HTMLMediaElementFetchListener {
-    fn process_request_body(&mut self, _: RequestId) {}
-
-    fn process_response(
-        &mut self,
-        cx: &mut JSContext,
-        _: RequestId,
-        metadata: Result<FetchMetadata, NetworkError>,
-    ) {
-        let element = self.element.root();
-
-        let (metadata, origin_clean) = match metadata {
-            Ok(fetch_metadata) => {
-                let is_cross_origin = fetch_metadata.is_cors_cross_origin();
-                (Some(fetch_metadata.into()), !is_cross_origin)
-            },
-            Err(_) => (None, true),
-        };
-
-        let (status_is_success, is_seekable) =
-            metadata
-                .as_ref()
-                .map_or((false, false), |metadata: &Metadata| {
-                    let status = &metadata.status;
-                    (status.is_success(), *status == StatusCode::PARTIAL_CONTENT)
-                });
-
-        // A fetch that restarts past the end of the resource, as after a response that was shorter
-        // than its Content-Length, ends the stream.
-        if self.offset > 0 &&
-            element.ready_state.get() != ReadyState::HaveNothing &&
-            metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.status == StatusCode::RANGE_NOT_SATISFIABLE)
-        {
-            self.range_not_satisfiable = true;
-            return;
-        }
-
-        // <https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list>
-        if !status_is_success {
-            if element.ready_state.get() == ReadyState::HaveNothing {
-                // => "If the media data cannot be fetched at all, due to network errors..."
-                element.media_data_processing_failure_steps(cx);
-            } else {
-                // => "If the connection is interrupted after some media data has been received..."
-                element.media_data_processing_fatal_steps(cx, MEDIA_ERR_NETWORK);
-            }
-            return;
-        }
-
-        let from_network = metadata
-            .as_ref()
-            .is_some_and(|metadata| matches!(metadata.final_url.scheme(), "http" | "https"));
-        if let Some(ref mut current_fetch_context) = *element.current_fetch_context.borrow_mut() {
-            current_fetch_context.set_seekable(is_seekable);
-            current_fetch_context
-                .set_origin_clean(current_fetch_context.origin_is_clean() && origin_clean);
-            current_fetch_context.set_from_network(from_network);
-        }
-
-        if let Some(metadata) = metadata.as_ref() &&
-            let Some(headers) = metadata.headers.as_ref()
-        {
-            // For range requests we get the size of the media asset from the Content-Range
-            // header. Otherwise, we get it from the Content-Length header.
-            let content_length = if let Some(content_range) = headers.typed_get::<ContentRange>() {
-                content_range.bytes_len()
-            } else {
-                headers
-                    .typed_get::<ContentLength>()
-                    .map(|content_length| content_length.0)
-            };
-
-            // The Content-Length of an encoded body is not the length of the decoded body.
-            if !headers.contains_key(CONTENT_ENCODING) {
-                self.expected_body_length = headers
-                    .typed_get::<ContentLength>()
-                    .map(|content_length| content_length.0)
-                    .or_else(|| {
-                        let (start, end) = headers.typed_get::<ContentRange>()?.bytes_range()?;
-                        Some(end + 1 - start)
-                    });
-                if let Some(ref mut current_fetch_context) =
-                    *element.current_fetch_context.borrow_mut()
-                {
-                    current_fetch_context.set_resource_length(content_length);
-                }
-            }
-
-            // We only set the expected input size if it changes.
-            if content_length != self.expected_content_length &&
-                let Some(content_length) = content_length
-            {
-                self.expected_content_length = Some(content_length);
-            }
-        }
-
-        // Explicit media player initialization with live/seekable source.
-        if let Err(e) = element
-            .player
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .set_seekable(is_seekable)
-        {
-            warn!("Could not set player seekable {:?}", e);
-        }
-
-        if let Some(expected_content_length) = self.expected_content_length &&
-            let Err(e) = element
-                .player
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .set_input_size(expected_content_length)
-        {
-            warn!("Could not set player input size {:?}", e);
-        }
-    }
-
-    fn process_response_chunk(&mut self, _: &mut JSContext, _: RequestId, chunk: Bytes) {
-        // An empty chunk, like the last frame of an HTTP/2 body, must not cancel a fetch that has
-        // delivered all of its bytes.
-        if chunk.is_empty() {
-            return;
-        }
-
-        if self.range_not_satisfiable {
-            return;
-        }
-
-        let element = self.element.root();
-
-        self.fetched_content_length += chunk.len() as u64;
-
-        // If an error was received previously, we skip processing the payload.
-        if let Some(ref mut current_fetch_context) = *element.current_fetch_context.borrow_mut() {
-            if let Some(CancelReason::Backoff) = current_fetch_context.cancel_reason() {
-                return;
-            }
-
-            // Backing off with the next chunk rather than on the EnoughData event makes sure that a
-            // fetch that delivered all of its bytes is not restarted at the end of the resource.
-            if current_fetch_context.player_has_enough_data() && current_fetch_context.is_seekable()
-            {
-                current_fetch_context.back_off(&element);
-                if current_fetch_context.cancel_reason().is_some() {
-                    return;
-                }
-            }
-
-            // Discard chunk of the response body if fetch context doesn't support range requests.
-            let payload =
-                if !current_fetch_context.is_seekable() && self.content_length_to_discard != 0 {
-                    if chunk.len() as u64 > self.content_length_to_discard {
-                        let shrink_chunk = chunk.slice(self.content_length_to_discard as usize..);
-                        self.content_length_to_discard = 0;
-                        shrink_chunk
-                    } else {
-                        // Completely discard this response chunk.
-                        self.content_length_to_discard -= chunk.len() as u64;
-                        return;
-                    }
-                } else {
-                    chunk
-                };
-
-            current_fetch_context.set_interrupted(false);
-            if let Err(e) = {
-                let mut data_source = current_fetch_context.data_source().borrow_mut();
-                data_source.add_buffer_to_queue(DataBuffer::Payload(payload));
-                data_source
-                    .process_into_player_from_queue(element.player.borrow().as_ref().unwrap())
-            } {
-                if e == PlayerError::EnoughData {
-                    current_fetch_context.back_off(&element);
-                }
-                return;
-            }
-
-            // The data queued for a player that has enough is capped, for a fetch that net does not
-            // suspend, at the cost of fetching a resource without range support from its start
-            // again.
-            if current_fetch_context.data_source().borrow().queued_bytes() > MAX_QUEUED_BYTES {
-                element.cancel_to_restart(current_fetch_context);
-                return;
-            }
-
-            if current_fetch_context.is_suspended() {
-                return;
-            }
-        }
-
-        // <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
-        // While the load is not suspended (see below), every 350ms (±200ms) or for every byte
-        // received, whichever is least frequent, queue a media element task given the media element
-        // to fire an event named progress at the element.
-        if Instant::now() > self.next_progress_event {
-            element.queue_media_element_task_to_fire_event(atom!("progress"));
-            self.next_progress_event = Instant::now() + Duration::from_millis(350);
-        }
-    }
-
-    fn process_response_eof(
-        self,
-        cx: &mut JSContext,
-        _: RequestId,
-        status: Result<(), NetworkError>,
-        timing: ResourceFetchTiming,
-    ) {
-        let element = self.element.root();
-
-        let backed_off = element
-            .current_fetch_context
-            .borrow()
-            .as_ref()
-            .is_some_and(|context| context.cancel_reason() == &Some(CancelReason::Backoff));
-
-        // A fetch that was cancelled because the player had enough data restarts once the player
-        // needs more, so its download is suspended rather than complete.
-        if backed_off {
-            network_listener::submit_timing(cx, &self, &status, &timing);
-            return;
-        }
-
-        let (download_suspended, was_suspended, restarts_interrupted_fetch, is_seekable) =
-            match *element.current_fetch_context.borrow_mut() {
-                Some(ref mut current_fetch_context) => {
-                    let state = (
-                        current_fetch_context.is_download_suspended(),
-                        current_fetch_context.was_suspended(),
-                        current_fetch_context.interrupted(),
-                        current_fetch_context.is_seekable(),
-                    );
-                    current_fetch_context.end();
-                    state
-                },
-                None => (false, false, false, false),
-            };
-
-        // A server may close a connection that it cannot write to for long, and net ends a fetch
-        // that stays suspended for too long, so a fetch that was suspended is restarted once if its
-        // response ends early. If the restart fails too before it delivers data, the connection
-        // counts as interrupted, unless a restart without range support ended without an error
-        // where the player stopped, as when the Content-Length of the server is too large, and
-        // the resource ends there.
-        let ended_early = !self.range_not_satisfiable &&
-            (status.is_err() ||
-                self.expected_body_length
-                    .is_some_and(|length| self.fetched_content_length < length));
-        let ends_where_the_player_stopped = status.is_ok() &&
-            !is_seekable &&
-            self.offset > 0 &&
-            self.fetched_content_length >= self.offset;
-        if ended_early && restarts_interrupted_fetch && !ends_where_the_player_stopped {
-            // => "If the connection is interrupted after some media data has been received..."
-            element.media_data_processing_fatal_steps(cx, MEDIA_ERR_NETWORK);
-            network_listener::submit_timing(cx, &self, &status, &timing);
-            return;
-        }
-        if ended_early && was_suspended && !restarts_interrupted_fetch {
-            element.restart_interrupted_fetch(cx, download_suspended);
-            network_listener::submit_timing(cx, &self, &status, &timing);
-            return;
-        }
-
-        // <https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list>
-        if self.range_not_satisfiable || (status.is_ok() && self.fetched_content_length != 0) {
-            // => "Once the entire media resource has been fetched..."
-
-            // There are no more chunks of the response body forthcoming, so we can
-            // go ahead and notify the media backend not to expect any further data.
-            if let Some(ref mut current_fetch_context) = *element.current_fetch_context.borrow_mut()
-            {
-                // On initial state change READY -> PAUSED the media player perform
-                // seek to initial position by event with seek segment (TIME format)
-                // while media stack operates in BYTES format and configuring segment
-                // start and stop positions without the total size of the stream is not
-                // possible. As fallback the media player perform seek with BYTES format
-                // and initiate seek request via "seek-data" callback with required offset.
-                if self.expected_content_length.is_none() &&
-                    self.fetched_content_length != 0 &&
-                    let Err(e) = element
-                        .player
-                        .borrow()
-                        .as_ref()
-                        .unwrap()
-                        .lock()
-                        .unwrap()
-                        .set_input_size(self.fetched_content_length)
-                {
-                    warn!("Could not set player input size {:?}", e);
-                }
-
-                let mut data_source = current_fetch_context.data_source().borrow_mut();
-
-                data_source.add_buffer_to_queue(DataBuffer::EndOfStream);
-                let _ = data_source
-                    .process_into_player_from_queue(element.player.borrow().as_ref().unwrap());
-            }
-
-            // Step 1. Fire an event named progress at the media element.
-            element
-                .upcast::<EventTarget>()
-                .fire_event(cx, atom!("progress"));
-
-            // Step 2. Set the networkState to NETWORK_IDLE and fire an event named suspend at the
-            // media element.
-            element.set_network_state(NetworkState::Idle);
-
-            element
-                .upcast::<EventTarget>()
-                .fire_event(cx, atom!("suspend"));
-        } else if status.is_err() && element.ready_state.get() != ReadyState::HaveNothing {
-            // => "If the connection is interrupted after some media data has been received..."
-            element.media_data_processing_fatal_steps(cx, MEDIA_ERR_NETWORK);
-        } else {
-            // => "If the media data can be fetched but is found by inspection to be in an
-            // unsupported format, or can otherwise not be rendered at all"
-            element.media_data_processing_failure_steps(cx);
-        }
-
-        network_listener::submit_timing(cx, &self, &status, &timing);
-    }
-
-    fn process_csp_violations(
-        &mut self,
-        cx: &mut JSContext,
-        _request_id: RequestId,
-        violations: Vec<Violation>,
-    ) {
-        let global = &self.resource_timing_global();
-        global.report_csp_violations(cx, violations, None, None);
-    }
-
-    fn should_invoke(&self) -> bool {
-        let element = self.element.root();
-
-        if element.generation_id.get() != self.generation_id || element.player.borrow().is_none() {
-            return false;
-        }
-
-        let Some(ref current_fetch_context) = *element.current_fetch_context.borrow() else {
-            return false;
-        };
-
-        // Whether the new fetch request was triggered.
-        if current_fetch_context.request_id() != self.request_id {
-            return false;
-        }
-
-        // Whether the current fetch request was cancelled due to a network or decoding error, or
-        // was aborted by the user.
-        if let Some(cancel_reason) = current_fetch_context.cancel_reason() &&
-            matches!(*cancel_reason, CancelReason::Error | CancelReason::Abort)
-        {
-            return false;
-        }
-
-        true
-    }
-}
-
-impl ResourceTimingListener for HTMLMediaElementFetchListener {
-    fn resource_timing_information(&self) -> (InitiatorType, ServoUrl) {
-        let initiator_type = InitiatorType::LocalName(
-            self.element
-                .root()
-                .upcast::<Element>()
-                .local_name()
-                .to_string(),
-        );
-        (initiator_type, self.url.clone())
-    }
-
-    fn resource_timing_global(&self) -> DomRoot<GlobalScope> {
-        self.element.root().owner_document().global()
-    }
-}
-
-impl HTMLMediaElementFetchListener {
-    fn new(element: &HTMLMediaElement, request_id: RequestId, url: ServoUrl, offset: u64) -> Self {
-        Self {
-            element: Trusted::new(element),
-            generation_id: element.generation_id.get(),
-            request_id,
-            next_progress_event: Instant::now() + Duration::from_millis(350),
-            url,
-            expected_content_length: None,
-            expected_body_length: None,
-            fetched_content_length: 0,
-            content_length_to_discard: offset,
-            offset,
-            range_not_satisfiable: false,
-        }
+        PushOutcome::Done
     }
 }
 
@@ -5127,7 +4465,7 @@ impl HTMLMediaElementEventHandler {
                 element.playback_position_changed(cx, position)
             },
             PlayerEvent::SeekData(offset, seek_lock) => {
-                element.fetch_request(cx, Some(offset), Some(seek_lock))
+                element.playback_seek_data(offset, seek_lock)
             },
             PlayerEvent::SeekDone(position) => element.playback_seek_done(cx, position),
             PlayerEvent::StateChanged(ref state) => element.playback_state_changed(cx, state),
@@ -5148,14 +4486,12 @@ impl Drop for HTMLMediaElementEventHandler {
 /// Queues tasks for a media element from any thread, without keeping the element alive. A task
 /// only runs while the element keeps the player that it had when the queue was made.
 #[derive(Clone)]
-#[expect(dead_code, reason = "Used from the next patch")]
 pub(crate) struct MediaElementTaskQueue {
     event_handler: Weak<Mutex<HTMLMediaElementEventHandler>>,
     task_source: Arc<Mutex<SendableTaskSource>>,
 }
 
 impl MediaElementTaskQueue {
-    #[expect(dead_code, reason = "Used from the next patch")]
     pub(crate) fn queue<F>(&self, task: F)
     where
         F: FnOnce(&mut JSContext, &HTMLMediaElement) + Send + 'static,

@@ -181,7 +181,7 @@ use crate::dom::html::htmlheadelement::HTMLHeadElement;
 use crate::dom::html::htmlhtmlelement::HTMLHtmlElement;
 use crate::dom::html::htmliframeelement::HTMLIFrameElement;
 use crate::dom::html::htmlimageelement::HTMLImageElement;
-use crate::dom::html::htmlmediaelement::{HTMLMediaElement, MediaElementWeakRef};
+use crate::dom::html::htmlmediaelement::{HTMLMediaElement, MediaElementWeakRef, NetworkState};
 use crate::dom::html::htmlscriptelement::{HTMLScriptElement, ScriptResult};
 use crate::dom::html::htmltitleelement::HTMLTitleElement;
 use crate::dom::htmldetailselement::DetailsNameGroups;
@@ -625,8 +625,9 @@ pub(crate) struct Document {
     /// document is, even if script holds no reference to them.
     /// <https://html.spec.whatwg.org/multipage/#playing-the-media-resource>
     media_elements_with_pending_activity: DomRefCell<Vec<Dom<HTMLMediaElement>>>,
-    /// The media elements that suspended their fetch, some of which may have resumed it since.
-    media_elements_with_suspended_fetch: DomRefCell<Vec<MediaElementWeakRef>>,
+    /// The media elements that opened a reader of the media cache, some of which may have closed
+    /// it since.
+    media_elements_with_reader: DomRefCell<Vec<MediaElementWeakRef>>,
     /// A set of dirty HTML canvas elements that need their WebRender images updated the
     /// next time the rendering is updated.
     dirty_canvases: DomRefCell<Vec<Dom<HTMLCanvasElement>>>,
@@ -899,6 +900,9 @@ impl Document {
             // Step 4.2. Clear window's map of active timers.
             self.timers.clear();
 
+            // The document is not restored, so its media elements need no media data.
+            self.close_media_readers();
+
             // Ensure the constellation discards all bfcache information for this document.
             let msg = ScriptToConstellationMessage::DiscardDocument;
             let _ = global_scope.script_to_constellation_chan().send(msg);
@@ -1156,7 +1160,7 @@ impl Document {
                 self.window().suspend(cx);
             }
             media.suspend(&client_context_id);
-            self.cancel_suspended_media_fetches();
+            self.update_media_reader_activities();
             return;
         }
 
@@ -1169,6 +1173,7 @@ impl Document {
         self.dirty_all_nodes(cx.no_gc());
         self.window().resume(cx);
         media.resume(&client_context_id);
+        self.update_media_reader_activities();
 
         if self.ready_state.get() != DocumentReadyState::Complete {
             return;
@@ -3057,11 +3062,14 @@ impl Document {
         self.deferred_scripts.clear();
 
         let global = self.window.as_global_scope();
-        self.cancel_suspended_media_fetches();
         let loads_cancelled = global.fetch_group_mut().terminate(global);
         let event_sources_canceled = global.close_event_sources();
+        // The media cache fetches for media elements outside the fetch group. When the document is
+        // navigated away from, a download in progress is cancelled once it is unloaded.
+        let media_downloads_cancelled =
+            matches!(reason, AbortReason::Navigate) && self.has_media_download_in_progress();
 
-        if loads_cancelled || event_sources_canceled {
+        if loads_cancelled || event_sources_canceled || media_downloads_cancelled {
             // If any loads were canceled.
             self.salvageable.set(false);
         };
@@ -3327,24 +3335,56 @@ impl Document {
             .retain(|registered| **registered != *element);
     }
 
-    pub(crate) fn register_media_element_with_suspended_fetch(&self, element: &HTMLMediaElement) {
-        let mut elements = self.media_elements_with_suspended_fetch.borrow_mut();
-        // `element` registers while it borrows its fetch context, so it is compared first, which
-        // keeps `has_suspended_fetch` from borrowing that context again.
+    pub(crate) fn register_media_element_with_reader(&self, element: &HTMLMediaElement) {
+        let mut elements = self.media_elements_with_reader.borrow_mut();
         elements.retain(|registered| {
-            registered.root().is_some_and(|registered| {
-                *registered != *element && registered.has_suspended_fetch()
-            })
+            registered
+                .root()
+                .is_some_and(|registered| *registered != *element && registered.has_media_reader())
         });
         elements.push(MediaElementWeakRef::new(element));
     }
 
-    /// Cancels the suspended fetches of media elements, which restart once their player needs
-    /// data again, so that a document that nothing might resume them in holds no connections.
-    pub(crate) fn cancel_suspended_media_fetches(&self) {
-        let elements = std::mem::take(&mut *self.media_elements_with_suspended_fetch.borrow_mut());
+    pub(crate) fn unregister_media_element_with_reader(&self, element: &HTMLMediaElement) {
+        self.media_elements_with_reader
+            .borrow_mut()
+            .retain(|registered| {
+                registered
+                    .root()
+                    .is_some_and(|registered| *registered != *element)
+            });
+    }
+
+    fn has_media_download_in_progress(&self) -> bool {
+        self.media_elements_with_reader
+            .borrow()
+            .iter()
+            .filter_map(MediaElementWeakRef::root)
+            .any(|element| {
+                element.has_media_reader() && element.network_state() == NetworkState::Loading
+            })
+    }
+
+    /// Tells the media cache how much of their media resource the media elements need, which
+    /// depends on whether the document is fully active.
+    fn update_media_reader_activities(&self) {
+        let elements: Vec<_> = self
+            .media_elements_with_reader
+            .borrow()
+            .iter()
+            .filter_map(MediaElementWeakRef::root)
+            .collect();
+        for element in elements {
+            element.update_reader_activity();
+        }
+    }
+
+    /// Closes the readers of the media cache of the media elements, which cancels the fetches
+    /// that no other document needs.
+    pub(crate) fn close_media_readers(&self) {
+        let elements = std::mem::take(&mut *self.media_elements_with_reader.borrow_mut());
         for element in elements.iter().filter_map(MediaElementWeakRef::root) {
-            element.cancel_suspended_fetch();
+            element.close_media_reader();
         }
     }
 
@@ -4358,7 +4398,7 @@ impl Document {
             shadow_roots_styles_changed: Cell::new(false),
             media_controls: DomRefCell::new(HashMap::new()),
             media_elements_with_pending_activity: Default::default(),
-            media_elements_with_suspended_fetch: Default::default(),
+            media_elements_with_reader: Default::default(),
             dirty_canvases: DomRefCell::new(Default::default()),
             has_pending_animated_image_update: Cell::new(false),
             selection: MutNullableDom::new(None),
