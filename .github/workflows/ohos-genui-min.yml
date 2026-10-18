@@ -1,0 +1,147 @@
+# Builds GenUI-min, the smallest servoshell configuration for OpenHarmony (`just genui-min`), and
+# reports the size of its library and HAP. The Main workflow calls it for pull requests that need
+# the OpenHarmony or QuickJS build.
+name: GenUI-min
+on:
+  push:
+    branches: ["ohos-main"]
+  workflow_call:
+    secrets:
+      BENCHER_API_KEY:
+        required: false
+  workflow_dispatch:
+
+env:
+  RUST_BACKTRACE: 1
+  SHELL: /bin/bash
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: OpenHarmony Build (GenUI-min)
+    timeout-minutes: 90
+    # The self-hosted runners labelled servo-ohos-linux have the OpenHarmony SDK, hvigor, just and
+    # a target directory with this build of a recent ohos-main. Pull requests from forks and runs
+    # while the repository variable NO_SELF_HOSTED_RUNNERS is set use GitHub-hosted runners.
+    runs-on: ${{ (vars.NO_SELF_HOSTED_RUNNERS || github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || 'servo-ohos-linux' }}
+    permissions:
+      contents: read
+    outputs:
+      library-size: ${{ steps.size.outputs.library }}
+      hap-size: ${{ steps.size.outputs.hap }}
+    steps:
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
+      - name: Setup Python
+        if: ${{ runner.environment != 'self-hosted' }}
+        uses: ./.github/actions/setup-python
+      - name: Change Mirror Priorities
+        if: ${{ runner.environment != 'self-hosted' }}
+        uses: ./.github/actions/apt-mirrors
+      - name: Bootstrap dependencies
+        if: ${{ runner.environment != 'self-hosted' }}
+        timeout-minutes: 30
+        run: |
+          sudo apt update
+          sudo apt install -y just
+          ./mach bootstrap --yes --skip-lints --skip-nextest --ohos
+      - name: Install LLVM and Clang
+        if: ${{ runner.environment != 'self-hosted' }}
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "20.1"
+          directory: ${{ runner.temp }}/llvm
+      - name: Setup OpenHarmony SDK
+        if: ${{ runner.environment != 'self-hosted' }}
+        id: setup_sdk
+        uses: openharmony-rs/setup-ohos-sdk@v1.0.0
+        with:
+          version: "6.1" # api 23 in openharmony
+          fixup-path: true
+      # The self-hosted runners set these in their environment.
+      - name: Set the OpenHarmony SDK env
+        if: ${{ runner.environment != 'self-hosted' }}
+        env:
+          OHOS_SDK_NATIVE: ${{ steps.setup_sdk.outputs.ohos_sdk_native }}
+          OHOS_BASE_SDK_HOME: ${{ steps.setup_sdk.outputs.ohos-base-sdk-home }}
+        run: |
+          echo "OHOS_SDK_NATIVE=$OHOS_SDK_NATIVE" >> "$GITHUB_ENV"
+          echo "OHOS_BASE_SDK_HOME=$OHOS_BASE_SDK_HOME" >> "$GITHUB_ENV"
+      - name: Install node for hvigor
+        if: ${{ runner.environment != 'self-hosted' }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install hvigor modules
+        if: ${{ runner.environment != 'self-hosted' }}
+        run: |
+          mkdir ~/hvigor-installation
+          cd ~/hvigor-installation
+          echo "@ohos:registry=https://repo.harmonyos.com/npm/" > .npmrc
+          npm install "@ohos/hvigor@5" "@ohos/hvigor-ohos-plugin@5"
+          echo "HVIGOR_PATH=$PWD" >> "$GITHUB_ENV"
+      - name: Build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: just genui-min
+      - name: Report the size
+        id: size
+        run: |
+          LLVM_STRIP="$OHOS_SDK_NATIVE/llvm/bin/llvm-strip" just genui-min-size | tee size.txt
+          {
+            echo "### GenUI-min"
+            echo '```'
+            cat size.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "library=$(stat -c %s target/aarch64-unknown-linux-ohos/genui-min/libservoshell.stripped.so)"
+            echo "hap=$(stat -c %s target/openharmony/aarch64-unknown-linux-ohos/genui-min/entry/build/default/outputs/default/servoshell-default-unsigned.hap)"
+          } >> "$GITHUB_OUTPUT"
+      - name: Upload the HAP and the library
+        uses: actions/upload-artifact@v7
+        with:
+          name: genui-min-ohos-aarch64-unknown-linux-ohos
+          path: |
+            target/openharmony/aarch64-unknown-linux-ohos/genui-min/entry/build/default/outputs/default/*.hap
+            target/aarch64-unknown-linux-ohos/genui-min/libservoshell.so
+          if-no-files-found: error
+
+  # The project key in the bencher environment's BENCHER_API_KEY can only write to the servo-ohos
+  # project. The Bencher jobs inherited from Servo use BENCHER_API_TOKEN and stay off. Pull requests
+  # from forks don't get the key.
+  bencher:
+    name: Send the GenUI-min size to Bencher
+    needs: build
+    if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-24.04
+    environment:
+      name: bencher
+      deployment: false
+    permissions:
+      checks: write
+      pull-requests: write
+    steps:
+      - uses: bencherdev/bencher@main
+      - name: Send the size
+        env:
+          BENCHER_API_KEY: ${{ secrets.BENCHER_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LIBRARY_SIZE: ${{ needs.build.outputs.library-size }}
+          HAP_SIZE: ${{ needs.build.outputs.hap-size }}
+          PR_NUMBER: ${{ github.event.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          jq -n --argjson library "$LIBRARY_SIZE" --argjson hap "$HAP_SIZE" \
+            '{"libservoshell.stripped.so": {"file-size": {"value": $library}}, "servoshell-default-unsigned.hap": {"file-size": {"value": $hap}}}' > size.json
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            options=(--branch "$PR_NUMBER/PR" --hash "$HEAD_SHA" --start-point "$GITHUB_BASE_REF" \
+              --start-point-hash "$BASE_SHA" --start-point-reset --start-point-clone-thresholds)
+          else
+            # The sizes are deterministic, so each push is compared with the previous one.
+            options=(--branch ohos-main --hash "$GITHUB_SHA" --threshold-measure file-size \
+              --threshold-test percentage --threshold-max-sample-size 1 --threshold-upper-boundary 0.001 \
+              --thresholds-reset)
+          fi
+          bencher run --project servo-ohos "${options[@]}" --testbed aarch64-unknown-linux-ohos \
+            --adapter json --file size.json --github-actions "$GITHUB_TOKEN"

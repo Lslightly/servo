@@ -52,6 +52,7 @@ NOT_BUILT = (
 # Code that is only built for OpenHarmony.
 OHOS_ONLY = (
     ".github/workflows/ohos-emulator.yml",
+    ".github/workflows/ohos-genui-min.yml",
     ".github/workflows/ohos.yml",
     "components/fonts/platform/freetype/ohos/",
     "components/media/backends/ohos/",
@@ -60,6 +61,7 @@ OHOS_ONLY = (
     "components/storage/ohos_rdb/",
     "components/storage/webstorage/engines/ohos_rdb.rs",
     "etc/ci/ohos_emulator_smoke_test.py",
+    "justfile",
     "ports/arkweb/",
     "ports/servoshell/egl/ohos/",
     "ports/servoshell/platform/openharmony/",

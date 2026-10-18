@@ -83,6 +83,21 @@ jobs:
       coverage: ${{ matrix.coverage }}
       capi: ${{ matrix.capi }}
 
+  # Pull requests that need the OpenHarmony or QuickJS build also build GenUI-min, which doesn't
+  # decide the result.
+  genui-min:
+    name: GenUI-min
+    needs: ["decision"]
+    if: ${{ github.event_name == 'pull_request' && (contains(fromJson(needs.decision.outputs.configuration).matrix.*.workflow, 'ohos') || contains(fromJson(needs.decision.outputs.configuration).matrix.*.workflow, 'quickjs')) }}
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/ohos-genui-min.yml
+    # Reusable workflows only get the environment secrets that the caller passes.
+    secrets:
+      BENCHER_API_KEY: ${{ secrets.BENCHER_API_KEY }}
+
   build-result:
     name: Result
     runs-on: ubuntu-latest
