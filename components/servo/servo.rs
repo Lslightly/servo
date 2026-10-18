@@ -44,9 +44,10 @@ use paint::{InitialPaintState, Paint};
 pub use paint_api::rendering_context::RenderingContext;
 use paint_api::{CrossProcessPaintApi, PaintMessage, PaintProxy};
 use profile::{mem as profile_mem, time as profile_time};
-use profile_traits::mem::MemoryReportResult;
-#[cfg(feature = "multiprocess")]
-use profile_traits::mem::{ProfilerMsg, Reporter};
+use profile_traits::mem::{
+    MemoryReportResult, ProcessReports, ProfilerChan, ProfilerMsg, Report, ReportKind, Reporter,
+    ReporterRequest, perform_memory_report,
+};
 use profile_traits::{mem, time};
 use rustc_hash::FxHashMap;
 use script::JSEngineSetup;
@@ -953,6 +954,7 @@ impl Servo {
             opts.time_profiler_trace_path.clone(),
         );
         let mem_profiler_chan = profile_mem::Profiler::create();
+        register_media_cache_memory_reporter(&mem_profiler_chan);
 
         let mut devtools_sender: Option<Sender<DevtoolsMessage>> = None;
         #[cfg(feature = "devtools")]
@@ -1377,6 +1379,11 @@ pub fn run_content_process(token: String) {
             );
 
             register_system_memory_reporter_for_event_loop(&new_event_loop_info);
+            register_media_cache_memory_reporter(
+                &new_event_loop_info
+                    .initial_script_state
+                    .memory_profiler_sender,
+            );
 
             let (background_hang_monitor_register, background_hang_monitor_join_handle) =
                 HangMonitorRegister::init(
@@ -1497,6 +1504,41 @@ impl ServoBuilder {
         self.protocol_registry = protocol_registry;
         self
     }
+}
+
+/// Registers the memory reporter of the media cache of this process, which runs on its own thread,
+/// like the system reporter, since the cache is shared by every script thread of the process.
+fn register_media_cache_memory_reporter(mem_profiler_chan: &ProfilerChan) {
+    let callback = GenericCallback::new(|message| {
+        let Ok(request): Result<ReporterRequest, _> = message else {
+            return;
+        };
+        let mut reports = vec![];
+        if let Some(cache) = servo_media_cache::MediaCache::existing() {
+            perform_memory_report(|ops| {
+                let memory = cache.measure_memory(ops);
+                let heap = |name: &str, size| Report {
+                    path: profile_traits::path!["media-cache", name],
+                    kind: ReportKind::ExplicitJemallocHeapSize,
+                    size,
+                };
+                reports.push(heap("resources-in-memory", memory.resources_in_memory));
+                reports.push(heap("write-buffers", memory.write_buffers));
+                reports.push(heap("memory-fallback", memory.memory_fallback));
+                reports.push(Report {
+                    path: profile_traits::path!["media-cache-file"],
+                    kind: ReportKind::NonExplicitSize,
+                    size: memory.file,
+                });
+            });
+        }
+        request.reports_channel.send(ProcessReports::new(reports));
+    })
+    .expect("Could not create media cache memory reporter callback");
+    mem_profiler_chan.send(ProfilerMsg::RegisterReporter(
+        format!("media-cache-{}", std::process::id()),
+        Reporter(callback),
+    ));
 }
 
 #[cfg(feature = "multiprocess")]

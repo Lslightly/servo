@@ -7,6 +7,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
+use malloc_size_of::MallocSizeOfOps;
 use parking_lot::Mutex;
 
 use crate::cache::Settings;
@@ -1967,4 +1968,69 @@ fn readers_on_other_threads() {
         thread.join().unwrap();
     }
     assert_eq!(server.requests().len(), 1);
+}
+
+fn measure_memory(cache: &MediaCache) -> MediaCacheMemory {
+    cache.measure_memory(&mut MallocSizeOfOps::new(
+        servo_allocator::usable_size,
+        servo_allocator::enclosing_size,
+        None,
+    ))
+}
+
+#[test]
+fn memory_reports_count_each_kind_of_data() {
+    let setup = setup(settings());
+    assert_eq!(measure_memory(&setup.cache), MediaCacheMemory::default());
+
+    let small = FakeServer::new(ServerConfig::new(4 * MIB));
+    let small_reader = setup.cache.open(key("small"), small.fetcher());
+    read_expect(&small, &small_reader, 0, 4 * MIB, 0);
+    let large = FakeServer::new(ServerConfig::new(20 * MIB));
+    let large_reader = setup.cache.open(key("large"), large.fetcher());
+    read_expect(&large, &large_reader, 0, 4 * MIB, 0);
+
+    let memory = measure_memory(&setup.cache);
+    let (file, buffered) = setup.with_resource(&key("large"), |res| {
+        let file = res
+            .blocks
+            .values()
+            .map(|block| block.file_len)
+            .sum::<usize>();
+        let buffered = res
+            .blocks
+            .values()
+            .filter(|block| !block.ram.is_empty())
+            .count();
+        (file, buffered)
+    });
+    assert!((4 * MIB as usize..5 * MIB as usize).contains(&memory.resources_in_memory));
+    assert_eq!(memory.file, file);
+    assert!(memory.file >= 4 * MIB as usize - BLOCK_SIZE as usize);
+    assert!(memory.write_buffers <= buffered * 2 * BLOCK_SIZE as usize);
+    assert_eq!(memory.memory_fallback, 0);
+}
+
+#[test]
+fn memory_reports_count_the_memory_fallback() {
+    let mut settings = settings();
+    settings.memory_fallback = 2 * MIB;
+    settings.directory = Some("/nonexistent/media-cache".into());
+    let setup = setup(settings);
+    let server = FakeServer::new(ServerConfig::new(20 * MIB));
+    let reader = setup.cache.open(key("a"), server.fetcher());
+    read_expect(&server, &reader, 0, MIB, 0);
+
+    let memory = measure_memory(&setup.cache);
+    assert!((MIB as usize..3 * MIB as usize).contains(&memory.memory_fallback));
+    assert_eq!(memory.resources_in_memory, 0);
+    assert_eq!(memory.write_buffers, 0);
+    assert_eq!(memory.file, 0);
+}
+
+#[test]
+fn the_cache_of_the_process_exists_once_it_is_used() {
+    let cache = MediaCache::get();
+    let existing = MediaCache::existing().expect("the cache exists");
+    assert!(Arc::ptr_eq(&cache, &existing));
 }

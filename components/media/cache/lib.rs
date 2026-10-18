@@ -27,10 +27,10 @@ mod store;
 mod tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
-use malloc_size_of::{MallocShallowSizeOf, MallocSizeOf, MallocSizeOfOps};
+use malloc_size_of::{MallocShallowSizeOf, MallocSizeOfOps};
 
 use crate::cache::{Inner, Settings};
 use crate::clock::{Clock, RealClock};
@@ -163,6 +163,23 @@ pub enum ReaderEvent {
     Error(ReaderError),
 }
 
+/// What the media cache keeps, in bytes, for memory reports.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MediaCacheMemory {
+    /// The heap memory of the resources that are kept in memory.
+    pub resources_in_memory: usize,
+    /// The heap memory of the data of other resources that is not written to the file yet.
+    pub write_buffers: usize,
+    /// The heap memory of the data of other resources that is kept in memory because the file
+    /// cannot be used.
+    pub memory_fallback: usize,
+    /// The data in the temporary file, which is in the page cache rather than in the memory of
+    /// the process.
+    pub file: usize,
+}
+
+static CACHE: OnceLock<Arc<MediaCache>> = OnceLock::new();
+
 /// The media resources of a content process.
 pub struct MediaCache {
     inner: Arc<Inner>,
@@ -171,13 +188,19 @@ pub struct MediaCache {
 impl MediaCache {
     /// The cache of this process, created on first use with the `media_cache_*` preferences.
     pub fn get() -> Arc<MediaCache> {
-        static CACHE: LazyLock<Arc<MediaCache>> = LazyLock::new(|| {
-            Arc::new(MediaCache::with_clock(
-                Settings::from_prefs(),
-                Arc::new(RealClock::new()),
-            ))
-        });
-        CACHE.clone()
+        CACHE
+            .get_or_init(|| {
+                Arc::new(MediaCache::with_clock(
+                    Settings::from_prefs(),
+                    Arc::new(RealClock::new()),
+                ))
+            })
+            .clone()
+    }
+
+    /// The cache of this process, if it was used.
+    pub fn existing() -> Option<Arc<MediaCache>> {
+        CACHE.get().cloned()
     }
 
     pub(crate) fn with_clock(settings: Settings, clock: Arc<dyn Clock>) -> Self {
@@ -203,14 +226,26 @@ impl MediaCache {
     }
 }
 
-/// Counts the blocks in memory, not those in the temporary file.
-impl MallocSizeOf for MediaCache {
-    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+impl MediaCache {
+    /// Measures the data that the cache keeps.
+    pub fn measure_memory(&self, ops: &mut MallocSizeOfOps) -> MediaCacheMemory {
         let state = self.inner.state.lock();
-        state
-            .blocks()
-            .map(|block| block.ram.shallow_size_of(ops))
-            .sum()
+        let memory_fallback = state.store.ram_mode();
+        let mut memory = MediaCacheMemory::default();
+        for resource in state.resources.values() {
+            for block in resource.blocks.values() {
+                let ram = block.ram.shallow_size_of(ops);
+                if resource.ram_backed {
+                    memory.resources_in_memory += ram;
+                } else if memory_fallback {
+                    memory.memory_fallback += ram;
+                } else {
+                    memory.write_buffers += ram;
+                }
+                memory.file += block.file_len;
+            }
+        }
+        memory
     }
 }
 
