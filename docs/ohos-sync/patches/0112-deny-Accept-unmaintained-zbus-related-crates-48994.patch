@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Martin Robinson <mrobinson@igalia.com>
+Date: Sat, 17 Oct 2026 19:36:39 +0000
+Subject: [PATCH] deny: Accept unmaintained zbus-related crates (#48994)
+
+We must accept these until our dependencies stop using them. In
+particular these are used by `atspi-common`.
+
+Testing: This should unblock the CI.
+
+Signed-off-by: Martin Robinson <mrobinson@abandonedwig.info>
+(cherry picked from commit 493d293e1947f8ebd9aed0b34c0393f0079838ef)
+
+----
+
+Fork note: backport of upstream 493d293e194 (#48994), which landed after
+base/2026-10-13. RustSec marked zbus_names, zvariant and zvariant_derive
+as unmaintained, so `cargo-deny` in the Lint job failed for every pull
+request; they come in through `atspi-common`. The subject drops the
+backticks of the upstream subject, which the stack manifest cannot
+quote.
+Drop at the next sync: every later base contains 493d293e194, so this
+commit applies empty and becomes a `Superseded-by: 493d293e194`
+placeholder (runbook decision 3).
+
+Validation: `./mach test-tidy` on ohos-main 5ca16eccdc1 fails in `cargo-deny` with four advisories for rustls 0.23.45 and three unmaintained crates (zbus_names, zvariant, zvariant_derive), as the Lint job of every pull request does; with both backports, `cargo-deny` reports nothing. With both: `./mach clippy --locked -- -- --deny warnings`, `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release`, the same with `--ohos` (SDK 6.1), and `./mach test-unit --profile checked-release` (1150 tests) and `--doc` pass.
+AI-assisted: Yes (agent session; the agent cherry-picked upstream commit 493d293e194 without changes and added the fork-style part of this message below the dashed line: fork note, Validation and these trailers)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ deny.toml | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/deny.toml b/deny.toml
+index 9198c7f72b4..900030e3f51 100644
+--- a/deny.toml
++++ b/deny.toml
+@@ -40,6 +40,15 @@ ignore = [
+     # This is a dependency of `usvg`, `rustybuzz`, `fontdb`.
+     # We will need to wait for upstream actions.
+     "RUSTSEC-2026-0192",
++    # The crate `zvariant` is unmaintained. Wait for `atspi-common` to start
++    # using `zbus`.
++    "RUSTSEC-2026-0370",
++    # The crate `zbus_names` is unmaintained. Wait for `atspi-common` to start
++    # using `zbus`.
++    "RUSTSEC-2026-0371",
++    # The crate `zvariant_derive` is unmaintained. Wait for `atspi-common` to start
++    # using `zbus`.
++    "RUSTSEC-2026-0372",
+ ]
+ 
+ # This section is considered when running `cargo deny check licenses`

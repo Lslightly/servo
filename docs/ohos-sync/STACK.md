@@ -134,6 +134,9 @@ those scripts (they need network access). `check_stack.py` runs each with
 108. `media (ohos): Report a failure of AVPlayer to the media element once` — B · manual · watch: components/script/dom/html/embedded_content/htmlmediaelement.rs
 109. `servoshell (ohos): Put the media cache's file in the application's temporary directory` — B · manual · watch: components/config/prefs.rs
 110. `docs: record patches 98 to 110 in the stack manifest` — B · none · watch: -
+111. `deps: Upgrade to rustls@0.23.46 (#48910)` — B · CI · watch: -
+112. `deny: Accept unmaintained zbus-related crates (#48994)` — B · CI · watch: -
+113. `docs: record patches 111 to 113 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

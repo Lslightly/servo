@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Narfinger <Narfinger@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 15:06:20 +0000
+Subject: [PATCH] deps: Upgrade to rustls@0.23.46 (#48910)
+
+`rustls` yanked `0.23.45`, so this fixes `cargo-deny` errors blocking
+the CI.
+
+Testing: Dependency update do not require tests apart from successful
+compilation.
+
+Signed-off-by: Narfinger <Narfinger@users.noreply.github.com>
+(cherry picked from commit 5abd89f8ca38ba705b46dd6dea4ba7b903d30373)
+
+----
+
+Fork note: backport of upstream 5abd89f8ca3 (#48910), which landed after
+base/2026-10-13. rustls 0.23.45 was yanked and has four advisories, so
+`cargo-deny` in the Lint job failed for every pull request. The subject
+drops the backticks of the upstream subject, which the stack manifest
+cannot quote.
+Drop at the next sync: every later base contains 5abd89f8ca3, so this
+commit applies empty and becomes a `Superseded-by: 5abd89f8ca3`
+placeholder (runbook decision 3).
+
+Validation: `./mach test-tidy` on ohos-main 5ca16eccdc1 fails in `cargo-deny` with four advisories for rustls 0.23.45 and three unmaintained crates (zbus_names, zvariant, zvariant_derive), as the Lint job of every pull request does; with both backports, `cargo-deny` reports nothing. With both: `./mach clippy --locked -- -- --deny warnings`, `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release`, the same with `--ohos` (SDK 6.1), and `./mach test-unit --profile checked-release` (1150 tests) and `--doc` pass.
+AI-assisted: Yes (agent session; the agent cherry-picked upstream commit 5abd89f8ca3 without changes and added the fork-style part of this message below the dashed line: fork note, Validation and these trailers)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 4b0ccc4889a..7004e5655fc 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7783,9 +7783,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "rustls"
+-version = "0.23.45"
++version = "0.23.46"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
++checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
+ dependencies = [
+  "aws-lc-rs",
+  "log",
