@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sun, 18 Oct 2026 13:40:24 +0000
+Subject: [PATCH] media: Report the memory of the media cache
+
+No memory reporter measured the media cache, so about:memory showed
+neither the media that it keeps in memory nor what it keeps in its
+temporary file.
+
+Register a reporter for the cache of each process, next to the system
+reporter: in the main process, where the cache lives in single-process
+mode, and in every content process. Like the system reporter, it runs
+on its own thread, since every script thread of the process shares the
+cache, and it reports nothing until the cache is used. Under
+`explicit/media-cache` it reports the heap memory of the resources that
+are kept in memory, of the write buffers of the other resources, and of
+the memory fallback when the temporary file cannot be used;
+`media-cache-file` reports the data in the temporary file, which is in
+the page cache rather than in the memory of the process.
+
+`MediaCache::measure_memory` replaces the unused `MallocSizeOf`
+implementation, and `MediaCache::existing` returns the cache of the
+process without creating it.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: unit tests of the measurement of each kind of data, of the
+memory fallback, and of `MediaCache::existing`.
+
+Validation: headless servoshell (`checked-release`) on Linux playing a 14.3 MB MP4 and a 96.9 KB WebM, then `navigator.servo.reportMemory()` with `expose_servointernals_globally`: in single-process mode the main process reports media-cache/resources-in-memory as 98304 bytes and media-cache-file as 14261838 bytes, the whole MP4; with `-M` the content process reports the same, and the main process nothing. `./mach clippy --locked -- -- --deny warnings`, `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release`, the same with `--ohos`, `./mach test-unit --profile checked-release` (1153 tests) and `--doc` pass.
+AI-assisted: Yes (agent session; implemented and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock                                    |  2 +
+ components/media/cache/Cargo.toml             |  3 +
+ components/media/cache/cache.rs               |  5 --
+ components/media/cache/lib.rs                 | 67 ++++++++++++++-----
+ components/media/cache/tests.rs               | 66 ++++++++++++++++++
+ .../html/embedded_content/htmlmediaelement.rs |  2 +-
+ components/servo/Cargo.toml                   |  1 +
+ components/servo/servo.rs                     | 48 ++++++++++++-
+ 8 files changed, 169 insertions(+), 25 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 7004e5655fc..3f818d85bd1 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -8255,6 +8255,7 @@ dependencies = [
+  "servo-layout",
+  "servo-layout-api",
+  "servo-media",
++ "servo-media-cache",
+  "servo-media-dummy",
+  "servo-media-gstreamer",
+  "servo-media-ohos",
+@@ -8972,6 +8973,7 @@ dependencies = [
+  "bytes",
+  "log",
+  "parking_lot",
++ "servo-allocator",
+  "servo-config",
+  "servo-malloc-size-of",
+  "tempfile",
+diff --git a/components/media/cache/Cargo.toml b/components/media/cache/Cargo.toml
+index dac8c57dcfd..cd82dde7bd6 100644
+--- a/components/media/cache/Cargo.toml
++++ b/components/media/cache/Cargo.toml
+@@ -21,5 +21,8 @@ parking_lot = { workspace = true }
+ servo-config = { workspace = true }
+ tempfile = { workspace = true }
+ 
++[dev-dependencies]
++servo-allocator = { workspace = true }
++
+ [lints]
+ workspace = true
+diff --git a/components/media/cache/cache.rs b/components/media/cache/cache.rs
+index 9c6147cb578..7c44adb1527 100644
+--- a/components/media/cache/cache.rs
++++ b/components/media/cache/cache.rs
+@@ -1801,11 +1801,6 @@ impl State {
+         self.schedule_all();
+     }
+ 
+-    /// The bytes of RAM that the blocks use, for memory reports.
+-    pub(crate) fn blocks(&self) -> impl Iterator<Item = &Block> {
+-        self.resources.values().flat_map(|res| res.blocks.values())
+-    }
+-
+     #[cfg(test)]
+     pub(crate) fn resource(&self, key: &ResourceKey) -> Option<&Resource> {
+         self.resources.get(self.by_key.get(key)?)
+diff --git a/components/media/cache/lib.rs b/components/media/cache/lib.rs
+index a41aac27a1c..9868a4bc560 100644
+--- a/components/media/cache/lib.rs
++++ b/components/media/cache/lib.rs
+@@ -27,10 +27,10 @@ mod store;
+ mod tests;
+ 
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use std::sync::{Arc, LazyLock};
++use std::sync::{Arc, OnceLock};
+ 
+ use bytes::Bytes;
+-use malloc_size_of::{MallocShallowSizeOf, MallocSizeOf, MallocSizeOfOps};
++use malloc_size_of::{MallocShallowSizeOf, MallocSizeOfOps};
+ 
+ use crate::cache::{Inner, Settings};
+ use crate::clock::{Clock, RealClock};
+@@ -163,6 +163,23 @@ pub enum ReaderEvent {
+     Error(ReaderError),
+ }
+ 
++/// What the media cache keeps, in bytes, for memory reports.
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub struct MediaCacheMemory {
++    /// The heap memory of the resources that are kept in memory.
++    pub resources_in_memory: usize,
++    /// The heap memory of the data of other resources that is not written to the file yet.
++    pub write_buffers: usize,
++    /// The heap memory of the data of other resources that is kept in memory because the file
++    /// cannot be used.
++    pub memory_fallback: usize,
++    /// The data in the temporary file, which is in the page cache rather than in the memory of
++    /// the process.
++    pub file: usize,
++}
++
++static CACHE: OnceLock<Arc<MediaCache>> = OnceLock::new();
++
+ /// The media resources of a content process.
+ pub struct MediaCache {
+     inner: Arc<Inner>,
+@@ -171,13 +188,19 @@ pub struct MediaCache {
+ impl MediaCache {
+     /// The cache of this process, created on first use with the `media_cache_*` preferences.
+     pub fn get() -> Arc<MediaCache> {
+-        static CACHE: LazyLock<Arc<MediaCache>> = LazyLock::new(|| {
+-            Arc::new(MediaCache::with_clock(
+-                Settings::from_prefs(),
+-                Arc::new(RealClock::new()),
+-            ))
+-        });
+-        CACHE.clone()
++        CACHE
++            .get_or_init(|| {
++                Arc::new(MediaCache::with_clock(
++                    Settings::from_prefs(),
++                    Arc::new(RealClock::new()),
++                ))
++            })
++            .clone()
++    }
++
++    /// The cache of this process, if it was used.
++    pub fn existing() -> Option<Arc<MediaCache>> {
++        CACHE.get().cloned()
+     }
+ 
+     pub(crate) fn with_clock(settings: Settings, clock: Arc<dyn Clock>) -> Self {
+@@ -203,14 +226,26 @@ impl MediaCache {
+     }
+ }
+ 
+-/// Counts the blocks in memory, not those in the temporary file.
+-impl MallocSizeOf for MediaCache {
+-    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
++impl MediaCache {
++    /// Measures the data that the cache keeps.
++    pub fn measure_memory(&self, ops: &mut MallocSizeOfOps) -> MediaCacheMemory {
+         let state = self.inner.state.lock();
+-        state
+-            .blocks()
+-            .map(|block| block.ram.shallow_size_of(ops))
+-            .sum()
++        let memory_fallback = state.store.ram_mode();
++        let mut memory = MediaCacheMemory::default();
++        for resource in state.resources.values() {
++            for block in resource.blocks.values() {
++                let ram = block.ram.shallow_size_of(ops);
++                if resource.ram_backed {
++                    memory.resources_in_memory += ram;
++                } else if memory_fallback {
++                    memory.memory_fallback += ram;
++                } else {
++                    memory.write_buffers += ram;
++                }
++                memory.file += block.file_len;
++            }
++        }
++        memory
+     }
+ }
+ 
+diff --git a/components/media/cache/tests.rs b/components/media/cache/tests.rs
+index 3841c816f2b..99e4015e933 100644
+--- a/components/media/cache/tests.rs
++++ b/components/media/cache/tests.rs
+@@ -7,6 +7,7 @@ use std::sync::{Arc, Weak};
+ use std::time::Duration;
+ 
+ use bytes::Bytes;
++use malloc_size_of::MallocSizeOfOps;
+ use parking_lot::Mutex;
+ 
+ use crate::cache::Settings;
+@@ -1968,3 +1969,68 @@ fn readers_on_other_threads() {
+     }
+     assert_eq!(server.requests().len(), 1);
+ }
++
++fn measure_memory(cache: &MediaCache) -> MediaCacheMemory {
++    cache.measure_memory(&mut MallocSizeOfOps::new(
++        servo_allocator::usable_size,
++        servo_allocator::enclosing_size,
++        None,
++    ))
++}
++
++#[test]
++fn memory_reports_count_each_kind_of_data() {
++    let setup = setup(settings());
++    assert_eq!(measure_memory(&setup.cache), MediaCacheMemory::default());
++
++    let small = FakeServer::new(ServerConfig::new(4 * MIB));
++    let small_reader = setup.cache.open(key("small"), small.fetcher());
++    read_expect(&small, &small_reader, 0, 4 * MIB, 0);
++    let large = FakeServer::new(ServerConfig::new(20 * MIB));
++    let large_reader = setup.cache.open(key("large"), large.fetcher());
++    read_expect(&large, &large_reader, 0, 4 * MIB, 0);
++
++    let memory = measure_memory(&setup.cache);
++    let (file, buffered) = setup.with_resource(&key("large"), |res| {
++        let file = res
++            .blocks
++            .values()
++            .map(|block| block.file_len)
++            .sum::<usize>();
++        let buffered = res
++            .blocks
++            .values()
++            .filter(|block| !block.ram.is_empty())
++            .count();
++        (file, buffered)
++    });
++    assert!((4 * MIB as usize..5 * MIB as usize).contains(&memory.resources_in_memory));
++    assert_eq!(memory.file, file);
++    assert!(memory.file >= 4 * MIB as usize - BLOCK_SIZE as usize);
++    assert!(memory.write_buffers <= buffered * 2 * BLOCK_SIZE as usize);
++    assert_eq!(memory.memory_fallback, 0);
++}
++
++#[test]
++fn memory_reports_count_the_memory_fallback() {
++    let mut settings = settings();
++    settings.memory_fallback = 2 * MIB;
++    settings.directory = Some("/nonexistent/media-cache".into());
++    let setup = setup(settings);
++    let server = FakeServer::new(ServerConfig::new(20 * MIB));
++    let reader = setup.cache.open(key("a"), server.fetcher());
++    read_expect(&server, &reader, 0, MIB, 0);
++
++    let memory = measure_memory(&setup.cache);
++    assert!((MIB as usize..3 * MIB as usize).contains(&memory.memory_fallback));
++    assert_eq!(memory.resources_in_memory, 0);
++    assert_eq!(memory.write_buffers, 0);
++    assert_eq!(memory.file, 0);
++}
++
++#[test]
++fn the_cache_of_the_process_exists_once_it_is_used() {
++    let cache = MediaCache::get();
++    let existing = MediaCache::existing().expect("the cache exists");
++    assert!(Arc::ptr_eq(&cache, &existing));
++}
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 4fad28da01f..3e3fc4b2b87 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -293,7 +293,7 @@ pub(crate) struct HTMLMediaElement {
+     #[ignore_malloc_size_of = "Defined in std::time"]
+     next_timeupdate_event: Cell<Instant>,
+     /// The reader of the media resource in the media cache, if the element reads one.
+-    #[ignore_malloc_size_of = "The media data is in the media cache, which is not reported yet"]
++    #[ignore_malloc_size_of = "The media data is in the media cache, which reports it itself"]
+     #[no_trace]
+     media_reader: DomRefCell<Option<Box<MediaResourceReader>>>,
+     /// Identifies the reader that the element opened last.
+diff --git a/components/servo/Cargo.toml b/components/servo/Cargo.toml
+index defcfc5208a..a4a55daef07 100644
+--- a/components/servo/Cargo.toml
++++ b/components/servo/Cargo.toml
+@@ -165,6 +165,7 @@ servo-constellation = { workspace = true }
+ servo-constellation-traits = { workspace = true }
+ servo-geometry = { workspace = true }
+ servo-media = { workspace = true }
++servo-media-cache = { workspace = true }
+ servo-media-dummy = { workspace = true }
+ servo-media-gstreamer = { workspace = true, optional = true }
+ servo-tracing = { workspace = true }
+diff --git a/components/servo/servo.rs b/components/servo/servo.rs
+index 0bcc7ed2cea..fdc9f6e6916 100644
+--- a/components/servo/servo.rs
++++ b/components/servo/servo.rs
+@@ -44,9 +44,10 @@ use paint::{InitialPaintState, Paint};
+ pub use paint_api::rendering_context::RenderingContext;
+ use paint_api::{CrossProcessPaintApi, PaintMessage, PaintProxy};
+ use profile::{mem as profile_mem, time as profile_time};
+-use profile_traits::mem::MemoryReportResult;
+-#[cfg(feature = "multiprocess")]
+-use profile_traits::mem::{ProfilerMsg, Reporter};
++use profile_traits::mem::{
++    MemoryReportResult, ProcessReports, ProfilerChan, ProfilerMsg, Report, ReportKind, Reporter,
++    ReporterRequest, perform_memory_report,
++};
+ use profile_traits::{mem, time};
+ use rustc_hash::FxHashMap;
+ use script::JSEngineSetup;
+@@ -953,6 +954,7 @@ impl Servo {
+             opts.time_profiler_trace_path.clone(),
+         );
+         let mem_profiler_chan = profile_mem::Profiler::create();
++        register_media_cache_memory_reporter(&mem_profiler_chan);
+ 
+         let mut devtools_sender: Option<Sender<DevtoolsMessage>> = None;
+         #[cfg(feature = "devtools")]
+@@ -1377,6 +1379,11 @@ pub fn run_content_process(token: String) {
+             );
+ 
+             register_system_memory_reporter_for_event_loop(&new_event_loop_info);
++            register_media_cache_memory_reporter(
++                &new_event_loop_info
++                    .initial_script_state
++                    .memory_profiler_sender,
++            );
+ 
+             let (background_hang_monitor_register, background_hang_monitor_join_handle) =
+                 HangMonitorRegister::init(
+@@ -1499,6 +1506,41 @@ impl ServoBuilder {
+     }
+ }
+ 
++/// Registers the memory reporter of the media cache of this process, which runs on its own thread,
++/// like the system reporter, since the cache is shared by every script thread of the process.
++fn register_media_cache_memory_reporter(mem_profiler_chan: &ProfilerChan) {
++    let callback = GenericCallback::new(|message| {
++        let Ok(request): Result<ReporterRequest, _> = message else {
++            return;
++        };
++        let mut reports = vec![];
++        if let Some(cache) = servo_media_cache::MediaCache::existing() {
++            perform_memory_report(|ops| {
++                let memory = cache.measure_memory(ops);
++                let heap = |name: &str, size| Report {
++                    path: profile_traits::path!["media-cache", name],
++                    kind: ReportKind::ExplicitJemallocHeapSize,
++                    size,
++                };
++                reports.push(heap("resources-in-memory", memory.resources_in_memory));
++                reports.push(heap("write-buffers", memory.write_buffers));
++                reports.push(heap("memory-fallback", memory.memory_fallback));
++                reports.push(Report {
++                    path: profile_traits::path!["media-cache-file"],
++                    kind: ReportKind::NonExplicitSize,
++                    size: memory.file,
++                });
++            });
++        }
++        request.reports_channel.send(ProcessReports::new(reports));
++    })
++    .expect("Could not create media cache memory reporter callback");
++    mem_profiler_chan.send(ProfilerMsg::RegisterReporter(
++        format!("media-cache-{}", std::process::id()),
++        Reporter(callback),
++    ));
++}
++
+ #[cfg(feature = "multiprocess")]
+ fn register_system_memory_reporter_for_event_loop(
+     new_event_loop_info: &NewScriptEventLoopProcessInfo,

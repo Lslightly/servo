@@ -137,6 +137,8 @@ those scripts (they need network access). `check_stack.py` runs each with
 111. `deps: Upgrade to rustls@0.23.46 (#48910)` — B · CI · watch: -
 112. `deny: Accept unmaintained zbus-related crates (#48994)` — B · CI · watch: -
 113. `docs: record patches 111 to 113 in the stack manifest` — B · none · watch: -
+114. `media: Report the memory of the media cache` — B · manual · watch: components/profile/system_reporter.rs components/shared/profile/mem.rs
+115. `docs: record patches 114 to 115 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 
