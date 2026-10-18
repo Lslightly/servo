@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 17 Oct 2026 15:59:23 +0000
+Subject: [PATCH] script: Let the media reader of a paused element idle outside
+ a document
+
+A media element told the media cache that its reader was paused when
+the element was paused or its document was not fully active, which kept
+loading up to the read-ahead of the cache without a rate: the whole of
+a 150 MB file for an element that was removed from its document and
+paused, which nothing might ever resume.
+
+The cache now distinguishes a paused reader, which loads ahead at the
+rate of the resource so that playback can resume without waiting, from
+an idle one, which loads nothing ahead and gives up its fetches. Tell
+the reader of a paused element in a document that it is paused, with
+the rate of the resource once its length and duration are known, and
+the reader of an element whose document is not fully active, or that is
+paused outside a document, that it idles. An element updates its reader
+when it is inserted into or removed from a document as well.
+
+The element also pushes data into a player whose reader idles only
+until HAVE_ENOUGH_DATA and while it seeks, so that an element that was
+never inserted still gets its metadata and first frame and completes
+seeks: every block it read for the 50 MiB buffer of GStreamer made the
+cache fetch for the idle reader again, 822 suspend events for the
+150 MB file at 5 MB/s. It continues once the reader no longer idles.
+
+Pushes into a player for a reader of the metadata are held the same way
+once the player has the first frame (HAVE_CURRENT_DATA), unless it
+seeks, since GStreamer otherwise asks for, and so loads, the whole
+resource for preload=metadata: about 17 MB of a 150 MB file instead of
+149.7 MB at 5 and 50 MB/s.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: no WPT test measures what a paused element downloads; see
+Validation.
+
+Validation: a 150 MB, 40 s file at 5 MB/s, paused in its document after 3 s for
+40 s, 1 request and 149.7 MB (phase 1: 2 requests, 152.8 MB); removed
+from its document and paused after 6 s, 33.2 MB and the connection
+closed 30 s later, when the cache gives up the suspended fetch (phase 1:
+86.5 MB, closed after 17 s; 89.5 MB, 822 suspend events and closed
+after 47 s without the push gating); removed after 6 s and put back and played
+after 30 s, it plays to the end in 1 request (phase 1: 2 requests). `./mach test-wpt --release --timeout-multiplier 2` on Linux with
+GStreamer of html/semantics/embedded-content/media-elements and
+the-video-element, html/canvas/element/manual/drawing-images-to-the-canvas
+and imagebitmap, fetch/range, content-security-policy/media-src,
+html/browsers/browsing-the-web/read-media and
+mozilla/media-autoplay-seek-after-ended.html with the series, 507 tests:
+the unexpected results also occur with the phase 1 build of ohos-main
+(load-removes-queued-error-event hangs, media_fragment_seek fails,
+track-remove-by-setting-innerHTML timed out 1 of 6 isolated runs here
+and 2 of 6 there, autoplay-default-permissions-policy passes where a
+timeout is expected); loop-from-ended failed 1 of 26 isolated runs here
+and 1 of 26 there. `./mach check` and `./mach check --ohos` pass.
+
+AI-assisted: Yes (agent session; implemented and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../html/embedded_content/htmlmediaelement.rs | 87 +++++++++++++------
+ 1 file changed, 60 insertions(+), 27 deletions(-)
+
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index faaaa9881b0..983fb9a2bd0 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -84,7 +84,7 @@ use crate::dom::mediafragmentparser::MediaFragmentParser;
+ use crate::dom::medialist::MediaList;
+ use crate::dom::mediastream::MediaStream;
+ use crate::dom::node::virtualmethods::VirtualMethods;
+-use crate::dom::node::{Node, NodeDamage, NodeTraits, UnbindContext};
++use crate::dom::node::{BindContext, Node, NodeDamage, NodeTraits, UnbindContext};
+ use crate::dom::promise::Promise;
+ use crate::dom::rules_for_rendering::{
+     RulesForUpdatingTheTextTrackRendering, ShouldResetRenderingControls,
+@@ -1704,37 +1704,47 @@ impl HTMLMediaElement {
+     }
+ 
+     /// Tells the media cache how much of the media resource the element needs: what playback at
+-    /// its bitrate needs while it plays, the metadata for preload=metadata until playback is
+-    /// requested, and otherwise what the cache keeps for a paused reader, as when the document is
+-    /// not fully active.
++    /// its bitrate needs while it plays or is paused in a document, the metadata for
++    /// preload=metadata until playback is requested, and nothing ahead while its document is not
++    /// fully active or while it is paused outside a document, which nothing might resume.
+     pub(crate) fn update_reader_activity(&self) {
+         let mut media_reader = self.media_reader.borrow_mut();
+         let Some(media_reader) = media_reader.as_mut() else {
+             return;
+         };
+-        let activity = if !self.owner_document().is_fully_active() {
+-            ReaderActivity::Paused {
+-                bytes_per_second: None,
+-            }
++        let duration = self.duration.get();
++        let bytes_per_second = media_reader
++            .metadata
++            .and_then(|metadata| metadata.length)
++            .filter(|_| duration.is_finite() && duration > 0.)
++            .map(|length| length as f64 / duration);
++        let activity = if !self.owner_document().is_fully_active() ||
++            (self.paused.get() && !self.upcast::<Node>().is_connected())
++        {
++            ReaderActivity::Idle
+         } else if !self.paused.get() {
+-            let duration = self.duration.get();
+-            let bytes_per_second = media_reader
+-                .metadata
+-                .and_then(|metadata| metadata.length)
+-                .filter(|_| duration.is_finite() && duration > 0.)
+-                .map(|length| length as f64 / duration);
+             ReaderActivity::Playing { bytes_per_second }
+         } else if self.Preload() == "metadata" && !self.playback_requested.get() && !self.Autoplay()
+         {
+             ReaderActivity::Metadata
+         } else {
+-            ReaderActivity::Paused {
+-                bytes_per_second: None,
+-            }
++            ReaderActivity::Paused { bytes_per_second }
+         };
+         if media_reader.activity != Some(activity) {
++            let was_held = matches!(
++                media_reader.activity,
++                Some(ReaderActivity::Idle | ReaderActivity::Metadata)
++            );
+             media_reader.activity = Some(activity);
+             media_reader.reader.set_activity(activity);
++            if was_held &&
++                media_reader
++                    .push
++                    .as_ref()
++                    .is_some_and(|push| push.needs_data)
++            {
++                self.queue_push_media_data(media_reader.id);
++            }
+         }
+     }
+ 
+@@ -2320,7 +2330,20 @@ impl HTMLMediaElement {
+             let Some(media_reader) = media_reader.as_mut().filter(|reader| reader.id == id) else {
+                 return;
+             };
+-            if media_reader.metadata.is_none() {
++            // A pushed player asks for data to fill its own buffer, which the reader would fetch.
++            // No playback needs it yet once the player can play, for an idle reader, or has the
++            // first frame, for a reader of the metadata, unless it seeks.
++            let held = !self.seeking.get() &&
++                match media_reader.activity {
++                    Some(ReaderActivity::Idle) => {
++                        self.ready_state.get() == ReadyState::HaveEnoughData
++                    },
++                    Some(ReaderActivity::Metadata) => {
++                        self.ready_state.get() >= ReadyState::HaveCurrentData
++                    },
++                    _ => false,
++                };
++            if media_reader.metadata.is_none() || held {
+                 return;
+             }
+             let Some(push) = media_reader.push.as_mut() else {
+@@ -2330,19 +2353,21 @@ impl HTMLMediaElement {
+         };
+         match outcome {
+             PushOutcome::Done => {},
+-            PushOutcome::Yield => {
+-                let this = Trusted::new(self);
+-                self.owner_global()
+-                    .task_manager()
+-                    .media_element_task_source()
+-                    .queue(task!(push_media_data: move |cx| {
+-                        this.root().push_media_data(cx, id);
+-                    }));
+-            },
++            PushOutcome::Yield => self.queue_push_media_data(id),
+             PushOutcome::Failed(error) => self.media_reader_failed(cx, id, error),
+         }
+     }
+ 
++    fn queue_push_media_data(&self, id: u32) {
++        let this = Trusted::new(self);
++        self.owner_global()
++            .task_manager()
++            .media_element_task_source()
++            .queue(task!(push_media_data: move |cx| {
++                this.root().push_media_data(cx, id);
++            }));
++    }
++
+     /// Appends a promise to the list of pending play promises.
+     fn push_pending_play_promise(&self, promise: &RootedPromise) {
+         self.pending_play_promises
+@@ -4185,10 +4210,18 @@ impl VirtualMethods for HTMLMediaElement {
+         };
+     }
+ 
++    fn bind_to_tree(&self, cx: &mut JSContext, context: &BindContext) {
++        self.super_type().unwrap().bind_to_tree(cx, context);
++
++        self.update_reader_activity();
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#playing-the-media-resource:remove-an-element-from-a-document>
+     fn unbind_from_tree(&self, cx: &mut JSContext, context: &UnbindContext) {
+         self.super_type().unwrap().unbind_from_tree(cx, context);
+ 
++        self.update_reader_activity();
++
+         self.remove_controls(cx);
+ 
+         // Step 1. Await a stable state, allowing the task that removed the media element from the Document to continue.

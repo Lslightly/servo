@@ -1,0 +1,339 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 17 Oct 2026 15:56:51 +0000
+Subject: [PATCH] script: Check the CSP of a media request before the media
+ cache serves it
+
+The media cache shares a resource among the media elements of a content
+process that request it with the same URL, CORS mode and document origin,
+and serves it without a fetch once it holds it. Net checks a request
+against the Content Security Policy of its client only when it fetches
+it, so a document whose policy blocks the media resource could play it
+from the cache after a document of the same origin with another policy
+had loaded it.
+
+Run "should request be blocked by Content Security Policy?" on the request
+that the media element would make before it opens a reader, with the
+policy list of the document, and report the violations. A blocked request
+runs the media data processing steps for media data that cannot be
+fetched at all, in a media element task, as a blocked fetch does.
+
+The fetcher no longer queues the failure steps itself when its first
+fetch fails: the cache reports such a failure to every reader as a
+network error, which runs the same steps whether the fetch was blocked or
+failed, and the only block that differs between documents sharing a
+resource, CSP, is now checked before the reader opens.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: content-security-policy/media-src covers blocked and allowed
+media requests, also from blob and data URLs.
+
+Validation: the 10 tests of content-security-policy/media-src give the
+expected results. `./mach test-wpt --release --timeout-multiplier 2` on Linux with
+GStreamer of html/semantics/embedded-content/media-elements and
+the-video-element, html/canvas/element/manual/drawing-images-to-the-canvas
+and imagebitmap, fetch/range, content-security-policy/media-src,
+html/browsers/browsing-the-web/read-media and
+mozilla/media-autoplay-seek-after-ended.html with the series, 507 tests:
+the unexpected results also occur with the phase 1 build of ohos-main
+(load-removes-queued-error-event hangs, media_fragment_seek fails,
+track-remove-by-setting-innerHTML timed out 1 of 6 isolated runs here
+and 2 of 6 there, autoplay-default-permissions-policy passes where a
+timeout is expected); loop-from-ended failed 1 of 26 isolated runs here
+and 1 of 26 there. `./mach check` and `./mach check --ohos` pass.
+
+AI-assisted: Yes (agent session; implemented and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../html/embedded_content/htmlmediaelement.rs | 38 ++++++++++----
+ .../media_elements/script_fetcher.rs          | 52 ++++++-------------
+ components/script/dom/security/csp.rs         | 43 +++++++++++++++
+ 3 files changed, 87 insertions(+), 46 deletions(-)
+
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index b55481d8ee1..faaaa9881b0 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -1337,7 +1337,7 @@ impl HTMLMediaElement {
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-algorithm>
+-    fn load_from_src_object(&self, cx: &JSContext) {
++    fn load_from_src_object(&self, cx: &mut JSContext) {
+         self.load_state.set(LoadState::LoadingFromSrcObject);
+ 
+         // Step 9.object.1. Set the currentSrc attribute to the empty string.
+@@ -1352,7 +1352,7 @@ impl HTMLMediaElement {
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-algorithm>
+-    fn load_from_src_attribute(&self, cx: &JSContext, base_url: ServoUrl, src: &str) {
++    fn load_from_src_attribute(&self, cx: &mut JSContext, base_url: ServoUrl, src: &str) {
+         self.load_state.set(LoadState::LoadingFromSrcAttribute);
+ 
+         // Step 9.attribute.1. If the src attribute's value is the empty string, then end
+@@ -1383,7 +1383,7 @@ impl HTMLMediaElement {
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-algorithm>
+-    fn load_from_source_child(&self, cx: &JSContext, source: &HTMLSourceElement) {
++    fn load_from_source_child(&self, cx: &mut JSContext, source: &HTMLSourceElement) {
+         self.load_state.set(LoadState::LoadingFromSourceChild);
+ 
+         // Step 9.children.1. Let pointer be a position defined by two adjacent nodes in the media
+@@ -1603,7 +1603,7 @@ impl HTMLMediaElement {
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>: opens a reader of
+     /// the media resource at `url` in the media cache, which fetches it. The player reads from
+     /// the reader, or the element pushes the data of the reader into the player.
+-    fn open_media_reader(&self, cx: &JSContext, url: ServoUrl) {
++    fn open_media_reader(&self, cx: &mut JSContext, url: ServoUrl) {
+         self.close_media_reader();
+ 
+         let id = self.last_reader_id.get().wrapping_add(1);
+@@ -1614,17 +1614,33 @@ impl HTMLMediaElement {
+                 .media_element_task_source()
+                 .to_sendable(),
+         );
+-        let fetcher = ScriptFetcher::new(
+-            self,
+-            url.clone(),
+-            Box::new(move |cx, element| element.media_reader_failed(cx, id, ReaderError::Network)),
+-        );
++        let fetcher = ScriptFetcher::new(self, url.clone());
+         let (Some(tasks), Some(fetcher)) = (tasks, fetcher) else {
+             error!("Missing media player");
+             self.resource_selection_algorithm_failure_steps(cx);
+             return;
+         };
+ 
++        // The media cache may hold the resource already and serve it without a fetch, which would
++        // check the request against the Content Security Policy of the document, so the element
++        // checks it first. A blocked request fails as a blocked fetch does.
++        if fetcher.is_blocked_by_csp(cx, self) {
++            let this = Trusted::new(self);
++            let generation_id = self.generation_id.get();
++            self.owner_global()
++                .task_manager()
++                .media_element_task_source()
++                .queue(task!(media_request_blocked: move |cx| {
++                    let this = this.root();
++                    if generation_id == this.generation_id.get() && !this.in_error_state() {
++                        // => "If the media data cannot be fetched at all, due to network
++                        // errors, causing the user agent to give up trying to fetch the resource"
++                        this.media_data_processing_failure_steps(cx);
++                    }
++                }));
++            return;
++        }
++
+         let document = self.owner_document();
+         let origin = document.origin().immutable().clone();
+         let key = ResourceKey {
+@@ -1748,7 +1764,7 @@ impl HTMLMediaElement {
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
+-    fn resource_fetch_algorithm(&self, cx: &JSContext, resource: Resource) {
++    fn resource_fetch_algorithm(&self, cx: &mut JSContext, resource: Resource) {
+         // Step 5.remote.1. Optionally, run the following substeps. This is the expected behavior
+         // if the user agent intends to not attempt to fetch the resource until the user requests
+         // it explicitly (e.g. as a way to implement the preload attribute's none keyword).
+@@ -1847,7 +1863,7 @@ impl HTMLMediaElement {
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
+-    fn fetch_resource(&self, cx: &JSContext, resource: Resource) {
++    fn fetch_resource(&self, cx: &mut JSContext, resource: Resource) {
+         if let Err(e) = self.create_media_player(&resource) {
+             error!("Create media player error {:?}", e);
+             self.resource_selection_algorithm_failure_steps(cx);
+diff --git a/components/script/dom/html/embedded_content/media_elements/script_fetcher.rs b/components/script/dom/html/embedded_content/media_elements/script_fetcher.rs
+index f121ae3a23d..e04c7627740 100644
+--- a/components/script/dom/html/embedded_content/media_elements/script_fetcher.rs
++++ b/components/script/dom/html/embedded_content/media_elements/script_fetcher.rs
+@@ -25,7 +25,7 @@ use servo_url::ServoUrl;
+ use crate::dom::bindings::inheritance::Castable;
+ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::DomRoot;
+-use crate::dom::csp::GlobalCspReporting;
++use crate::dom::csp::{CspReporting, GlobalCspReporting};
+ use crate::dom::element::{Element, cors_setting_for_element, referrer_policy_for_element};
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::html::htmlmediaelement::{HTMLMediaElement, MediaElementTaskQueue};
+@@ -36,31 +36,21 @@ use crate::fetch::fetch::{RequestWithGlobalScope, create_a_potential_cors_reques
+ use crate::fetch::network_listener::{self, ResourceTimingListener};
+ use crate::url::ensure_blob_referenced_by_url_is_kept_alive;
+ 
+-/// Runs on a media element when the first fetch of a [`ScriptFetcher`] fails.
+-pub(crate) type FetchFailureSteps = Box<dyn Fn(&mut JSContext, &HTMLMediaElement) + Send + Sync>;
+-
+ /// Fetches a media resource for the media cache on behalf of a media element, from any thread.
+ /// The fetches report to the cache on the `FetchThread`, and queue tasks on the element only for
+-/// what script does: CSP violation reports, resource timing entries, and the failure of the first
+-/// fetch.
++/// what script does: CSP violation reports and resource timing entries.
+ pub(crate) struct ScriptFetcher {
+     /// The request that every fetch starts from, as the media element builds it.
+     request: RequestBuilder,
+     core_resource_thread: Mutex<CoreResourceThread>,
+     element: Arc<ElementTasks>,
+-    /// Whether no fetch was started yet.
+-    first_fetch: AtomicBool,
+ }
+ 
+ impl ScriptFetcher {
+     /// Builds the fetcher of `url` for `element`, as the resource fetch algorithm does. Returns
+     /// None if the element has no player, which its tasks need.
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
+-    pub(crate) fn new(
+-        element: &HTMLMediaElement,
+-        url: ServoUrl,
+-        first_fetch_failure_steps: FetchFailureSteps,
+-    ) -> Option<Self> {
++    pub(crate) fn new(element: &HTMLMediaElement, url: ServoUrl) -> Option<Self> {
+         let global = element.global();
+         let tasks =
+             element.task_queue(global.task_manager().networking_task_source().to_sendable())?;
+@@ -90,14 +80,22 @@ impl ScriptFetcher {
+         Some(Self {
+             request,
+             core_resource_thread: Mutex::new(global.core_resource_thread()),
+-            element: Arc::new(ElementTasks {
+-                tasks,
+-                url,
+-                first_fetch_failure_steps,
+-            }),
+-            first_fetch: AtomicBool::new(true),
++            element: Arc::new(ElementTasks { tasks, url }),
+         })
+     }
++
++    /// Whether the Content Security Policy of the element's document blocks the requests of this
++    /// fetcher, which the media cache may not make when it holds the resource already. Reports
++    /// the violations.
++    pub(crate) fn is_blocked_by_csp(&self, cx: &mut JSContext, element: &HTMLMediaElement) -> bool {
++        let global = element.global();
++        global.get_csp_list().should_request_be_blocked(
++            cx,
++            &global,
++            &self.request,
++            Some(element.upcast()),
++        )
++    }
+ }
+ 
+ impl Fetcher for ScriptFetcher {
+@@ -126,7 +124,6 @@ impl Fetcher for ScriptFetcher {
+         let mut listener = ScriptFetchListener {
+             fetch: fetch.clone(),
+             element: self.element.clone(),
+-            first: self.first_fetch.swap(false, Ordering::AcqRel),
+             responded: false,
+         };
+         fetch_async(
+@@ -143,7 +140,6 @@ impl Fetcher for ScriptFetcher {
+ struct ElementTasks {
+     tasks: MediaElementTaskQueue,
+     url: ServoUrl,
+-    first_fetch_failure_steps: FetchFailureSteps,
+ }
+ 
+ /// The state of one fetch, shared by its handle and by its listener on the `FetchThread`.
+@@ -218,8 +214,6 @@ impl Drop for ScriptFetchHandle {
+ struct ScriptFetchListener {
+     fetch: Arc<ScriptFetch>,
+     element: Arc<ElementTasks>,
+-    /// Whether this is the first fetch of its fetcher.
+-    first: bool,
+     /// Whether the response was passed to the sink.
+     responded: bool,
+ }
+@@ -306,19 +300,7 @@ impl ScriptFetchListener {
+         }
+     }
+ 
+-    /// Ends a fetch that failed. If it is the first fetch of its fetcher and failed before its
+-    /// response, the media data cannot be fetched at all, which the element learns even if the
+-    /// cache recovers for other readers.
+     fn fail(&mut self, error: FetchError) {
+-        if self.fetch.is_ended() {
+-            return;
+-        }
+-        if self.first && !self.responded {
+-            let element_tasks = self.element.clone();
+-            self.element.tasks.queue(move |cx, element| {
+-                (element_tasks.first_fetch_failure_steps)(cx, element);
+-            });
+-        }
+         self.fetch.end(Err(error));
+     }
+ 
+diff --git a/components/script/dom/security/csp.rs b/components/script/dom/security/csp.rs
+index 8b07dbec1f9..5e320679621 100644
+--- a/components/script/dom/security/csp.rs
++++ b/components/script/dom/security/csp.rs
+@@ -19,6 +19,7 @@ use js::context::JSContext;
+ use js::realm::CurrentRealm;
+ use js::rust::describe_scripted_caller;
+ use log::warn;
++use net_traits::request::{ParserMetadata as NetParserMetadata, RequestBuilder};
+ use servo_constellation_traits::{LoadData, LoadOrigin};
+ use url::Url;
+ 
+@@ -59,6 +60,13 @@ pub(crate) trait CspReporting {
+         url: Url,
+         self_origin: &url::Origin,
+     ) -> bool;
++    fn should_request_be_blocked(
++        &self,
++        cx: &mut JSContext,
++        global: &GlobalScope,
++        request: &RequestBuilder,
++        element: Option<&Element>,
++    ) -> bool;
+     fn should_elements_inline_type_behavior_be_blocked(
+         &self,
+         cx: &mut JSContext,
+@@ -248,6 +256,41 @@ impl CspReporting for Option<CspList> {
+         is_navigation_response_blocked == CheckResult::Blocked
+     }
+ 
++    /// <https://www.w3.org/TR/CSP/#should-block-request>, for a request that script checks before
++    /// it is fetched, as when a cache may serve it without a fetch.
++    fn should_request_be_blocked(
++        &self,
++        cx: &mut JSContext,
++        global: &GlobalScope,
++        request: &RequestBuilder,
++        element: Option<&Element>,
++    ) -> bool {
++        let Some(csp_list) = self else {
++            return false;
++        };
++        let url = request.url.url().into_url();
++        let request = Request {
++            url: url.clone(),
++            current_url: url,
++            origin: global.origin().immutable().clone().into_url_origin(),
++            redirect_count: 0,
++            destination: request.destination,
++            initiator: Initiator::None,
++            nonce: request.cryptographic_nonce_metadata.clone(),
++            integrity_metadata: request.integrity_metadata.clone(),
++            parser_metadata: match request.parser_metadata {
++                NetParserMetadata::ParserInserted => ParserMetadata::ParserInserted,
++                NetParserMetadata::NotParserInserted => ParserMetadata::NotParserInserted,
++                NetParserMetadata::Default => ParserMetadata::None,
++            },
++        };
++        let (result, violations) = csp_list.should_request_be_blocked(&request);
++
++        global.report_csp_violations(cx, violations, element, None);
++
++        result == CheckResult::Blocked
++    }
++
+     /// <https://www.w3.org/TR/CSP/#should-block-inline>
+     fn should_elements_inline_type_behavior_be_blocked(
+         &self,

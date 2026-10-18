@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 17 Oct 2026 16:54:05 +0000
+Subject: [PATCH] script: Run the error steps of media data once per player
+
+A media element ignores a player error once it has an error. The
+failure steps of the media data processing steps only set the error in
+a queued task, though, or not at all when they move on to the next
+source element, so a second error of the same player, as the
+OpenHarmony backend sent for `data:,` through its error callback and its
+error state, ran them again: a second error event, or a skipped source
+element.
+
+Remember that the failure or fatal steps ran for the current player,
+and ignore its later errors. A new player, for the next source element
+or the next load, starts afresh. The errors of a player whose reader the
+element closed are ignored as well: its reads fail then, as AVPlayer
+reports with error -2.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: resource-selection-invoke-pause-networkState.html fired a
+second error event on the OpenHarmony device, whose backend reported
+one error twice; GStreamer reports one, so the Linux runs do not show
+it.
+
+Validation: `./mach test-wpt --release --timeout-multiplier 2` on Linux with
+GStreamer of html/semantics/embedded-content/media-elements and
+the-video-element, html/canvas/element/manual/drawing-images-to-the-canvas
+and imagebitmap, fetch/range, content-security-policy/media-src,
+html/browsers/browsing-the-web/read-media and
+mozilla/media-autoplay-seek-after-ended.html with the series, 507 tests:
+the unexpected results also occur with the phase 1 build of ohos-main
+(load-removes-queued-error-event hangs, media_fragment_seek fails,
+track-remove-by-setting-innerHTML timed out 1 of 6 isolated runs here
+and 2 of 6 there, autoplay-default-permissions-policy passes where a
+timeout is expected); loop-from-ended failed 1 of 26 isolated runs here
+and 1 of 26 there. `./mach check` and `./mach check --ohos` pass.
+
+AI-assisted: Yes (agent session; implemented and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../html/embedded_content/htmlmediaelement.rs | 23 +++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 321045ab2f3..62ab7c8e2dc 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -304,6 +304,12 @@ pub(crate) struct HTMLMediaElement {
+     origin_clean: Cell<bool>,
+     /// Whether playback was requested since the media element load algorithm last ran.
+     playback_requested: Cell<bool>,
++    /// Whether the media data processing steps ran their failure or fatal steps for the current
++    /// player, whose later errors must not run them again.
++    media_data_failed: Cell<bool>,
++    /// Whether the element opened a reader for the current player. Once the element closed it,
++    /// the reads of the player fail, and its errors are no errors of the media data.
++    player_has_reader: Cell<bool>,
+     /// Media controls id.
+     /// In order to workaround the lack of privileged JS context, we secure the
+     /// the access to the "privileged" document.servoGetMediaControls(id) API by
+@@ -474,6 +480,8 @@ impl HTMLMediaElement {
+             last_reader_id: Cell::new(0),
+             origin_clean: Cell::new(true),
+             playback_requested: Cell::new(false),
++            media_data_failed: Cell::new(false),
++            player_has_reader: Cell::new(false),
+             media_controls_id: DomRefCell::new(None),
+             did_perform_automatic_track_selection: Default::default(),
+             position_when_time_marches_on_ran: Default::default(),
+@@ -1668,6 +1676,7 @@ impl HTMLMediaElement {
+         reader.set_observer(Box::new(move |event| {
+             observer_tasks.queue(move |cx, element| element.handle_reader_event(cx, id, event));
+         }));
++        self.player_has_reader.set(true);
+ 
+         let pulls = self.player.borrow().as_ref().is_some_and(|player| {
+             player
+@@ -2547,6 +2556,8 @@ impl HTMLMediaElement {
+     /// => "If the media data can be fetched but is found by inspection to be in an unsupported
+     /// format, or can otherwise not be rendered at all"
+     fn media_data_processing_failure_steps(&self, cx: &JSContext) {
++        self.media_data_failed.set(true);
++
+         // Step 1. The user agent should cancel the fetching process.
+         self.close_media_reader();
+ 
+@@ -2621,6 +2632,7 @@ impl HTMLMediaElement {
+     /// => "If the connection is interrupted after some media data has been received..."
+     /// => "If the media data is corrupted"
+     fn media_data_processing_fatal_steps(&self, cx: &mut JSContext, error: u16) {
++        self.media_data_failed.set(true);
+         *self.source_children_pointer.borrow_mut() = None;
+         self.current_source_child.set(None);
+ 
+@@ -2900,6 +2912,8 @@ impl HTMLMediaElement {
+         };
+ 
+         *self.player.borrow_mut() = Some(player);
++        self.media_data_failed.set(false);
++        self.player_has_reader.set(false);
+ 
+         let task_source = self
+             .owner_global()
+@@ -3101,8 +3115,13 @@ impl HTMLMediaElement {
+ 
+         // If we have already flagged an error condition while processing
+         // the network response, we should silently skip any observable
+-        // errors originating while decoding the erroneous response.
+-        if self.in_error_state() {
++        // errors originating while decoding the erroneous response. The error of the
++        // failure steps is set in a task, which may not have run yet. A player whose reader the
++        // element closed fails because of that.
++        if self.in_error_state() ||
++            self.media_data_failed.get() ||
++            (self.player_has_reader.get() && !self.has_media_reader())
++        {
+             return;
+         }
+ 

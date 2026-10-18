@@ -121,6 +121,19 @@ those scripts (they need network access). `check_stack.py` runs each with
 95. `script: Suspend a media fetch instead of cancelling it when the player is full` — B · manual · watch: components/media/backends/gstreamer/player.rs components/media/backends/ohos/player.rs components/shared/net/fetch/fetch_controller.rs
 96. `script: Cancel a suspended media fetch that nothing might resume` — B · manual · watch: components/shared/net/fetch/fetch_controller.rs
 97. `docs: record patches 92 to 97 in the stack manifest` — B · none · watch: -
+98. `media: Add a cache that fetches and keeps media resources for players` — B · CI · watch: -
+99. `script: Add a fetcher of media resources for the media cache` — B · CI · watch: components/shared/net/lib.rs components/shared/net/fetch/fetch_controller.rs components/shared/net/request.rs
+100. `script: Read the media resource of a media element from the media cache` — B · CI · watch: components/media/backends/gstreamer/player.rs components/media/backends/ohos/player.rs components/media/player/lib.rs
+101. `script: Check the CSP of a media request before the media cache serves it` — B · CI · watch: -
+102. `script: Let the media reader of a paused element idle outside a document` — B · manual · watch: components/media/backends/gstreamer/player.rs
+103. `script: Fire stalled when a media download receives no data` — B · manual · watch: -
+104. `script: Abort the media downloads of a document that stops loading` — B · manual · watch: components/script/dom/window/window.rs
+105. `script: Run the error steps of media data once per player` — B · CI · watch: components/media/backends/ohos/player.rs
+106. `script: Keep the media reader state of a media element on the heap` — B · CI · watch: -
+107. `media (ohos): Read the media resource from the media cache` — B · manual · watch: components/script/dom/html/embedded_content/htmlmediaelement.rs
+108. `media (ohos): Report a failure of AVPlayer to the media element once` — B · manual · watch: components/script/dom/html/embedded_content/htmlmediaelement.rs
+109. `servoshell (ohos): Put the media cache's file in the application's temporary directory` — B · manual · watch: components/config/prefs.rs
+110. `docs: record patches 98 to 110 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

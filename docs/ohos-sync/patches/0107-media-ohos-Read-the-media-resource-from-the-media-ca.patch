@@ -1,0 +1,1544 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 17 Oct 2026 16:45:08 +0000
+Subject: [PATCH] media (ohos): Read the media resource from the media cache
+
+The OpenHarmony AVPlayer backend kept its own window of the media
+resource, which the media element pushed bytes into: a playback buffer
+that asked the element to stop and resume pushing, and to restart the
+fetch at the position of a read outside the window, on a thread of its
+own that waited for the element to answer a SeekData event. The media
+cache now owns the bytes and the fetches, so implement
+`Player::set_data_source` and let the `readAt` callback of the AVPlayer
+data source read from the `MediaReader`: its data is returned as is, a
+pending read returns 0, after which AVPlayer reads again 100 to 500 ms
+later, the end of the resource returns -1 (`SOURCE_ERROR_EOF`), and an
+error returns -2 (`SOURCE_ERROR_IO`), which ends playback with an error
+that the error callback reports to the media element. A read never
+blocks, so AVPlayer never waits for the script thread.
+
+AVPlayer reads the size of the data source only when it gets it, and
+treats a source without a size as a live stream. Hand it the data
+source once the reader knows the length of the resource: at once if
+it already does, or once the media element reports the metadata of the
+resource with `set_seekable` and `set_input_size`. A length that is
+still unknown then makes the data source a live stream, which AVPlayer
+reads in sequence without positions, so keep the position of those
+reads in the data source. The data source and its reader are dropped
+with the AVPlayer wrapper, after AVPlayer is released, which waits for
+the running reads.
+
+When the reader has no data at a position yet, readAt waits up to 1 s
+for it, woken by the reader's waker, by closing the reader or by
+releasing AVPlayer, before it returns 0: AVPlayer gives up after about
+20 empty reads within ~4.6 s. The data source is owned through a raw
+pointer, so that no `&mut` to it lives while AVPlayer reads, and the
+element takes origin_clean from the reader before handing it over,
+since AVPlayer may render a frame of a cached tainted resource before
+its metadata event reaches the element.
+
+Remove the playback buffer and its tests, the EnoughData, NeedData and
+SeekData events and the seek lock. `push_data` returns
+`PlayerError::NotSupported`, except with the dummy data source below
+API 21, where `set_data_source` is not supported and the element
+pushes the bytes as before.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: no unit test; the mapping of the read results is a match, and
+the backend only builds for OpenHarmony; see Validation.
+
+Validation: `./mach check --ohos` with API 21 and with the dummy data source. A HiHope DAYU200 (OpenHarmony 7.0, API 26), headless release builds (`./mach build --ohos --release --headless-binary`) of the series on the media cache and the media element that reads from it, against phase 1 (patches 91 to 96), each scenario in a fresh process, every run played to its end without a stall: a 90 s, 42.5 MB video takes 1 request and 42.5 MB with range support, at 1.5 MB/s and without range support, as before, with a peak RSS of 168 to 181 instead of 203 MB; a 30 s, 14.3 MB video takes 1 request and 14.3 MB for two passes of `loop` with or without range support instead of 3 requests and 42.8 MB, 1 request instead of 2 (27.5 MB) when seeking from 20 s back to 2 s, 1 instead of 2 (28.5 MB) for two elements, and 1 instead of 3 (42.8 MB) for three loads of the page; the 42.5 MB video takes 1 request for a seek back, for two passes of `loop`, for two elements and for two loads with or without range support. `./mach test-wpt --ohos --processes 1 --timeout-multiplier 2` of the series' 63 media tests: the same results as phase 1, with only the known unexpected OK of autoplay-default-permissions-policy, once the next patch reports a failure of AVPlayer once.
+AI-assisted: Yes (agent session; written and tested on a device by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock                                    |   1 +
+ components/media/backends/ohos/Cargo.toml     |   1 +
+ components/media/backends/ohos/lib.rs         |   1 -
+ .../backends/ohos/ohos_media/avplayer.rs      |  94 +--
+ .../backends/ohos/ohos_media/dummy_source.rs  |  36 +-
+ .../media/backends/ohos/ohos_media/mod.rs     |   3 -
+ .../ohos/ohos_media/playback_buffer.rs        | 576 ------------------
+ .../media/backends/ohos/ohos_media/source.rs  | 303 +++++----
+ .../ohos/ohos_media/source_builder.rs         |  52 --
+ components/media/backends/ohos/player.rs      | 134 +---
+ .../html/embedded_content/htmlmediaelement.rs |   4 +-
+ 11 files changed, 272 insertions(+), 933 deletions(-)
+ delete mode 100644 components/media/backends/ohos/ohos_media/playback_buffer.rs
+ delete mode 100644 components/media/backends/ohos/ohos_media/source_builder.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 27841ba22bb..4b0ccc4889a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -9094,6 +9094,7 @@ dependencies = [
+  "servo-base",
+  "servo-media",
+  "servo-media-audio",
++ "servo-media-cache",
+  "servo-media-player",
+  "servo-media-streams",
+  "servo-media-traits",
+diff --git a/components/media/backends/ohos/Cargo.toml b/components/media/backends/ohos/Cargo.toml
+index e0e76592d64..536478751ab 100644
+--- a/components/media/backends/ohos/Cargo.toml
++++ b/components/media/backends/ohos/Cargo.toml
+@@ -24,6 +24,7 @@ ohos-window-sys = { workspace = true, features = ["api-13"] }
+ servo-base = { workspace = true }
+ servo-media = { workspace = true }
+ servo-media-audio = { workspace = true }
++servo-media-cache = { workspace = true }
+ servo-media-player = { workspace = true }
+ servo-media-streams = { workspace = true }
+ servo-media-traits = { workspace = true }
+diff --git a/components/media/backends/ohos/lib.rs b/components/media/backends/ohos/lib.rs
+index fc8e52d2d6f..6a44771b043 100644
+--- a/components/media/backends/ohos/lib.rs
++++ b/components/media/backends/ohos/lib.rs
+@@ -136,7 +136,6 @@ impl Backend for OhosBackend {
+ 
+         player.setup_error_event();
+         player.setup_info_event();
+-        player.setup_data_source();
+         Arc::new(Mutex::new(player))
+     }
+ 
+diff --git a/components/media/backends/ohos/ohos_media/avplayer.rs b/components/media/backends/ohos/ohos_media/avplayer.rs
+index f27efa338de..38377f160e0 100644
+--- a/components/media/backends/ohos/ohos_media/avplayer.rs
++++ b/components/media/backends/ohos/ohos_media/avplayer.rs
+@@ -5,7 +5,7 @@ use std::collections::HashMap;
+ use std::ffi::{CStr, c_char, c_void};
+ use std::ptr;
+ use std::sync::atomic::{AtomicUsize, Ordering};
+-use std::sync::{LazyLock, Mutex};
++use std::sync::{Arc, LazyLock, Mutex};
+ 
+ use libc::pollfd;
+ use log::{debug, warn};
+@@ -31,6 +31,7 @@ use ohos_window_sys::native_window::{
+     OH_NativeWindow_GetBufferHandleFromNative, OH_NativeWindow_NativeObjectReference,
+     OH_NativeWindow_NativeObjectUnreference,
+ };
++use servo_media_cache::MediaReader;
+ 
+ #[cfg(not(sdk_api_21))]
+ use crate::ohos_media::dummy_source::MediaSourceWrapper;
+@@ -60,12 +61,16 @@ pub struct FrameInfo {
+ pub struct OhosPlayer {
+     native_image: Option<*mut OH_NativeImage>,
+     ohos_av_player: *mut OH_AVPlayer,
++    /// Dropped with the wrapper, once AVPlayer is released, which waits for the running reads.
+     media_data_source: Option<MediaSourceWrapper>,
+     event_info_callback_closure: Option<*mut Box<dyn Fn(AVPlayerOnInfoType, *mut OH_AVFormat)>>,
+     error_callback_closure: Option<*mut Box<dyn Fn(i32, String)>>,
+     frame_available_listener_id: Option<usize>,
+     native_window: Option<*mut OHNativeWindow>,
+-    has_set_source_size: bool,
++    /// Whether the media element reported the metadata of the media resource, after which a
++    /// length that is still unknown makes the data source a live stream.
++    has_metadata: bool,
++    has_set_data_source: bool,
+     /// Whether the player renders video, in which case it only prepares once its window is set.
+     has_video_output: bool,
+     has_prepared: bool,
+@@ -85,7 +90,8 @@ impl OhosPlayer {
+             error_callback_closure: None,
+             frame_available_listener_id: None,
+             native_window: None,
+-            has_set_source_size: false,
++            has_metadata: false,
++            has_set_data_source: false,
+             has_video_output,
+             has_prepared: false,
+             volume: 1.0,
+@@ -129,17 +135,6 @@ impl OhosPlayer {
+         }
+     }
+ 
+-    /// The first step of initialization process, after this avplayer will
+-    /// become initialized. Kickstart the initialize process.
+-    fn setup_data_source(&mut self) {
+-        let Some(ref mut source) = self.media_data_source else {
+-            warn!("Error Source not initialized!");
+-            return;
+-        };
+-        debug!("Setting up data source");
+-        source.set_data_src(self.ohos_av_player);
+-    }
+-
+     pub fn set_volume(&mut self, volume: f64) {
+         unsafe {
+             OH_AVPlayer_SetVolume(self.ohos_av_player, volume as f32, volume as f32);
+@@ -151,22 +146,42 @@ impl OhosPlayer {
+         self.volume
+     }
+ 
+-    pub fn set_source(&mut self, source: MediaSourceWrapper) {
+-        // Todo: Should think of better way to change the way the data is given.
+-        self.media_data_source = Some(source);
++    /// Makes AVPlayer read the media resource from `reader`. Returns false if it already has a
++    /// data source, which AVPlayer cannot change.
++    pub fn set_reader(&mut self, reader: Arc<MediaReader>) -> bool {
++        if self.media_data_source.is_some() {
++            return false;
++        }
++        self.media_data_source = Some(MediaSourceWrapper::new(reader));
++        self.setup_data_source(None);
++        true
+     }
+ 
+-    pub fn end_of_stream(&self) {
+-        if let Some(source) = &self.media_data_source {
+-            source.end_of_stream();
+-        }
++    /// Called once the media element knows the metadata of the media resource, with its length if
++    /// it is known. AVPlayer derives whether the resource is seekable from its size.
++    pub fn metadata_known(&mut self, length: Option<u64>) {
++        self.has_metadata = true;
++        self.setup_data_source(length);
+     }
+ 
+-    /// Returns false if the data source is full and did not take any of the bytes.
+-    pub fn push_data(&self, data: Vec<u8>) -> bool {
+-        self.media_data_source
+-            .as_ref()
+-            .is_none_or(|inner_source| inner_source.push_data(data))
++    /// The first step of initialization process, after this avplayer will become initialized.
++    /// AVPlayer reads the size of the data source only now, and treats one without a size as a
++    /// live stream, so wait for the length of the media resource, or for its metadata if the
++    /// length is unknown.
++    fn setup_data_source(&mut self, size: Option<u64>) {
++        if self.has_set_data_source {
++            return;
++        }
++        let Some(source) = &mut self.media_data_source else {
++            return;
++        };
++        let size = size.or_else(|| source.length());
++        if size.is_none() && !self.has_metadata {
++            return;
++        }
++        debug!("Setting up data source of size {size:?}");
++        source.set_data_src(self.ohos_av_player, size);
++        self.has_set_data_source = true;
+     }
+ 
+     pub fn play(&self) {
+@@ -249,11 +264,16 @@ impl OhosPlayer {
+     }
+ 
+     /// Releases AVPlayer, which then calls no more callbacks. Releasing waits for the running
+-    /// callbacks and calls the info callback, and both can lock `this`, so `this` must not be
+-    /// locked by the caller.
++    /// callbacks and reads, so the reads that wait for data are ended first. It also calls the
++    /// info callback, and both can lock `this`, so `this` must not be locked by the caller.
+     pub fn release(this: &Mutex<Self>) {
+-        let ohos_av_player =
+-            std::mem::replace(&mut this.lock().unwrap().ohos_av_player, ptr::null_mut());
++        let ohos_av_player = {
++            let mut player = this.lock().unwrap();
++            if let Some(source) = &player.media_data_source {
++                source.release();
++            }
++            std::mem::replace(&mut player.ohos_av_player, ptr::null_mut())
++        };
+         if !ohos_av_player.is_null() {
+             debug!("OH_AVPlayer_Release!");
+             unsafe {
+@@ -269,20 +289,6 @@ impl OhosPlayer {
+         }
+     }
+ 
+-    // For AVPlayer only call SetSource after SetInputSize to avoid being recognized as live stream.
+-    pub fn set_input_size(&mut self, size: u64) {
+-        if let Some(inner_source) = &mut self.media_data_source {
+-            debug!("Setting up data source size: {}", size);
+-            inner_source.set_input_size(size as usize);
+-            // Only set once when first time initialized
+-            if !self.has_set_source_size {
+-                debug!("Setup data Source");
+-                self.setup_data_source();
+-                self.has_set_source_size = true;
+-            }
+-        }
+-    }
+-
+     pub fn connect_info_event_callback<F>(&mut self, f: F)
+     where
+         F: Fn(AVPlayerOnInfoType, *mut OH_AVFormat) + Send + 'static,
+diff --git a/components/media/backends/ohos/ohos_media/dummy_source.rs b/components/media/backends/ohos/ohos_media/dummy_source.rs
+index 30731fffbd2..7dd2688cd11 100644
+--- a/components/media/backends/ohos/ohos_media/dummy_source.rs
++++ b/components/media/backends/ohos/ohos_media/dummy_source.rs
+@@ -1,38 +1,28 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+-use crate::ohos_media::source_builder::MediaSourceBuilder;
++use std::sync::Arc;
++
++use servo_media_cache::MediaReader;
+ 
+ pub struct MediaSourceWrapper {}
+ 
+ impl MediaSourceWrapper {
+-    pub fn new() -> Self {
++    pub fn new(_reader: Arc<MediaReader>) -> Self {
+         Self {}
+     }
+-}
+ 
+-impl MediaSourceWrapper {
+-    pub fn builder() -> MediaSourceBuilder {
+-        MediaSourceBuilder {
+-            enough_data: None,
+-            need_data: None,
+-            seek_data: None,
+-        }
+-    }
+-    pub fn set_input_size(&self, _size: usize) {
+-        // No-op for dummy source
++    pub fn length(&self) -> Option<u64> {
++        None
+     }
+ 
+-    pub fn end_of_stream(&self) {
+-        // No-op for dummy source
+-    }
+-
+-    pub fn push_data(&self, _data: Vec<u8>) -> bool {
+-        // No-op for dummy source
+-        true
+-    }
+-
+-    pub fn set_data_src(&mut self, _av_player: *mut ohos_media_sys::avplayer_base::OH_AVPlayer) {
++    pub fn set_data_src(
++        &mut self,
++        _av_player: *mut ohos_media_sys::avplayer_base::OH_AVPlayer,
++        _size: Option<u64>,
++    ) {
+         // No-op for dummy source.
+     }
++
++    pub fn release(&self) {}
+ }
+diff --git a/components/media/backends/ohos/ohos_media/mod.rs b/components/media/backends/ohos/ohos_media/mod.rs
+index fcd5e8636a3..fe6fa1fd12a 100644
+--- a/components/media/backends/ohos/ohos_media/mod.rs
++++ b/components/media/backends/ohos/ohos_media/mod.rs
+@@ -5,7 +5,4 @@ pub mod avplayer;
+ #[cfg(not(sdk_api_21))]
+ pub mod dummy_source;
+ #[cfg(sdk_api_21)]
+-pub mod playback_buffer;
+-#[cfg(sdk_api_21)]
+ pub mod source;
+-pub mod source_builder;
+diff --git a/components/media/backends/ohos/ohos_media/playback_buffer.rs b/components/media/backends/ohos/ohos_media/playback_buffer.rs
+deleted file mode 100644
+index a9bf53a2930..00000000000
+--- a/components/media/backends/ohos/ohos_media/playback_buffer.rs
++++ /dev/null
+@@ -1,576 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+-
+-use std::collections::VecDeque;
+-
+-use log::debug;
+-
+-/// The most bytes of the media resource that a player keeps.
+-const CAPACITY: usize = 8 * 1024 * 1024;
+-/// How many bytes before the furthest read are kept, so that AVPlayer can read them again.
+-const BACK_BUFFER: u64 = 1024 * 1024;
+-/// A stopped fetch resumes at the end of the buffered bytes once fewer bytes than this are left to
+-/// read.
+-const REFILL_THRESHOLD: u64 = CAPACITY as u64 / 4;
+-/// How far after the buffered bytes a read waits for the fetch to arrive, instead of restarting
+-/// the fetch at the read position.
+-const MAX_READ_AHEAD: u64 = 1024 * 1024;
+-
+-#[derive(Clone, Copy, Debug, PartialEq)]
+-enum FetchState {
+-    /// The pushed bytes continue the buffered bytes.
+-    Active,
+-    /// The buffer was full, so a pushed chunk was refused, and the media element keeps it until it
+-    /// is asked for data again.
+-    Stopped,
+-    /// The fetch reached the end of the media resource.
+-    Ended,
+-    /// The media element was asked to restart the fetch, and the pushed bytes are dropped until it
+-    /// answers.
+-    Restarting,
+-}
+-
+-/// A window of the media resource that slides with the reads of AVPlayer. The media element pushes
+-/// bytes from the script thread, and AVPlayer reads them from its own threads.
+-pub struct PlaybackBuffer {
+-    enough_data_closure: Option<Box<dyn Fn() + Send + Sync>>,
+-    /// Asks the media element to push data again. It is called with the buffer locked, so that the
+-    /// request reaches the media element before a restart of the fetch that a later read asks for.
+-    need_data_closure: Option<Box<dyn Fn() + Send + Sync>>,
+-    /// The buffered bytes, starting at `start` in the media resource.
+-    data: VecDeque<u8>,
+-    start: u64,
+-    /// The furthest position that AVPlayer read up to, or waits at, since the buffer was emptied.
+-    /// Evicting bytes relative to the furthest read, rather than the last one, makes sure that
+-    /// reads at two positions cannot keep each other from progressing.
+-    furthest_read: u64,
+-    fetch_state: FetchState,
+-    /// Whether the media element was asked to push data again and has not pushed since. Its next
+-    /// chunk is the refused one, or the first one of a fetch that it restarted at the end of the
+-    /// buffered bytes.
+-    resumed: bool,
+-    size: Option<u64>,
+-}
+-
+-impl PlaybackBuffer {
+-    pub fn new(
+-        enough_data_closure: Option<Box<dyn Fn() + Send + Sync>>,
+-        need_data_closure: Option<Box<dyn Fn() + Send + Sync>>,
+-    ) -> Self {
+-        PlaybackBuffer {
+-            enough_data_closure,
+-            need_data_closure,
+-            data: VecDeque::with_capacity(CAPACITY),
+-            start: 0,
+-            furthest_read: 0,
+-            fetch_state: FetchState::Active,
+-            resumed: false,
+-            size: None,
+-        }
+-    }
+-
+-    fn end(&self) -> u64 {
+-        self.start + self.data.len() as u64
+-    }
+-
+-    pub fn set_size(&mut self, size: u64) {
+-        self.size = Some(size);
+-    }
+-
+-    /// Copies the bytes at `pos` into `dest`. Returns how many bytes were copied, and the position
+-    /// at which the media element has to restart the fetch, if any.
+-    pub fn read_data(&mut self, dest: &mut [u8], pos: u64) -> (usize, Option<u64>) {
+-        let end = self.end();
+-        if (self.start..end).contains(&pos) {
+-            let read_len = dest.len().min((end - pos) as usize);
+-            self.copy_to(pos - self.start, &mut dest[..read_len]);
+-            self.furthest_read = self.furthest_read.max(pos + read_len as u64);
+-            if self.fetch_state == FetchState::Stopped &&
+-                end - self.furthest_read < REFILL_THRESHOLD
+-            {
+-                self.resume();
+-            }
+-            return (read_len, None);
+-        }
+-
+-        if self.size.is_some_and(|size| pos >= size) {
+-            return (0, None);
+-        }
+-        if pos >= end && pos - end <= MAX_READ_AHEAD {
+-            self.furthest_read = self.furthest_read.max(pos);
+-            if self.fetch_state == FetchState::Stopped {
+-                self.resume();
+-            }
+-            return (0, None);
+-        }
+-        if self.fetch_state == FetchState::Restarting {
+-            return (0, None);
+-        }
+-        debug!(
+-            "No data at position {pos}, buffered {}..{end}, fetch {:?}",
+-            self.start, self.fetch_state
+-        );
+-        (0, Some(self.restart_at(pos)))
+-    }
+-
+-    fn copy_to(&self, offset: u64, dest: &mut [u8]) {
+-        let offset = offset as usize;
+-        let (front, back) = self.data.as_slices();
+-        let (first, second) = match front.get(offset..) {
+-            Some(first) => (first, back),
+-            None => (&[][..], &back[offset - front.len()..]),
+-        };
+-        let first_len = first.len().min(dest.len());
+-        let (dest_first, dest_second) = dest.split_at_mut(first_len);
+-        dest_first.copy_from_slice(&first[..first_len]);
+-        dest_second.copy_from_slice(&second[..dest_second.len()]);
+-    }
+-
+-    /// Accepts pushed bytes again, and asks the media element for them. It pushes the refused
+-    /// chunk first, so the fetch continues at the end of the buffered bytes without a restart.
+-    fn resume(&mut self) {
+-        self.fetch_state = FetchState::Active;
+-        self.resumed = true;
+-        if let Some(need_data_closure) = &self.need_data_closure {
+-            need_data_closure();
+-        }
+-    }
+-
+-    fn restart_at(&mut self, pos: u64) -> u64 {
+-        self.data.clear();
+-        self.start = pos;
+-        self.furthest_read = pos;
+-        self.fetch_state = FetchState::Restarting;
+-        self.resumed = false;
+-        pos
+-    }
+-
+-    /// Must be called once the media element answered the restart of the fetch, before it can push
+-    /// the bytes of the restarted fetch.
+-    pub fn restarted(&mut self, success: bool) {
+-        if success && self.fetch_state == FetchState::Restarting {
+-            self.fetch_state = FetchState::Active;
+-        }
+-    }
+-
+-    /// Appends bytes of the fetch. Returns false if the buffer is full, in which case none of the
+-    /// bytes were buffered, and the media element has to push them again once it is asked for
+-    /// data.
+-    pub fn push_buffer(&mut self, data: &[u8]) -> bool {
+-        match self.fetch_state {
+-            FetchState::Active => {},
+-            FetchState::Stopped => return false,
+-            // The bytes of a fetch that is being restarted, or that already ended, are not needed.
+-            FetchState::Ended | FetchState::Restarting => return true,
+-        }
+-        let excess = (self.data.len() + data.len()).saturating_sub(CAPACITY);
+-        if excess > 0 {
+-            let evictable = self
+-                .furthest_read
+-                .saturating_sub(BACK_BUFFER)
+-                .saturating_sub(self.start)
+-                .min(self.data.len() as u64) as usize;
+-            let evicted = excess.min(evictable);
+-            self.data.drain(..evicted);
+-            self.start += evicted as u64;
+-        }
+-        // A chunk that does not fit is still taken whole after a resume, and when AVPlayer read all
+-        // buffered bytes, as refusing it then would only stop the fetch again, or stall AVPlayer.
+-        // The buffer overshoots its capacity by at most that chunk.
+-        let fits = self.data.len() + data.len() <= CAPACITY;
+-        if fits || self.resumed || self.furthest_read >= self.end() {
+-            if fits && self.data.capacity() > CAPACITY {
+-                self.data.shrink_to(CAPACITY);
+-            }
+-            self.resumed = false;
+-            self.data.extend(data);
+-            return true;
+-        }
+-        debug!(
+-            "Buffer is full, buffered {}..{}, furthest read {}",
+-            self.start,
+-            self.end(),
+-            self.furthest_read
+-        );
+-        self.fetch_state = FetchState::Stopped;
+-        if let Some(enough_data_closure) = &self.enough_data_closure {
+-            enough_data_closure();
+-        }
+-        false
+-    }
+-
+-    pub fn end_of_stream(&mut self) {
+-        if self.fetch_state == FetchState::Active {
+-            self.fetch_state = FetchState::Ended;
+-        }
+-    }
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use std::sync::Arc;
+-    use std::sync::atomic::{AtomicUsize, Ordering};
+-
+-    use super::*;
+-
+-    const CHUNK: usize = 64 * 1024;
+-
+-    fn byte_at(pos: u64) -> u8 {
+-        (pos % 251) as u8
+-    }
+-
+-    fn bytes(pos: u64, len: usize) -> Vec<u8> {
+-        (pos..pos + len as u64).map(byte_at).collect()
+-    }
+-
+-    fn counter() -> (Arc<AtomicUsize>, Box<dyn Fn() + Send + Sync>) {
+-        let count = Arc::new(AtomicUsize::new(0));
+-        let closure_count = count.clone();
+-        let closure = Box::new(move || {
+-            closure_count.fetch_add(1, Ordering::SeqCst);
+-        });
+-        (count, closure)
+-    }
+-
+-    /// Returns a buffer, and how often it signalled EnoughData and NeedData.
+-    fn buffer() -> (PlaybackBuffer, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+-        let (enough_data_count, enough_data_closure) = counter();
+-        let (need_data_count, need_data_closure) = counter();
+-        let buffer = PlaybackBuffer::new(Some(enough_data_closure), Some(need_data_closure));
+-        (buffer, enough_data_count, need_data_count)
+-    }
+-
+-    fn count(counter: &AtomicUsize) -> usize {
+-        counter.load(Ordering::SeqCst)
+-    }
+-
+-    fn read(buffer: &mut PlaybackBuffer, pos: u64, len: usize) -> (Vec<u8>, Option<u64>) {
+-        let mut dest = vec![0; len];
+-        let (read_len, restart) = buffer.read_data(&mut dest, pos);
+-        dest.truncate(read_len);
+-        (dest, restart)
+-    }
+-
+-    /// Pushes the bytes from `from` until the buffer is full, and returns where they stopped.
+-    fn fill(buffer: &mut PlaybackBuffer, from: u64) -> u64 {
+-        let mut pos = from;
+-        while buffer.push_buffer(&bytes(pos, CHUNK)) {
+-            pos += CHUNK as u64;
+-        }
+-        assert_eq!(buffer.end(), pos);
+-        pos
+-    }
+-
+-    /// Reads from `from` until the buffer asks for data again, and returns where the reads ended.
+-    fn read_until_resumed(buffer: &mut PlaybackBuffer, need_data: &AtomicUsize, from: u64) -> u64 {
+-        let needed = count(need_data);
+-        let mut pos = from;
+-        while count(need_data) == needed {
+-            assert_eq!(read(buffer, pos, CHUNK), (bytes(pos, CHUNK), None));
+-            pos += CHUNK as u64;
+-        }
+-        assert_eq!(count(need_data), needed + 1);
+-        pos
+-    }
+-
+-    #[test]
+-    fn reads_the_pushed_bytes_and_waits_at_the_end() {
+-        let (mut buffer, _, _) = buffer();
+-        assert!(buffer.push_buffer(&bytes(0, 1000)));
+-        assert_eq!(read(&mut buffer, 100, 50), (bytes(100, 50), None));
+-        assert_eq!(read(&mut buffer, 990, 50), (bytes(990, 10), None));
+-        assert_eq!(read(&mut buffer, 1000, 50), (vec![], None));
+-    }
+-
+-    #[test]
+-    fn slides_with_a_reader_that_keeps_up() {
+-        let (mut buffer, enough_data_count, need_data_count) = buffer();
+-        let mut pos = 0;
+-        while pos < 3 * CAPACITY as u64 {
+-            assert!(buffer.push_buffer(&bytes(pos, CHUNK)));
+-            assert_eq!(read(&mut buffer, pos, CHUNK), (bytes(pos, CHUNK), None));
+-            pos += CHUNK as u64;
+-        }
+-        assert_eq!(count(&enough_data_count), 0);
+-        assert_eq!(count(&need_data_count), 0);
+-        assert_eq!(
+-            read(&mut buffer, pos - BACK_BUFFER, CHUNK),
+-            (bytes(pos - BACK_BUFFER, CHUNK), None)
+-        );
+-    }
+-
+-    #[test]
+-    fn refuses_a_chunk_that_does_not_fit_whole() {
+-        let (mut buffer, enough_data_count, _) = buffer();
+-        let chunk = 100_000;
+-        let mut pos = 0;
+-        while buffer.push_buffer(&bytes(pos, chunk)) {
+-            pos += chunk as u64;
+-        }
+-        assert!(pos < CAPACITY as u64);
+-        assert_eq!(buffer.end(), pos);
+-        assert_eq!(count(&enough_data_count), 1);
+-        assert!(!buffer.push_buffer(&bytes(pos, 10)));
+-        assert_eq!(buffer.end(), pos);
+-        assert_eq!(count(&enough_data_count), 1);
+-    }
+-
+-    #[test]
+-    fn resumes_at_the_end_before_the_reader_gets_there() {
+-        let (mut buffer, enough_data_count, need_data_count) = buffer();
+-        let end = fill(&mut buffer, 0);
+-        let mut pos = read_until_resumed(&mut buffer, &need_data_count, 0);
+-        assert!(end - pos < REFILL_THRESHOLD);
+-        assert_eq!(read(&mut buffer, pos, CHUNK), (bytes(pos, CHUNK), None));
+-        pos += CHUNK as u64;
+-        assert_eq!(count(&need_data_count), 1);
+-
+-        // The refused chunk comes first and continues the buffered bytes.
+-        let new_end = fill(&mut buffer, end);
+-        assert!(new_end > end);
+-        assert_eq!(buffer.start, pos - BACK_BUFFER);
+-        assert_eq!(count(&enough_data_count), 2);
+-        pos = read_until_resumed(&mut buffer, &need_data_count, pos);
+-        while pos < new_end {
+-            assert_eq!(read(&mut buffer, pos, CHUNK), (bytes(pos, CHUNK), None));
+-            pos += CHUNK as u64;
+-        }
+-        assert_eq!(read(&mut buffer, new_end, CHUNK), (vec![], None));
+-        assert_eq!(count(&need_data_count), 2);
+-    }
+-
+-    #[test]
+-    fn asks_for_data_before_a_restart_that_a_later_read_asks_for() {
+-        let (mut buffer, _, need_data_count) = buffer();
+-        let end = fill(&mut buffer, 0);
+-        assert_eq!(read(&mut buffer, end, CHUNK), (vec![], None));
+-        assert_eq!(count(&need_data_count), 1);
+-        let far = end + MAX_READ_AHEAD + 1;
+-        assert_eq!(read(&mut buffer, far, CHUNK), (vec![], Some(far)));
+-
+-        // The refused chunk arrives after the restart was asked for, and is dropped.
+-        assert!(buffer.push_buffer(&bytes(end, CHUNK)));
+-        assert_eq!(buffer.end(), far);
+-        buffer.restarted(true);
+-        assert!(buffer.push_buffer(&bytes(far, CHUNK)));
+-        assert!(buffer.push_buffer(&bytes(far + CHUNK as u64, CHUNK)));
+-        assert_eq!(
+-            read(&mut buffer, far, 2 * CHUNK),
+-            (bytes(far, 2 * CHUNK), None)
+-        );
+-        assert_eq!(count(&need_data_count), 1);
+-    }
+-
+-    #[test]
+-    fn restarts_a_stopped_fetch_at_a_read_outside_the_window() {
+-        let (mut buffer, _, need_data_count) = buffer();
+-        let end = fill(&mut buffer, 0);
+-        let far = end + MAX_READ_AHEAD + 1;
+-        assert_eq!(read(&mut buffer, far, CHUNK), (vec![], Some(far)));
+-        assert_eq!(count(&need_data_count), 0);
+-        assert!(buffer.push_buffer(&bytes(end, CHUNK)));
+-        assert_eq!(buffer.end(), far);
+-        buffer.restarted(true);
+-        assert!(buffer.push_buffer(&bytes(far, CHUNK)));
+-        assert_eq!(read(&mut buffer, far, CHUNK), (bytes(far, CHUNK), None));
+-    }
+-
+-    #[test]
+-    fn restarts_at_a_read_outside_the_window() {
+-        let (mut buffer, _, _) = buffer();
+-        assert!(buffer.push_buffer(&bytes(0, CHUNK)));
+-        let far = CHUNK as u64 + MAX_READ_AHEAD + 1;
+-        assert_eq!(read(&mut buffer, far, CHUNK), (vec![], Some(far)));
+-
+-        // Reads elsewhere wait for the pending restart, and the previous fetch is dropped.
+-        assert_eq!(read(&mut buffer, 0, CHUNK), (vec![], None));
+-        assert!(buffer.push_buffer(&bytes(CHUNK as u64, CHUNK)));
+-        assert_eq!(buffer.end(), far);
+-        buffer.end_of_stream();
+-
+-        buffer.restarted(true);
+-        assert!(buffer.push_buffer(&bytes(far, CHUNK)));
+-        assert_eq!(read(&mut buffer, far, CHUNK), (bytes(far, CHUNK), None));
+-        assert_eq!(read(&mut buffer, 0, CHUNK), (vec![], Some(0)));
+-    }
+-
+-    #[test]
+-    fn waits_for_a_read_shortly_after_the_buffered_bytes() {
+-        let (mut buffer, _, _) = buffer();
+-        assert!(buffer.push_buffer(&bytes(0, CHUNK)));
+-        let near = CHUNK as u64 + MAX_READ_AHEAD;
+-        assert_eq!(read(&mut buffer, near, CHUNK), (vec![], None));
+-        let mut pos = CHUNK as u64;
+-        while pos <= near {
+-            assert!(buffer.push_buffer(&bytes(pos, CHUNK)));
+-            pos += CHUNK as u64;
+-        }
+-        assert_eq!(read(&mut buffer, near, CHUNK), (bytes(near, CHUNK), None));
+-    }
+-
+-    #[test]
+-    fn restarts_before_the_buffered_bytes() {
+-        let (mut buffer, _, _) = buffer();
+-        let mut pos = 0;
+-        while pos < 2 * CAPACITY as u64 {
+-            assert!(buffer.push_buffer(&bytes(pos, CHUNK)));
+-            assert_eq!(read(&mut buffer, pos, CHUNK).0, bytes(pos, CHUNK));
+-            pos += CHUNK as u64;
+-        }
+-        assert_eq!(buffer.start, pos - CAPACITY as u64);
+-        let before = buffer.start - 1;
+-        assert_eq!(read(&mut buffer, before, CHUNK), (vec![], Some(before)));
+-    }
+-
+-    #[test]
+-    fn resumes_for_a_read_shortly_after_a_full_buffer() {
+-        let (mut buffer, _, need_data_count) = buffer();
+-        let end = fill(&mut buffer, 0);
+-        assert_eq!(read(&mut buffer, end + 10, CHUNK), (vec![], None));
+-        assert_eq!(read(&mut buffer, end + 10, CHUNK), (vec![], None));
+-        assert_eq!(count(&need_data_count), 1);
+-        assert_eq!(buffer.start, 0);
+-        assert_eq!(read(&mut buffer, 0, CHUNK), (bytes(0, CHUNK), None));
+-        assert!(buffer.push_buffer(&bytes(end, CHUNK)));
+-        assert_eq!(read(&mut buffer, end, CHUNK), (bytes(end, CHUNK), None));
+-    }
+-
+-    #[test]
+-    fn takes_a_chunk_larger_than_the_buffer_once_the_reader_caught_up() {
+-        let (mut buffer, _, need_data_count) = buffer();
+-        let len = CAPACITY + CHUNK;
+-        assert!(buffer.push_buffer(&bytes(0, len)));
+-        assert!(!buffer.push_buffer(&bytes(len as u64, len)));
+-        let last = len as u64 - 100;
+-        assert_eq!(read(&mut buffer, last, CHUNK), (bytes(last, 100), None));
+-        assert_eq!(count(&need_data_count), 1);
+-        assert!(buffer.push_buffer(&bytes(len as u64, len)));
+-        assert_eq!(buffer.start, len as u64 - BACK_BUFFER);
+-        assert_eq!(
+-            read(&mut buffer, 2 * len as u64 - 100, CHUNK),
+-            (bytes(2 * len as u64 - 100, 100), None)
+-        );
+-    }
+-
+-    #[test]
+-    fn takes_a_chunk_that_does_not_fit_once_after_a_resume() {
+-        let (mut buffer, enough_data_count, need_data_count) = buffer();
+-        let end = fill(&mut buffer, 0);
+-        let mut pos = read_until_resumed(&mut buffer, &need_data_count, 0);
+-        assert!(buffer.push_buffer(&bytes(end, CAPACITY)));
+-        let new_end = end + CAPACITY as u64;
+-        assert!(buffer.data.len() > CAPACITY);
+-        assert!(!buffer.push_buffer(&bytes(new_end, CHUNK)));
+-        assert_eq!(count(&enough_data_count), 2);
+-        assert_eq!(buffer.end(), new_end);
+-
+-        pos = read_until_resumed(&mut buffer, &need_data_count, pos);
+-        while pos < new_end {
+-            assert_eq!(read(&mut buffer, pos, CHUNK), (bytes(pos, CHUNK), None));
+-            pos += CHUNK as u64;
+-        }
+-        let grown_capacity = buffer.data.capacity();
+-        assert!(grown_capacity > CAPACITY);
+-        assert!(buffer.push_buffer(&bytes(new_end, CHUNK)));
+-        assert!(buffer.data.capacity() < grown_capacity);
+-        assert_eq!(
+-            read(&mut buffer, new_end, CHUNK),
+-            (bytes(new_end, CHUNK), None)
+-        );
+-    }
+-
+-    #[test]
+-    fn ends_a_resumed_fetch() {
+-        let (mut buffer, _, need_data_count) = buffer();
+-        let size = CAPACITY as u64 + 2 * CHUNK as u64;
+-        buffer.set_size(size);
+-        let end = fill(&mut buffer, 0);
+-        let mut pos = read_until_resumed(&mut buffer, &need_data_count, 0);
+-        assert!(buffer.push_buffer(&bytes(end, (size - end) as usize)));
+-        buffer.end_of_stream();
+-        assert_eq!(buffer.fetch_state, FetchState::Ended);
+-        while pos < size {
+-            assert_eq!(read(&mut buffer, pos, CHUNK), (bytes(pos, CHUNK), None));
+-            pos += CHUNK as u64;
+-        }
+-        assert_eq!(read(&mut buffer, size, CHUNK), (vec![], None));
+-        assert_eq!(count(&need_data_count), 1);
+-    }
+-
+-    #[test]
+-    fn ignores_the_end_of_a_stopped_fetch() {
+-        let (mut buffer, _, need_data_count) = buffer();
+-        let end = fill(&mut buffer, 0);
+-        buffer.end_of_stream();
+-        assert_eq!(read(&mut buffer, end, CHUNK), (vec![], None));
+-        assert_eq!(count(&need_data_count), 1);
+-    }
+-
+-    #[test]
+-    fn drops_the_bytes_after_a_failed_restart() {
+-        let (mut buffer, _, _) = buffer();
+-        assert_eq!(
+-            read(&mut buffer, 2 * MAX_READ_AHEAD, CHUNK).1,
+-            Some(2 * MAX_READ_AHEAD)
+-        );
+-        buffer.restarted(false);
+-        assert!(buffer.push_buffer(&bytes(2 * MAX_READ_AHEAD, CHUNK)));
+-        assert_eq!(buffer.end(), 2 * MAX_READ_AHEAD);
+-        assert_eq!(read(&mut buffer, 0, CHUNK), (vec![], None));
+-    }
+-
+-    #[test]
+-    fn progresses_with_reads_at_two_positions() {
+-        let (mut buffer, _, need_data_count) = buffer();
+-        let end = fill(&mut buffer, 0);
+-        assert_eq!(read(&mut buffer, end, CHUNK), (vec![], None));
+-        assert_eq!(count(&need_data_count), 1);
+-        assert_eq!(read(&mut buffer, 0, CHUNK), (bytes(0, CHUNK), None));
+-        assert!(buffer.push_buffer(&bytes(end, CHUNK)));
+-        assert_eq!(read(&mut buffer, end, CHUNK), (bytes(end, CHUNK), None));
+-    }
+-
+-    #[test]
+-    fn keeps_the_unread_bytes_after_a_read_past_the_end_of_the_resource() {
+-        let (mut buffer, _, _) = buffer();
+-        let size = CAPACITY as u64 + CHUNK as u64;
+-        buffer.set_size(size);
+-        let end = fill(&mut buffer, 0);
+-        assert_eq!(read(&mut buffer, size, CHUNK), (vec![], None));
+-        buffer.fetch_state = FetchState::Active;
+-        assert!(!buffer.push_buffer(&bytes(end, CHUNK)));
+-        assert_eq!(buffer.start, 0);
+-    }
+-
+-    #[test]
+-    fn does_not_restart_after_the_end_of_the_resource() {
+-        let (mut buffer, _, _) = buffer();
+-        buffer.set_size(1000);
+-        assert!(buffer.push_buffer(&bytes(0, 1000)));
+-        buffer.end_of_stream();
+-        assert_eq!(read(&mut buffer, 1000, CHUNK), (vec![], None));
+-        assert_eq!(
+-            read(&mut buffer, 1000 + 2 * MAX_READ_AHEAD, CHUNK),
+-            (vec![], None)
+-        );
+-        assert_eq!(read(&mut buffer, 900, CHUNK), (bytes(900, 100), None));
+-    }
+-
+-    #[test]
+-    fn reads_across_the_wrap_of_the_ring() {
+-        let (mut buffer, _, _) = buffer();
+-        let end = fill(&mut buffer, 0);
+-        buffer.furthest_read = end;
+-        buffer.fetch_state = FetchState::Active;
+-        let pos = end - 100;
+-        assert!(buffer.push_buffer(&bytes(end, 1000)));
+-        assert!(!buffer.data.as_slices().1.is_empty());
+-        assert_eq!(read(&mut buffer, pos, 1100), (bytes(pos, 1100), None));
+-        assert_eq!(read(&mut buffer, end, 1000), (bytes(end, 1000), None));
+-        assert_eq!(
+-            read(&mut buffer, end + 10, 1000),
+-            (bytes(end + 10, 990), None)
+-        );
+-    }
+-}
+diff --git a/components/media/backends/ohos/ohos_media/source.rs b/components/media/backends/ohos/ohos_media/source.rs
+index c7e8b9203a0..a6164dd218f 100644
+--- a/components/media/backends/ohos/ohos_media/source.rs
++++ b/components/media/backends/ohos/ohos_media/source.rs
+@@ -2,161 +2,212 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-use core::slice;
+-use std::sync::{Arc, Mutex};
+-use std::thread;
+-
+-use log::warn;
+-use ohos_media_sys::avbuffer::OH_AVBuffer;
++use std::ffi::c_void;
++use std::ptr::NonNull;
++use std::slice;
++use std::sync::{Arc, Condvar, Mutex};
++use std::time::{Duration, Instant};
++
++use log::{debug, warn};
++use ohos_media_sys::avbuffer::{OH_AVBuffer, OH_AVBuffer_GetAddr, OH_AVBuffer_GetCapacity};
+ use ohos_media_sys::avcodec_base::OH_AVDataSourceExt;
+ use ohos_media_sys::avplayer::OH_AVPlayer_SetDataSource;
+ use ohos_media_sys::avplayer_base::OH_AVPlayer;
++use servo_media_cache::{MediaReader, ReadResult};
++
++/// What `readAt` returns at the end of the media resource (`SOURCE_ERROR_EOF`).
++const END_OF_STREAM: i32 = -1;
++/// What `readAt` returns when the media resource cannot be read (`SOURCE_ERROR_IO`), after which
++/// AVPlayer reports an error.
++const READ_ERROR: i32 = -2;
++/// How long a read waits for data before it returns none. AVPlayer reads again 100 to 500 ms
++/// after a read that returns none, and gives up after 20 of them in a row, about 4.6 s, which can
++/// fail a seek. Waiting here gives a slow download about 25 s. AVPlayer reads on a thread of its
++/// own.
++const MAX_READ_WAIT: Duration = Duration::from_secs(1);
++
++/// The data source of AVPlayer, which reads the media resource from the media cache.
++pub struct MediaSourceWrapper {
++    /// Owned: leaked from a `Box` and freed on drop. AVPlayer keeps pointers to it until it is
++    /// released, so it is only accessed through shared references once AVPlayer has it.
++    data_source: NonNull<DataSource>,
++}
+ 
+-use crate::ohos_media::playback_buffer::PlaybackBuffer;
+-use crate::ohos_media::source_builder::MediaSourceBuilder;
++struct DataSource {
++    ext: OH_AVDataSourceExt,
++    reader: Arc<MediaReader>,
++    /// Where the next read starts when AVPlayer reads in sequence, without a position, which it
++    /// does for a data source of unknown size.
++    sequential_pos: Mutex<u64>,
++    wake: Arc<Wake>,
++}
+ 
+-pub struct MediaSourceWrapper {
+-    pub(crate) data_src: ohos_media_sys::avcodec_base::OH_AVDataSourceExt,
+-    total_media_source_size: usize,
+-    playback_buffer: Arc<Mutex<PlaybackBuffer>>,
+-    closure_handle: *mut Box<dyn Fn(*mut u8, u32, i64) -> i32>,
++/// Wakes the reads that wait for data.
++#[derive(Default)]
++struct Wake {
++    state: Mutex<WakeState>,
++    condvar: Condvar,
+ }
+ 
+-impl MediaSourceWrapper {
+-    pub fn builder() -> MediaSourceBuilder {
+-        MediaSourceBuilder {
+-            enough_data: None,
+-            need_data: None,
+-            seek_data: None,
+-        }
+-    }
++#[derive(Default)]
++struct WakeState {
++    /// How often the reader's waker was called.
++    wakes: u64,
++    /// Whether AVPlayer is being released, after which reads don't wait.
++    released: bool,
+ }
+ 
+-impl MediaSourceWrapper {
+-    pub fn new(source_cb: MediaSourceBuilder) -> Self {
+-        let playback_buffer = Arc::new(Mutex::new(PlaybackBuffer::new(
+-            source_cb.enough_data,
+-            source_cb.need_data,
+-        )));
+-
+-        let playback_buffer_clone = playback_buffer.clone();
+-
+-        let read_at_closure = move |buffer: *mut u8, length: u32, pos: i64| -> i32 {
+-            log::debug!(
+-                "Inside Read At Closure: {:p}, length: {}, pos: {}",
+-                buffer,
+-                length,
+-                pos
+-            );
+-            let Ok(pos) = u64::try_from(pos) else {
+-                return 0;
+-            };
+-            let buffer = unsafe { slice::from_raw_parts_mut(buffer, length as usize) };
+-            let (read_bytes, restart_pos) = {
+-                let mut playback_buffer_lock = playback_buffer_clone.lock().unwrap();
+-                playback_buffer_lock.read_data(buffer, pos)
+-            };
+-            // The playback_buffer lock must be released before calling the seek
+-            // closure, which blocks on IPC with the script thread. Holding the
+-            // lock here would deadlock if the script thread is simultaneously
+-            // trying to push_data (which also acquires this lock).
+-            if let Some(restart_pos) = restart_pos &&
+-                let Some(seek_closure) = &source_cb.seek_data
+-            {
+-                let restart = {
+-                    let seek_closure = seek_closure.clone();
+-                    let playback_buffer = playback_buffer_clone.clone();
+-                    move || {
+-                        seek_closure(restart_pos, &|success| {
+-                            playback_buffer.lock().unwrap().restarted(success)
+-                        })
+-                    }
+-                };
+-                // Restarting the fetch waits for the script thread, which must not hold up the
+-                // reads of AVPlayer.
+-                if let Err(error) = thread::Builder::new()
+-                    .name("Media Fetch Restart".to_owned())
+-                    .spawn(restart)
+-                {
+-                    warn!("Could not restart the fetch on its own thread: {error}");
+-                    seek_closure(restart_pos, &|success| {
+-                        playback_buffer_clone.lock().unwrap().restarted(success)
+-                    });
+-                }
+-            }
+-            read_bytes as i32
+-        };
++impl Wake {
++    fn wakes(&self) -> u64 {
++        self.state.lock().unwrap().wakes
++    }
+ 
+-        let box_closure: Box<dyn Fn(*mut u8, u32, i64) -> i32> = Box::new(read_at_closure);
+-        // Double boxing is needed because we need to convert the closure into a raw pointer to pass to C,
+-        // but Rust does not allow us to directly convert a Box<dyn Fn> into a raw pointer, we need to first box it
+-        // and then convert the box into a raw pointer.
+-        let double_box_closure = Box::new(box_closure);
+-
+-        extern "C" fn oh_avdatasource_read_at_callback(
+-            data: *mut OH_AVBuffer,
+-            length: i32,
+-            pos: i64,
+-            user_data: *mut std::ffi::c_void,
+-        ) -> i32 {
+-            assert!(
+-                !user_data.is_null(),
+-                "oh_avdatasource_read_at_callback: user_data must not be null"
+-            );
+-            let f = unsafe { &*(user_data as *mut Box<dyn Fn(*mut u8, u32, i64) -> i32>) };
+-            let buffer_addr = unsafe { ohos_media_sys::avbuffer::OH_AVBuffer_GetAddr(data) };
+-            f(buffer_addr, length as u32, pos)
+-        }
+-        let data_src = OH_AVDataSourceExt {
+-            size: 0,
+-            readAt: Some(oh_avdatasource_read_at_callback),
+-        };
++    fn wake(&self) {
++        self.state.lock().unwrap().wakes += 1;
++        self.condvar.notify_all();
++    }
+ 
+-        let raw_ptr_f = Box::into_raw(double_box_closure);
++    fn release(&self) {
++        self.state.lock().unwrap().released = true;
++        self.condvar.notify_all();
++    }
+ 
+-        Self {
+-            data_src,
+-            total_media_source_size: 0,
+-            playback_buffer,
+-            closure_handle: raw_ptr_f,
++    /// Waits until the waker is called after it was called `wakes` times, unless AVPlayer is
++    /// being released or `deadline` passes. Returns whether it was called.
++    fn wait(&self, wakes: u64, deadline: Instant) -> bool {
++        let mut state = self.state.lock().unwrap();
++        while state.wakes == wakes && !state.released {
++            let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
++                return false;
++            };
++            state = self.condvar.wait_timeout(state, timeout).unwrap().0;
+         }
++        !state.released
+     }
++}
+ 
+-    pub fn set_input_size(&mut self, size: usize) {
+-        log::debug!("Setting input size to {}", size);
+-        if self.total_media_source_size == 0 {
+-            self.total_media_source_size = size;
+-            self.data_src.size = size as i64;
+-            self.playback_buffer.lock().unwrap().set_size(size as u64);
++impl MediaSourceWrapper {
++    pub fn new(reader: Arc<MediaReader>) -> Self {
++        let wake = Arc::new(Wake::default());
++        let waker_wake = wake.clone();
++        reader.set_waker(Box::new(move || waker_wake.wake()));
++        let data_source = Box::new(DataSource {
++            ext: OH_AVDataSourceExt {
++                size: -1,
++                readAt: Some(read_at),
++            },
++            reader,
++            sequential_pos: Mutex::new(0),
++            wake,
++        });
++        Self {
++            data_source: NonNull::from(Box::leak(data_source)),
+         }
+     }
+ 
+-    /// Returns false if the playback buffer is full and did not take any of the bytes.
+-    pub fn push_data(&self, data: Vec<u8>) -> bool {
+-        let mut playback_buffer_lock = self.playback_buffer.lock().unwrap();
+-        playback_buffer_lock.push_buffer(&data)
++    fn data_source(&self) -> &DataSource {
++        // SAFETY: `data_source` is valid until `self` is dropped, and is only mutated before
++        // AVPlayer has it, in `set_data_src`, which takes `&mut self`.
++        unsafe { self.data_source.as_ref() }
+     }
+ 
+-    pub fn end_of_stream(&self) {
+-        self.playback_buffer.lock().unwrap().end_of_stream();
++    pub fn length(&self) -> Option<u64> {
++        self.data_source().reader.length()
+     }
+ 
+-    pub fn set_data_src(&mut self, av_player: *mut OH_AVPlayer) {
++    /// Hands the data source to AVPlayer, which reads its size only now. Without a size, AVPlayer
++    /// treats it as a live stream, which it reads in sequence and cannot seek in.
++    pub fn set_data_src(&mut self, av_player: *mut OH_AVPlayer, size: Option<u64>) {
++        let data_source = self.data_source.as_ptr();
++        // SAFETY: `data_source` is valid, and nothing else accesses it until AVPlayer has it, as
++        // `OhosPlayer` hands it over once.
+         unsafe {
+-            OH_AVPlayer_SetDataSource(
+-                av_player,
+-                &mut self.data_src as *mut OH_AVDataSourceExt,
+-                self.closure_handle as *mut std::ffi::c_void,
+-            );
++            (*data_source).ext.size = size.and_then(|size| i64::try_from(size).ok()).unwrap_or(-1);
+         }
++        // SAFETY: AVPlayer reads the data source and calls `read_at` with `data_source` until it
++        // is released, which waits for the running reads. The owner of the AVPlayer wrapper
++        // releases it before the wrapper, which owns `self`, is dropped.
++        let ret = unsafe {
++            OH_AVPlayer_SetDataSource(av_player, &raw mut (*data_source).ext, data_source.cast())
++        };
++        debug!("OH_AVPlayer_SetDataSource of size {size:?}: {ret:?}");
++    }
++
++    /// Ends the reads that wait for data, as releasing AVPlayer waits for the running reads.
++    pub fn release(&self) {
++        self.data_source().wake.release();
+     }
+ }
+ 
+ impl Drop for MediaSourceWrapper {
+     fn drop(&mut self) {
+-        unsafe {
+-            let box_closure = Box::from_raw(self.closure_handle);
+-            drop(box_closure);
++        // SAFETY: `data_source` was leaked from a `Box`, and AVPlayer, which is released before
++        // `self` is dropped, no longer uses it.
++        drop(unsafe { Box::from_raw(self.data_source.as_ptr()) });
++    }
++}
++
++impl DataSource {
++    fn read(&self, pos: i64, dest: &mut [u8]) -> i32 {
++        let deadline = Instant::now() + MAX_READ_WAIT;
++        loop {
++            // Counting the wakes before reading makes sure that a wake right after a pending read
++            // is not lost.
++            let wakes = self.wake.wakes();
++            let result = self.read_once(pos, dest);
++            if result != ReadResult::Pending || !self.wake.wait(wakes, deadline) {
++                return self.read_result(pos, result);
++            }
+         }
+     }
++
++    fn read_once(&self, pos: i64, dest: &mut [u8]) -> ReadResult {
++        match u64::try_from(pos) {
++            Ok(pos) => self.reader.read_at(pos, dest),
++            Err(_) => {
++                let mut sequential_pos = self.sequential_pos.lock().unwrap();
++                let result = self.reader.read_at(*sequential_pos, dest);
++                if let ReadResult::Data(len) = result {
++                    *sequential_pos += len as u64;
++                }
++                result
++            },
++        }
++    }
++
++    fn read_result(&self, pos: i64, result: ReadResult) -> i32 {
++        match result {
++            // At most `dest.len()`, which came from an `i32`.
++            ReadResult::Data(len) => len as i32,
++            // AVPlayer reads again 100 to 500 ms later.
++            ReadResult::Pending => 0,
++            ReadResult::EndOfStream => END_OF_STREAM,
++            ReadResult::Error(error) => {
++                warn!("Could not read the media resource at {pos}: {error:?}");
++                READ_ERROR
++            },
++        }
++    }
++}
++
++extern "C" fn read_at(
++    data: *mut OH_AVBuffer,
++    length: i32,
++    pos: i64,
++    user_data: *mut c_void,
++) -> i32 {
++    assert!(!user_data.is_null(), "read_at: user_data must not be null");
++    // SAFETY: `user_data` is the `DataSource` that `set_data_src` passed, which outlives AVPlayer.
++    let data_source = unsafe { &*(user_data as *const DataSource) };
++    // SAFETY: AVPlayer passes a valid buffer, which these functions check.
++    let (addr, capacity) = unsafe { (OH_AVBuffer_GetAddr(data), OH_AVBuffer_GetCapacity(data)) };
++    let Ok(len) = usize::try_from(length.min(capacity)) else {
++        return READ_ERROR;
++    };
++    if addr.is_null() {
++        return READ_ERROR;
++    }
++    // SAFETY: the buffer holds `capacity` bytes at `addr`, and nothing else uses it during the read.
++    let dest = unsafe { slice::from_raw_parts_mut(addr, len) };
++    data_source.read(pos, dest)
+ }
+diff --git a/components/media/backends/ohos/ohos_media/source_builder.rs b/components/media/backends/ohos/ohos_media/source_builder.rs
+deleted file mode 100644
+index 18056752c9d..00000000000
+--- a/components/media/backends/ohos/ohos_media/source_builder.rs
++++ /dev/null
+@@ -1,52 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+-use std::sync::Arc;
+-
+-#[cfg(not(sdk_api_21))]
+-use crate::ohos_media::dummy_source::MediaSourceWrapper;
+-#[cfg(sdk_api_21)]
+-use crate::ohos_media::source::MediaSourceWrapper;
+-
+-/// Asks the media element to restart the fetch at a position. Unless the player was released, it
+-/// calls the given closure with whether the media element did, before the media element can push
+-/// the bytes of the restarted fetch.
+-type SeekDataClosure = Arc<dyn Fn(u64, &dyn Fn(bool)) + Send + Sync>;
+-
+-pub struct MediaSourceBuilder {
+-    pub enough_data: Option<Box<dyn Fn() + Send + Sync>>,
+-    /// Asks the media element to push data again, continuing with the bytes that were refused.
+-    pub need_data: Option<Box<dyn Fn() + Send + Sync>>,
+-    pub seek_data: Option<SeekDataClosure>,
+-}
+-
+-impl MediaSourceBuilder {
+-    pub fn set_enough_data<F: Fn() + Send + Sync + Clone + 'static>(mut self, callback: F) -> Self {
+-        self.enough_data = Some(Box::new(callback));
+-        self
+-    }
+-
+-    pub fn set_need_data<F: Fn() + Send + Sync + Clone + 'static>(mut self, callback: F) -> Self {
+-        self.need_data = Some(Box::new(callback));
+-        self
+-    }
+-
+-    pub fn set_seek_data<F: Fn(u64, &dyn Fn(bool)) + Send + Sync + Clone + 'static>(
+-        mut self,
+-        callback: F,
+-    ) -> Self {
+-        self.seek_data = Some(Arc::new(callback));
+-        self
+-    }
+-
+-    pub fn build(self) -> MediaSourceWrapper {
+-        #[cfg(not(sdk_api_21))]
+-        {
+-            MediaSourceWrapper::new()
+-        }
+-        #[cfg(sdk_api_21)]
+-        {
+-            MediaSourceWrapper::new(self)
+-        }
+-    }
+-}
+diff --git a/components/media/backends/ohos/player.rs b/components/media/backends/ohos/player.rs
+index 8baa11e6ea1..cdf1464cd72 100644
+--- a/components/media/backends/ohos/player.rs
++++ b/components/media/backends/ohos/player.rs
+@@ -20,18 +20,15 @@ use ohos_media_sys::avplayer_base::{
+     OH_PLAYER_SEEK_POSITION, OH_PLAYER_STATE, OH_PLAYER_STATE_CHANGE_REASON,
+     OH_PLAYER_VIDEO_HEIGHT, OH_PLAYER_VIDEO_WIDTH, OH_PLAYER_VOLUME,
+ };
+-use servo_base::generic_channel::{GenericCallback, GenericReceiver, channel};
++use servo_base::generic_channel::GenericCallback;
+ use servo_media::{BackendMsg, ClientContextId, MediaInstance, MediaInstanceError};
++use servo_media_cache::MediaReader;
+ use servo_media_player::metadata::Metadata;
+ use servo_media_player::video::{self, Buffer, VideoFrame, VideoFrameData};
+-use servo_media_player::{PlaybackState, Player, PlayerEvent, SeekLock, SeekLockMsg};
++use servo_media_player::{PlaybackState, Player, PlayerEvent};
+ use yuv::yuv_nv12_to_bgra;
+ 
+ use crate::ohos_media::avplayer::OhosPlayer as OhosPlayerInner;
+-#[cfg(not(sdk_api_21))]
+-use crate::ohos_media::dummy_source::MediaSourceWrapper;
+-#[cfg(sdk_api_21)]
+-use crate::ohos_media::source::MediaSourceWrapper;
+ 
+ // Height of decoded video frame from AVPlayer is padded to multiples of this value by the codec.
+ // https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/video-decoding
+@@ -74,12 +71,6 @@ pub struct OhosAvPlayer {
+     /// Whether AVPlayer reported an error, after which its info events are ignored: the player
+     /// can still change state, for example to paused, which must not raise the ready state.
+     errored: Arc<AtomicBool>,
+-    /// Whether this player is being dropped, after which the media element no longer answers
+-    /// SeekData events.
+-    released: Arc<AtomicBool>,
+-    /// The sender of the channel on which reads wait for the media element to answer a SeekData
+-    /// event.
+-    seek_lock: Option<SeekLock>,
+ }
+ 
+ // Procedure for setting up AVPlayer, state change condition:
+@@ -130,8 +121,6 @@ impl OhosAvPlayer {
+             }))),
+             state_manager: Arc::new(Mutex::new(StateManager::new())),
+             errored: Arc::new(AtomicBool::new(false)),
+-            released: Arc::new(AtomicBool::new(false)),
+-            seek_lock: None,
+         }
+     }
+ 
+@@ -359,99 +348,11 @@ impl OhosAvPlayer {
+                     .send(PlayerEvent::Error(format!("{error_code}: {message}")));
+             });
+     }
+-
+-    pub fn setup_data_source(&mut self) {
+-        let sender_clone = self.event_sender.clone();
+-        let sender_clone_clone = self.event_sender.clone();
+-        let need_data_sender = self.event_sender.clone();
+-        let released_clone = self.released.clone();
+-        let seek_channel = SeekChannel::new();
+-        self.seek_lock = Some(seek_channel.sender());
+-        let seek_channel = Arc::new(Mutex::new(seek_channel));
+-        let seekdata_send_closure = move |pos: u64, answered: &dyn Fn(bool)| {
+-            // Checking whether the player is released under the lock that waiting holds makes sure
+-            // that the answer that releasing sends reaches the only restart that can still wait.
+-            let seek_channel = seek_channel.lock().unwrap();
+-            if released_clone.load(Ordering::SeqCst) {
+-                return;
+-            }
+-            let _ = sender_clone
+-                .lock()
+-                .unwrap()
+-                .send(PlayerEvent::SeekData(pos, seek_channel.sender()));
+-            let (ret, ack_channel) = seek_channel.wait();
+-            drop(seek_channel);
+-            // The media element waits for the acknowledgement before it can push the bytes of the
+-            // restarted fetch.
+-            answered(ret);
+-            debug!("Seek Initiated! :{}", pos);
+-            let _ = sender_clone.lock().unwrap().send(PlayerEvent::NeedData);
+-            let _ = ack_channel.send(());
+-        };
+-
+-        let source = MediaSourceWrapper::builder()
+-            .set_enough_data(move || {
+-                let _ = sender_clone_clone
+-                    .lock()
+-                    .unwrap()
+-                    .send(PlayerEvent::EnoughData);
+-            })
+-            .set_need_data(move || {
+-                let _ = need_data_sender.lock().unwrap().send(PlayerEvent::NeedData);
+-            })
+-            .set_seek_data(seekdata_send_closure)
+-            .build();
+-
+-        self.player_inner.lock().unwrap().set_source(source);
+-        // To kickstart the first need data event.
+-        let _ = self
+-            .event_sender
+-            .lock()
+-            .unwrap()
+-            .send(PlayerEvent::NeedData);
+-    }
+-}
+-
+-struct SeekChannel {
+-    sender: SeekLock,
+-    recv: GenericReceiver<SeekLockMsg>,
+-}
+-
+-impl SeekChannel {
+-    fn new() -> Self {
+-        let (sender, recv) = channel::<SeekLockMsg>().expect("Couldn't create IPC channel");
+-        Self {
+-            sender: SeekLock {
+-                lock_channel: sender,
+-            },
+-            recv,
+-        }
+-    }
+-    fn sender(&self) -> SeekLock {
+-        self.sender.clone()
+-    }
+-    fn wait(&self) -> SeekLockMsg {
+-        self.recv.recv().unwrap()
+-    }
+ }
+ 
+ impl Drop for OhosAvPlayer {
+     fn drop(&mut self) {
+         debug!("Ohos Dropping");
+-        // A restart of the fetch that waits for the answer to its SeekData event would wait
+-        // forever, as the media element ignores the events of a player it dropped, so answer it
+-        // here.
+-        self.released.store(true, Ordering::SeqCst);
+-        if let Some(seek_lock) = &self.seek_lock {
+-            match channel() {
+-                Some((ack_sender, _)) => {
+-                    let _ = seek_lock.lock_channel.send((false, ack_sender));
+-                },
+-                None => {
+-                    warn!("Could not answer a pending SeekData event before releasing AVPlayer")
+-                },
+-            }
+-        }
+         OhosPlayerInner::release(&self.player_inner);
+         let (sender, _) = std::sync::mpsc::channel::<()>();
+         let _ = self
+@@ -542,12 +443,31 @@ impl Player for OhosAvPlayer {
+     fn set_input_size(&self, size: u64) -> Result<(), servo_media::player::PlayerError> {
+         debug!("SetInputSize: {}", size);
+ 
+-        self.player_inner.lock().unwrap().set_input_size(size);
++        self.player_inner.lock().unwrap().metadata_known(Some(size));
++        Ok(())
++    }
++
++    fn set_data_source(
++        &self,
++        source: Arc<MediaReader>,
++    ) -> Result<(), servo_media::player::PlayerError> {
++        if !cfg!(sdk_api_21) {
++            return Err(servo_media::player::PlayerError::NotSupported);
++        }
++        if !self.player_inner.lock().unwrap().set_reader(source) {
++            return Err(servo_media::player::PlayerError::Backend(
++                "AVPlayer already has a data source".to_owned(),
++            ));
++        }
+         Ok(())
+     }
+ 
+     fn set_seekable(&self, seekable: bool) -> Result<(), servo_media::player::PlayerError> {
+         debug!("SetSeekable: {}", seekable);
++        // AVPlayer derives whether the resource is seekable from the size of the data source, so
++        // this only says that the media element knows the metadata of the media resource. It calls
++        // `set_input_size` first if the length is known.
++        self.player_inner.lock().unwrap().metadata_known(None);
+         Ok(())
+     }
+ 
+@@ -568,16 +488,16 @@ impl Player for OhosAvPlayer {
+         Ok(())
+     }
+ 
+-    fn push_data(&self, data: Vec<u8>) -> Result<(), servo_media::player::PlayerError> {
+-        if !self.player_inner.lock().unwrap().push_data(data) {
+-            return Err(servo_media::player::PlayerError::EnoughData);
++    fn push_data(&self, _data: Vec<u8>) -> Result<(), servo_media::player::PlayerError> {
++        // AVPlayer reads from its data source instead, which needs API 21.
++        if cfg!(sdk_api_21) {
++            return Err(servo_media::player::PlayerError::NotSupported);
+         }
+         Ok(())
+     }
+ 
+     fn end_of_stream(&self) -> Result<(), servo_media::player::PlayerError> {
+         debug!("Player: Current Request End of Stream reached!");
+-        self.player_inner.lock().unwrap().end_of_stream();
+         Ok(())
+     }
+ 
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index de446b78657..4fad28da01f 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -1676,6 +1676,9 @@ impl HTMLMediaElement {
+         reader.set_observer(Box::new(move |event| {
+             observer_tasks.queue(move |cx, element| element.handle_reader_event(cx, id, event));
+         }));
++        // A player that reads from the reader may render the media data before the metadata
++        // event of a resource that the cache holds already reaches the element.
++        self.origin_clean.set(!reader.cors_tainted());
+         self.player_has_reader.set(true);
+ 
+         let pulls = self.player.borrow().as_ref().is_some_and(|player| {
+@@ -1702,7 +1705,6 @@ impl HTMLMediaElement {
+             stall_check_pending: false,
+             stalled: false,
+         }));
+-        self.origin_clean.set(true);
+         document.register_media_element_with_reader(self);
+         self.update_reader_activity();
+         self.update_keep_alive();

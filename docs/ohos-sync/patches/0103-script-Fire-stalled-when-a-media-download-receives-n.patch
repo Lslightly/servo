@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 17 Oct 2026 15:59:26 +0000
+Subject: [PATCH] script: Fire stalled when a media download receives no data
+
+The media element never fired stalled, which the HTML specification
+asks for when a media element that is actively attempting to obtain
+media data has received none for the media element stall timeout, about
+three seconds.
+
+While its networkState is NETWORK_LOADING and its download is not
+suspended, the element checks every second whether three seconds passed
+since data last arrived, since the download started or since it
+resumed, and if so queues a media element task to fire stalled. It fires
+once per stall, and data that arrives starts the wait again. The checks
+use a fixed interval because the run-steps-after-a-timeout timers of all
+media elements share one ordering identifier, and Servo runs a timer of
+that identifier only once those with a shorter timeout ran.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: no WPT test stalls a media download; see Validation.
+
+Validation: a server that sends 2 MB of a video and then nothing for
+8 s: stalled fires 4.0 s after the request, 3.7 s after the last data,
+in 2 of 2 runs, and never with the phase 1 build; no stalled event in
+any other scenario of the series (play, loop, seek back, two elements,
+reload, replay, large files at full speed and at 5 MB/s). `./mach test-wpt --release --timeout-multiplier 2` on Linux with
+GStreamer of html/semantics/embedded-content/media-elements and
+the-video-element, html/canvas/element/manual/drawing-images-to-the-canvas
+and imagebitmap, fetch/range, content-security-policy/media-src,
+html/browsers/browsing-the-web/read-media and
+mozilla/media-autoplay-seek-after-ended.html with the series, 507 tests:
+the unexpected results also occur with the phase 1 build of ohos-main
+(load-removes-queued-error-event hangs, media_fragment_seek fails,
+track-remove-by-setting-innerHTML timed out 1 of 6 isolated runs here
+and 2 of 6 there, autoplay-default-permissions-policy passes where a
+timeout is expected); loop-from-ended failed 1 of 26 isolated runs here
+and 1 of 26 there. `./mach check` and `./mach check --ohos` pass.
+
+AI-assisted: Yes (agent session; implemented and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../html/embedded_content/htmlmediaelement.rs | 75 +++++++++++++++++++
+ 1 file changed, 75 insertions(+)
+
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 983fb9a2bd0..4bf26af2973 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -117,6 +117,13 @@ static MEDIA_CONTROL_JS: &str = include_str!("../../../resources/media-controls.
+ /// instead of strict equality. (Unit is second)
+ const SEEK_POSITION_THRESHOLD: f64 = 0.5;
+ 
++/// <https://html.spec.whatwg.org/multipage/#media-element-stall-timeout>
++const STALL_TIMEOUT: Duration = Duration::from_secs(3);
++
++/// How often a media element that downloads checks whether it stalled. Checks at a fixed interval
++/// keep the order of the timers of all elements, which share an ordering identifier.
++const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(1);
++
+ /// The size of the chunks of media data that are pushed into a player.
+ const PUSH_CHUNK_SIZE: usize = 64 * 1024;
+ 
+@@ -1682,11 +1689,71 @@ impl HTMLMediaElement {
+             metadata: None,
+             activity: None,
+             download_suspended: false,
++            last_progress: Instant::now(),
++            stall_check_pending: false,
++            stalled: false,
+         });
+         self.origin_clean.set(true);
+         document.register_media_element_with_reader(self);
+         self.update_reader_activity();
+         self.update_keep_alive();
++        self.watch_for_stall();
++    }
++
++    /// Starts to wait for the media element stall timeout from now, as when data arrives.
++    fn watch_for_stall(&self) {
++        let id = {
++            let mut media_reader = self.media_reader.borrow_mut();
++            let Some(media_reader) = media_reader.as_mut() else {
++                return;
++            };
++            media_reader.last_progress = Instant::now();
++            media_reader.stalled = false;
++            if media_reader.stall_check_pending {
++                return;
++            }
++            media_reader.stall_check_pending = true;
++            media_reader.id
++        };
++        self.schedule_stall_check(id);
++    }
++
++    fn schedule_stall_check(&self, id: u32) {
++        let this = Trusted::new(self);
++        self.global().run_steps_after_a_timeout(
++            DOMString::from_static("media-element-stall"),
++            STALL_CHECK_INTERVAL.as_millis() as i64,
++            move |_, _| this.root().check_for_stall(id),
++        );
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
++    /// > When a media element that is actively attempting to obtain media data has failed to
++    /// > receive any data for a duration equal to the media element stall timeout, the user agent
++    /// > must queue a media element task given the media element to [...] fire an event named
++    /// > stalled at the element.
++    fn check_for_stall(&self, id: u32) {
++        let stalled = {
++            let mut media_reader = self.media_reader.borrow_mut();
++            let Some(media_reader) = media_reader.as_mut().filter(|reader| reader.id == id) else {
++                return;
++            };
++            media_reader.stall_check_pending = false;
++            if self.network_state.get() != NetworkState::Loading ||
++                media_reader.download_suspended ||
++                media_reader.stalled
++            {
++                return;
++            }
++            media_reader.stalled = media_reader.last_progress.elapsed() >= STALL_TIMEOUT;
++            media_reader.stall_check_pending = !media_reader.stalled;
++            media_reader.stalled
++        };
++        if stalled {
++            self.queue_media_element_task_to_fire_event(Atom::from("stalled"));
++        } else {
++            self.schedule_stall_check(id);
++        }
+     }
+ 
+     /// Stops reading the media resource from the media cache, which cancels the fetches that no
+@@ -2226,6 +2293,7 @@ impl HTMLMediaElement {
+     ///
+     /// The reader reports progress at most every 350 ms.
+     fn reader_progress(&self, cx: &mut JSContext) {
++        self.watch_for_stall();
+         let download_suspended = self
+             .media_reader
+             .borrow()
+@@ -2273,6 +2341,7 @@ impl HTMLMediaElement {
+         if self.network_state.get() == NetworkState::Idle {
+             self.set_network_state(NetworkState::Loading);
+         }
++        self.watch_for_stall();
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list>
+@@ -4376,6 +4445,12 @@ struct MediaResourceReader {
+     activity: Option<ReaderActivity>,
+     /// Whether the download is suspended or complete, while which no progress event fires.
+     download_suspended: bool,
++    /// When data last arrived, or the download started or resumed.
++    last_progress: Instant,
++    /// Whether a check for a stalled download is scheduled.
++    stall_check_pending: bool,
++    /// Whether the element fired stalled since data last arrived.
++    stalled: bool,
+ }
+ 
+ /// Pushes the data of a reader into a player, as the player asks for it.

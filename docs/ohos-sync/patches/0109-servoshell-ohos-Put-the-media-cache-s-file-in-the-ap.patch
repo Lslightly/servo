@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 17 Oct 2026 16:45:09 +0000
+Subject: [PATCH] servoshell (ohos): Put the media cache's file in the
+ application's temporary directory
+
+The sandbox of an OpenHarmony application has no system temporary
+directory, so the media cache could not create its temporary file and
+kept at most 32 MiB of media in memory. Set the `media_cache_directory`
+preference to the temporary directory of the application context,
+unless it is already set.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: nothing observable from a test page; see Validation.
+
+Validation: `./mach check --ohos` with API 21. A HiHope DAYU200 (OpenHarmony 7.0, API 26), a release HAP of the series under a separate bundle name, signed with the SDK's test keys: a 90 s, 42.5 MB video plays to its end with 1 request, and the application holds the media cache's deleted temporary file in `/data/storage/el2/base/temp`.
+AI-assisted: Yes (agent session; written and tested on a device by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ ports/servoshell/Cargo.toml      |  2 +-
+ ports/servoshell/egl/ohos/mod.rs | 54 +++++++++++++++++++++-----------
+ 2 files changed, 37 insertions(+), 19 deletions(-)
+
+diff --git a/ports/servoshell/Cargo.toml b/ports/servoshell/Cargo.toml
+index 7c7169ff7f5..46058b2286a 100644
+--- a/ports/servoshell/Cargo.toml
++++ b/ports/servoshell/Cargo.toml
+@@ -117,7 +117,7 @@ hilog = { workspace = true }
+ ipc-channel = { workspace = true, features = ["force-inprocess"] }
+ napi-derive-ohos = { workspace = true }
+ napi-ohos = { workspace = true }
+-ohos-abilitykit-sys = { workspace = true, features = ["api-14"] }
++ohos-abilitykit-sys = { workspace = true, features = ["api-16"] }
+ ohos-deviceinfo = { workspace = true }
+ ohos-ime = { workspace = true }
+ ohos-ime-sys = { workspace = true }
+diff --git a/ports/servoshell/egl/ohos/mod.rs b/ports/servoshell/egl/ohos/mod.rs
+index 2a5ad58987f..004bd77ab70 100644
+--- a/ports/servoshell/egl/ohos/mod.rs
++++ b/ports/servoshell/egl/ohos/mod.rs
+@@ -59,6 +59,7 @@ mod resources;
+ pub(crate) mod headless;
+ 
+ use std::cell::RefCell;
++use std::ffi::c_char;
+ use std::mem::MaybeUninit;
+ use std::os::raw::c_void;
+ use std::path::PathBuf;
+@@ -76,7 +77,9 @@ use napi_derive_ohos::napi;
+ use napi_ohos::bindgen_prelude::{Function, JsObjectValue, Object};
+ use napi_ohos::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+ use napi_ohos::{Env, JsString, JsValue};
+-use ohos_abilitykit_sys::runtime::application_context;
++use ohos_abilitykit_sys::runtime::{
++    AbilityRuntimeErrorCode, AbilityRuntimeResult, application_context,
++};
+ use ohos_ime::{
+     AttachOptions, CreateImeProxyError, CreateTextEditorProxyError, Ime, ImeProxy, KeyboardStatus,
+     RawTextEditorProxy,
+@@ -183,6 +186,7 @@ pub(crate) fn get_raw_window_handle(
+ #[derive(Debug)]
+ struct NativeValues {
+     cache_dir: String,
++    temp_dir: Result<String, AbilityRuntimeErrorCode>,
+     #[expect(dead_code)]
+     display_density: f32,
+     device_type: ohos_deviceinfo::OhosDeviceType,
+@@ -204,26 +208,32 @@ fn get_display_density() -> f32 {
+     density
+ }
+ 
++/// Gets a directory of the application with one of the getters of the application context.
++fn get_application_dir(
++    getter: unsafe extern "C" fn(*mut c_char, i32, *mut i32) -> AbilityRuntimeResult,
++) -> Result<String, AbilityRuntimeErrorCode> {
++    const BUFFER_SIZE: i32 = 100;
++    let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE as usize);
++    let mut write_length = 0;
++    // SAFETY: the getters of the application context write at most `BUFFER_SIZE` bytes to the
++    // buffer and the length they wrote to `write_length`, which is clamped to the buffer anyway.
++    unsafe {
++        getter(buffer.as_mut_ptr().cast(), BUFFER_SIZE, &mut write_length)?;
++        buffer.set_len(write_length.clamp(0, BUFFER_SIZE) as usize);
++    }
++    Ok(String::from_utf8(buffer).expect("UTF-8"))
++}
++
+ /// Gets the resource and cache directory from the native c methods.
+ fn get_native_values() -> NativeValues {
+-    let cache_dir = {
+-        const BUFFER_SIZE: i32 = 100;
+-        let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE as usize);
+-        let mut write_length = 0;
+-        unsafe {
+-            application_context::OH_AbilityRuntime_ApplicationContextGetCacheDir(
+-                buffer.as_mut_ptr().cast(),
+-                BUFFER_SIZE,
+-                &mut write_length,
+-            )
+-            .expect("Call to cache dir failed");
+-            buffer.set_len(write_length as usize);
+-            String::from_utf8(buffer).expect("UTF-8")
+-        }
+-    };
+-
+     NativeValues {
+-        cache_dir,
++        cache_dir: get_application_dir(
++            application_context::OH_AbilityRuntime_ApplicationContextGetCacheDir,
++        )
++        .expect("Call to cache dir failed"),
++        temp_dir: get_application_dir(
++            application_context::OH_AbilityRuntime_ApplicationContextGetTempDir,
++        ),
+         display_density: get_display_density(),
+         device_type: ohos_deviceinfo::get_device_type(),
+         os_full_name: String::from(ohos_deviceinfo::get_os_full_name().unwrap_or("Undefined")),
+@@ -303,6 +313,14 @@ fn init_app(
+         preferences.set_value("viewport_meta_enabled", PrefValue::Bool(true));
+     }
+ 
++    // The application sandbox has no system temporary directory.
++    if preferences.media_cache_directory.is_empty() {
++        match native_values.temp_dir {
++            Ok(temp_dir) => preferences.media_cache_directory = temp_dir,
++            Err(error) => warn!("Could not get the temporary directory: {error:?}"),
++        }
++    }
++
+     if servoshell_preferences.log_to_file {
+         let mut servo_log = PathBuf::from(&native_values.cache_dir);
+         servo_log.push("servo.log");

@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 17 Oct 2026 16:06:10 +0000
+Subject: [PATCH] script: Abort the media downloads of a document that stops
+ loading
+
+The media cache fetches the media resources of media elements outside
+the fetch group of their document, so window.stop() and document.open(),
+which abort the document and terminate its fetch group, no longer
+cancelled them. Before the media cache, they cancelled the fetch but left
+the element as it was, with no error.
+
+When a document is aborted to stop loading or to be reopened, cancel the
+download of every media element of the document that is still loading:
+close its reader, and run the steps for a media data fetching process
+that is aborted by the user in a media element task. They set the error
+to MEDIA_ERR_ABORTED and fire abort; an element with no data yet goes to
+NETWORK_EMPTY, shows its poster and fires emptied, and any other to
+NETWORK_IDLE; the element stops delaying the load event and leaves the
+resource selection algorithm. Cancelling a download makes the document
+unsalvageable, as other cancelled fetches do. A download that is
+suspended or complete goes on.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: no WPT test aborts a document while a media element loads; see
+Validation.
+
+Validation: a video loading a 150 MB file at 5 MB/s: window.stop()
+3 s in fires abort, then emptied with NETWORK_EMPTY at HAVE_NOTHING, or
+leaves NETWORK_IDLE at HAVE_METADATA, with MEDIA_ERR_ABORTED, and the
+server sees the connection closed at 3.0 s; document.open() closes it
+at 3.0 s as well and sets the same error, where its listeners are
+already gone. With the phase 1 build, the connection was closed and the
+element stayed in NETWORK_IDLE without an error or an event. `./mach test-wpt --release --timeout-multiplier 2` on Linux with
+GStreamer of html/semantics/embedded-content/media-elements and
+the-video-element, html/canvas/element/manual/drawing-images-to-the-canvas
+and imagebitmap, fetch/range, content-security-policy/media-src,
+html/browsers/browsing-the-web/read-media and
+mozilla/media-autoplay-seek-after-ended.html with the series, 507 tests:
+the unexpected results also occur with the phase 1 build of ohos-main
+(load-removes-queued-error-event hangs, media_fragment_seek fails,
+track-remove-by-setting-innerHTML timed out 1 of 6 isolated runs here
+and 2 of 6 there, autoplay-default-permissions-policy passes where a
+timeout is expected); loop-from-ended failed 1 of 26 isolated runs here
+and 1 of 26 there. `./mach check` and `./mach check --ohos` pass.
+
+AI-assisted: Yes (agent session; implemented and tested by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/document/document.rs    | 26 +++++++-
+ .../html/embedded_content/htmlmediaelement.rs | 63 +++++++++++++++++++
+ 2 files changed, 86 insertions(+), 3 deletions(-)
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 6195641a669..a1b0a8b59cf 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -3065,9 +3065,13 @@ impl Document {
+         let loads_cancelled = global.fetch_group_mut().terminate(global);
+         let event_sources_canceled = global.close_event_sources();
+         // The media cache fetches for media elements outside the fetch group. When the document is
+-        // navigated away from, a download in progress is cancelled once it is unloaded.
+-        let media_downloads_cancelled =
+-            matches!(reason, AbortReason::Navigate) && self.has_media_download_in_progress();
++        // navigated away from, a download in progress is cancelled once it is unloaded; stopping
++        // or reopening the document cancels it now.
++        let media_downloads_cancelled = match reason {
++            AbortReason::Navigate => self.has_media_download_in_progress(),
++            AbortReason::StopLoading | AbortReason::DocumentOpen => self.abort_media_downloads(),
++            AbortReason::Destroy | AbortReason::PipelineExited => false,
++        };
+ 
+         if loads_cancelled || event_sources_canceled || media_downloads_cancelled {
+             // If any loads were canceled.
+@@ -3365,6 +3369,22 @@ impl Document {
+             })
+     }
+ 
++    /// Cancels the downloads in progress of the media elements, which then run the steps for a
++    /// fetching process aborted by the user. Returns whether there were any.
++    fn abort_media_downloads(&self) -> bool {
++        let elements: Vec<_> = self
++            .media_elements_with_reader
++            .borrow()
++            .iter()
++            .filter_map(MediaElementWeakRef::root)
++            .collect();
++        let mut aborted = false;
++        for element in elements {
++            aborted |= element.abort_media_download();
++        }
++        aborted
++    }
++
+     /// Tells the media cache how much of their media resource the media elements need, which
+     /// depends on whether the document is fully active.
+     fn update_media_reader_activities(&self) {
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 4bf26af2973..321045ab2f3 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -2554,6 +2554,69 @@ impl HTMLMediaElement {
+         self.resource_selection_algorithm_failure_steps(cx);
+     }
+ 
++    /// Cancels a download of the media resource in progress, as aborting the document does, and
++    /// queues the rest of the steps for a fetching process aborted by the user. Returns whether
++    /// there was such a download.
++    pub(crate) fn abort_media_download(&self) -> bool {
++        if !self.has_media_reader() || self.network_state.get() != NetworkState::Loading {
++            return false;
++        }
++
++        // Step 1. The user agent should cancel the fetching process.
++        self.close_media_reader();
++
++        let this = Trusted::new(self);
++        let generation_id = self.generation_id.get();
++        self.owner_global()
++            .task_manager()
++            .media_element_task_source()
++            .queue(task!(media_fetching_aborted: move |cx| {
++                let this = this.root();
++                if generation_id == this.generation_id.get() && !this.in_error_state() {
++                    this.media_data_fetching_aborted_steps(cx);
++                }
++            }));
++        true
++    }
++
++    /// <https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list>
++    /// => "If the media data fetching process is aborted by the user", after the fetching process
++    /// was cancelled.
++    fn media_data_fetching_aborted_steps(&self, cx: &mut JSContext) {
++        *self.source_children_pointer.borrow_mut() = None;
++        self.current_source_child.set(None);
++
++        // Step 2. Set the error attribute to the result of creating a MediaError with
++        // MEDIA_ERR_ABORTED.
++        self.set_error(Some(&*MediaError::new(
++            cx,
++            &self.owner_window(),
++            MEDIA_ERR_ABORTED,
++        )));
++
++        // Step 3. Fire an event named abort at the media element.
++        self.upcast::<EventTarget>().fire_event(cx, atom!("abort"));
++
++        // Step 4. If the media element's readyState attribute has a value equal to HAVE_NOTHING,
++        // set the element's networkState attribute to the NETWORK_EMPTY value, set the element's
++        // show poster flag to true, and fire an event named emptied at the element. Otherwise,
++        // set the element's networkState attribute to the NETWORK_IDLE value.
++        if self.ready_state.get() == ReadyState::HaveNothing {
++            self.set_network_state(NetworkState::Empty);
++            self.show_poster.set(true);
++            self.upcast::<EventTarget>()
++                .fire_event(cx, atom!("emptied"));
++        } else {
++            self.set_network_state(NetworkState::Idle);
++        }
++
++        // Step 5. Set the element's delaying-the-load-event flag to false. This stops delaying
++        // the load event.
++        self.delay_load_event(cx, false);
++
++        // Step 6. Abort the overall resource selection algorithm.
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#media-data-processing-steps-list>
+     /// => "If the connection is interrupted after some media data has been received..."
+     /// => "If the media data is corrupted"

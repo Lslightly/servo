@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 17 Oct 2026 16:45:09 +0000
+Subject: [PATCH] media (ohos): Report a failure of AVPlayer to the media
+ element once
+
+AVPlayer reports a failure through its error callback and by entering
+its error state, and the backend sent a player error to the media
+element for each. Before the element has metadata, each player error
+runs the media data processing failure steps, which queue the error
+event, so an element whose resource AVPlayer cannot play could fire
+`error` twice. Reading from the media cache made this likely: the end
+of the resource now reaches AVPlayer at once, so an empty or
+unsupported resource fails within the test of
+resource-selection-invoke-pause-networkState.html, which then saw a
+second error event. Send only the first of the two.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: resource-selection-invoke-pause-networkState.html on OpenHarmony; see Validation.
+
+Validation: a HiHope DAYU200 (OpenHarmony 7.0, API 26), headless release builds of the series. Without this patch, one run of the series' 63 media tests failed resource-selection-invoke-pause-networkState.html with a second error event, and its log shows both player errors; the test passed three times alone with and without the series. With it, two runs of the 63 tests: only the known unexpected OK of autoplay-default-permissions-policy, and one player error in the log of that test.
+AI-assisted: Yes (agent session; written and tested on a device by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/media/backends/ohos/player.rs | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/components/media/backends/ohos/player.rs b/components/media/backends/ohos/player.rs
+index cdf1464cd72..e6c0282db9a 100644
+--- a/components/media/backends/ohos/player.rs
++++ b/components/media/backends/ohos/player.rs
+@@ -198,10 +198,11 @@ impl OhosAvPlayer {
+                                 let _ = sender_clone.lock().unwrap().send(PlayerEvent::EndOfStream);
+                             },
+                             AVPlayerState::AV_ERROR => {
+-                                errored_clone.store(true, Ordering::SeqCst);
+-                                let _ = sender_clone.lock().unwrap().send(PlayerEvent::Error(
+-                                    "AVPlayer entered its error state".to_owned(),
+-                                ));
++                                if !errored_clone.swap(true, Ordering::SeqCst) {
++                                    let _ = sender_clone.lock().unwrap().send(PlayerEvent::Error(
++                                        "AVPlayer entered its error state".to_owned(),
++                                    ));
++                                }
+                             },
+                             AVPlayerState::AV_RELEASED => {},
+                             _ => {
+@@ -336,12 +337,15 @@ impl OhosAvPlayer {
+             .connect_error_callback(move |error_code, message| {
+                 // AVPlayer also reports operations it does not permit, such as a playback speed for
+                 // media it treats as a live stream, or an audio interruption, which don't end
+-                // playback. A failure that does also moves AVPlayer to its error state.
++                // playback. A failure that does also moves AVPlayer to its error state, and only
++                // the first of the two reaches the media element.
+                 if error_code == OH_AVErrCode::AV_ERR_OPERATE_NOT_PERMIT.0 as i32 {
+                     warn!("AVPlayer did not permit an operation: {}", message);
+                     return;
+                 }
+-                errored_clone.store(true, Ordering::SeqCst);
++                if errored_clone.swap(true, Ordering::SeqCst) {
++                    return;
++                }
+                 let _ = sender_clone
+                     .lock()
+                     .unwrap()
