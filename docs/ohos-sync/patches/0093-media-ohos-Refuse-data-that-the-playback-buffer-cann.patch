@@ -1,0 +1,807 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 17 Oct 2026 05:40:32 +0000
+Subject: [PATCH] media (ohos): Refuse data that the playback buffer cannot
+ take
+
+Once the playback buffer of the OpenHarmony AVPlayer backend was full,
+it kept the part of a chunk that fitted and dropped the rest and every
+later chunk, while `push_data` reported success. The media element
+could not tell which bytes the player had taken, so a refill restarted
+the fetch at the end of the buffered bytes with a SeekData event, and
+every refill of a fetch without range support downloaded the resource
+from its start again.
+
+Refuse a chunk that does not fit whole with `PlayerError::EnoughData`,
+like the GStreamer backend, and still send the EnoughData event once.
+The media element then keeps the chunk and knows the next byte that the
+player expects. Once AVPlayer reads close to the end of the buffered
+bytes, accept pushes again and send NeedData: the media element pushes
+the chunks it kept, or restarts a fetch it cancelled at that byte, so a
+contiguous refill needs neither a seek nor the handshake that waits
+for the media element. NeedData is sent with the buffer locked, like
+EnoughData, which keeps it ordered before the SeekData of any later
+read without relying on the handshake of the seek lock. Reads elsewhere
+still restart the fetch with SeekData.
+
+A refill of a fetch without range support now drains the chunks that
+the media element queued instead of downloading the resource again,
+unless the element's 32 MiB queue cap cancelled that fetch, for example
+while paused, which still restarts it from the start until a fetch can
+be suspended. So a refill starts before AVPlayer reaches the end of the
+buffered bytes for every fetch, and the buffer no longer needs to know
+whether the server supports range requests.
+
+The first chunk after NeedData, which is the refused chunk or the first
+chunk of the resumed fetch, is taken whole even if it does not fit, as
+is a chunk that arrives once AVPlayer read every buffered byte, like
+the whole body of a data URL. Refusing it again would only stop the
+fetch again, or stall playback. The buffer exceeds its capacity by at
+most that chunk, and shrinks back once its bytes fit again.
+
+In the media element, don't warn about a refused chunk, which is now
+part of every refill, and update a comment that described the old
+behaviour.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: unit tests for the playback buffer, which only build for
+OpenHarmony; see Validation.
+
+Validation: the 19 unit tests of playback_buffer.rs, which only build for OpenHarmony, pass when the file is built as a standalone host crate, and each old behaviour makes a test fail when put back (keeping the part of a chunk that fits, restarting the fetch at the end of the buffered bytes instead of resuming it, refilling a fetch without range support only at the end), as do not sending NeedData from within the buffer, refusing the first chunk after NeedData or a chunk for a reader that caught up, not shrinking the buffer, and not ending a resumed fetch. A HiHope DAYU200 (OpenHarmony 7.0, API 26), headless release builds of the series with and without this patch, each scenario in a fresh process, every run played to its end without a stall: a 90 s, 42 MB video without range support takes 1 request and 42.5 MB instead of 5 requests and 212 MB, at the price of up to 30 MB of RSS for the data that the media element queues; a 30 s, 14 MB video without range support takes 3 instead of 5 full downloads (42.8 instead of 71.3 MB) for two passes of `loop`, and 2 instead of 4 (28.5 instead of 57.0 MB) when seeking from 20 s back to 2 s. With range support, every refill still cancels the fetch and starts a new request, so the counts stay the same: 7 requests and 58.5 MB instead of 61.8 and 62.6 MB for the 42 MB video from a local server, 4 requests and 43.0 MB either way at 1.5 MB/s, 4 requests and 34.2 instead of 32.0 MB for the seek. `./mach test-wpt --ohos --processes 1` of the series' 60 media tests: the same results as without this patch, with only the known unexpected OK of autoplay-default-permissions-policy.
+AI-assisted: Yes (agent session; written and tested on a device by the agent, reviewed by another agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .../backends/ohos/ohos_media/avplayer.rs      |  15 +-
+ .../backends/ohos/ohos_media/dummy_source.rs  |   8 +-
+ .../ohos/ohos_media/playback_buffer.rs        | 334 ++++++++++++------
+ .../media/backends/ohos/ohos_media/source.rs  |  11 +-
+ .../ohos/ohos_media/source_builder.rs         |   7 +
+ components/media/backends/ohos/player.rs      |   9 +-
+ .../html/embedded_content/htmlmediaelement.rs |   7 +-
+ 7 files changed, 261 insertions(+), 130 deletions(-)
+
+diff --git a/components/media/backends/ohos/ohos_media/avplayer.rs b/components/media/backends/ohos/ohos_media/avplayer.rs
+index 5a6daf04423..f27efa338de 100644
+--- a/components/media/backends/ohos/ohos_media/avplayer.rs
++++ b/components/media/backends/ohos/ohos_media/avplayer.rs
+@@ -162,16 +162,11 @@ impl OhosPlayer {
+         }
+     }
+ 
+-    pub fn push_data(&self, data: Vec<u8>) {
+-        if let Some(inner_source) = &self.media_data_source {
+-            inner_source.push_data(data);
+-        }
+-    }
+-
+-    pub fn set_seekable(&self, seekable: bool) {
+-        if let Some(inner_source) = &self.media_data_source {
+-            inner_source.set_seekable(seekable);
+-        }
++    /// Returns false if the data source is full and did not take any of the bytes.
++    pub fn push_data(&self, data: Vec<u8>) -> bool {
++        self.media_data_source
++            .as_ref()
++            .is_none_or(|inner_source| inner_source.push_data(data))
+     }
+ 
+     pub fn play(&self) {
+diff --git a/components/media/backends/ohos/ohos_media/dummy_source.rs b/components/media/backends/ohos/ohos_media/dummy_source.rs
+index 6edc3dba5b5..30731fffbd2 100644
+--- a/components/media/backends/ohos/ohos_media/dummy_source.rs
++++ b/components/media/backends/ohos/ohos_media/dummy_source.rs
+@@ -15,6 +15,7 @@ impl MediaSourceWrapper {
+     pub fn builder() -> MediaSourceBuilder {
+         MediaSourceBuilder {
+             enough_data: None,
++            need_data: None,
+             seek_data: None,
+         }
+     }
+@@ -26,12 +27,9 @@ impl MediaSourceWrapper {
+         // No-op for dummy source
+     }
+ 
+-    pub fn set_seekable(&self, _seekable: bool) {
+-        // No-op for dummy source
+-    }
+-
+-    pub fn push_data(&self, _data: Vec<u8>) {
++    pub fn push_data(&self, _data: Vec<u8>) -> bool {
+         // No-op for dummy source
++        true
+     }
+ 
+     pub fn set_data_src(&mut self, _av_player: *mut ohos_media_sys::avplayer_base::OH_AVPlayer) {
+diff --git a/components/media/backends/ohos/ohos_media/playback_buffer.rs b/components/media/backends/ohos/ohos_media/playback_buffer.rs
+index 228a6b161a5..a9bf53a2930 100644
+--- a/components/media/backends/ohos/ohos_media/playback_buffer.rs
++++ b/components/media/backends/ohos/ohos_media/playback_buffer.rs
+@@ -10,8 +10,8 @@ use log::debug;
+ const CAPACITY: usize = 8 * 1024 * 1024;
+ /// How many bytes before the furthest read are kept, so that AVPlayer can read them again.
+ const BACK_BUFFER: u64 = 1024 * 1024;
+-/// A stopped fetch restarts at the end of the buffered bytes once fewer bytes than this are left
+-/// to read.
++/// A stopped fetch resumes at the end of the buffered bytes once fewer bytes than this are left to
++/// read.
+ const REFILL_THRESHOLD: u64 = CAPACITY as u64 / 4;
+ /// How far after the buffered bytes a read waits for the fetch to arrive, instead of restarting
+ /// the fetch at the read position.
+@@ -21,8 +21,8 @@ const MAX_READ_AHEAD: u64 = 1024 * 1024;
+ enum FetchState {
+     /// The pushed bytes continue the buffered bytes.
+     Active,
+-    /// The buffer was full, so the media element was asked to stop fetching, and the pushed bytes
+-    /// are dropped until the fetch restarts at the end of the buffered bytes.
++    /// The buffer was full, so a pushed chunk was refused, and the media element keeps it until it
++    /// is asked for data again.
+     Stopped,
+     /// The fetch reached the end of the media resource.
+     Ended,
+@@ -35,6 +35,9 @@ enum FetchState {
+ /// bytes from the script thread, and AVPlayer reads them from its own threads.
+ pub struct PlaybackBuffer {
+     enough_data_closure: Option<Box<dyn Fn() + Send + Sync>>,
++    /// Asks the media element to push data again. It is called with the buffer locked, so that the
++    /// request reaches the media element before a restart of the fetch that a later read asks for.
++    need_data_closure: Option<Box<dyn Fn() + Send + Sync>>,
+     /// The buffered bytes, starting at `start` in the media resource.
+     data: VecDeque<u8>,
+     start: u64,
+@@ -43,21 +46,26 @@ pub struct PlaybackBuffer {
+     /// reads at two positions cannot keep each other from progressing.
+     furthest_read: u64,
+     fetch_state: FetchState,
+-    /// Whether the server answers range requests, so that a fetch can restart at the end of the
+-    /// buffered bytes without fetching the media resource from its start again.
+-    seekable: bool,
++    /// Whether the media element was asked to push data again and has not pushed since. Its next
++    /// chunk is the refused one, or the first one of a fetch that it restarted at the end of the
++    /// buffered bytes.
++    resumed: bool,
+     size: Option<u64>,
+ }
+ 
+ impl PlaybackBuffer {
+-    pub fn new(enough_data_closure: Option<Box<dyn Fn() + Send + Sync>>) -> Self {
++    pub fn new(
++        enough_data_closure: Option<Box<dyn Fn() + Send + Sync>>,
++        need_data_closure: Option<Box<dyn Fn() + Send + Sync>>,
++    ) -> Self {
+         PlaybackBuffer {
+             enough_data_closure,
++            need_data_closure,
+             data: VecDeque::with_capacity(CAPACITY),
+             start: 0,
+             furthest_read: 0,
+             fetch_state: FetchState::Active,
+-            seekable: false,
++            resumed: false,
+             size: None,
+         }
+     }
+@@ -70,10 +78,6 @@ impl PlaybackBuffer {
+         self.size = Some(size);
+     }
+ 
+-    pub fn set_seekable(&mut self, seekable: bool) {
+-        self.seekable = seekable;
+-    }
+-
+     /// Copies the bytes at `pos` into `dest`. Returns how many bytes were copied, and the position
+     /// at which the media element has to restart the fetch, if any.
+     pub fn read_data(&mut self, dest: &mut [u8], pos: u64) -> (usize, Option<u64>) {
+@@ -82,10 +86,12 @@ impl PlaybackBuffer {
+             let read_len = dest.len().min((end - pos) as usize);
+             self.copy_to(pos - self.start, &mut dest[..read_len]);
+             self.furthest_read = self.furthest_read.max(pos + read_len as u64);
+-            let refill = self.fetch_state == FetchState::Stopped &&
+-                self.seekable &&
+-                end - self.furthest_read < REFILL_THRESHOLD;
+-            return (read_len, refill.then(|| self.restart_at(end)));
++            if self.fetch_state == FetchState::Stopped &&
++                end - self.furthest_read < REFILL_THRESHOLD
++            {
++                self.resume();
++            }
++            return (read_len, None);
+         }
+ 
+         if self.size.is_some_and(|size| pos >= size) {
+@@ -94,7 +100,7 @@ impl PlaybackBuffer {
+         if pos >= end && pos - end <= MAX_READ_AHEAD {
+             self.furthest_read = self.furthest_read.max(pos);
+             if self.fetch_state == FetchState::Stopped {
+-                return (0, Some(self.restart_at(end)));
++                self.resume();
+             }
+             return (0, None);
+         }
+@@ -121,13 +127,22 @@ impl PlaybackBuffer {
+         dest_second.copy_from_slice(&second[..dest_second.len()]);
+     }
+ 
+-    fn restart_at(&mut self, pos: u64) -> u64 {
+-        if pos != self.end() {
+-            self.data.clear();
+-            self.start = pos;
+-            self.furthest_read = pos;
++    /// Accepts pushed bytes again, and asks the media element for them. It pushes the refused
++    /// chunk first, so the fetch continues at the end of the buffered bytes without a restart.
++    fn resume(&mut self) {
++        self.fetch_state = FetchState::Active;
++        self.resumed = true;
++        if let Some(need_data_closure) = &self.need_data_closure {
++            need_data_closure();
+         }
++    }
++
++    fn restart_at(&mut self, pos: u64) -> u64 {
++        self.data.clear();
++        self.start = pos;
++        self.furthest_read = pos;
+         self.fetch_state = FetchState::Restarting;
++        self.resumed = false;
+         pos
+     }
+ 
+@@ -139,10 +154,15 @@ impl PlaybackBuffer {
+         }
+     }
+ 
+-    /// Appends bytes of the fetch. Returns false if they were not all buffered.
++    /// Appends bytes of the fetch. Returns false if the buffer is full, in which case none of the
++    /// bytes were buffered, and the media element has to push them again once it is asked for
++    /// data.
+     pub fn push_buffer(&mut self, data: &[u8]) -> bool {
+-        if self.fetch_state != FetchState::Active {
+-            return false;
++        match self.fetch_state {
++            FetchState::Active => {},
++            FetchState::Stopped => return false,
++            // The bytes of a fetch that is being restarted, or that already ended, are not needed.
++            FetchState::Ended | FetchState::Restarting => return true,
+         }
+         let excess = (self.data.len() + data.len()).saturating_sub(CAPACITY);
+         if excess > 0 {
+@@ -155,8 +175,15 @@ impl PlaybackBuffer {
+             self.data.drain(..evicted);
+             self.start += evicted as u64;
+         }
+-        let room = CAPACITY - self.data.len();
+-        if data.len() <= room {
++        // A chunk that does not fit is still taken whole after a resume, and when AVPlayer read all
++        // buffered bytes, as refusing it then would only stop the fetch again, or stall AVPlayer.
++        // The buffer overshoots its capacity by at most that chunk.
++        let fits = self.data.len() + data.len() <= CAPACITY;
++        if fits || self.resumed || self.furthest_read >= self.end() {
++            if fits && self.data.capacity() > CAPACITY {
++                self.data.shrink_to(CAPACITY);
++            }
++            self.resumed = false;
+             self.data.extend(data);
+             return true;
+         }
+@@ -166,7 +193,6 @@ impl PlaybackBuffer {
+             self.end(),
+             self.furthest_read
+         );
+-        self.data.extend(&data[..room]);
+         self.fetch_state = FetchState::Stopped;
+         if let Some(enough_data_closure) = &self.enough_data_closure {
+             enough_data_closure();
+@@ -198,14 +224,25 @@ mod tests {
+         (pos..pos + len as u64).map(byte_at).collect()
+     }
+ 
+-    fn buffer(seekable: bool) -> (PlaybackBuffer, Arc<AtomicUsize>) {
+-        let enough_data_count = Arc::new(AtomicUsize::new(0));
+-        let count = enough_data_count.clone();
+-        let mut buffer = PlaybackBuffer::new(Some(Box::new(move || {
+-            count.fetch_add(1, Ordering::SeqCst);
+-        })));
+-        buffer.set_seekable(seekable);
+-        (buffer, enough_data_count)
++    fn counter() -> (Arc<AtomicUsize>, Box<dyn Fn() + Send + Sync>) {
++        let count = Arc::new(AtomicUsize::new(0));
++        let closure_count = count.clone();
++        let closure = Box::new(move || {
++            closure_count.fetch_add(1, Ordering::SeqCst);
++        });
++        (count, closure)
++    }
++
++    /// Returns a buffer, and how often it signalled EnoughData and NeedData.
++    fn buffer() -> (PlaybackBuffer, Arc<AtomicUsize>, Arc<AtomicUsize>) {
++        let (enough_data_count, enough_data_closure) = counter();
++        let (need_data_count, need_data_closure) = counter();
++        let buffer = PlaybackBuffer::new(Some(enough_data_closure), Some(need_data_closure));
++        (buffer, enough_data_count, need_data_count)
++    }
++
++    fn count(counter: &AtomicUsize) -> usize {
++        counter.load(Ordering::SeqCst)
+     }
+ 
+     fn read(buffer: &mut PlaybackBuffer, pos: u64, len: usize) -> (Vec<u8>, Option<u64>) {
+@@ -221,12 +258,25 @@ mod tests {
+         while buffer.push_buffer(&bytes(pos, CHUNK)) {
+             pos += CHUNK as u64;
+         }
+-        buffer.end()
++        assert_eq!(buffer.end(), pos);
++        pos
++    }
++
++    /// Reads from `from` until the buffer asks for data again, and returns where the reads ended.
++    fn read_until_resumed(buffer: &mut PlaybackBuffer, need_data: &AtomicUsize, from: u64) -> u64 {
++        let needed = count(need_data);
++        let mut pos = from;
++        while count(need_data) == needed {
++            assert_eq!(read(buffer, pos, CHUNK), (bytes(pos, CHUNK), None));
++            pos += CHUNK as u64;
++        }
++        assert_eq!(count(need_data), needed + 1);
++        pos
+     }
+ 
+     #[test]
+     fn reads_the_pushed_bytes_and_waits_at_the_end() {
+-        let (mut buffer, _) = buffer(true);
++        let (mut buffer, _, _) = buffer();
+         assert!(buffer.push_buffer(&bytes(0, 1000)));
+         assert_eq!(read(&mut buffer, 100, 50), (bytes(100, 50), None));
+         assert_eq!(read(&mut buffer, 990, 50), (bytes(990, 10), None));
+@@ -235,14 +285,15 @@ mod tests {
+ 
+     #[test]
+     fn slides_with_a_reader_that_keeps_up() {
+-        let (mut buffer, enough_data_count) = buffer(true);
++        let (mut buffer, enough_data_count, need_data_count) = buffer();
+         let mut pos = 0;
+         while pos < 3 * CAPACITY as u64 {
+             assert!(buffer.push_buffer(&bytes(pos, CHUNK)));
+             assert_eq!(read(&mut buffer, pos, CHUNK), (bytes(pos, CHUNK), None));
+             pos += CHUNK as u64;
+         }
+-        assert_eq!(enough_data_count.load(Ordering::SeqCst), 0);
++        assert_eq!(count(&enough_data_count), 0);
++        assert_eq!(count(&need_data_count), 0);
+         assert_eq!(
+             read(&mut buffer, pos - BACK_BUFFER, CHUNK),
+             (bytes(pos - BACK_BUFFER, CHUNK), None)
+@@ -250,73 +301,92 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn drops_the_bytes_after_a_full_buffer() {
+-        let (mut buffer, enough_data_count) = buffer(true);
+-        let end = fill(&mut buffer, 0);
+-        assert_eq!(end, CAPACITY as u64);
+-        assert_eq!(enough_data_count.load(Ordering::SeqCst), 1);
+-        assert!(!buffer.push_buffer(&bytes(end + 100, 10)));
+-        assert_eq!(buffer.end(), end);
+-        assert_eq!(enough_data_count.load(Ordering::SeqCst), 1);
++    fn refuses_a_chunk_that_does_not_fit_whole() {
++        let (mut buffer, enough_data_count, _) = buffer();
++        let chunk = 100_000;
++        let mut pos = 0;
++        while buffer.push_buffer(&bytes(pos, chunk)) {
++            pos += chunk as u64;
++        }
++        assert!(pos < CAPACITY as u64);
++        assert_eq!(buffer.end(), pos);
++        assert_eq!(count(&enough_data_count), 1);
++        assert!(!buffer.push_buffer(&bytes(pos, 10)));
++        assert_eq!(buffer.end(), pos);
++        assert_eq!(count(&enough_data_count), 1);
+     }
+ 
+     #[test]
+-    fn refills_at_the_end_before_the_reader_gets_there() {
+-        let (mut buffer, _) = buffer(true);
++    fn resumes_at_the_end_before_the_reader_gets_there() {
++        let (mut buffer, enough_data_count, need_data_count) = buffer();
+         let end = fill(&mut buffer, 0);
+-        let mut pos = 0;
+-        let restart = loop {
+-            let (read_bytes, restart) = read(&mut buffer, pos, CHUNK);
+-            assert_eq!(read_bytes, bytes(pos, CHUNK));
+-            pos += CHUNK as u64;
+-            if restart.is_some() {
+-                break restart;
+-            }
+-        };
+-        assert_eq!(restart, Some(end));
++        let mut pos = read_until_resumed(&mut buffer, &need_data_count, 0);
+         assert!(end - pos < REFILL_THRESHOLD);
+-
+-        // The bytes of the stopped fetch are dropped until the restart is answered, while the
+-        // buffered bytes can still be read.
+-        assert!(!buffer.push_buffer(&bytes(end + 4096, CHUNK)));
+         assert_eq!(read(&mut buffer, pos, CHUNK), (bytes(pos, CHUNK), None));
+         pos += CHUNK as u64;
++        assert_eq!(count(&need_data_count), 1);
+ 
+-        buffer.restarted(true);
++        // The refused chunk comes first and continues the buffered bytes.
+         let new_end = fill(&mut buffer, end);
+         assert!(new_end > end);
+         assert_eq!(buffer.start, pos - BACK_BUFFER);
++        assert_eq!(count(&enough_data_count), 2);
++        pos = read_until_resumed(&mut buffer, &need_data_count, pos);
+         while pos < new_end {
+-            assert_eq!(read(&mut buffer, pos, CHUNK).0, bytes(pos, CHUNK));
++            assert_eq!(read(&mut buffer, pos, CHUNK), (bytes(pos, CHUNK), None));
+             pos += CHUNK as u64;
+         }
++        assert_eq!(read(&mut buffer, new_end, CHUNK), (vec![], None));
++        assert_eq!(count(&need_data_count), 2);
+     }
+ 
+     #[test]
+-    fn refills_only_at_the_end_without_range_requests() {
+-        let (mut buffer, _) = buffer(false);
++    fn asks_for_data_before_a_restart_that_a_later_read_asks_for() {
++        let (mut buffer, _, need_data_count) = buffer();
+         let end = fill(&mut buffer, 0);
+-        let mut pos = 0;
+-        while pos < end {
+-            assert_eq!(read(&mut buffer, pos, CHUNK), (bytes(pos, CHUNK), None));
+-            pos += CHUNK as u64;
+-        }
+-        assert_eq!(read(&mut buffer, end, CHUNK), (vec![], Some(end)));
++        assert_eq!(read(&mut buffer, end, CHUNK), (vec![], None));
++        assert_eq!(count(&need_data_count), 1);
++        let far = end + MAX_READ_AHEAD + 1;
++        assert_eq!(read(&mut buffer, far, CHUNK), (vec![], Some(far)));
++
++        // The refused chunk arrives after the restart was asked for, and is dropped.
++        assert!(buffer.push_buffer(&bytes(end, CHUNK)));
++        assert_eq!(buffer.end(), far);
+         buffer.restarted(true);
++        assert!(buffer.push_buffer(&bytes(far, CHUNK)));
++        assert!(buffer.push_buffer(&bytes(far + CHUNK as u64, CHUNK)));
++        assert_eq!(
++            read(&mut buffer, far, 2 * CHUNK),
++            (bytes(far, 2 * CHUNK), None)
++        );
++        assert_eq!(count(&need_data_count), 1);
++    }
++
++    #[test]
++    fn restarts_a_stopped_fetch_at_a_read_outside_the_window() {
++        let (mut buffer, _, need_data_count) = buffer();
++        let end = fill(&mut buffer, 0);
++        let far = end + MAX_READ_AHEAD + 1;
++        assert_eq!(read(&mut buffer, far, CHUNK), (vec![], Some(far)));
++        assert_eq!(count(&need_data_count), 0);
+         assert!(buffer.push_buffer(&bytes(end, CHUNK)));
+-        assert_eq!(read(&mut buffer, end, CHUNK), (bytes(end, CHUNK), None));
++        assert_eq!(buffer.end(), far);
++        buffer.restarted(true);
++        assert!(buffer.push_buffer(&bytes(far, CHUNK)));
++        assert_eq!(read(&mut buffer, far, CHUNK), (bytes(far, CHUNK), None));
+     }
+ 
+     #[test]
+     fn restarts_at_a_read_outside_the_window() {
+-        let (mut buffer, _) = buffer(true);
++        let (mut buffer, _, _) = buffer();
+         assert!(buffer.push_buffer(&bytes(0, CHUNK)));
+         let far = CHUNK as u64 + MAX_READ_AHEAD + 1;
+         assert_eq!(read(&mut buffer, far, CHUNK), (vec![], Some(far)));
+ 
+         // Reads elsewhere wait for the pending restart, and the previous fetch is dropped.
+         assert_eq!(read(&mut buffer, 0, CHUNK), (vec![], None));
+-        assert!(!buffer.push_buffer(&bytes(CHUNK as u64, CHUNK)));
++        assert!(buffer.push_buffer(&bytes(CHUNK as u64, CHUNK)));
++        assert_eq!(buffer.end(), far);
+         buffer.end_of_stream();
+ 
+         buffer.restarted(true);
+@@ -327,7 +397,7 @@ mod tests {
+ 
+     #[test]
+     fn waits_for_a_read_shortly_after_the_buffered_bytes() {
+-        let (mut buffer, _) = buffer(true);
++        let (mut buffer, _, _) = buffer();
+         assert!(buffer.push_buffer(&bytes(0, CHUNK)));
+         let near = CHUNK as u64 + MAX_READ_AHEAD;
+         assert_eq!(read(&mut buffer, near, CHUNK), (vec![], None));
+@@ -341,7 +411,7 @@ mod tests {
+ 
+     #[test]
+     fn restarts_before_the_buffered_bytes() {
+-        let (mut buffer, _) = buffer(true);
++        let (mut buffer, _, _) = buffer();
+         let mut pos = 0;
+         while pos < 2 * CAPACITY as u64 {
+             assert!(buffer.push_buffer(&bytes(pos, CHUNK)));
+@@ -354,54 +424,108 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn keeps_the_bytes_that_fit_into_a_full_buffer() {
+-        let (mut buffer, _) = buffer(false);
+-        let chunk = 100_000;
+-        let mut pos = 0;
+-        while buffer.push_buffer(&bytes(pos, chunk)) {
+-            pos += chunk as u64;
+-        }
+-        assert_eq!(buffer.end(), CAPACITY as u64);
+-        assert!(!buffer.push_buffer(&bytes(pos + chunk as u64, 10)));
+-        let last = CAPACITY as u64 - 100;
++    fn resumes_for_a_read_shortly_after_a_full_buffer() {
++        let (mut buffer, _, need_data_count) = buffer();
++        let end = fill(&mut buffer, 0);
++        assert_eq!(read(&mut buffer, end + 10, CHUNK), (vec![], None));
++        assert_eq!(read(&mut buffer, end + 10, CHUNK), (vec![], None));
++        assert_eq!(count(&need_data_count), 1);
++        assert_eq!(buffer.start, 0);
++        assert_eq!(read(&mut buffer, 0, CHUNK), (bytes(0, CHUNK), None));
++        assert!(buffer.push_buffer(&bytes(end, CHUNK)));
++        assert_eq!(read(&mut buffer, end, CHUNK), (bytes(end, CHUNK), None));
++    }
++
++    #[test]
++    fn takes_a_chunk_larger_than_the_buffer_once_the_reader_caught_up() {
++        let (mut buffer, _, need_data_count) = buffer();
++        let len = CAPACITY + CHUNK;
++        assert!(buffer.push_buffer(&bytes(0, len)));
++        assert!(!buffer.push_buffer(&bytes(len as u64, len)));
++        let last = len as u64 - 100;
+         assert_eq!(read(&mut buffer, last, CHUNK), (bytes(last, 100), None));
++        assert_eq!(count(&need_data_count), 1);
++        assert!(buffer.push_buffer(&bytes(len as u64, len)));
++        assert_eq!(buffer.start, len as u64 - BACK_BUFFER);
++        assert_eq!(
++            read(&mut buffer, 2 * len as u64 - 100, CHUNK),
++            (bytes(2 * len as u64 - 100, 100), None)
++        );
+     }
+ 
+     #[test]
+-    fn restarts_at_the_end_for_a_read_shortly_after_a_full_buffer() {
+-        let (mut buffer, _) = buffer(true);
++    fn takes_a_chunk_that_does_not_fit_once_after_a_resume() {
++        let (mut buffer, enough_data_count, need_data_count) = buffer();
+         let end = fill(&mut buffer, 0);
+-        assert_eq!(read(&mut buffer, end + 10, CHUNK), (vec![], Some(end)));
+-        assert_eq!(buffer.start, 0);
+-        assert_eq!(read(&mut buffer, 0, CHUNK), (bytes(0, CHUNK), None));
++        let mut pos = read_until_resumed(&mut buffer, &need_data_count, 0);
++        assert!(buffer.push_buffer(&bytes(end, CAPACITY)));
++        let new_end = end + CAPACITY as u64;
++        assert!(buffer.data.len() > CAPACITY);
++        assert!(!buffer.push_buffer(&bytes(new_end, CHUNK)));
++        assert_eq!(count(&enough_data_count), 2);
++        assert_eq!(buffer.end(), new_end);
++
++        pos = read_until_resumed(&mut buffer, &need_data_count, pos);
++        while pos < new_end {
++            assert_eq!(read(&mut buffer, pos, CHUNK), (bytes(pos, CHUNK), None));
++            pos += CHUNK as u64;
++        }
++        let grown_capacity = buffer.data.capacity();
++        assert!(grown_capacity > CAPACITY);
++        assert!(buffer.push_buffer(&bytes(new_end, CHUNK)));
++        assert!(buffer.data.capacity() < grown_capacity);
++        assert_eq!(
++            read(&mut buffer, new_end, CHUNK),
++            (bytes(new_end, CHUNK), None)
++        );
++    }
++
++    #[test]
++    fn ends_a_resumed_fetch() {
++        let (mut buffer, _, need_data_count) = buffer();
++        let size = CAPACITY as u64 + 2 * CHUNK as u64;
++        buffer.set_size(size);
++        let end = fill(&mut buffer, 0);
++        let mut pos = read_until_resumed(&mut buffer, &need_data_count, 0);
++        assert!(buffer.push_buffer(&bytes(end, (size - end) as usize)));
++        buffer.end_of_stream();
++        assert_eq!(buffer.fetch_state, FetchState::Ended);
++        while pos < size {
++            assert_eq!(read(&mut buffer, pos, CHUNK), (bytes(pos, CHUNK), None));
++            pos += CHUNK as u64;
++        }
++        assert_eq!(read(&mut buffer, size, CHUNK), (vec![], None));
++        assert_eq!(count(&need_data_count), 1);
+     }
+ 
+     #[test]
+     fn ignores_the_end_of_a_stopped_fetch() {
+-        let (mut buffer, _) = buffer(false);
++        let (mut buffer, _, need_data_count) = buffer();
+         let end = fill(&mut buffer, 0);
+         buffer.end_of_stream();
+-        assert_eq!(read(&mut buffer, end, CHUNK), (vec![], Some(end)));
++        assert_eq!(read(&mut buffer, end, CHUNK), (vec![], None));
++        assert_eq!(count(&need_data_count), 1);
+     }
+ 
+     #[test]
+     fn drops_the_bytes_after_a_failed_restart() {
+-        let (mut buffer, _) = buffer(true);
++        let (mut buffer, _, _) = buffer();
+         assert_eq!(
+             read(&mut buffer, 2 * MAX_READ_AHEAD, CHUNK).1,
+             Some(2 * MAX_READ_AHEAD)
+         );
+         buffer.restarted(false);
+-        assert!(!buffer.push_buffer(&bytes(2 * MAX_READ_AHEAD, CHUNK)));
++        assert!(buffer.push_buffer(&bytes(2 * MAX_READ_AHEAD, CHUNK)));
++        assert_eq!(buffer.end(), 2 * MAX_READ_AHEAD);
+         assert_eq!(read(&mut buffer, 0, CHUNK), (vec![], None));
+     }
+ 
+     #[test]
+     fn progresses_with_reads_at_two_positions() {
+-        let (mut buffer, _) = buffer(true);
++        let (mut buffer, _, need_data_count) = buffer();
+         let end = fill(&mut buffer, 0);
+-        assert_eq!(read(&mut buffer, end, CHUNK), (vec![], Some(end)));
+-        buffer.restarted(true);
++        assert_eq!(read(&mut buffer, end, CHUNK), (vec![], None));
++        assert_eq!(count(&need_data_count), 1);
+         assert_eq!(read(&mut buffer, 0, CHUNK), (bytes(0, CHUNK), None));
+         assert!(buffer.push_buffer(&bytes(end, CHUNK)));
+         assert_eq!(read(&mut buffer, end, CHUNK), (bytes(end, CHUNK), None));
+@@ -409,7 +533,7 @@ mod tests {
+ 
+     #[test]
+     fn keeps_the_unread_bytes_after_a_read_past_the_end_of_the_resource() {
+-        let (mut buffer, _) = buffer(true);
++        let (mut buffer, _, _) = buffer();
+         let size = CAPACITY as u64 + CHUNK as u64;
+         buffer.set_size(size);
+         let end = fill(&mut buffer, 0);
+@@ -421,7 +545,7 @@ mod tests {
+ 
+     #[test]
+     fn does_not_restart_after_the_end_of_the_resource() {
+-        let (mut buffer, _) = buffer(true);
++        let (mut buffer, _, _) = buffer();
+         buffer.set_size(1000);
+         assert!(buffer.push_buffer(&bytes(0, 1000)));
+         buffer.end_of_stream();
+@@ -435,7 +559,7 @@ mod tests {
+ 
+     #[test]
+     fn reads_across_the_wrap_of_the_ring() {
+-        let (mut buffer, _) = buffer(true);
++        let (mut buffer, _, _) = buffer();
+         let end = fill(&mut buffer, 0);
+         buffer.furthest_read = end;
+         buffer.fetch_state = FetchState::Active;
+diff --git a/components/media/backends/ohos/ohos_media/source.rs b/components/media/backends/ohos/ohos_media/source.rs
+index b9b4c79f278..c7e8b9203a0 100644
+--- a/components/media/backends/ohos/ohos_media/source.rs
++++ b/components/media/backends/ohos/ohos_media/source.rs
+@@ -26,6 +26,7 @@ impl MediaSourceWrapper {
+     pub fn builder() -> MediaSourceBuilder {
+         MediaSourceBuilder {
+             enough_data: None,
++            need_data: None,
+             seek_data: None,
+         }
+     }
+@@ -33,7 +34,10 @@ impl MediaSourceWrapper {
+ 
+ impl MediaSourceWrapper {
+     pub fn new(source_cb: MediaSourceBuilder) -> Self {
+-        let playback_buffer = Arc::new(Mutex::new(PlaybackBuffer::new(source_cb.enough_data)));
++        let playback_buffer = Arc::new(Mutex::new(PlaybackBuffer::new(
++            source_cb.enough_data,
++            source_cb.need_data,
++        )));
+ 
+         let playback_buffer_clone = playback_buffer.clone();
+ 
+@@ -127,10 +131,7 @@ impl MediaSourceWrapper {
+         }
+     }
+ 
+-    pub fn set_seekable(&self, seekable: bool) {
+-        self.playback_buffer.lock().unwrap().set_seekable(seekable);
+-    }
+-
++    /// Returns false if the playback buffer is full and did not take any of the bytes.
+     pub fn push_data(&self, data: Vec<u8>) -> bool {
+         let mut playback_buffer_lock = self.playback_buffer.lock().unwrap();
+         playback_buffer_lock.push_buffer(&data)
+diff --git a/components/media/backends/ohos/ohos_media/source_builder.rs b/components/media/backends/ohos/ohos_media/source_builder.rs
+index 9d9aa053582..18056752c9d 100644
+--- a/components/media/backends/ohos/ohos_media/source_builder.rs
++++ b/components/media/backends/ohos/ohos_media/source_builder.rs
+@@ -15,6 +15,8 @@ type SeekDataClosure = Arc<dyn Fn(u64, &dyn Fn(bool)) + Send + Sync>;
+ 
+ pub struct MediaSourceBuilder {
+     pub enough_data: Option<Box<dyn Fn() + Send + Sync>>,
++    /// Asks the media element to push data again, continuing with the bytes that were refused.
++    pub need_data: Option<Box<dyn Fn() + Send + Sync>>,
+     pub seek_data: Option<SeekDataClosure>,
+ }
+ 
+@@ -24,6 +26,11 @@ impl MediaSourceBuilder {
+         self
+     }
+ 
++    pub fn set_need_data<F: Fn() + Send + Sync + Clone + 'static>(mut self, callback: F) -> Self {
++        self.need_data = Some(Box::new(callback));
++        self
++    }
++
+     pub fn set_seek_data<F: Fn(u64, &dyn Fn(bool)) + Send + Sync + Clone + 'static>(
+         mut self,
+         callback: F,
+diff --git a/components/media/backends/ohos/player.rs b/components/media/backends/ohos/player.rs
+index 9209f6c91a5..8baa11e6ea1 100644
+--- a/components/media/backends/ohos/player.rs
++++ b/components/media/backends/ohos/player.rs
+@@ -363,6 +363,7 @@ impl OhosAvPlayer {
+     pub fn setup_data_source(&mut self) {
+         let sender_clone = self.event_sender.clone();
+         let sender_clone_clone = self.event_sender.clone();
++        let need_data_sender = self.event_sender.clone();
+         let released_clone = self.released.clone();
+         let seek_channel = SeekChannel::new();
+         self.seek_lock = Some(seek_channel.sender());
+@@ -395,6 +396,9 @@ impl OhosAvPlayer {
+                     .unwrap()
+                     .send(PlayerEvent::EnoughData);
+             })
++            .set_need_data(move || {
++                let _ = need_data_sender.lock().unwrap().send(PlayerEvent::NeedData);
++            })
+             .set_seek_data(seekdata_send_closure)
+             .build();
+ 
+@@ -544,7 +548,6 @@ impl Player for OhosAvPlayer {
+ 
+     fn set_seekable(&self, seekable: bool) -> Result<(), servo_media::player::PlayerError> {
+         debug!("SetSeekable: {}", seekable);
+-        self.player_inner.lock().unwrap().set_seekable(seekable);
+         Ok(())
+     }
+ 
+@@ -566,7 +569,9 @@ impl Player for OhosAvPlayer {
+     }
+ 
+     fn push_data(&self, data: Vec<u8>) -> Result<(), servo_media::player::PlayerError> {
+-        self.player_inner.lock().unwrap().push_data(data);
++        if !self.player_inner.lock().unwrap().push_data(data) {
++            return Err(servo_media::player::PlayerError::EnoughData);
++        }
+         Ok(())
+     }
+ 
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 449534dea73..3f5622209c8 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -3069,8 +3069,7 @@ impl HTMLMediaElement {
+         // The media engine signals that the source has enough data and asks us to stop pushing bytes
+         // to avoid excessive buffer queueing, so we cancel the ongoing fetch request with its next
+         // chunk if we are able to restart it from where we left. Otherwise, we continue the current
+-        // fetch request: we queue the data that the media engine refuses until it needs more, while
+-        // a media engine that accepts data it cannot hold, like the OpenHarmony one, drops it.
++        // fetch request and queue the data that the media engine refuses until it needs more.
+         if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() {
+             current_fetch_context.set_player_has_enough_data(true);
+         }
+@@ -4160,7 +4159,9 @@ impl BufferedDataSource {
+                         self.position += payload.len() as u64;
+                     }
+                     if let Err(error) = result {
+-                        warn!("Could not push input data to player: {error:?}");
++                        if error != PlayerError::EnoughData {
++                            warn!("Could not push input data to player: {error:?}");
++                        }
+                         return Err(error);
+                     }
+                 },

@@ -1,0 +1,1656 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 17 Oct 2026 05:32:47 +0000
+Subject: [PATCH] net: Allow a fetch to be suspended and resumed
+
+A fetch can only be cancelled. When its player is full, a media element
+cancels its fetch and later starts a new Range request. That throws away
+the bytes in flight (about 2.5 MB per refill on an OpenHarmony board),
+costs a new request and, on HTTP/1.1, a new connection, because a body
+that is not read to its end cannot be drained. Gecko suspends the
+channel instead, and Chromium defers loading.
+
+Add FetchController::suspend and FetchController::resume. Like a
+cancellation, they go through the fetch thread of the content process,
+so they stay ordered after the start of the fetch, and reach the
+resource thread as CoreResourceMsg::Suspend and CoreResourceMsg::Resume.
+There they set the state of the request's CancellationListener, which
+now keeps running, suspended or cancelled in a tokio watch channel.
+
+The HTTP network fetch reads the body in a loop that, while the fetch
+is suspended, waits for the state to change instead of polling the
+body, so that TCP or HTTP/2 flow control holds back the server. Data
+received before the suspension is still delivered, and after a resume
+the body continues with the next byte. A cancellation wakes the loop at
+once, also while it waits for data from the network; before, it was
+only noticed when the next chunk arrived. If the connection fails or
+closes while the fetch is suspended, the fetch ends after the resume as
+an interrupted body does. The loop keeps what it did before: media
+bodies are not kept, and a cancellation marks the response aborted
+under the body lock.
+
+Net bounds suspension itself, since it learns of no content process
+that goes away and an unread body never sees its connection close. A
+fetch that stays suspended for longer than the new pref
+network_fetch_suspend_timeout_ms (60 s) ends with a network error, as
+if its connection was lost. At most two fetches per origin are
+suspended at once in each HTTP state, and a further suspension is
+ignored: the fetches to an origin share an HTTP/2 connection, and every
+suspended stream holds its stream window of the connection window, 2 of
+5 MiB with hyper's defaults, so three would stall every other request
+to the origin. A suspended fetch that is redirected moves to the new
+origin, or is resumed if that has no place left. Suspension is advisory
+and only takes effect while a body is read from the network: cache
+hits, which are delivered in one chunk, data, file, blob and protocol
+handler responses, and fetches that ended ignore it.
+
+A fetch that waits in the HTTP cache for a body that another fetch is
+still receiving treats a suspension of that fetch like an abort, and
+goes to the network instead of waiting for the resume.
+
+The responses of the redirects, authentication retries and CORS
+preflight of a fetch share its listener, so while it is suspended, the
+unread bodies of such responses hold their connection until the resume
+or the deadline instead of being drained.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: unit tests with servers that stream a 64 MiB body and count
+what they hand to the connection: a suspended fetch holds back the
+server and receives the whole body intact after the resume, over
+HTTP/1.1 and over HTTP/2 (TLS with ALPN, a new test server); a
+cancellation ends a suspended fetch, and one that waits for a stalled
+server, within a second; a fetch whose server closes the connection
+while it is suspended ends after the resume with what was sent; the
+deadline ends suspended fetches with a network error and frees their
+places; a third suspension per origin is ignored and its server keeps
+sending; fetches waiting in the HTTP cache for a suspended response go
+to the network; FetchController suspends and resumes a fetch through
+the fetch thread and the resource thread, and does nothing after the
+end.
+
+Validation: `./mach test-unit -p servo-net`: 412 tests pass (403 before), also with the suspension tests in one process. While a fetch was suspended, the server handed 4.9 MiB of a 64 MiB body to the connection over HTTP/1.1 and 2.1 MiB over HTTP/2. `./mach test-wpt --release --processes 6 --timeout-multiplier 2` fetch/api/basic fetch/api/abort fetch/range fetch/http-cache xhr html/semantics/embedded-content/media-elements: 1034 tests, 1027 as expected; the other seven behave the same with the parent commit when run alone three times.
+AI-assisted: Yes (agent session; implemented, tested and measured by the agent, reworked after a review by another agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/config/prefs.rs                    |   4 +
+ components/net/Cargo.toml                     |   2 +-
+ components/net/fetch/methods.rs               | 182 ++++-
+ components/net/http_cache.rs                  |  46 +-
+ components/net/http_loader.rs                 | 152 +++--
+ components/net/resource_thread.rs             |  12 +
+ components/net/test_util.rs                   |  78 ++-
+ components/net/tests/http_loader.rs           | 641 +++++++++++++++++-
+ components/net/tests/main.rs                  |   1 +
+ .../html/embedded_content/htmlmediaelement.rs |   4 +-
+ .../shared/net/fetch/fetch_controller.rs      |  30 +-
+ components/shared/net/lib.rs                  |  36 +
+ 12 files changed, 1090 insertions(+), 98 deletions(-)
+
+diff --git a/components/config/prefs.rs b/components/config/prefs.rs
+index ac6e99c45f5..62e0684b740 100644
+--- a/components/config/prefs.rs
++++ b/components/config/prefs.rs
+@@ -342,6 +342,9 @@ pub struct Preferences {
+     pub network_enforce_tls_enabled: bool,
+     pub network_enforce_tls_localhost: bool,
+     pub network_enforce_tls_onion: bool,
++    /// How long a fetch may stay suspended, in milliseconds. A fetch suspended for longer
++    /// ends with a network error, so that it does not hold its connection forever.
++    pub network_fetch_suspend_timeout_ms: u64,
+     pub network_http_cache_disabled: bool,
+     /// The path to a disk cache file. Empty string disables the disk cache.
+     pub network_http_disk_cache: String,
+@@ -570,6 +573,7 @@ impl Preferences {
+             network_enforce_tls_enabled: false,
+             network_enforce_tls_localhost: false,
+             network_enforce_tls_onion: false,
++            network_fetch_suspend_timeout_ms: 60000,
+             network_http_cache_disabled: false,
+             network_http_disk_cache: String::new(),
+             network_http_disk_cache_size: 1024 * 1024 * 100, // Roughtly 100MB
+diff --git a/components/net/Cargo.toml b/components/net/Cargo.toml
+index 9acc21eae52..36f4b282679 100644
+--- a/components/net/Cargo.toml
++++ b/components/net/Cargo.toml
+@@ -83,7 +83,7 @@ sea-query-rusqlite = { workspace = true }
+ smallvec = { workspace = true }
+ tempfile = { workspace = true }
+ time = { workspace = true }
+-tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync"] }
++tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+ tokio-rustls = { workspace = true }
+ tokio-stream = { workspace = true }
+ tokio-util = { workspace = true, features = ["codec", "io"] }
+diff --git a/components/net/fetch/methods.rs b/components/net/fetch/methods.rs
+index 4ab5cbab236..83f0a8a906a 100644
+--- a/components/net/fetch/methods.rs
++++ b/components/net/fetch/methods.rs
+@@ -3,7 +3,8 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::Ordering;
++use std::time::Duration;
+ use std::{io, mem, str};
+ 
+ use base64::Engine as _;
+@@ -41,9 +42,10 @@ use rustls_pki_types::CertificateDer;
+ use serde::{Deserialize, Serialize};
+ use servo_base::generic_channel::CallbackSetter;
+ use servo_base::id::PipelineId;
+-use servo_url::{Host, ServoUrl};
+-use tokio::sync::Mutex as TokioMutex;
++use servo_config::pref;
++use servo_url::{Host, ImmutableOrigin, ServoUrl};
+ use tokio::sync::mpsc::{UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender};
++use tokio::sync::{Mutex as TokioMutex, watch};
+ 
+ use crate::connector::CACertificates;
+ use crate::devtools::{
+@@ -114,18 +116,186 @@ pub struct FetchContext {
+     pub in_flight_keep_alive_records: SharedInflightKeepAliveRecords,
+ }
+ 
++/// Whether the network may read the response body of a fetch.
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub(crate) enum FetchFlowState {
++    #[default]
++    Running,
++    /// Reading the body is suspended until the fetch is resumed or cancelled.
++    Suspended,
++    Cancelled,
++}
++
++/// How many fetches to one origin may be suspended at once, per [`crate::http_loader::HttpState`].
++/// The fetches to an origin share an HTTP/2 connection, and every suspended stream keeps up to its
++/// stream window (2 MiB) of the connection window (5 MiB): three would stall the connection.
++const MAX_SUSPENDED_FETCHES_PER_ORIGIN: usize = 2;
++
++/// The number of suspended fetches per origin.
++#[derive(Default)]
++pub struct SuspendedFetches {
++    counts: Mutex<FxHashMap<ImmutableOrigin, usize>>,
++    /// Replaces the `network_fetch_suspend_timeout_ms` pref.
++    timeout: Option<Duration>,
++}
++
++impl SuspendedFetches {
++    /// Suspended fetches that end after `timeout` instead of the time that the
++    /// `network_fetch_suspend_timeout_ms` pref sets.
++    pub fn with_timeout(timeout: Duration) -> Self {
++        Self {
++            counts: Default::default(),
++            timeout: Some(timeout),
++        }
++    }
++
++    /// How long a fetch may stay suspended.
++    pub(crate) fn timeout(&self) -> Duration {
++        self.timeout
++            .unwrap_or_else(|| Duration::from_millis(pref!(network_fetch_suspend_timeout_ms)))
++    }
++
++    fn try_acquire(self: &Arc<Self>, origin: &ImmutableOrigin) -> Option<SuspensionSlot> {
++        let mut counts = self.counts.lock();
++        let count = counts.entry(origin.clone()).or_default();
++        if *count >= MAX_SUSPENDED_FETCHES_PER_ORIGIN {
++            return None;
++        }
++        *count += 1;
++        Some(SuspensionSlot {
++            fetches: self.clone(),
++            origin: origin.clone(),
++        })
++    }
++}
++
++/// A suspended fetch counted in [`SuspendedFetches`] until this is dropped.
++struct SuspensionSlot {
++    fetches: Arc<SuspendedFetches>,
++    origin: ImmutableOrigin,
++}
++
++impl Drop for SuspensionSlot {
++    fn drop(&mut self) {
++        let mut counts = self.fetches.counts.lock();
++        if let Some(count) = counts.get_mut(&self.origin) {
++            *count -= 1;
++            if *count == 0 {
++                counts.remove(&self.origin);
++            }
++        }
++    }
++}
++
++#[derive(Default)]
++struct Suspension {
++    /// Identifies the network body that `budget` belongs to.
++    generation: u64,
++    /// Where a suspension is counted, while a body is read from the network.
++    budget: Option<(Arc<SuspendedFetches>, ImmutableOrigin)>,
++    /// Held while the fetch is suspended.
++    slot: Option<SuspensionSlot>,
++}
++
++/// Lets the resource thread cancel, suspend and resume a fetch.
++/// Only the HTTP network fetch honours suspension, while it reads the body.
+ #[derive(Default)]
+ pub struct CancellationListener {
+-    cancelled: AtomicBool,
++    state: watch::Sender<FetchFlowState>,
++    suspension: Mutex<Suspension>,
+ }
+ 
+ impl CancellationListener {
+     pub(crate) fn cancelled(&self) -> bool {
+-        self.cancelled.load(Ordering::Relaxed)
++        *self.state.borrow() == FetchFlowState::Cancelled
+     }
+ 
+     pub fn cancel(&self) {
+-        self.cancelled.store(true, Ordering::Relaxed)
++        self.state.send_replace(FetchFlowState::Cancelled);
++        self.suspension.lock().slot = None;
++    }
++
++    /// Suspend reading the body, and return whether the fetch is suspended now. A suspension is
++    /// ignored unless the body is being read from the network and fewer than
++    /// `MAX_SUSPENDED_FETCHES_PER_ORIGIN` fetches to its origin are suspended.
++    pub fn suspend(&self) -> bool {
++        let mut suspension = self.suspension.lock();
++        if suspension.slot.is_some() {
++            return true;
++        }
++        let Some(slot) = suspension
++            .budget
++            .as_ref()
++            .and_then(|(fetches, origin)| fetches.try_acquire(origin))
++        else {
++            return false;
++        };
++        let suspended = self.state.send_if_modified(|state| {
++            let running = *state == FetchFlowState::Running;
++            if running {
++                *state = FetchFlowState::Suspended;
++            }
++            running
++        });
++        if suspended {
++            suspension.slot = Some(slot);
++        }
++        suspended
++    }
++
++    pub fn resume(&self) {
++        let mut suspension = self.suspension.lock();
++        self.state.send_if_modified(|state| {
++            let suspended = *state == FetchFlowState::Suspended;
++            if suspended {
++                *state = FetchFlowState::Running;
++            }
++            suspended
++        });
++        suspension.slot = None;
++    }
++
++    /// A receiver that is notified whenever the fetch is cancelled, suspended or resumed.
++    pub(crate) fn subscribe(&self) -> watch::Receiver<FetchFlowState> {
++        self.state.subscribe()
++    }
++
++    /// Allow suspending the fetch while a body is read from the network, counted in `fetches`
++    /// for `origin`. A fetch that is suspended already, such as across a redirect, is counted for
++    /// `origin` from now on, and resumed if `origin` has no place left. Returns what to pass to
++    /// [`Self::end_network_body`].
++    pub(crate) fn start_network_body(
++        &self,
++        fetches: Arc<SuspendedFetches>,
++        origin: ImmutableOrigin,
++    ) -> u64 {
++        let mut suspension = self.suspension.lock();
++        suspension.generation += 1;
++        if let Some(slot) = suspension.slot.take() {
++            drop(slot);
++            suspension.slot = fetches.try_acquire(&origin);
++            if suspension.slot.is_none() {
++                self.state.send_if_modified(|state| {
++                    let suspended = *state == FetchFlowState::Suspended;
++                    if suspended {
++                        *state = FetchFlowState::Running;
++                    }
++                    suspended
++                });
++            }
++        }
++        suspension.budget = Some((fetches, origin));
++        suspension.generation
++    }
++
++    /// The body that [`Self::start_network_body`] returned `generation` for has ended, so a
++    /// suspension no longer has an effect and releases its slot.
++    pub(crate) fn end_network_body(&self, generation: u64) {
++        let mut suspension = self.suspension.lock();
++        if suspension.generation == generation {
++            suspension.budget = None;
++            suspension.slot = None;
++        }
+     }
+ }
+ 
+diff --git a/components/net/http_cache.rs b/components/net/http_cache.rs
+index 9fcd323eb06..7f06f5eeb6a 100644
+--- a/components/net/http_cache.rs
++++ b/components/net/http_cache.rs
+@@ -32,10 +32,11 @@ use servo_arc::Arc;
+ use servo_config::pref;
+ use servo_url::ServoUrl;
+ use tokio::sync::mpsc::{UnboundedSender as TokioSender, unbounded_channel as unbounded};
+-use tokio::sync::{OwnedRwLockWriteGuard, RwLock as TokioRwLock};
++use tokio::sync::{OwnedRwLockWriteGuard, RwLock as TokioRwLock, watch};
+ 
++use crate::async_runtime::spawn_task;
+ use crate::disk_cache::DiskCache;
+-use crate::fetch::methods::{Data, DoneChannel};
++use crate::fetch::methods::{CancellationListener, Data, DoneChannel, FetchFlowState};
+ 
+ /// A duration in seconds.
+ ///
+@@ -141,6 +142,10 @@ pub struct CachedResource {
+     #[conditional_malloc_size_of]
+     #[serde(skip)]
+     awaiting_body: Arc<ParkingLotMutex<Vec<TokioSender<Data>>>>,
++    /// The state of the fetch that reads the body from the network, if it is not done.
++    #[ignore_malloc_size_of = "Channel"]
++    #[serde(skip)]
++    producer_state: Option<watch::Receiver<FetchFlowState>>,
+     metadata: CachedMetadata,
+     location_url: Option<Result<ServoUrl, String>>,
+     status: HttpStatus,
+@@ -163,6 +168,26 @@ impl CachedResource {
+     fn is_abandoned(&self) -> bool {
+         self.aborted.load(Ordering::Acquire) && self.awaiting_body.lock().is_empty()
+     }
++
++    /// Wait for the body, which is still being received, through `done_sender`. A suspended
++    /// fetch may not receive it for a long time, so treat its suspension like an abort: send
++    /// [`Data::Cancelled`], and the waiting fetch goes to the network instead.
++    fn add_awaiting_body(&self, done_sender: TokioSender<Data>) {
++        self.awaiting_body.lock().push(done_sender.clone());
++        let Some(mut producer_state) = self.producer_state.clone() else {
++            return;
++        };
++        spawn_task(async move {
++            tokio::select! {
++                suspended = producer_state.wait_for(|state| *state == FetchFlowState::Suspended) => {
++                    if suspended.is_ok() {
++                        let _ = done_sender.send(Data::Cancelled);
++                    }
++                },
++                _ = done_sender.closed() => {},
++            }
++        });
++    }
+ }
+ 
+ #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+@@ -619,7 +644,7 @@ fn create_cached_response(
+         debug!("existing body is in progress");
+         let (done_sender, done_receiver) = unbounded();
+         *done_chan = Some((done_sender.clone(), done_receiver));
+-        cached_resource.awaiting_body.lock().push(done_sender);
++        cached_resource.add_awaiting_body(done_sender);
+     }
+     drop(body);
+     let resource_timing = ResourceFetchTiming::new(request.timing_type());
+@@ -683,6 +708,7 @@ fn create_resource_with_bytes_from_resource(
+         body: Arc::new(ParkingLotMutex::new(ResponseBody::Done(bytes.to_owned()))),
+         aborted: resource.aborted.clone(),
+         awaiting_body: Arc::new(ParkingLotMutex::new(vec![])),
++        producer_state: None,
+         metadata: resource.metadata.clone(),
+         location_url: resource.location_url.clone(),
+         status: StatusCode::PARTIAL_CONTENT.into(),
+@@ -1006,7 +1032,7 @@ pub fn refresh(
+         match in_progress_channel {
+             Some((done_sender, done_receiver)) => {
+                 *done_chan = Some((done_sender.clone(), done_receiver));
+-                cached_resource.awaiting_body.lock().push(done_sender);
++                cached_resource.add_awaiting_body(done_sender);
+             },
+             None => *done_chan = None,
+         }
+@@ -1246,6 +1272,17 @@ pub enum CachedResourcesOrGuard<'a> {
+ impl<'a> CachedResourcesOrGuard<'a> {
+     /// Insert into the cache according to http spec
+     pub fn insert(self, request: &Request, response: &Response) {
++        self.insert_from_network(request, response, None);
++    }
++
++    /// Like [`Self::insert`], for a response whose body the fetch with `producer` is still
++    /// reading from the network.
++    pub(crate) fn insert_from_network(
++        self,
++        request: &Request,
++        response: &Response,
++        producer: Option<&CancellationListener>,
++    ) {
+         if pref!(network_http_cache_disabled) {
+             return;
+         }
+@@ -1286,6 +1323,7 @@ impl<'a> CachedResourcesOrGuard<'a> {
+             body: response.body.clone(),
+             aborted: response.aborted.clone(),
+             awaiting_body: Arc::new(ParkingLotMutex::new(vec![])),
++            producer_state: producer.map(CancellationListener::subscribe),
+             metadata: cacheable_metadata,
+             location_url: response.location_url.clone(),
+             status: response.status.clone(),
+diff --git a/components/net/http_loader.rs b/components/net/http_loader.rs
+index 50c891a15ab..4ee8c3258b6 100644
+--- a/components/net/http_loader.rs
++++ b/components/net/http_loader.rs
+@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
+ use async_recursion::async_recursion;
+ use content_security_policy::percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+ use embedder_traits::{AuthenticationResponse, GenericEmbedderProxy};
+-use futures::{TryFutureExt, TryStreamExt, future};
++use futures::{StreamExt, TryFutureExt, future};
+ use headers::authorization::Basic;
+ use headers::{
+     AccessControlAllowCredentials, AccessControlAllowHeaders, AccessControlAllowMethods,
+@@ -89,7 +89,9 @@ use crate::embedder::NetToEmbedderMsg;
+ use crate::fetch::cors_cache::CorsCache;
+ use crate::fetch::fetch_params::FetchParams;
+ use crate::fetch::headers::{SecFetchDest, SecFetchMode, SecFetchSite, SecFetchUser};
+-use crate::fetch::methods::{Data, DoneChannel, FetchContext, Target, fetch, main_fetch};
++use crate::fetch::methods::{
++    Data, DoneChannel, FetchContext, FetchFlowState, SuspendedFetches, Target, fetch, main_fetch,
++};
+ use crate::hsts::HstsList;
+ use crate::http_cache::{
+     CacheKey, CachedResourcesOrGuard, HttpCache, ValidationStatus, construct_response,
+@@ -124,6 +126,8 @@ pub struct HttpState {
+     pub client: ServoClient,
+     pub override_manager: CertificateErrorOverrideManager,
+     pub embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
++    /// The fetches of this state that are suspended, which share its connections.
++    pub suspended_fetches: StdArc<SuspendedFetches>,
+ }
+ 
+ impl HttpState {
+@@ -1652,7 +1656,11 @@ async fn http_network_or_cache_fetch(
+                 if http_request.cache_mode != CacheMode::NoStore {
+                     // Step 10.5.2 Store httpRequest and forwardResponse in httpCache, as per the
+                     //             "Storing Responses in Caches" chapter of HTTP Caching.
+-                    cache_guard.insert(http_request, forward_response);
++                    cache_guard.insert_from_network(
++                        http_request,
++                        forward_response,
++                        Some(&context.cancellation_listener),
++                    );
+                 }
+             }
+             false
+@@ -2367,12 +2375,8 @@ async fn http_network_fetch(
+         )
+     };
+ 
+-    let done_sender2 = done_sender.clone();
+-    let done_sender3 = done_sender.clone();
+-    let timing_ptr2 = context.timing.clone();
+-    let timing_ptr3 = context.timing.clone();
+-    let url1 = request.url();
+-    let url2 = url1.clone();
++    let timing = context.timing.clone();
++    let request_url = request.url();
+ 
+     let prealloc_size: usize = if let Some(possible_length) = response_stream
+         .headers()
+@@ -2407,36 +2411,76 @@ async fn http_network_fetch(
+         Vec::new()
+     };
+     *response_body.lock() = ResponseBody::Receiving(body);
+-    let response_body2 = response_body.clone();
+     let aborted = response.aborted.clone();
+-    let aborted2 = response.aborted.clone();
+-
+-    spawn_task(
+-        response_stream
+-            .into_body()
+-            .try_fold(response_body, move |response_body_accumulator, chunk| {
+-                if cancellation_listener.cancelled() {
+-                    let mut body = response_body_accumulator.lock();
+-                    aborted.store(true, Ordering::Release);
+-                    *body = ResponseBody::Done(vec![]);
+-                    drop(body);
+-                    let _ = done_sender.send(Data::Cancelled);
+-                    return future::ready(Err(std::io::Error::new(
+-                        std::io::ErrorKind::Interrupted,
+-                        "Fetch aborted",
+-                    )));
+-                }
+-                if let ResponseBody::Receiving(ref mut body) = *response_body_accumulator.lock() {
+-                    if keep_body {
+-                        body.extend_from_slice(&chunk);
++    let suspend_timeout = context.state.suspended_fetches.timeout();
++    let network_body = cancellation_listener
++        .start_network_body(context.state.suspended_fetches.clone(), url.origin());
++
++    spawn_task(async move {
++        let mut body_stream = response_stream.into_body();
++        let mut flow_state = cancellation_listener.subscribe();
++        let mut suspended_until = None;
++        let mut suspended_too_long = false;
++        let result = loop {
++            // While suspended, do not poll the body: what is not read is held back
++            // by TCP or HTTP/2 flow control, and the body continues with the next byte.
++            let state = *flow_state.borrow_and_update();
++            let cancelled = match state {
++                FetchFlowState::Cancelled => true,
++                FetchFlowState::Suspended => {
++                    let deadline = *suspended_until
++                        .get_or_insert_with(|| tokio::time::Instant::now() + suspend_timeout);
++                    match tokio::time::timeout_at(deadline, flow_state.changed()).await {
++                        Ok(Ok(())) => continue,
++                        // Nobody can resume the fetch once the listener is gone.
++                        Ok(Err(_)) => true,
++                        Err(_) => {
++                            suspended_too_long = true;
++                            break Err(std::io::Error::other("Fetch suspended for too long"));
++                        },
+                     }
+-                    let _ = done_sender.send(Data::Payload(chunk));
+-                }
+-                future::ready(Ok(response_body_accumulator))
+-            })
+-            .and_then(move |complete_response_body| {
+-                debug!("successfully finished response for {:?}", url1);
+-                let mut body = complete_response_body.lock();
++                },
++                FetchFlowState::Running => {
++                    suspended_until = None;
++                    false
++                },
++            };
++            if cancelled {
++                let mut body = response_body.lock();
++                aborted.store(true, Ordering::Release);
++                *body = ResponseBody::Done(vec![]);
++                drop(body);
++                let _ = done_sender.send(Data::Cancelled);
++                break Err(std::io::Error::new(
++                    std::io::ErrorKind::Interrupted,
++                    "Fetch aborted",
++                ));
++            }
++            let chunk = tokio::select! {
++                biased;
++                Ok(()) = flow_state.changed() => continue,
++                chunk = body_stream.next() => chunk,
++            };
++            match chunk {
++                Some(Ok(chunk)) => {
++                    if let ResponseBody::Receiving(ref mut body) = *response_body.lock() {
++                        if keep_body {
++                            body.extend_from_slice(&chunk);
++                        }
++                        let _ = done_sender.send(Data::Payload(chunk));
++                    }
++                },
++                Some(Err(error)) => break Err(error),
++                None => break Ok(()),
++            }
++        };
++
++        cancellation_listener.end_network_body(network_body);
++
++        match result {
++            Ok(()) => {
++                debug!("successfully finished response for {:?}", request_url);
++                let mut body = response_body.lock();
+                 let mut completed_body = match *body {
+                     ResponseBody::Receiving(ref mut body) => std::mem::take(body),
+                     _ => vec![],
+@@ -2458,31 +2502,35 @@ async fn http_network_fetch(
+                     &devtools_request,
+                     devtools_chan,
+                 );
+-                timing_ptr2.set_attribute(ResourceAttribute::ResponseEnd);
+-                let _ = done_sender2.send(Data::Done);
+-                future::ready(Ok(()))
+-            })
+-            .map_err(move |error| {
++                timing.set_attribute(ResourceAttribute::ResponseEnd);
++                let _ = done_sender.send(Data::Done);
++            },
++            Err(error) => {
+                 // The body is incomplete, so keep the HTTP cache from using it.
+-                aborted2.store(true, Ordering::Release);
++                aborted.store(true, Ordering::Release);
+                 if let std::io::ErrorKind::InvalidData = error.kind() {
+-                    debug!("Content decompression error for {:?}", url2);
+-                    let _ = done_sender3.send(Data::Error(NetworkError::DecompressionError));
+-                    let mut body = response_body2.lock();
++                    debug!("Content decompression error for {:?}", request_url);
++                    let _ = done_sender.send(Data::Error(NetworkError::DecompressionError));
++                    let mut body = response_body.lock();
+ 
+                     *body = ResponseBody::Done(vec![]);
+                 }
+-                debug!("finished response for {:?}", url2);
+-                let mut body = response_body2.lock();
++                if suspended_too_long {
++                    debug!("Fetch suspended for too long: {:?}", request_url);
++                    let _ = done_sender.send(Data::Error(NetworkError::ConnectionFailure));
++                }
++                debug!("finished response for {:?}", request_url);
++                let mut body = response_body.lock();
+                 let completed_body = match *body {
+                     ResponseBody::Receiving(ref mut body) => std::mem::take(body),
+                     _ => vec![],
+                 };
+                 *body = ResponseBody::Done(completed_body);
+-                timing_ptr3.set_attribute(ResourceAttribute::ResponseEnd);
+-                let _ = done_sender3.send(Data::Done);
+-            }),
+-    );
++                timing.set_attribute(ResourceAttribute::ResponseEnd);
++                let _ = done_sender.send(Data::Done);
++            },
++        }
++    });
+ 
+     // TODO these substeps aren't possible yet
+     // Substep 1
+diff --git a/components/net/resource_thread.rs b/components/net/resource_thread.rs
+index 118f6adf6ed..90616464950 100644
+--- a/components/net/resource_thread.rs
++++ b/components/net/resource_thread.rs
+@@ -226,6 +226,7 @@ fn create_http_states(
+         )),
+         override_manager,
+         embedder_proxy: embedder_proxy.clone(),
++        suspended_fetches: Default::default(),
+     };
+ 
+     let override_manager = CertificateErrorOverrideManager::new();
+@@ -242,6 +243,7 @@ fn create_http_states(
+         )),
+         override_manager,
+         embedder_proxy,
++        suspended_fetches: Default::default(),
+     };
+ 
+     (Arc::new(http_state), Arc::new(private_http_state))
+@@ -452,6 +454,16 @@ impl ResourceChannelManager {
+                     cancellation_listener.cancel();
+                 }
+             },
++            CoreResourceMsg::Suspend(request_id) => {
++                if let Some(cancellation_listener) = self.cancellation_listener(request_id) {
++                    let _ = cancellation_listener.suspend();
++                }
++            },
++            CoreResourceMsg::Resume(request_id) => {
++                if let Some(cancellation_listener) = self.cancellation_listener(request_id) {
++                    cancellation_listener.resume();
++                }
++            },
+             CoreResourceMsg::DeleteCookiesForSites(sites, sender) => {
+                 http_state
+                     .cookie_jar
+diff --git a/components/net/test_util.rs b/components/net/test_util.rs
+index b27ad90c818..d2d4aa90eb2 100644
+--- a/components/net/test_util.rs
++++ b/components/net/test_util.rs
+@@ -13,10 +13,10 @@ use futures::future::ready;
+ use http_body_util::combinators::BoxBody;
+ use http_body_util::{BodyExt, Empty, Full};
+ use hyper::body::{Bytes, Incoming};
+-use hyper::server::conn::http1;
++use hyper::server::conn::{http1, http2};
+ use hyper::service::service_fn;
+ use hyper::{Request as HyperRequest, Response as HyperResponse};
+-use hyper_util::rt::tokio::TokioIo;
++use hyper_util::rt::tokio::{TokioExecutor, TokioIo};
+ use net_traits::AsyncRuntime;
+ use net_traits::blob_url_store::UrlWithBlobClaim;
+ use rustls_pki_types::pem::PemObject;
+@@ -170,6 +170,32 @@ fn load_private_key_from_file() -> Result<PrivateKeyDer<'static>, Box<dyn std::e
+ }
+ 
+ pub fn make_ssl_server<H>(handler: H) -> (Server, UrlWithBlobClaim)
++where
++    H: Fn(HyperRequest<Incoming>, &mut HyperResponse<BoxBody<Bytes, hyper::Error>>)
++        + Send
++        + Sync
++        + 'static,
++{
++    make_tls_server(handler, vec![])
++}
++
++/// Like [`make_ssl_server`], but serves HTTP/2, negotiated with ALPN, and returns an `https`
++/// URL.
++pub fn make_h2_ssl_server<H>(handler: H) -> (Server, UrlWithBlobClaim)
++where
++    H: Fn(HyperRequest<Incoming>, &mut HyperResponse<BoxBody<Bytes, hyper::Error>>)
++        + Send
++        + Sync
++        + 'static,
++{
++    let (server, mut url) = make_tls_server(handler, vec![b"h2".to_vec()]);
++    url.as_mut_url().set_scheme("https").unwrap();
++    (server, url)
++}
++
++/// A TLS server that offers `alpn_protocols`, and serves HTTP/2 if the client chooses `h2`
++/// and HTTP/1.1 otherwise.
++fn make_tls_server<H>(handler: H, alpn_protocols: Vec<Vec<u8>>) -> (Server, UrlWithBlobClaim)
+ where
+     H: Fn(HyperRequest<Incoming>, &mut HyperResponse<BoxBody<Bytes, hyper::Error>>)
+         + Send
+@@ -190,11 +216,12 @@ where
+     let certificates = load_certificates_from_pem().expect("Invalid certificate");
+     let key = load_private_key_from_file().expect("Invalid key");
+ 
+-    let config = rustls::ServerConfig::builder()
++    let mut config = rustls::ServerConfig::builder()
+         .with_no_client_auth()
+         .with_single_cert(certificates.clone(), key)
+         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
+         .expect("Could not create rustls ServerConfig");
++    config.alpn_protocols = alpn_protocols;
+     let acceptor = TlsAcceptor::from(Arc::new(config));
+ 
+     let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+@@ -214,25 +241,32 @@ where
+             let handler = handler.clone();
+             let acceptor = acceptor.clone();
+ 
+-            let stream = match acceptor.accept(stream).await {
+-                Ok(stream) => stream,
+-                Err(_) => {
+-                    eprintln!("Error handling TLS stream.");
+-                    continue;
+-                },
+-            };
+-
+-            let _ = http1::Builder::new()
+-                .serve_connection(
+-                    TokioIo::new(stream),
+-                    service_fn(move |req: HyperRequest<Incoming>| {
+-                        let mut response =
+-                            HyperResponse::new(Empty::new().map_err(|_| unreachable!()).boxed());
+-                        handler(req, &mut response);
+-                        ready(Ok::<_, Infallible>(response))
+-                    }),
+-                )
+-                .await;
++            spawn_task(async move {
++                let stream = match acceptor.accept(stream).await {
++                    Ok(stream) => stream,
++                    Err(_) => {
++                        eprintln!("Error handling TLS stream.");
++                        return;
++                    },
++                };
++
++                let negotiated_http2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
++                let service = service_fn(move |req: HyperRequest<Incoming>| {
++                    let mut response =
++                        HyperResponse::new(Empty::new().map_err(|_| unreachable!()).boxed());
++                    handler(req, &mut response);
++                    ready(Ok::<_, Infallible>(response))
++                });
++                if negotiated_http2 {
++                    let _ = http2::Builder::new(TokioExecutor::new())
++                        .serve_connection(TokioIo::new(stream), service)
++                        .await;
++                } else {
++                    let _ = http1::Builder::new()
++                        .serve_connection(TokioIo::new(stream), service)
++                        .await;
++                }
++            });
+         }
+     };
+ 
+diff --git a/components/net/tests/http_loader.rs b/components/net/tests/http_loader.rs
+index afc382f86ea..2f2d55bce4b 100644
+--- a/components/net/tests/http_loader.rs
++++ b/components/net/tests/http_loader.rs
+@@ -3,7 +3,7 @@
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ use std::collections::HashMap;
+-use std::io::Write;
++use std::io::{Read, Write};
+ use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ use std::task::Poll;
+@@ -32,29 +32,39 @@ use http_body_util::{BodyExt, StreamBody};
+ use hyper::body::{Body, Bytes, Frame, Incoming};
+ use hyper::{Request as HyperRequest, Response as HyperResponse};
+ use net::async_runtime::spawn_task;
++use net::connector::CACertificates;
+ use net::cookie::ServoCookie;
+ use net::cookie_storage::CookieStorage;
+-use net::fetch::methods::{self, CancellationListener, FetchContext};
++use net::fetch::methods::{self, CancellationListener, FetchContext, SuspendedFetches};
+ use net::http_loader::{determine_requests_referrer, serialize_origin};
+-use net::resource_thread::AuthCacheEntry;
++use net::protocols::ProtocolRegistry;
++use net::resource_thread::{AuthCacheEntry, new_core_resource_thread};
+ use net::test::DECODER_BUFFER_SIZE;
++use net::test_util::make_h2_ssl_server;
+ use net_traits::blob_url_store::UrlWithBlobClaim;
++use net_traits::fetch::fetch_controller::FetchController;
+ use net_traits::http_status::HttpStatus;
+ use net_traits::request::{
+     CredentialsMode, Destination, Referrer, Request, RequestBuilder, RequestMode,
+     TraversableForUserPrompts, create_request_body_with_content,
+ };
+ use net_traits::response::{CacheState, Response, ResponseBody};
+-use net_traits::{CookieSource, FetchTaskTarget, NetworkError, ReferrerPolicy, get_current_locale};
++use net_traits::{
++    CookieSource, CoreResourceMsg, CoreResourceThread, FetchResponseMsg, FetchTaskTarget,
++    NetworkError, ReferrerPolicy, fetch_async, get_current_locale,
++};
+ use parking_lot::{Mutex, RwLock};
++use profile_traits::mem::ProfilerChan as MemProfilerChan;
++use profile_traits::time::ProfilerChan;
++use servo_base::generic_channel;
+ use servo_base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
+ use servo_url::{ImmutableOrigin, ServoUrl};
+ use url::Url;
+ 
+ use crate::{
+-    create_generic_embedder_proxy_and_receiver, fetch, fetch_with_context, make_body, make_server,
+-    make_ssl_server, mock_origin, new_fetch_context, receive_credential_prompt_msgs,
+-    replace_host_table, spawn_blocking_task,
++    create_generic_embedder_proxy, create_generic_embedder_proxy_and_receiver, create_http_state,
++    fetch, fetch_with_context, make_body, make_server, make_ssl_server, mock_origin,
++    new_fetch_context, receive_credential_prompt_msgs, replace_host_table, spawn_blocking_task,
+ };
+ 
+ fn assert_cookie_for_domain(
+@@ -2418,9 +2428,7 @@ fn wait_until(condition: impl Fn() -> bool) {
+ }
+ 
+ /// Wait for the end of a fetch started with `start_fetch`, for at most ten seconds.
+-fn wait_for_fetch(
+-    mut receiver: tokio::sync::oneshot::Receiver<(Response, usize)>,
+-) -> (Response, usize) {
++fn wait_for_fetch<T>(mut receiver: tokio::sync::oneshot::Receiver<T>) -> T {
+     let deadline = Instant::now() + Duration::from_secs(10);
+     loop {
+         if let Ok(result) = receiver.try_recv() {
+@@ -2518,3 +2526,616 @@ fn test_fetch_waiting_for_a_response_whose_fetch_failed_is_woken_up() {
+ 
+     let _ = server.close();
+ }
++
++const STREAM_CHUNK_SIZE: usize = 64 * 1024;
++const STREAM_LENGTH: usize = 64 * 1024 * 1024;
++
++/// Chunk `index` of the bodies that the streaming servers send. Every chunk differs, so a lost,
++/// duplicated or reordered chunk does not compare equal.
++fn stream_chunk(index: usize) -> Bytes {
++    let mut chunk = vec![index as u8; STREAM_CHUNK_SIZE];
++    chunk[..8].copy_from_slice(&(index as u64).to_le_bytes());
++    Bytes::from(chunk)
++}
++
++/// A body of `length` bytes: the first chunk, then the others once `release` fires. `sent`
++/// counts the bytes handed to the connection.
++fn streaming_body(
++    length: usize,
++    release: tokio::sync::oneshot::Receiver<()>,
++    sent: Arc<AtomicUsize>,
++) -> impl futures::Stream<Item = Result<Frame<Bytes>, hyper::Error>> {
++    use futures::StreamExt;
++    let rest = stream::once(release).flat_map(move |_| stream::iter(1..length / STREAM_CHUNK_SIZE));
++    stream::iter([0]).chain(rest).map(move |index| {
++        sent.fetch_add(STREAM_CHUNK_SIZE, Ordering::SeqCst);
++        Ok(Frame::data(stream_chunk(index)))
++    })
++}
++
++struct StreamingServer {
++    server: net::test_util::Server,
++    url: UrlWithBlobClaim,
++    /// For each request, in the order they arrive: lets the server send the body after its first
++    /// chunk.
++    releases: Vec<Option<tokio::sync::oneshot::Sender<()>>>,
++    /// For each request: the number of body bytes the server has handed to its connection.
++    sent: Vec<Arc<AtomicUsize>>,
++    /// Whether the last request came over HTTP/2.
++    used_http2: Arc<AtomicBool>,
++}
++
++impl StreamingServer {
++    fn release(&mut self, request: usize) {
++        let _ = self.releases[request].take().unwrap().send(());
++    }
++
++    fn sent(&self, request: usize) -> usize {
++        self.sent[request].load(Ordering::SeqCst)
++    }
++}
++
++/// A server for `requests` requests to one URL, which answers each with a body of `length` bytes.
++/// It sends the first chunk, then waits for `StreamingServer::release`, then sends the rest as
++/// fast as the client reads it. If `cacheable`, the HTTP cache may store the responses.
++fn make_streaming_server(
++    http2: bool,
++    requests: usize,
++    length: usize,
++    cacheable: bool,
++) -> StreamingServer {
++    let (releases, release_receivers): (Vec<_>, Vec<_>) = (0..requests)
++        .map(|_| {
++            let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
++            (Some(sender), Some(receiver))
++        })
++        .unzip();
++    let release_receivers = Mutex::new(release_receivers);
++    let sent: Vec<_> = (0..requests)
++        .map(|_| Arc::new(AtomicUsize::new(0)))
++        .collect();
++    let sent_clone = sent.clone();
++    let next_request = AtomicUsize::new(0);
++    let used_http2 = Arc::new(AtomicBool::new(false));
++    let used_http2_clone = used_http2.clone();
++    let handler =
++        move |request: HyperRequest<Incoming>,
++              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
++            used_http2_clone.store(request.version() == http::Version::HTTP_2, Ordering::SeqCst);
++            let index = next_request.fetch_add(1, Ordering::SeqCst);
++            response
++                .headers_mut()
++                .typed_insert(ContentLength(length as u64));
++            if cacheable {
++                response.headers_mut().insert(
++                    header::CACHE_CONTROL,
++                    HeaderValue::from_static("max-age=3600"),
++                );
++            }
++            let release = release_receivers
++                .lock()
++                .get_mut(index)
++                .and_then(Option::take)
++                .expect("more requests than expected");
++            *response.body_mut() =
++                StreamBody::new(streaming_body(length, release, sent_clone[index].clone())).boxed();
++        };
++    let (server, url) = if http2 {
++        make_h2_ssl_server(handler)
++    } else {
++        make_server(handler)
++    };
++    StreamingServer {
++        server,
++        url,
++        releases,
++        sent,
++        used_http2,
++    }
++}
++
++/// A server for one HTTP/1.1 request, which announces `STREAM_LENGTH` bytes and sends the first
++/// chunk, then waits for the returned sender, sends the next `chunks - 1` chunks and closes the
++/// connection. The flag is set once the connection is closed.
++fn make_closing_server(
++    chunks: usize,
++) -> (
++    UrlWithBlobClaim,
++    std::sync::mpsc::Sender<()>,
++    Arc<AtomicBool>,
++) {
++    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++    let url = ServoUrl::parse(&format!(
++        "http://127.0.0.1:{}",
++        listener.local_addr().unwrap().port()
++    ))
++    .unwrap();
++    let (release_sender, release) = std::sync::mpsc::channel();
++    let closed = Arc::new(AtomicBool::new(false));
++    let closed_clone = closed.clone();
++    std::thread::spawn(move || {
++        let (mut stream, _) = listener.accept().unwrap();
++        let mut request = Vec::new();
++        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
++            let mut buffer = [0; 1024];
++            let length = stream.read(&mut buffer).unwrap();
++            assert!(length > 0);
++            request.extend_from_slice(&buffer[..length]);
++        }
++        write!(
++            stream,
++            "HTTP/1.1 200 OK\r\nContent-Length: {STREAM_LENGTH}\r\n\r\n"
++        )
++        .unwrap();
++        stream.write_all(&stream_chunk(0)).unwrap();
++        release.recv().unwrap();
++        for index in 1..chunks {
++            stream.write_all(&stream_chunk(index)).unwrap();
++        }
++        stream.shutdown(std::net::Shutdown::Both).unwrap();
++        closed_clone.store(true, Ordering::SeqCst);
++    });
++    (UrlWithBlobClaim::new(url, None), release_sender, closed)
++}
++
++fn new_streaming_fetch_context(server: &StreamingServer) -> FetchContext {
++    let context = new_fetch_context(None, None);
++    for certificate in server.server.certificates.iter().flatten() {
++        context.state.override_manager.add_override(certificate);
++    }
++    context
++}
++
++/// A context for another fetch with the same HTTP state, with a listener of its own.
++fn with_new_listener(context: &FetchContext) -> FetchContext {
++    let mut context = context.clone();
++    context.cancellation_listener = Arc::new(Default::default());
++    context
++}
++
++fn build_streaming_request(url: &UrlWithBlobClaim) -> RequestBuilder {
++    RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
++        .destination(Destination::Video)
++        .origin(url.clone().origin())
++        .pipeline_id(Some(TEST_PIPELINE_ID))
++        .policy_container(Default::default())
++}
++
++/// Compares a body with what the streaming servers send.
++#[derive(Default)]
++struct StreamVerifier {
++    received: usize,
++    mismatch: bool,
++}
++
++impl StreamVerifier {
++    fn verify(&mut self, mut data: &[u8]) {
++        while !data.is_empty() {
++            let offset = self.received % STREAM_CHUNK_SIZE;
++            let length = data.len().min(STREAM_CHUNK_SIZE - offset);
++            let expected = stream_chunk(self.received / STREAM_CHUNK_SIZE);
++            self.mismatch |= data[..length] != expected[offset..offset + length];
++            data = &data[length..];
++            self.received += length;
++        }
++    }
++
++    /// Whether the body arrived whole and intact.
++    fn is_intact(&self, length: usize) -> bool {
++        self.received == length && !self.mismatch
++    }
++}
++
++/// Verifies the body of a fetch from a streaming server, and publishes how many bytes arrived
++/// so far.
++struct StreamCollector {
++    sender: Option<tokio::sync::oneshot::Sender<(Response, StreamVerifier)>>,
++    verifier: Option<StreamVerifier>,
++    received: Arc<AtomicUsize>,
++}
++
++impl FetchTaskTarget for StreamCollector {
++    fn process_request_body(&mut self, _: &Request) {}
++    fn process_response(&mut self, _: &Request, _: &Response) {}
++    fn process_response_chunk(&mut self, _: &Request, chunk: Bytes) {
++        let verifier = self.verifier.as_mut().unwrap();
++        verifier.verify(&chunk);
++        self.received.store(verifier.received, Ordering::SeqCst);
++    }
++    fn process_response_eof(&mut self, _: &Request, response: &Response) {
++        let _ = self
++            .sender
++            .take()
++            .unwrap()
++            .send((response.clone(), self.verifier.take().unwrap()));
++    }
++    fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
++    fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
++}
++
++/// A fetch started with `start_streaming_fetch`.
++struct StreamingFetch {
++    listener: Arc<CancellationListener>,
++    /// The number of body bytes received so far.
++    received: Arc<AtomicUsize>,
++    end: tokio::sync::oneshot::Receiver<(Response, StreamVerifier)>,
++}
++
++impl StreamingFetch {
++    fn received(&self) -> usize {
++        self.received.load(Ordering::SeqCst)
++    }
++
++    /// Wait for the first chunk of the body.
++    fn wait_for_first_chunk(&self) {
++        wait_until(|| self.received() == STREAM_CHUNK_SIZE);
++    }
++
++    /// Wait for the end of the fetch, and return its response and what arrived of the body.
++    fn wait_for_end(self) -> (Response, StreamVerifier) {
++        wait_for_fetch(self.end)
++    }
++}
++
++/// Start a fetch of `url` in the background, the way a video element does.
++fn start_streaming_fetch(url: &UrlWithBlobClaim, context: FetchContext) -> StreamingFetch {
++    let (sender, end) = tokio::sync::oneshot::channel();
++    let received = Arc::new(AtomicUsize::new(0));
++    let listener = context.cancellation_listener.clone();
++    let mut target = StreamCollector {
++        sender: Some(sender),
++        verifier: Some(StreamVerifier::default()),
++        received: received.clone(),
++    };
++    let request = build_streaming_request(url).build();
++    spawn_task(async move {
++        methods::fetch(request, &mut target, &context).await;
++    });
++    StreamingFetch {
++        listener,
++        received,
++        end,
++    }
++}
++
++/// Wait until `count` has not changed for half a second, and return it.
++fn wait_for_plateau(count: &AtomicUsize) -> usize {
++    let deadline = Instant::now() + Duration::from_secs(10);
++    let mut last = count.load(Ordering::SeqCst);
++    let mut unchanged_since = Instant::now();
++    loop {
++        std::thread::sleep(Duration::from_millis(20));
++        let current = count.load(Ordering::SeqCst);
++        if current != last {
++            last = current;
++            unchanged_since = Instant::now();
++        } else if unchanged_since.elapsed() >= Duration::from_millis(500) {
++            return current;
++        }
++        assert!(Instant::now() < deadline, "the server kept sending");
++    }
++}
++
++fn check_suspended_fetch_holds_back_the_server(http2: bool) {
++    let mut server = make_streaming_server(http2, 1, STREAM_LENGTH, false);
++    let fetch = start_streaming_fetch(&server.url, new_streaming_fetch_context(&server));
++
++    fetch.wait_for_first_chunk();
++    assert!(fetch.listener.suspend());
++    assert!(fetch.listener.suspend());
++    server.release(0);
++    let held = wait_for_plateau(&server.sent[0]);
++    // Over HTTP/1.1, what the kernel buffers depends on the host; HTTP/2 holds the stream window.
++    let bound = if http2 {
++        STREAM_LENGTH / 4
++    } else {
++        STREAM_LENGTH
++    };
++    assert!(
++        held < bound,
++        "the server sent {held} bytes while the fetch was suspended"
++    );
++    assert_eq!(fetch.received(), STREAM_CHUNK_SIZE);
++
++    fetch.listener.resume();
++    fetch.listener.resume();
++    let listener = fetch.listener.clone();
++    let (response, body) = fetch.wait_for_end();
++    assert!(!response.is_network_error());
++    assert!(!response.aborted.load(Ordering::SeqCst));
++    assert!(body.is_intact(STREAM_LENGTH));
++    assert_eq!(server.sent(0), STREAM_LENGTH);
++    assert_eq!(server.used_http2.load(Ordering::SeqCst), http2);
++    assert!(!listener.suspend());
++
++    let _ = server.server.close();
++}
++
++#[test]
++fn test_suspended_fetch_holds_back_the_server_until_resumed() {
++    check_suspended_fetch_holds_back_the_server(false);
++}
++
++#[test]
++fn test_suspended_http2_fetch_holds_back_the_server_until_resumed() {
++    check_suspended_fetch_holds_back_the_server(true);
++}
++
++#[test]
++fn test_cancelling_a_suspended_fetch_ends_it() {
++    let mut server = make_streaming_server(false, 1, STREAM_LENGTH, false);
++    let fetch = start_streaming_fetch(&server.url, new_streaming_fetch_context(&server));
++
++    fetch.wait_for_first_chunk();
++    assert!(fetch.listener.suspend());
++    server.release(0);
++    assert!(wait_for_plateau(&server.sent[0]) < STREAM_LENGTH);
++
++    let cancelled_at = Instant::now();
++    fetch.listener.cancel();
++    let (response, body) = fetch.wait_for_end();
++    assert!(cancelled_at.elapsed() < Duration::from_secs(1));
++    assert!(response.aborted.load(Ordering::SeqCst));
++    assert_eq!(body.received, STREAM_CHUNK_SIZE);
++
++    let _ = server.server.close();
++}
++
++#[test]
++fn test_cancelling_a_fetch_that_waits_for_the_network_ends_it() {
++    // The server is never released, so it sends nothing after the first chunk.
++    let server = make_streaming_server(false, 1, STREAM_LENGTH, false);
++    let fetch = start_streaming_fetch(&server.url, new_streaming_fetch_context(&server));
++
++    fetch.wait_for_first_chunk();
++    let cancelled_at = Instant::now();
++    fetch.listener.cancel();
++    let (response, body) = fetch.wait_for_end();
++    assert!(cancelled_at.elapsed() < Duration::from_secs(1));
++    assert!(response.aborted.load(Ordering::SeqCst));
++    assert_eq!(body.received, STREAM_CHUNK_SIZE);
++
++    let _ = server.server.close();
++}
++
++#[test]
++fn test_fetch_whose_connection_closes_while_suspended_ends_when_resumed() {
++    let chunks = 2;
++    let (url, release, closed) = make_closing_server(chunks);
++    let fetch = start_streaming_fetch(&url, new_fetch_context(None, None));
++
++    fetch.wait_for_first_chunk();
++    assert!(fetch.listener.suspend());
++    release.send(()).unwrap();
++    wait_until(|| closed.load(Ordering::SeqCst));
++    assert_eq!(fetch.received(), STREAM_CHUNK_SIZE);
++
++    fetch.listener.resume();
++    let (response, body) = fetch.wait_for_end();
++    assert!(response.aborted.load(Ordering::SeqCst));
++    assert!(!body.mismatch);
++    assert_eq!(body.received, chunks * STREAM_CHUNK_SIZE);
++}
++
++#[test]
++fn test_fetch_suspended_for_too_long_ends_with_a_network_error() {
++    let mut server = make_streaming_server(false, 3, STREAM_LENGTH, false);
++    let mut context = new_streaming_fetch_context(&server);
++    let mut state = create_http_state(None);
++    state.suspended_fetches = Arc::new(SuspendedFetches::with_timeout(Duration::from_millis(300)));
++    context.state = Arc::new(state);
++    let fetches: Vec<_> = (0..2)
++        .map(|_| {
++            let fetch = start_streaming_fetch(&server.url, with_new_listener(&context));
++            fetch.wait_for_first_chunk();
++            fetch
++        })
++        .collect();
++
++    let suspended_at = Instant::now();
++    for (index, fetch) in fetches.iter().enumerate() {
++        assert!(fetch.listener.suspend());
++        server.release(index);
++    }
++    for fetch in fetches {
++        let (response, body) = fetch.wait_for_end();
++        assert_eq!(
++            response.get_network_error(),
++            Some(&NetworkError::ConnectionFailure)
++        );
++        assert_eq!(body.received, STREAM_CHUNK_SIZE);
++    }
++    let elapsed = suspended_at.elapsed();
++    assert!(elapsed >= Duration::from_millis(300));
++    assert!(elapsed < Duration::from_secs(5));
++
++    // The fetches that ended gave up their places among the suspended fetches of the origin.
++    let fetch = start_streaming_fetch(&server.url, with_new_listener(&context));
++    fetch.wait_for_first_chunk();
++    assert!(fetch.listener.suspend());
++    fetch.listener.cancel();
++    let _ = fetch.wait_for_end();
++
++    let _ = server.server.close();
++}
++
++#[test]
++fn test_at_most_two_fetches_per_origin_are_suspended() {
++    let mut server = make_streaming_server(false, 5, STREAM_LENGTH, false);
++    let context = new_streaming_fetch_context(&server);
++    let start = |server: &StreamingServer| {
++        let fetch = start_streaming_fetch(&server.url, with_new_listener(&context));
++        fetch.wait_for_first_chunk();
++        fetch
++    };
++    let first = start(&server);
++    let second = start(&server);
++    let third = start(&server);
++
++    assert!(first.listener.suspend());
++    assert!(second.listener.suspend());
++    assert!(!third.listener.suspend());
++    for index in 0..3 {
++        server.release(index);
++    }
++    let (_, body) = third.wait_for_end();
++    assert!(body.is_intact(STREAM_LENGTH));
++    assert!(wait_for_plateau(&server.sent[0]) < STREAM_LENGTH);
++    assert!(wait_for_plateau(&server.sent[1]) < STREAM_LENGTH);
++
++    // Cancelling and resuming give up the places of the suspended fetches.
++    first.listener.cancel();
++    second.listener.resume();
++    let fourth = start(&server);
++    let fifth = start(&server);
++    assert!(fourth.listener.suspend());
++    assert!(fifth.listener.suspend());
++
++    let (response, _) = first.wait_for_end();
++    assert!(response.aborted.load(Ordering::SeqCst));
++    let (_, body) = second.wait_for_end();
++    assert!(body.is_intact(STREAM_LENGTH));
++    for fetch in [fourth, fifth] {
++        fetch.listener.cancel();
++        let _ = fetch.wait_for_end();
++    }
++
++    let _ = server.server.close();
++}
++
++#[test]
++fn test_fetch_waiting_for_a_suspended_response_uses_the_network() {
++    // Small enough for the HTTP cache to store the response to a video request.
++    let length = 16 * STREAM_CHUNK_SIZE;
++    let mut server = make_streaming_server(false, 3, length, true);
++    let context = new_streaming_fetch_context(&server);
++    let request = build_streaming_request(&server.url).build();
++    let producer = start_streaming_fetch(&server.url, context.clone());
++    producer.wait_for_first_chunk();
++    assert_eq!(stored_response_count(&context, &request), 1);
++
++    // A fetch that waits for the stored body when its producer is suspended...
++    let waiting = start_streaming_fetch(&server.url, with_new_listener(&context));
++    wait_until(|| awaiting_consumer_count(&context, &request) == 1);
++    assert!(producer.listener.suspend());
++    server.release(1);
++    let (response, body) = waiting.wait_for_end();
++    assert!(matches!(response.cache_state, CacheState::None));
++    assert!(body.is_intact(length));
++
++    // ...and one that starts while the producer is suspended, go to the network.
++    let later = start_streaming_fetch(&server.url, with_new_listener(&context));
++    server.release(2);
++    let (response, body) = later.wait_for_end();
++    assert!(matches!(response.cache_state, CacheState::None));
++    assert!(body.is_intact(length));
++    assert_eq!(server.sent(1), length);
++    assert_eq!(server.sent(2), length);
++
++    producer.listener.resume();
++    server.release(0);
++    let (_, body) = producer.wait_for_end();
++    assert!(body.is_intact(length));
++
++    let _ = server.server.close();
++}
++
++/// Fetch a `data:` URL through the fetch thread and `resource_thread`, and wait for its body.
++fn fetch_data_url(resource_thread: &CoreResourceThread) -> Vec<u8> {
++    let url = UrlWithBlobClaim::new(ServoUrl::parse("data:,data").unwrap(), None);
++    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
++        .origin(url.origin())
++        .policy_container(Default::default());
++    let (sender, receiver) = unbounded();
++    fetch_async(
++        resource_thread,
++        request,
++        None,
++        Box::new(move |message| {
++            let _ = sender.send(message);
++        }),
++    );
++    let mut body = Vec::new();
++    loop {
++        match receiver.recv_timeout(Duration::from_secs(10)).unwrap() {
++            FetchResponseMsg::ProcessResponseChunk(_, chunk) => body.extend_from_slice(&chunk),
++            FetchResponseMsg::ProcessResponseEOF(_, result, _) => {
++                assert!(result.is_ok(), "{result:?}");
++                return body;
++            },
++            _ => {},
++        }
++    }
++}
++
++#[test]
++fn test_fetch_controller_suspends_and_resumes_a_fetch() {
++    let (time_sender, _time_receiver) = generic_channel::channel().unwrap();
++    let (memory_sender, _memory_receiver) = generic_channel::channel().unwrap();
++    let (resource_thread, _private_resource_thread) = new_core_resource_thread(
++        None,
++        ProfilerChan(Some(time_sender)),
++        MemProfilerChan(memory_sender),
++        create_generic_embedder_proxy(),
++        None,
++        CACertificates::Default,
++        false, /* ignore_certificate_errors */
++        Arc::new(ProtocolRegistry::with_internal_protocols()),
++    );
++
++    let mut server = make_streaming_server(false, 1, STREAM_LENGTH, false);
++    let request = build_streaming_request(&server.url);
++    let controller = FetchController::new(request.id, false, resource_thread.clone());
++    let (sender, receiver) = unbounded();
++    fetch_async(
++        &resource_thread,
++        request,
++        None,
++        Box::new(move |message| {
++            let _ = sender.send(message);
++        }),
++    );
++
++    let mut verifier = StreamVerifier::default();
++    let receive = |verifier: &mut StreamVerifier| loop {
++        match receiver.recv_timeout(Duration::from_secs(10)).unwrap() {
++            FetchResponseMsg::ProcessResponseChunk(_, chunk) => {
++                verifier.verify(&chunk);
++                return false;
++            },
++            FetchResponseMsg::ProcessResponseEOF(_, result, _) => {
++                assert!(result.is_ok());
++                return true;
++            },
++            _ => {},
++        }
++    };
++    while verifier.received < STREAM_CHUNK_SIZE {
++        assert!(!receive(&mut verifier));
++    }
++    controller.suspend();
++    // Net handles messages from the fetch thread in order, so it handled the suspension once a
++    // later fetch has ended.
++    assert_eq!(fetch_data_url(&resource_thread), b"data");
++    server.release(0);
++    assert!(wait_for_plateau(&server.sent[0]) < STREAM_LENGTH);
++    assert_eq!(verifier.received, STREAM_CHUNK_SIZE);
++
++    controller.resume();
++    while !receive(&mut verifier) {}
++    assert!(verifier.is_intact(STREAM_LENGTH));
++
++    // After the end, both do nothing: no message arrives and net keeps working.
++    controller.suspend();
++    controller.resume();
++    controller.suspend();
++    assert_eq!(fetch_data_url(&resource_thread), b"data");
++    assert!(receiver.try_recv().is_err());
++
++    let _ = server.server.close();
++    let (exit_sender, exit_receiver) = generic_channel::oneshot().unwrap();
++    resource_thread
++        .send(CoreResourceMsg::Exit(exit_sender))
++        .unwrap();
++    exit_receiver.recv().unwrap();
++}
+diff --git a/components/net/tests/main.rs b/components/net/tests/main.rs
+index 64127188cc4..f5a062bc970 100644
+--- a/components/net/tests/main.rs
++++ b/components/net/tests/main.rs
+@@ -123,6 +123,7 @@ fn create_http_state(fc: Option<GenericEmbedderProxy<NetToEmbedderMsg>>) -> Http
+         )),
+         override_manager,
+         embedder_proxy: fc.unwrap_or_else(|| create_generic_embedder_proxy()),
++        suspended_fetches: Default::default(),
+     }
+ }
+ 
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 86fbbd69d44..449534dea73 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -4208,8 +4208,8 @@ pub(crate) struct HTMLMediaElementFetchContext {
+     origin_clean: bool,
+     /// The buffered data source which to be processed by media backend.
+     data_source: RefCell<BufferedDataSource>,
+-    /// Fetch controller. Allows cancelling the current fetch request by
+-    /// manually calling its .cancel() method or automatically on Drop.
++    /// Fetch controller. Allows aborting the current fetch request with its abort()
++    /// method. Dropping it does not cancel the fetch.
+     fetch_controller: FetchController,
+ }
+ 
+diff --git a/components/shared/net/fetch/fetch_controller.rs b/components/shared/net/fetch/fetch_controller.rs
+index a17b1e20d13..accb3c4e1dc 100644
+--- a/components/shared/net/fetch/fetch_controller.rs
++++ b/components/shared/net/fetch/fetch_controller.rs
+@@ -5,7 +5,7 @@
+ use malloc_size_of_derive::MallocSizeOf;
+ 
+ use crate::request::RequestId;
+-use crate::{CoreResourceThread, cancel_async_fetch};
++use crate::{CoreResourceThread, cancel_async_fetch, resume_async_fetch, suspend_async_fetch};
+ 
+ /// <https://fetch.spec.whatwg.org/#fetch-controller-state>
+ #[derive(Default, MallocSizeOf, PartialEq)]
+@@ -63,6 +63,34 @@ impl FetchController {
+         }
+     }
+ 
++    /// Ask to stop reading the response body until [`Self::resume`] is called, so that flow
++    /// control holds back the server. Data that was already received is still delivered.
++    ///
++    /// This is advisory, so the body may keep arriving: net ignores it when the body is not
++    /// being read from the network (cache hits, other schemes, after the end), and when two
++    /// fetches to the origin of the request are suspended already.
++    ///
++    /// A fetch that stays suspended for longer than the `network_fetch_suspend_timeout_ms` pref
++    /// ends with [`NetworkError::ConnectionFailure`](crate::NetworkError::ConnectionFailure),
++    /// which cannot be told apart from a lost connection. A consumer that suspended a fetch
++    /// should restart it after such an error, for example with a Range request for the rest.
++    pub fn suspend(&self) {
++        if let (Some(request_id), Some(core_resource_thread)) =
++            (self.request_id, &self.core_resource_thread)
++        {
++            suspend_async_fetch(request_id, core_resource_thread);
++        }
++    }
++
++    /// Continue reading a response body that [`Self::suspend`] stopped.
++    pub fn resume(&self) {
++        if let (Some(request_id), Some(core_resource_thread)) =
++            (self.request_id, &self.core_resource_thread)
++        {
++            resume_async_fetch(request_id, core_resource_thread);
++        }
++    }
++
+     /// Use this if you don't want it to send a cancellation request
+     /// on drop (e.g. if the fetch completes)
+     pub fn ignore(&mut self) {
+diff --git a/components/shared/net/lib.rs b/components/shared/net/lib.rs
+index 5b4addfe210..2352705f316 100644
+--- a/components/shared/net/lib.rs
++++ b/components/shared/net/lib.rs
+@@ -762,6 +762,10 @@ pub enum FetchChannels {
+ pub enum CoreResourceMsg {
+     Fetch(RequestBuilder, FetchChannels),
+     Cancel(Vec<RequestId>),
++    /// Stop reading the response body of a request from the network until it is resumed.
++    Suspend(RequestId),
++    /// Continue reading the response body of a suspended request.
++    Resume(RequestId),
+     /// Initiate a fetch in response to processing a redirection
+     FetchRedirect(
+         RequestBuilder,
+@@ -886,6 +890,8 @@ impl CacheEntryDescriptor {
+ #[expect(clippy::large_enum_variant)]
+ enum ToFetchThreadMessage {
+     Cancel(Vec<RequestId>, CoreResourceThread),
++    Suspend(RequestId, CoreResourceThread),
++    Resume(RequestId, CoreResourceThread),
+     StartFetch(
+         /* request_builder */ RequestBuilder,
+         /* response_init */ Option<ResponseInit>,
+@@ -1001,6 +1007,12 @@ impl FetchThread {
+                     // during this time.
+                     let _ = core_resource_thread.send(CoreResourceMsg::Cancel(request_ids));
+                 },
++                Ok(ToFetchThreadMessage::Suspend(request_id, core_resource_thread)) => {
++                    let _ = core_resource_thread.send(CoreResourceMsg::Suspend(request_id));
++                },
++                Ok(ToFetchThreadMessage::Resume(request_id, core_resource_thread)) => {
++                    let _ = core_resource_thread.send(CoreResourceMsg::Resume(request_id));
++                },
+                 Ok(ToFetchThreadMessage::Exit) | Err(_) => break,
+             }
+         }
+@@ -1031,6 +1043,12 @@ impl FetchThread {
+         }
+     }
+ 
++    fn send_if_running(message: ToFetchThreadMessage) {
++        if let Some(fetch_thread) = FETCH_THREAD.get() {
++            let _ = fetch_thread.sender.send(message);
++        }
++    }
++
+     /// If the `FetchThread` is running, send the exit message and wait for it to exit.
+     pub fn exit() {
+         let Some(fetch_thread) = FETCH_THREAD.get() else {
+@@ -1068,6 +1086,24 @@ pub fn cancel_async_fetch(request_ids: Vec<RequestId>, core_resource_thread: &Co
+     FetchThread::cancel_async_fetch(request_ids, core_resource_thread);
+ }
+ 
++/// Instruct the resource thread to stop reading the response body of a request until
++/// [`resume_async_fetch`] is called. See [`fetch::fetch_controller::FetchController::suspend`].
++pub fn suspend_async_fetch(request_id: RequestId, core_resource_thread: &CoreResourceThread) {
++    FetchThread::send_if_running(ToFetchThreadMessage::Suspend(
++        request_id,
++        core_resource_thread.clone(),
++    ));
++}
++
++/// Instruct the resource thread to continue reading the response body of a request
++/// suspended by [`suspend_async_fetch`].
++pub fn resume_async_fetch(request_id: RequestId, core_resource_thread: &CoreResourceThread) {
++    FetchThread::send_if_running(ToFetchThreadMessage::Resume(
++        request_id,
++        core_resource_thread.clone(),
++    ));
++}
++
+ #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+ pub struct ResourceCorsData {
+     /// CORS Preflight flag

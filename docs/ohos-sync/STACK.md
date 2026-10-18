@@ -115,6 +115,12 @@ those scripts (they need network access). `check_stack.py` runs each with
 89. `script: Set the duration of an infinite media stream when it ends` — B · manual · watch: -
 90. `servoshell: Drop an unmet lint expectation of the embedded app` — B · manual · watch: -
 91. `docs: record patches 79 to 91 in the stack manifest` — B · none · watch: -
+92. `net: Allow a fetch to be suspended and resumed` — B · CI · watch: components/net/connector.rs
+93. `media (ohos): Refuse data that the playback buffer cannot take` — B · manual · watch: components/script/dom/html/embedded_content/htmlmediaelement.rs
+94. `net: Report whether a fetch was suspended` — B · CI · watch: -
+95. `script: Suspend a media fetch instead of cancelling it when the player is full` — B · manual · watch: components/media/backends/gstreamer/player.rs components/media/backends/ohos/player.rs components/shared/net/fetch/fetch_controller.rs
+96. `script: Cancel a suspended media fetch that nothing might resume` — B · manual · watch: components/shared/net/fetch/fetch_controller.rs
+97. `docs: record patches 92 to 97 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

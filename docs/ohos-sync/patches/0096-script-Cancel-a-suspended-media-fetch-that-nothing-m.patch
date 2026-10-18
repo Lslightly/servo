@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Sat, 17 Oct 2026 06:16:42 +0000
+Subject: [PATCH] script: Cancel a suspended media fetch that nothing might
+ resume
+
+A media element resumes a suspended fetch only once its player needs
+data again, and nothing cancels a fetch when its fetch context is
+dropped. A suspended fetch that nothing resumes holds its connection,
+and up to an HTTP/2 stream window in net, until net gives up on it. The
+fetch listener keeps the element alive while its fetch runs, so it is
+not collected meanwhile either.
+
+The fetch context goes away, or its fetch is left alone, on these
+paths:
+- a fetch that replaces it, after a seek or a restart, cancels it;
+- the load algorithm, run by load() and a new src or srcObject, cancels
+  it, and so do the failure and fatal steps;
+- the element cannot be collected while its fetch runs;
+- an element that is paused outside a document, after it was removed
+  from its document or because it was never inserted, as with
+  new Audio(), might never need data again;
+- a document that is no longer fully active, such as one navigated away
+  from and kept in the session history, has its timers and media
+  suspended;
+- aborting a document, on a navigation, window.stop(), document.open()
+  or when the document is destroyed, terminates its fetch group, which
+  cancels the fetch but leaves the element waiting for it to resume;
+- when the pipeline exits, nothing cancels the fetch.
+
+Do not suspend the fetch of an element that is paused outside a
+document, or whose document is not fully active; back off as before.
+Cancel a suspended fetch, to restart it once the player needs data
+again, when its element is paused outside a document, which the steps
+for a removed element do, and when its document is aborted, stops
+being fully active or exits; for these, the document keeps weak
+references to the media elements that suspended their fetch. Also
+cancel a fetch that is still running when its fetch context is
+dropped. A fetch whose response ended is marked as such when the
+element handles the end, so that none of these cancellations send
+anything for it; if the end was not handled, because the element had
+moved on to another load or lost its player, dropping the context sends
+one cancellation, which net ignores.
+
+Fork note: meant for upstream. Drop once upstream has it.
+
+Testing: no test; a fetch is only suspended once the 50 MiB queue of the
+GStreamer player is full. See Validation.
+
+Validation: the setup of the previous patch. A suspended element removed from its document 6 s into the load: the server sees the connection closed at 6.0 s, with or without range support; without this patch, on an earlier revision of the previous patch, at 33.5 s through the timeout with range support, and only when servoshell exited without. A suspended element whose load() runs with another src, and a document that navigates away, close it at 6.0 s. `./mach test-wpt --release --processes 6 --timeout-multiplier 2` html/semantics/embedded-content/media-elements, the-video-element and html/canvas/element/manual/drawing-images-to-the-canvas with the series: 451 tests, 446 as expected; the other five behave the same on the parent commit of the series when run alone: autoplay-default-permissions-policy.https.sub.html passes where a timeout is expected (3/3 on both), media_fragment_seek.html fails a subtest (3/3 on both), src_object_blob.html times out 1 of 3 runs on both, video_timeupdate_on_seek.html passes a subtest that is expected to time out, and load-removes-queued-error-event.html hangs intermittently because GStreamer never reports the metadata of the 539-byte sound_0.mp3 (3 of 8 runs with the series, 4 of 8 without, alternating). `./mach check --ohos` passes at each commit; `./mach test-tidy` reports only the known rustls advisories.
+AI-assisted: Yes (agent session; implemented, tested and measured by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ components/script/dom/document/document.rs    | 28 +++++++++++-
+ .../html/embedded_content/htmlmediaelement.rs | 44 ++++++++++++++++++-
+ components/script/event_loop/script_thread.rs |  2 +
+ 3 files changed, 72 insertions(+), 2 deletions(-)
+
+diff --git a/components/script/dom/document/document.rs b/components/script/dom/document/document.rs
+index 8ad87a2de4f..ac52c4c78d2 100644
+--- a/components/script/dom/document/document.rs
++++ b/components/script/dom/document/document.rs
+@@ -181,7 +181,7 @@ use crate::dom::html::htmlheadelement::HTMLHeadElement;
+ use crate::dom::html::htmlhtmlelement::HTMLHtmlElement;
+ use crate::dom::html::htmliframeelement::HTMLIFrameElement;
+ use crate::dom::html::htmlimageelement::HTMLImageElement;
+-use crate::dom::html::htmlmediaelement::HTMLMediaElement;
++use crate::dom::html::htmlmediaelement::{HTMLMediaElement, MediaElementWeakRef};
+ use crate::dom::html::htmlscriptelement::{HTMLScriptElement, ScriptResult};
+ use crate::dom::html::htmltitleelement::HTMLTitleElement;
+ use crate::dom::htmldetailselement::DetailsNameGroups;
+@@ -625,6 +625,8 @@ pub(crate) struct Document {
+     /// document is, even if script holds no reference to them.
+     /// <https://html.spec.whatwg.org/multipage/#playing-the-media-resource>
+     media_elements_with_pending_activity: DomRefCell<Vec<Dom<HTMLMediaElement>>>,
++    /// The media elements that suspended their fetch, some of which may have resumed it since.
++    media_elements_with_suspended_fetch: DomRefCell<Vec<MediaElementWeakRef>>,
+     /// A set of dirty HTML canvas elements that need their WebRender images updated the
+     /// next time the rendering is updated.
+     dirty_canvases: DomRefCell<Vec<Dom<HTMLCanvasElement>>>,
+@@ -1154,6 +1156,7 @@ impl Document {
+                 self.window().suspend(cx);
+             }
+             media.suspend(&client_context_id);
++            self.cancel_suspended_media_fetches();
+             return;
+         }
+ 
+@@ -3054,6 +3057,7 @@ impl Document {
+         self.deferred_scripts.clear();
+ 
+         let global = self.window.as_global_scope();
++        self.cancel_suspended_media_fetches();
+         let loads_cancelled = global.fetch_group_mut().terminate(global);
+         let event_sources_canceled = global.close_event_sources();
+ 
+@@ -3323,6 +3327,27 @@ impl Document {
+             .retain(|registered| **registered != *element);
+     }
+ 
++    pub(crate) fn register_media_element_with_suspended_fetch(&self, element: &HTMLMediaElement) {
++        let mut elements = self.media_elements_with_suspended_fetch.borrow_mut();
++        // `element` registers while it borrows its fetch context, so it is compared first, which
++        // keeps `has_suspended_fetch` from borrowing that context again.
++        elements.retain(|registered| {
++            registered.root().is_some_and(|registered| {
++                *registered != *element && registered.has_suspended_fetch()
++            })
++        });
++        elements.push(MediaElementWeakRef::new(element));
++    }
++
++    /// Cancels the suspended fetches of media elements, which restart once their player needs
++    /// data again, so that a document that nothing might resume them in holds no connections.
++    pub(crate) fn cancel_suspended_media_fetches(&self) {
++        let elements = std::mem::take(&mut *self.media_elements_with_suspended_fetch.borrow_mut());
++        for element in elements.iter().filter_map(MediaElementWeakRef::root) {
++            element.cancel_suspended_fetch();
++        }
++    }
++
+     pub(crate) fn mark_canvas_as_dirty(&self, canvas: &Dom<HTMLCanvasElement>) {
+         let mut dirty_canvases = self.dirty_canvases.borrow_mut();
+         if dirty_canvases
+@@ -4333,6 +4358,7 @@ impl Document {
+             shadow_roots_styles_changed: Cell::new(false),
+             media_controls: DomRefCell::new(HashMap::new()),
+             media_elements_with_pending_activity: Default::default(),
++            media_elements_with_suspended_fetch: Default::default(),
+             dirty_canvases: DomRefCell::new(Default::default()),
+             has_pending_animated_image_update: Cell::new(false),
+             selection: MutNullableDom::new(None),
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index b958197a7c2..3f3bdfaafdc 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -1017,6 +1017,10 @@ impl HTMLMediaElement {
+                 .set(self.current_playback_position.get());
+         }
+ 
++        if !self.upcast::<Node>().is_connected() {
++            self.cancel_suspended_fetch();
++        }
++
+         self.update_media_state();
+     }
+ 
+@@ -2110,6 +2114,31 @@ impl HTMLMediaElement {
+         }
+     }
+ 
++    /// Cancels the current fetch if it is suspended, to restart it once the player needs data
++    /// again, for when nothing might resume it.
++    pub(crate) fn cancel_suspended_fetch(&self) {
++        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() &&
++            current_fetch_context.is_suspended()
++        {
++            self.cancel_to_restart(current_fetch_context);
++        }
++    }
++
++    pub(crate) fn has_suspended_fetch(&self) -> bool {
++        self.current_fetch_context
++            .borrow()
++            .as_ref()
++            .is_some_and(HTMLMediaElementFetchContext::is_suspended)
++    }
++
++    /// Whether the fetch may be suspended rather than cancelled when the player has enough data.
++    /// Nothing might resume the fetch of an element that is paused outside a document, or in a
++    /// document that is not fully active.
++    fn may_suspend_fetch(&self) -> bool {
++        self.owner_document().is_fully_active() &&
++            (self.upcast::<Node>().is_connected() || !self.Paused())
++    }
++
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
+     /// > When a media element's download has been suspended, the user agent must queue a media
+     /// > element task given the media element to set the networkState to NETWORK_IDLE and fire
+@@ -2145,6 +2174,8 @@ impl HTMLMediaElement {
+             return;
+         };
+         current_fetch_context.suspend(Some(reply));
++        self.owner_document()
++            .register_media_element_with_suspended_fetch(self);
+     }
+ 
+     /// Backs off as a fetch that cannot be suspended does, for a fetch that net did not suspend.
+@@ -4530,7 +4561,7 @@ impl HTMLMediaElementFetchContext {
+             return;
+         }
+         self.data_source.borrow().set_locked(true);
+-        if self.from_network {
++        if self.from_network && element.may_suspend_fetch() {
+             element.suspend_fetch(self);
+         } else if self.is_seekable {
+             element.cancel_to_restart(self);
+@@ -4549,6 +4580,7 @@ impl HTMLMediaElementFetchContext {
+     /// Marks the response as complete, which also ends a suspension.
+     fn end(&mut self) {
+         self.suspension = None;
++        self.fetch_controller.ignore();
+     }
+ 
+     fn cancel(&mut self, reason: CancelReason) {
+@@ -4566,6 +4598,16 @@ impl HTMLMediaElementFetchContext {
+     }
+ }
+ 
++impl Drop for HTMLMediaElementFetchContext {
++    fn drop(&mut self) {
++        // Nothing else cancels a fetch that is still running, and a suspended one holds its
++        // connection until net gives up on it.
++        if self.cancel_reason.is_none() {
++            self.fetch_controller.abort();
++        }
++    }
++}
++
+ struct HTMLMediaElementFetchListener {
+     /// The element that initiated the request.
+     element: Trusted<HTMLMediaElement>,
+diff --git a/components/script/event_loop/script_thread.rs b/components/script/event_loop/script_thread.rs
+index a6e130f38b2..00d817a40be 100644
+--- a/components/script/event_loop/script_thread.rs
++++ b/components/script/event_loop/script_thread.rs
+@@ -3232,6 +3232,8 @@ impl ScriptThread {
+                 parser.abort(cx, AbortReason::PipelineExited);
+             }
+ 
++            document.cancel_suspended_media_fetches();
++
+             if !document.window_detached() {
+                 debug!("{pipeline_id}: Shutting down layout");
+                 document.window().layout_mut().exit_now();
