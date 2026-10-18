@@ -292,7 +292,7 @@ pub(crate) struct HTMLMediaElement {
     /// Time of last timeupdate notification.
     next_timeupdate_event: Cell<Instant>,
     /// The reader of the media resource in the media cache, if the element reads one.
-    #[ignore_malloc_size_of = "The media data is in the media cache, which is not reported yet"]
+    #[ignore_malloc_size_of = "The media data is in the media cache, which reports it itself"]
     #[no_trace]
     media_reader: DomRefCell<Option<Box<MediaResourceReader>>>,
     /// Identifies the reader that the element opened last.

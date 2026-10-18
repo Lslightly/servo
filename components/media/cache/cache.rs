@@ -1801,11 +1801,6 @@ impl State {
         self.schedule_all();
     }
 
-    /// The bytes of RAM that the blocks use, for memory reports.
-    pub(crate) fn blocks(&self) -> impl Iterator<Item = &Block> {
-        self.resources.values().flat_map(|res| res.blocks.values())
-    }
-
     #[cfg(test)]
     pub(crate) fn resource(&self, key: &ResourceKey) -> Option<&Resource> {
         self.resources.get(self.by_key.get(key)?)
