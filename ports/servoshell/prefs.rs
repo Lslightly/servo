@@ -843,8 +843,8 @@ fn test_parse_pref_from_command_line() {
     assert_eq!(preferences.layout_threads, 42);
 
     // Test with unsigned numbers
-    let preferences = test_parse_pref("network_http_cache_size=50");
-    assert_eq!(preferences.network_http_cache_size, 50);
+    let preferences = test_parse_pref("network_http_memory_cache_size=50");
+    assert_eq!(preferences.network_http_memory_cache_size, 50);
     let preferences = test_parse_pref("network_connection_timeout=30");
     assert_eq!(preferences.network_connection_timeout, 30);
 

@@ -44,7 +44,7 @@ use net_traits::FetchTaskTarget;
 use net_traits::blob_url_store::BlobTokenCommunicator;
 use net_traits::filemanager_thread::FileTokenCheck;
 use net_traits::request::Request;
-use net_traits::response::Response;
+use net_traits::response::{Response, ResponseBody};
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use servo_url::{ImmutableOrigin, ServoUrl};
@@ -54,6 +54,10 @@ const DEFAULT_USER_AGENT: &'static str = "Such Browser. Very Layout. Wow.";
 
 struct FetchResponseCollector {
     sender: Option<tokio::sync::oneshot::Sender<Response>>,
+    /// Bodies are streamed to the consumer and not retained by the net process, so
+    /// the chunks are collected here and put back on the response, which lets the
+    /// tests keep asserting against `Response::body`.
+    body: Vec<u8>,
 }
 
 fn create_embedder_proxy_and_receiver() -> (EmbedderProxy, Receiver<EmbedderMsg>) {
@@ -153,10 +157,17 @@ fn new_fetch_context(
 impl FetchTaskTarget for FetchResponseCollector {
     fn process_request_body(&mut self, _: &Request) {}
     fn process_response(&mut self, _: &Request, _: &Response) {}
-    fn process_response_chunk(&mut self, _: &Request, _: bytes::Bytes) {}
+    fn process_response_chunk(&mut self, _: &Request, chunk: bytes::Bytes) {
+        self.body.extend_from_slice(&chunk);
+    }
     /// Fired when the response is fully fetched
     fn process_response_eof(&mut self, _: &Request, response: &Response) {
-        let _ = self.sender.take().unwrap().send(response.clone());
+        let response = response.clone();
+        let body = &response.actual_response().body;
+        if matches!(&*body.lock(), ResponseBody::Streamed) {
+            *body.lock() = ResponseBody::Done(std::mem::take(&mut self.body));
+        }
+        let _ = self.sender.take().unwrap().send(response);
     }
     fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
 
@@ -167,6 +178,7 @@ fn fetch_with_context(request: Request, mut context: &mut FetchContext) -> Respo
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let mut target = FetchResponseCollector {
         sender: Some(sender),
+        body: Vec::new(),
     };
     spawn_blocking_task(async move {
         methods::fetch(request, &mut target, &mut context).await;
@@ -178,6 +190,7 @@ fn fetch_with_cors_cache(request: Request, cache: &mut CorsCache) -> Response {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let mut target = FetchResponseCollector {
         sender: Some(sender),
+        body: Vec::new(),
     };
     let mut fetch_context = new_fetch_context(None, None);
     // Pre-seed the shared CORS cache in the context, then read it back after.

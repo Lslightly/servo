@@ -148,7 +148,12 @@ fn apply_algorithm_to_response(
         let response_digest = digest::digest(algorithm, vec);
         base64::engine::general_purpose::STANDARD.encode(response_digest)
     } else {
-        unreachable!("Tried to calculate digest of incomplete response body")
+        // There is nothing to digest: a null body status leaves the body empty, and
+        // a streamed body is delivered to the consumer rather than retained. Return
+        // a digest that cannot match, so the integrity check fails rather than the
+        // process.
+        log::debug!("integrity check on a response with no retained body");
+        String::new()
     }
 }
 

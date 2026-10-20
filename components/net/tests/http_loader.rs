@@ -172,17 +172,26 @@ pub fn expect_devtools_http_response(
     }
 }
 
+/// Bodies are streamed rather than accumulated by the net process, so the devtools
+/// notification carrying the whole body is the one sent once the last chunk has been
+/// delivered. Several body-less notifications precede it.
 pub fn devtools_response_with_body(
     devtools_port: &Receiver<DevtoolsControlMsg>,
 ) -> DevtoolsHttpResponse {
-    let devhttpresponses = vec![
-        expect_devtools_http_response(devtools_port),
-        expect_devtools_http_response(devtools_port),
-    ];
-    return devhttpresponses
-        .into_iter()
-        .find(|resp| resp.body.is_some())
-        .expect("One of the responses should have a body");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while let Ok(message) = devtools_port.recv_deadline(deadline) {
+        let DevtoolsControlMsg::FromChrome(ChromeToDevtoolsControlMsg::NetworkEvent(
+            _,
+            NetworkEvent::HttpResponse(response),
+        )) = message
+        else {
+            continue;
+        };
+        if response.body.is_some() {
+            return response;
+        }
+    }
+    panic!("One of the responses should have a body");
 }
 
 #[test]
@@ -2246,7 +2255,7 @@ fn test_large_media_response_is_neither_kept_nor_stored() {
         assert_eq!(body_length, LENGTH);
         assert!(matches!(
             &*response.actual_response().body.lock(),
-            ResponseBody::Done(body) if body.is_empty()
+            ResponseBody::Streamed
         ));
         assert_eq!(request_count.load(Ordering::SeqCst), expected_request_count);
     }
@@ -2348,6 +2357,71 @@ fn test_truncated_response_is_not_served_from_cache() {
     let _ = server.close();
 }
 
+fn gzip(body: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// A server that answers with `body` as gzip, cacheable, and counts its requests.
+fn make_gzip_server(body: Vec<u8>) -> (net::test_util::Server, UrlWithBlobClaim, Arc<AtomicUsize>) {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_clone = request_count.clone();
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            request_count_clone.fetch_add(1, Ordering::SeqCst);
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("max-age=3600"),
+            );
+            response
+                .headers_mut()
+                .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            *response.body_mut() = make_body(body.clone());
+        };
+    let (server, url) = make_server(handler);
+    (server, url, request_count)
+}
+
+#[test]
+fn test_compressed_response_is_answered_from_cache() {
+    let (server, url, request_count) = make_gzip_server(gzip(b"compressed content"));
+    let mut context = new_fetch_context(None, None);
+
+    for from_cache in [false, true] {
+        let response = fetch_with_context(build_cacheable_request(&url), &mut context);
+        assert_eq!(
+            matches!(response.cache_state, CacheState::Local),
+            from_cache
+        );
+        assert_eq!(
+            *response.actual_response().body.lock(),
+            ResponseBody::Done(b"compressed content".to_vec())
+        );
+    }
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+    let _ = server.close();
+}
+
+#[test]
+fn test_compressed_response_cut_short_is_not_stored() {
+    // Without the gzip trailer, but with a Content-Length that matches what is sent.
+    let mut body = gzip(b"compressed content");
+    body.truncate(body.len() - 8);
+    let (server, url, request_count) = make_gzip_server(body);
+    let mut context = new_fetch_context(None, None);
+
+    let response = fetch_with_context(build_cacheable_request(&url), &mut context);
+    assert!(response.is_network_error());
+    let response = fetch_with_context(build_cacheable_request(&url), &mut context);
+    assert!(matches!(response.cache_state, CacheState::None));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+    let _ = server.close();
+}
+
 #[test]
 fn test_cancelled_response_is_removed_from_cache() {
     let handler =
@@ -2396,7 +2470,6 @@ fn test_cancelled_response_is_removed_from_cache() {
         stored_response_count(&context, &build_cacheable_request(&url)),
         0
     );
-    assert_eq!(context.state.http_cache.len(), 0);
 
     let _ = server.close();
 }
@@ -2439,13 +2512,16 @@ fn wait_for_fetch<T>(mut receiver: tokio::sync::oneshot::Receiver<T>) -> T {
     }
 }
 
-fn awaiting_consumer_count(context: &FetchContext, request: &Request) -> usize {
-    spawn_blocking_task(context.state.http_cache.awaiting_consumer_count(request))
+fn waiting_fetch_count(context: &FetchContext, request: &Request) -> Option<usize> {
+    context.state.http_cache.waiting_fetch_count(request)
 }
 
-/// A cacheable server whose first response sends `comp`, then `lete` once the returned sender
-/// fires; later responses send `complete` at once.
-fn make_held_server() -> (
+/// A server whose responses carry `cache_control`, and `Vary: vary` if given. The first sends
+/// `comp`, then `lete` once the returned sender fires; later responses send `complete` at once.
+fn make_held_server(
+    cache_control: &'static str,
+    vary: Option<&'static str>,
+) -> (
     net::test_util::Server,
     UrlWithBlobClaim,
     tokio::sync::oneshot::Sender<()>,
@@ -2461,8 +2537,13 @@ fn make_held_server() -> (
             request_count_clone.fetch_add(1, Ordering::SeqCst);
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
-                HeaderValue::from_static("max-age=3600"),
+                HeaderValue::from_static(cache_control),
             );
+            if let Some(vary) = vary {
+                response
+                    .headers_mut()
+                    .insert(header::VARY, HeaderValue::from_static(vary));
+            }
             *response.body_mut() = match release.lock().take() {
                 Some(release) => {
                     let first = stream::iter([Ok(Frame::data(Bytes::from_static(b"comp")))]);
@@ -2480,17 +2561,211 @@ fn make_held_server() -> (
 }
 
 #[test]
+fn test_fetch_does_not_wait_for_the_headers_of_another_fetch() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = UrlWithBlobClaim::new(
+        ServoUrl::parse(&format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().unwrap().port()
+        ))
+        .unwrap(),
+        None,
+    );
+    let (release_sender, release) = std::sync::mpsc::channel::<()>();
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_clone = request_count.clone();
+    std::thread::spawn(move || {
+        let accept = || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0; 1024];
+                let length = stream.read(&mut buffer).unwrap();
+                assert!(length > 0);
+                request.extend_from_slice(&buffer[..length]);
+            }
+            request_count_clone.fetch_add(1, Ordering::SeqCst);
+            stream
+        };
+        let respond = |mut stream: std::net::TcpStream| {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nCache-Control: max-age=3600\r\n\
+                      Content-Length: 8\r\n\r\ncomplete",
+                )
+                .unwrap();
+        };
+        // Hold the headers of the first response until the test releases them.
+        let first = accept();
+        respond(accept());
+        let _ = release.recv();
+        respond(first);
+    });
+    let context = new_fetch_context(None, None);
+
+    let first_fetch = start_fetch(build_cacheable_request(&url), context.clone());
+    wait_until(|| request_count.load(Ordering::SeqCst) == 1);
+    let (response, body_length) =
+        wait_for_fetch(start_fetch(build_cacheable_request(&url), context.clone()));
+    assert_eq!(body_length, b"complete".len());
+    assert!(matches!(response.cache_state, CacheState::None));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+    let _ = release_sender.send(());
+    let _ = wait_for_fetch(first_fetch);
+}
+
+#[test]
+fn test_fetch_does_not_wait_for_a_response_that_needs_validation() {
+    let (server, url, release, request_count) = make_held_server("no-cache", None);
+    let context = new_fetch_context(None, None);
+
+    let _first_fetch = start_fetch(build_cacheable_request(&url), context.clone());
+    wait_until(|| request_count.load(Ordering::SeqCst) == 1);
+    let (response, body_length) =
+        wait_for_fetch(start_fetch(build_cacheable_request(&url), context.clone()));
+    assert_eq!(body_length, b"complete".len());
+    assert!(matches!(response.cache_state, CacheState::None));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+    let _ = release.send(());
+    let _ = server.close();
+}
+
+#[test]
+fn test_a_waiting_fetch_stops_waiting_when_it_is_cancelled() {
+    let (server, url, release, request_count) = make_held_server("max-age=3600", None);
+    let context = new_fetch_context(None, None);
+    context
+        .state
+        .http_cache
+        .set_wait_timeout_for_test(Duration::from_secs(60));
+    let waiting_context = with_new_listener(&context);
+    let request = build_cacheable_request(&url);
+
+    let _first_fetch = start_fetch(build_cacheable_request(&url), context.clone());
+    wait_until(|| waiting_fetch_count(&context, &request) == Some(0));
+    let _waiting_fetch = start_fetch(build_cacheable_request(&url), waiting_context.clone());
+    wait_until(|| waiting_fetch_count(&context, &request) == Some(1));
+    waiting_context.cancellation_listener.cancel();
+
+    // It goes on as any cancelled fetch does, instead of waiting for the other one.
+    wait_until(|| request_count.load(Ordering::SeqCst) == 2);
+    assert_eq!(waiting_fetch_count(&context, &request), Some(0));
+
+    let _ = release.send(());
+    let _ = server.close();
+}
+
+#[test]
+fn test_fetch_does_not_wait_for_a_response_that_varies_from_its_request() {
+    let (server, url, release, request_count) = make_held_server("max-age=3600", Some("x-variant"));
+    let context = new_fetch_context(None, None);
+    context
+        .state
+        .http_cache
+        .set_wait_timeout_for_test(Duration::from_secs(60));
+    let request_for_variant = |variant: &'static str| {
+        let mut request = build_cacheable_request(&url);
+        request
+            .headers
+            .insert("x-variant", HeaderValue::from_static(variant));
+        request
+    };
+
+    let _first_fetch = start_fetch(request_for_variant("a"), context.clone());
+    wait_until(|| waiting_fetch_count(&context, &request_for_variant("a")) == Some(0));
+    let (response, body_length) =
+        wait_for_fetch(start_fetch(request_for_variant("b"), context.clone()));
+    assert_eq!(body_length, b"complete".len());
+    assert!(matches!(response.cache_state, CacheState::None));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+    let _ = release.send(());
+    let _ = server.close();
+}
+
+#[test]
+fn test_fetch_does_not_wait_for_a_response_too_large_to_store() {
+    let context = new_fetch_context(None, None);
+    context
+        .state
+        .http_cache
+        .set_wait_timeout_for_test(Duration::from_secs(60));
+    let too_large = context.state.http_cache.max_entry_bytes_for_test() as usize + 1;
+    let (release_sender, release) = tokio::sync::oneshot::channel::<()>();
+    let release = Mutex::new(Some(release));
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_clone = request_count.clone();
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            request_count_clone.fetch_add(1, Ordering::SeqCst);
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("max-age=3600"),
+            );
+            // No `Content-Length`, so the size is only found out from the body.
+            *response.body_mut() = match release.lock().take() {
+                Some(release) => {
+                    let first = stream::iter([Ok(Frame::data(Bytes::from(vec![0; too_large])))]);
+                    let last = stream::once(async move {
+                        let _ = release.await;
+                        Ok(Frame::data(Bytes::from_static(b"end")))
+                    });
+                    StreamBody::new(futures::StreamExt::chain(first, last)).boxed()
+                },
+                None => make_body(b"complete".to_vec()),
+            };
+        };
+    let (server, url) = make_server(handler);
+
+    let _first_fetch = start_fetch(build_cacheable_request(&url), context.clone());
+    wait_until(|| request_count.load(Ordering::SeqCst) == 1);
+    let (response, body_length) =
+        wait_for_fetch(start_fetch(build_cacheable_request(&url), context.clone()));
+    assert_eq!(body_length, b"complete".len());
+    assert!(matches!(response.cache_state, CacheState::None));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+    let _ = release_sender.send(());
+    let _ = server.close();
+}
+
+#[test]
+fn test_a_waiting_fetch_goes_to_the_network_after_a_while() {
+    let (server, url, release, request_count) = make_held_server("max-age=3600", None);
+    let context = new_fetch_context(None, None);
+    context
+        .state
+        .http_cache
+        .set_wait_timeout_for_test(Duration::from_millis(200));
+    let request = build_cacheable_request(&url);
+
+    let _first_fetch = start_fetch(build_cacheable_request(&url), context.clone());
+    wait_until(|| waiting_fetch_count(&context, &request) == Some(0));
+    let (response, body_length) =
+        wait_for_fetch(start_fetch(build_cacheable_request(&url), context.clone()));
+    assert_eq!(body_length, b"complete".len());
+    assert!(matches!(response.cache_state, CacheState::None));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+    let _ = release.send(());
+    let _ = server.close();
+}
+
+#[test]
 fn test_fetch_waiting_for_an_aborted_response_uses_the_network() {
-    let (server, url, release, request_count) = make_held_server();
+    let (server, url, release, request_count) = make_held_server("max-age=3600", None);
     let context = new_fetch_context(None, None);
     let mut waiting_context = context.clone();
     waiting_context.cancellation_listener = Arc::new(Default::default());
     let request = build_cacheable_request(&url);
 
     let _first_fetch = start_fetch(build_cacheable_request(&url), context.clone());
-    wait_until(|| stored_response_count(&context, &request) == 1);
+    wait_until(|| waiting_fetch_count(&context, &request) == Some(0));
     let waiting_fetch = start_fetch(build_cacheable_request(&url), waiting_context);
-    wait_until(|| awaiting_consumer_count(&context, &request) == 1);
+    wait_until(|| waiting_fetch_count(&context, &request) == Some(1));
     context.cancellation_listener.cancel();
     let _ = release.send(());
 
@@ -2504,7 +2779,7 @@ fn test_fetch_waiting_for_an_aborted_response_uses_the_network() {
 
 #[test]
 fn test_fetch_waiting_for_a_response_whose_fetch_failed_is_woken_up() {
-    let (server, url, release, request_count) = make_held_server();
+    let (server, url, release, request_count) = make_held_server("max-age=3600", None);
     let context = new_fetch_context(None, None);
     let request = build_cacheable_request(&url);
     let mut request_with_wrong_integrity = build_cacheable_request(&url);
@@ -2512,9 +2787,9 @@ fn test_fetch_waiting_for_a_response_whose_fetch_failed_is_woken_up() {
         "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned();
 
     let failing_fetch = start_fetch(request_with_wrong_integrity, context.clone());
-    wait_until(|| stored_response_count(&context, &request) == 1);
+    wait_until(|| waiting_fetch_count(&context, &request) == Some(0));
     let waiting_fetch = start_fetch(build_cacheable_request(&url), context.clone());
-    wait_until(|| awaiting_consumer_count(&context, &request) == 1);
+    wait_until(|| waiting_fetch_count(&context, &request) == Some(1));
     let _ = release.send(());
 
     let (response, _) = wait_for_fetch(failing_fetch);
@@ -3012,11 +3287,11 @@ fn test_fetch_waiting_for_a_suspended_response_uses_the_network() {
     let request = build_streaming_request(&server.url).build();
     let producer = start_streaming_fetch(&server.url, context.clone());
     producer.wait_for_first_chunk();
-    assert_eq!(stored_response_count(&context, &request), 1);
+    assert_eq!(waiting_fetch_count(&context, &request), Some(0));
 
     // A fetch that waits for the stored body when its producer is suspended...
     let waiting = start_streaming_fetch(&server.url, with_new_listener(&context));
-    wait_until(|| awaiting_consumer_count(&context, &request) == 1);
+    wait_until(|| waiting_fetch_count(&context, &request) == Some(1));
     assert!(producer.listener.suspend());
     server.release(1);
     let (response, body) = waiting.wait_for_end();

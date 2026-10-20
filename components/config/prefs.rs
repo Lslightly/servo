@@ -387,9 +387,8 @@ pub struct Preferences {
     /// ends with a network error, so that it does not hold its connection forever.
     pub network_fetch_suspend_timeout_ms: u64,
     pub network_http_cache_disabled: bool,
-    /// The path to a disk cache file. Empty string disables the disk cache.
-    pub network_http_disk_cache: String,
-    /// Maximum size of the disk cache file in bytes.
+    /// Maximum size of the disk cache in bytes. Zero picks a size from the free
+    /// space of the volume the cache lives on.
     pub network_http_disk_cache_size: u64,
     /// A url for a http proxy. We treat an empty string as no proxy.
     pub network_http_proxy_uri: String,
@@ -399,9 +398,12 @@ pub struct Preferences {
     /// The exact behavior is given by
     /// <https://docs.rs/hyper-util/latest/hyper_util/client/proxy/matcher/struct.Builder.html#method.no>
     pub network_http_no_proxy: String,
-    /// The weight of the http memory cache
-    /// Notice that this is not equal to the number of different urls in the cache.
-    pub network_http_cache_size: u64,
+    /// Maximum size in bytes of an in-memory HTTP cache. Used for private browsing,
+    /// for temporary storage, and whenever no cache directory is available.
+    pub network_http_memory_cache_size: u64,
+    /// Responses larger than this are not cached at all. Zero derives it from the
+    /// cache's budget, which is what Chromium does.
+    pub network_http_cache_max_entry_size: u64,
     pub network_local_directory_listing_enabled: bool,
     /// Force the use of `rust-webpki` verification for CA roots. If this is false (the
     /// default), then `rustls-platform-verifier` will be used, except on Android where
@@ -634,12 +636,12 @@ impl Preferences {
             network_enforce_tls_onion: false,
             network_fetch_suspend_timeout_ms: 60000,
             network_http_cache_disabled: false,
-            network_http_disk_cache: String::new(),
-            network_http_disk_cache_size: 1024 * 1024 * 100, // Roughtly 100MB
+            network_http_disk_cache_size: 0,
             network_http_proxy_uri: String::new(),
             network_https_proxy_uri: String::new(),
             network_http_no_proxy: String::new(),
-            network_http_cache_size: 5000,
+            network_http_memory_cache_size: 16 * 1024 * 1024,
+            network_http_cache_max_entry_size: 0,
             network_local_directory_listing_enabled: true,
             network_use_webpki_roots: false,
             network_max_content_length: 5 * 1024 * 1024,

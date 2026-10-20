@@ -1355,6 +1355,183 @@ fn test_response_cache_status_is_validated() {
     let _ = server.close();
 }
 
+/// The body of a response from `fetch_with_context`.
+fn body_of(response: &Response) -> Vec<u8> {
+    match &*response.actual_response().body.lock() {
+        ResponseBody::Done(body) => body.clone(),
+        _ => panic!("the body is not complete"),
+    }
+}
+
+#[test]
+fn test_a_304_for_another_response_makes_the_request_again_without_preconditions() {
+    let preconditions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let preconditions_clone = preconditions.clone();
+    let handler =
+        move |request: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            let precondition = request.headers().get(header::IF_NONE_MATCH).cloned();
+            let mut preconditions = preconditions_clone.lock().unwrap();
+            preconditions.push(precondition.clone());
+            if let Some(precondition) = precondition {
+                // The first 304 carries a strong validator that is not the stored one's.
+                let etag = if precondition == "\"first\"" {
+                    "\"other\""
+                } else {
+                    "\"second\""
+                };
+                *response.status_mut() = StatusCode::NOT_MODIFIED;
+                response
+                    .headers_mut()
+                    .insert(header::ETAG, HeaderValue::from_static(etag));
+                return;
+            }
+            let (etag, body): (_, &[u8]) = if preconditions.len() == 1 {
+                ("\"first\"", b"first")
+            } else {
+                ("\"second\"", b"second")
+            };
+            response
+                .headers_mut()
+                .typed_insert(CacheControl::new().with_no_cache());
+            response
+                .headers_mut()
+                .insert(header::ETAG, HeaderValue::from_static(etag));
+            *response.body_mut() = make_body(body.to_vec());
+        };
+    let (server, url) = make_server(handler);
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .policy_container(Default::default())
+        .build();
+    let mut context = new_fetch_context(None, None);
+
+    let response = fetch_with_context(request.clone(), &mut context);
+    assert_eq!(body_of(&response), b"first");
+
+    let response = fetch_with_context(request.clone(), &mut context);
+    assert!(matches!(response.cache_state, CacheState::None));
+    assert_eq!(body_of(&response), b"second");
+
+    // The response of the unconditional request was stored.
+    let response = fetch_with_context(request, &mut context);
+    assert!(matches!(response.cache_state, CacheState::Validated));
+    assert_eq!(body_of(&response), b"second");
+    assert_eq!(
+        *preconditions.lock().unwrap(),
+        [
+            None,
+            Some(HeaderValue::from_static("\"first\"")),
+            None,
+            Some(HeaderValue::from_static("\"second\""))
+        ]
+    );
+
+    let _ = server.close();
+}
+
+#[test]
+fn test_a_304_resets_the_age_of_the_stored_response() {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_clone = request_count.clone();
+    let handler =
+        move |request: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            request_count_clone.fetch_add(1, Ordering::SeqCst);
+            if request.headers().typed_get::<IfNoneMatch>().is_some() {
+                *response.status_mut() = StatusCode::NOT_MODIFIED;
+                return;
+            }
+            response
+                .headers_mut()
+                .typed_insert(CacheControl::new().with_max_age(Duration::from_secs(60)));
+            response
+                .headers_mut()
+                .insert(header::AGE, HeaderValue::from_static("100"));
+            response
+                .headers_mut()
+                .typed_insert(ETag::from_str("\"1234abcd\"").unwrap());
+            *response.body_mut() = make_body(b"body".to_vec());
+        };
+    let (server, url) = make_server(handler);
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .policy_container(Default::default())
+        .build();
+    let mut context = new_fetch_context(None, None);
+    let age = |response: &Response| -> u64 {
+        response.headers[header::AGE]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+
+    let response = fetch_with_context(request.clone(), &mut context);
+    assert!(matches!(response.cache_state, CacheState::None));
+
+    // Older than its freshness lifetime, so validated.
+    let response = fetch_with_context(request.clone(), &mut context);
+    assert!(matches!(response.cache_state, CacheState::Validated));
+    assert!(
+        age(&response) < 60,
+        "the stored Age is that of the old response"
+    );
+
+    let response = fetch_with_context(request, &mut context);
+    assert!(matches!(response.cache_state, CacheState::Local));
+    assert_eq!(body_of(&response), b"body");
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+    let _ = server.close();
+}
+
+#[test]
+fn test_a_304_with_no_store_answers_once_and_removes_the_entry() {
+    let preconditions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let preconditions_clone = preconditions.clone();
+    let handler =
+        move |request: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            let precondition = request.headers().get(header::IF_NONE_MATCH).cloned();
+            preconditions_clone
+                .lock()
+                .unwrap()
+                .push(precondition.is_some());
+            if precondition.is_some() {
+                *response.status_mut() = StatusCode::NOT_MODIFIED;
+                response
+                    .headers_mut()
+                    .typed_insert(CacheControl::new().with_no_store());
+                return;
+            }
+            response
+                .headers_mut()
+                .typed_insert(CacheControl::new().with_no_cache());
+            response
+                .headers_mut()
+                .typed_insert(ETag::from_str("\"1234abcd\"").unwrap());
+            *response.body_mut() = make_body(b"body".to_vec());
+        };
+    let (server, url) = make_server(handler);
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .policy_container(Default::default())
+        .build();
+    let mut context = new_fetch_context(None, None);
+
+    let _ = fetch_with_context(request.clone(), &mut context);
+    let response = fetch_with_context(request.clone(), &mut context);
+    assert!(matches!(response.cache_state, CacheState::Validated));
+    assert_eq!(body_of(&response), b"body");
+
+    let response = fetch_with_context(request, &mut context);
+    assert!(matches!(response.cache_state, CacheState::None));
+    assert_eq!(*preconditions.lock().unwrap(), [false, true, false]);
+
+    let _ = server.close();
+}
+
 #[test]
 fn test_opaque_filtered_fetch_async_returns_complete_response() {
     static MESSAGE: &'static [u8] = b"";

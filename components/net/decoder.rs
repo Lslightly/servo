@@ -23,7 +23,7 @@ use std::pin::Pin;
 
 use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder};
 use bytes::Bytes;
-use futures::stream::Peekable;
+use futures::stream::{BoxStream, Peekable};
 use futures::task::{Context, Poll};
 use futures::{Future, Stream};
 use futures_util::StreamExt;
@@ -32,6 +32,8 @@ use http_body_util::BodyExt;
 use hyper::Response;
 use hyper::body::Body;
 use hyper::header::{CONTENT_ENCODING, HeaderValue, TRANSFER_ENCODING};
+use malloc_size_of_derive::MallocSizeOf;
+use serde::{Deserialize, Serialize};
 use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::io::StreamReader;
 
@@ -83,12 +85,38 @@ pub struct Decoder {
     inner: Inner,
 }
 
-#[derive(PartialEq)]
-enum DecoderType {
+/// The content codings the decoder understands. A cached body is stored exactly as
+/// received, so the coding it was received with is stored alongside it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub enum DecoderType {
     Gzip,
     Brotli,
     Deflate,
     Zstd,
+}
+
+impl DecoderType {
+    /// The coding named by a response's `Content-Encoding`/`Transfer-Encoding`, if
+    /// it is one the decoder understands.
+    pub fn detect(headers: &http::HeaderMap) -> Option<DecoderType> {
+        headers
+            .get_all(CONTENT_ENCODING)
+            .iter()
+            .chain(headers.get_all(TRANSFER_ENCODING).iter())
+            .find_map(|enc| {
+                if enc == HeaderValue::from_static("gzip") {
+                    Some(DecoderType::Gzip)
+                } else if enc == HeaderValue::from_static("br") {
+                    Some(DecoderType::Brotli)
+                } else if enc == HeaderValue::from_static("deflate") {
+                    Some(DecoderType::Deflate)
+                } else if enc == HeaderValue::from_static("zstd") {
+                    Some(DecoderType::Zstd)
+                } else {
+                    None
+                }
+            })
+    }
 }
 
 enum Inner {
@@ -124,7 +152,7 @@ impl Decoder {
     /// This decoder will emit the underlying bytes as-is.
     #[inline]
     fn plain_text(
-        body: BoxedBody,
+        body: BodySource,
         is_secure_scheme: bool,
         content_length: Option<ContentLength>,
     ) -> Decoder {
@@ -138,7 +166,7 @@ impl Decoder {
     /// This decoder will buffer and decompress bytes that are encoded in the expected format.
     #[inline]
     fn pending(
-        body: BoxedBody,
+        body: BodySource,
         type_: DecoderType,
         is_secure_scheme: bool,
         content_length: Option<ContentLength>,
@@ -163,32 +191,33 @@ impl Decoder {
     ///
     /// Uses the correct variant by inspecting the Content-Encoding header.
     pub fn detect(response: Response<BoxedBody>, is_secure_scheme: bool) -> Response<Decoder> {
-        let values = response
-            .headers()
-            .get_all(CONTENT_ENCODING)
-            .iter()
-            .chain(response.headers().get_all(TRANSFER_ENCODING).iter());
-        let decoder = values.fold(None, |acc, enc| {
-            acc.or_else(|| {
-                if enc == HeaderValue::from_static("gzip") {
-                    Some(DecoderType::Gzip)
-                } else if enc == HeaderValue::from_static("br") {
-                    Some(DecoderType::Brotli)
-                } else if enc == HeaderValue::from_static("deflate") {
-                    Some(DecoderType::Deflate)
-                } else if enc == HeaderValue::from_static("zstd") {
-                    Some(DecoderType::Zstd)
-                } else {
-                    None
-                }
-            })
-        });
+        let decoder = DecoderType::detect(response.headers());
         let content_length = response.headers().typed_get::<ContentLength>();
         match decoder {
-            Some(type_) => {
-                response.map(|r| Decoder::pending(r, type_, is_secure_scheme, content_length))
-            },
-            None => response.map(|r| Decoder::plain_text(r, is_secure_scheme, content_length)),
+            Some(type_) => response.map(|r| {
+                Decoder::pending(
+                    BodySource::Hyper(r),
+                    type_,
+                    is_secure_scheme,
+                    content_length,
+                )
+            }),
+            None => response.map(|r| {
+                Decoder::plain_text(BodySource::Hyper(r), is_secure_scheme, content_length)
+            }),
+        }
+    }
+
+    /// A decoder over a body that did not come from the network, such as one read
+    /// back out of the HTTP cache, which is stored with its content coding intact.
+    pub fn for_stream(
+        stream: BoxStream<'static, io::Result<Bytes>>,
+        type_: Option<DecoderType>,
+    ) -> Decoder {
+        let source = BodySource::Stream(stream);
+        match type_ {
+            Some(type_) => Decoder::pending(source, type_, false, None),
+            None => Decoder::plain_text(source, false, None),
         }
     }
 }
@@ -286,8 +315,15 @@ impl Future for Pending {
     }
 }
 
+/// Where a decoded body's bytes come from: the network, or a stored body being
+/// read back out of the HTTP cache.
+enum BodySource {
+    Hyper(BoxedBody),
+    Stream(BoxStream<'static, io::Result<Bytes>>),
+}
+
 struct BodyStream {
-    body: BoxedBody,
+    body: BodySource,
     is_secure_scheme: bool,
     content_length: Option<ContentLength>,
     total_read: u64,
@@ -296,16 +332,22 @@ struct BodyStream {
 impl BodyStream {
     fn empty() -> Self {
         BodyStream {
-            body: http_body_util::Empty::new()
-                .map_err(|_| unreachable!())
-                .boxed(),
+            body: BodySource::Hyper(
+                http_body_util::Empty::new()
+                    .map_err(|_| unreachable!())
+                    .boxed(),
+            ),
             is_secure_scheme: false,
             content_length: None,
             total_read: 0,
         }
     }
 
-    fn new(body: BoxedBody, is_secure_scheme: bool, content_length: Option<ContentLength>) -> Self {
+    fn new(
+        body: BodySource,
+        is_secure_scheme: bool,
+        content_length: Option<ContentLength>,
+    ) -> Self {
         BodyStream {
             body,
             is_secure_scheme,
@@ -319,7 +361,11 @@ impl Stream for BodyStream {
     type Item = Result<Bytes, io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        match futures_core::ready!(Pin::new(&mut self.body).poll_frame(cx)) {
+        let body = match self.body {
+            BodySource::Stream(ref mut stream) => return stream.as_mut().poll_next(cx),
+            BodySource::Hyper(ref mut body) => body,
+        };
+        match futures_core::ready!(Pin::new(body).poll_frame(cx)) {
             Some(Ok(bytes)) => {
                 let Ok(bytes) = bytes.into_data() else {
                     return Poll::Ready(None);

@@ -50,12 +50,15 @@ pub enum ResponseBody {
     Receiving(Vec<u8>),
     #[serde(with = "serde_bytes")]
     Done(Vec<u8>),
+    /// The body is delivered to the consumer chunk by chunk and is not retained
+    /// anywhere in the net process.
+    Streamed,
 }
 
 impl ResponseBody {
     pub fn is_done(&self) -> bool {
         match *self {
-            ResponseBody::Done(..) => true,
+            ResponseBody::Done(..) | ResponseBody::Streamed => true,
             ResponseBody::Empty | ResponseBody::Receiving(..) => false,
         }
     }
@@ -124,8 +127,7 @@ pub struct Response {
     pub return_internal: bool,
     /// <https://fetch.spec.whatwg.org/#concept-response-aborted>
     ///
-    /// Also set when the body failed before its end. The HTTP cache shares this flag with the
-    /// responses it stores, and never uses one whose flag is set, since its body is incomplete.
+    /// Also set when the body failed before its end.
     #[conditional_malloc_size_of]
     pub aborted: Arc<AtomicBool>,
     /// track network metrics

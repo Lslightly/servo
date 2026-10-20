@@ -344,6 +344,15 @@ pub(crate) fn transfers_request_body_stream_to_later_manual_redirect(
 
 pub type DoneChannel = Option<(TokioSender<Data>, TokioReceiver<Data>)>;
 
+/// Whether the whole decoded body has to be kept in the net process rather than
+/// only streamed to the consumer.
+///
+/// Subresource integrity has to digest the body before the response is handed on,
+/// and a preloaded response may later be consumed by a fetch that does.
+pub(crate) fn retains_whole_body(request: &Request) -> bool {
+    !request.integrity_metadata.is_empty() || request.preload_id.is_some()
+}
+
 /// [Fetch](https://fetch.spec.whatwg.org#concept-fetch)
 pub async fn fetch(request: Request, target: Target<'_>, context: &FetchContext) -> Response {
     // Step 7. Let timingInfo be a new fetch timing info whose start time
@@ -1055,12 +1064,6 @@ pub async fn main_fetch(
     // processed before sending the response to Devtools.
     send_response_to_devtools(request, context, &response, None);
 
-    context
-        .state
-        .http_cache
-        .update_awaiting_consumers(request)
-        .await;
-
     // Steps 25-27.
     // TODO: remove this line when only asynchronous fetches are used
     response
@@ -1126,7 +1129,7 @@ async fn wait_for_response(
                     send_response_to_devtools(request, context, response, Some(vec.clone()));
                 }
             },
-            ResponseBody::Done(_) | ResponseBody::Empty => {},
+            ResponseBody::Done(_) | ResponseBody::Empty | ResponseBody::Streamed => {},
             _ => unreachable!(),
         }
     }
