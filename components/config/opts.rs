@@ -65,6 +65,10 @@ pub struct Opts {
     /// Directory for a default config directory
     pub config_dir: Option<PathBuf>,
 
+    /// Where the HTTP cache may keep its files. `None` keeps the cache in memory,
+    /// which is also what `temporary_storage` forces.
+    pub http_cache_dir: Option<PathBuf>,
+
     /// Use temporary storage (data on disk will not persist across restarts).
     pub temporary_storage: bool,
 
@@ -254,6 +258,7 @@ impl Default for Opts {
             sandbox: false,
             debug: Default::default(),
             config_dir: None,
+            http_cache_dir: None,
             temporary_storage: false,
             shaders_path: None,
             certificate_path: None,

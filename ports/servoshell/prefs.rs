@@ -177,6 +177,22 @@ pub fn default_config_dir() -> Option<PathBuf> {
     Some(config_dir)
 }
 
+/// Where the HTTP cache keeps its files.
+///
+/// On Android and OpenHarmony this is under the application's cache directory,
+/// which the system may empty at any time; the cache is built to survive that.
+#[cfg(any(target_os = "android", target_env = "ohos"))]
+pub fn default_http_cache_dir() -> Option<PathBuf> {
+    default_config_dir().map(|dir| dir.join("http-cache"))
+}
+
+/// Where the HTTP cache keeps its files: `~/.cache` on Linux,
+/// `~/Library/Caches` on macOS and `%LOCALAPPDATA%` on Windows.
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+pub fn default_http_cache_dir() -> Option<PathBuf> {
+    ::dirs::cache_dir().map(|dir| dir.join("servo").join("http-cache"))
+}
+
 /// Get a Servo [`Preferences`] to use when initializing Servo by first reading the user
 /// preferences file and then overriding these preferences with the ones from the `--prefs-file`
 /// command-line argument, if given.
@@ -765,6 +781,12 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
         sandbox: cmd_args.sandbox,
         random_pipeline_closure_probability: cmd_args.random_pipeline_closure_probability,
         random_pipeline_closure_seed: cmd_args.random_pipeline_closure_seed,
+        // A profile given with `--config-dir` gets a cache of its own.
+        http_cache_dir: cmd_args
+            .config_dir
+            .as_ref()
+            .map(|dir| dir.join("http-cache"))
+            .or_else(default_http_cache_dir),
         config_dir,
         temporary_storage,
         shaders_path: cmd_args.shaders,

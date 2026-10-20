@@ -8,10 +8,11 @@
 
 use std::ops::Deref;
 use std::sync::LazyLock;
+use std::time::SystemTime;
 
 use headers::{ContentLength, ContentRange, HeaderMapExt};
 use http::{HeaderMap, StatusCode, header};
-use http_cache_rules::{CacheConfig, StoredPolicy};
+use http_cache_rules::{CacheConfig, Exchange, StoredPolicy};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use net_traits::request::{Destination, Request};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,27 @@ pub(crate) static CONFIG: LazyLock<CacheConfig> = LazyLock::new(|| CacheConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct EntryPolicy(pub StoredPolicy);
+
+impl EntryPolicy {
+    /// The policy for storing a response with `status` and `headers` to `request`,
+    /// sent and received at `time`, or `None` if it may not be stored.
+    pub fn new(
+        request: &Request,
+        status: StatusCode,
+        headers: &HeaderMap,
+        time: SystemTime,
+    ) -> Option<Self> {
+        let exchange = Exchange {
+            method: &request.method,
+            request_headers: &request.headers,
+            status,
+            response_headers: headers,
+            request_time: time,
+            response_time: time,
+        };
+        StoredPolicy::new(&CONFIG, &exchange).ok().map(Self)
+    }
+}
 
 impl Deref for EntryPolicy {
     type Target = StoredPolicy;

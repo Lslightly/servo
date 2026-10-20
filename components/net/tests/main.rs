@@ -5,6 +5,7 @@
 #![cfg(test)]
 #![expect(dead_code)]
 
+mod cache_store;
 mod cookie;
 mod cookie_http_state;
 mod data_loader;

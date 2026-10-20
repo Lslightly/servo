@@ -159,12 +159,17 @@ impl CacheStore for MemoryStore {
     fn open(
         &self,
         id: EntryId,
+        meta: &EntryMeta,
         range: Option<BodyRange>,
     ) -> BoxFuture<'_, Result<BodyReader, StoreError>> {
         let inner = self.inner.clone();
+        let stamp = meta.stamp;
         Box::pin(async move {
             let inner = inner.lock().unwrap();
-            let variant = inner.variant(id).ok_or(StoreError::Missing)?;
+            let variant = inner
+                .variant(id)
+                .filter(|variant| variant.meta.stamp == stamp)
+                .ok_or(StoreError::Missing)?;
             let encoding = variant.meta.content_encoding;
             let len = variant.bytes as u64;
             let chunks = match range {
@@ -315,15 +320,17 @@ impl CacheStore for MemoryStore {
         }
     }
 
-    fn descriptors(&self) -> Vec<CacheEntryDescriptor> {
-        self.inner
+    fn descriptors(&self) -> BoxFuture<'_, Vec<CacheEntryDescriptor>> {
+        let descriptors = self
+            .inner
             .lock()
             .unwrap()
             .entries
             .values()
             .flat_map(|variants| variants.iter())
             .map(|variant| CacheEntryDescriptor::new(variant.meta.key.url().to_string()))
-            .collect()
+            .collect();
+        Box::pin(async move { descriptors })
     }
 
     fn stored_bytes(&self) -> usize {

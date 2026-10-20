@@ -138,9 +138,16 @@ impl HttpState {
     pub(crate) fn memory_reports(&self, suffix: &str, ops: &mut MallocSizeOfOps) -> Vec<Report> {
         vec![
             Report {
-                path: path!["http-cache", suffix],
+                path: path!["http-cache", "index", suffix],
                 kind: ReportKind::ExplicitJemallocHeapSize,
                 size: self.http_cache.size_of(ops),
+            },
+            // Bodies of a disk-backed cache are files, not process memory. Reported
+            // so that device measurements can see how much the cache is using.
+            Report {
+                path: path!["http-cache", "disk", suffix],
+                kind: ReportKind::ExplicitNonHeapSize,
+                size: self.http_cache.disk_bytes() as usize,
             },
             Report {
                 path: path!["hsts-list", suffix],

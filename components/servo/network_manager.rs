@@ -56,8 +56,8 @@ impl NetworkManager {
     ///
     /// Both public and private browsing contexts are included in the result.
     ///
-    /// Note: The networking layer currently only implements an in-memory HTTP
-    /// cache. Support for an on-disk cache is under development.
+    /// Note: Entries may be held in memory or on disk depending on how the
+    /// embedder configured the cache directory.
     pub fn cache_entries(&self) -> Vec<CacheEntry> {
         let public_entries = self.public_resource_threads.cache_entries();
         let private_entries = self.private_resource_threads.cache_entries();
@@ -71,13 +71,30 @@ impl NetworkManager {
         unique_keys.into_iter().map(CacheEntry::new).collect()
     }
 
+    /// Tell the networking layer the embedding application moved to the background.
+    ///
+    /// The HTTP cache keeps an index in memory that is otherwise only written out
+    /// once changes stop, so an application that is killed while backgrounded
+    /// would lose it and pay a directory scan on the next start. Embedders should
+    /// call this from whatever "app is no longer in the foreground" signal their
+    /// platform provides -- `onBackground` on OpenHarmony, `onTrimMemory` /
+    /// `ApplicationStatusListener` on Android. Chromium hooks the same signal for
+    /// the same reason.
+    ///
+    /// Blocks until the networking layer is done persisting.
+    pub fn notify_application_backgrounded(&self) {
+        self.public_resource_threads
+            .notify_application_backgrounded();
+        self.private_resource_threads
+            .notify_application_backgrounded();
+    }
+
     /// Clears the network (HTTP) cache.
     ///
     /// This removes all cached network responses maintained by the networking
     /// layer for both public and private browsing contexts.
     ///
-    /// Note: The networking layer currently only implements an in-memory HTTP
-    /// cache. Support for an on-disk cache is under development.
+    /// Note: This clears both the in-memory and the on-disk cache.
     pub fn clear_cache(&self) {
         self.public_resource_threads.clear_cache();
         self.private_resource_threads.clear_cache();

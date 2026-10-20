@@ -54,7 +54,7 @@ pub mod disk;
 mod inflight;
 mod key;
 pub mod memory_store;
-mod policy;
+pub mod policy;
 mod range;
 pub mod store;
 mod tee;
@@ -124,19 +124,30 @@ impl HttpCache {
         self.store.stored_bytes()
     }
 
+    /// The bytes this cache holds on disk, for `about:memory`.
+    pub fn disk_bytes(&self) -> u64 {
+        self.store.disk_bytes()
+    }
+
     /// Whether this is the public cache.
     pub fn assignment(&self) -> HttpCacheAssignment {
         self.assignment
     }
 
     /// Descriptors for the entries devtools lists.
-    pub(crate) fn cache_entry_descriptors(&self) -> Vec<CacheEntryDescriptor> {
-        self.store.descriptors()
+    pub(crate) async fn cache_entry_descriptors(&self) -> Vec<CacheEntryDescriptor> {
+        self.store.descriptors().await
     }
 
     /// Drop everything this cache holds.
     pub(crate) async fn clear(&self) {
         self.store.clear().await;
+    }
+
+    /// Persist anything that only lives in memory. Called when the embedding
+    /// application is backgrounded, since it may be killed without further notice.
+    pub(crate) async fn flush(&self) {
+        self.store.flush().await;
     }
 
     /// Flush anything that only lives in memory. Called when the resource thread exits.
@@ -341,7 +352,7 @@ impl HttpCache {
             },
         };
 
-        let reader = match self.store.open(id, body_range).await {
+        let reader = match self.store.open(id, meta, body_range).await {
             Ok(reader) => reader,
             Err(error) => {
                 debug!("could not open cache entry for {}: {error}", meta.key.url());
@@ -709,8 +720,8 @@ impl HttpCache {
     /// Read a stored response back as one buffer. Only for tests.
     pub async fn read_body_for_test(&self, request: &Request) -> Option<Vec<u8>> {
         let mut transaction = self.new_transaction(request, watch::channel(Default::default()).1);
-        let (id, _, _) = self.select_variant(&mut transaction, request).await?;
-        let reader = self.store.open(id, None).await.ok()?;
+        let (id, meta, _) = self.select_variant(&mut transaction, request).await?;
+        let reader = self.store.open(id, &meta, None).await.ok()?;
         let mut stream = reader.into_stream();
         let mut body = Vec::new();
         while let Some(chunk) = stream.next().await {

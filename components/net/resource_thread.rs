@@ -653,7 +653,15 @@ impl ResourceChannelManager {
                 }
             },
             CoreResourceMsg::GetCacheEntries(sender) => {
-                sender.send_or_ignore(http_state.http_cache.cache_entry_descriptors());
+                sender.send_or_ignore(spawn_blocking_task(
+                    http_state.http_cache.cache_entry_descriptors(),
+                ));
+            },
+            CoreResourceMsg::ApplicationBackgrounded(sender) => {
+                spawn_blocking_task(http_state.http_cache.flush());
+                if let Some(sender) = sender {
+                    sender.send_or_ignore(());
+                }
             },
             CoreResourceMsg::ClearCache(sender) => {
                 spawn_blocking_task(http_state.http_cache.clear());

@@ -605,6 +605,19 @@ impl ResourceThreads {
         receiver.recv().unwrap()
     }
 
+    /// Tell the networking layer the embedding application moved to the background.
+    ///
+    /// Blocks until the networking layer has persisted what it needs to, so that
+    /// the caller can rely on it having happened before the process is frozen or
+    /// killed.
+    pub fn notify_application_backgrounded(&self) {
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        let _ = self
+            .core_thread
+            .send(CoreResourceMsg::ApplicationBackgrounded(Some(sender)));
+        let _ = receiver.recv();
+    }
+
     pub fn clear_cache(&self) {
         // NOTE: Messages used in these methods are currently handled
         // synchronously on the backend without consulting other threads, so
@@ -864,6 +877,10 @@ pub enum CoreResourceMsg {
     GetCacheEntries(GenericSender<Vec<CacheEntryDescriptor>>),
     /// Clear the network cache.
     ClearCache(Option<GenericSender<()>>),
+    /// The embedding application moved to the background. Persist any network
+    /// state that is otherwise only written on a timer, because a backgrounded
+    /// application may be killed without further notice.
+    ApplicationBackgrounded(Option<GenericSender<()>>),
     /// Send the service worker network mediator for an origin to CoreResourceThread
     NetworkMediator(GenericSender<CustomResponseMediator>, ImmutableOrigin),
     /// Message forwarded to file manager's handler
