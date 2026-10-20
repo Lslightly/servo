@@ -63,6 +63,10 @@ void ServoNWeb::Resize(uint32_t width, uint32_t height, bool /*isKeyboard*/) {
 void ServoNWeb::OnPause() {
     paused_ = true;
     UpdateThrottled();
+    // ACE calls OnPause on window hide and when the host application is
+    // backgrounded. A backgrounded application may be killed without any further
+    // callback, so this is the last reliable chance to persist network state.
+    servo::embedder::application_backgrounded();
 }
 
 void ServoNWeb::OnContinue() {

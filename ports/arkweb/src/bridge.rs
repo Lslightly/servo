@@ -41,6 +41,9 @@ pub mod ffi {
         fn navigate_back_or_forward(id: u32, step: i32);
         fn resize(id: u32, width: u32, height: u32);
         fn set_throttled(id: u32, throttled: bool);
+        /// The host application moved to the background; persist what would
+        /// otherwise be lost if it is killed while there.
+        fn application_backgrounded();
         fn focus(id: u32);
         fn blur(id: u32);
         fn touch_event(id: u32, kind: u8, x: f32, y: f32, pointer_id: i32);
@@ -248,6 +251,9 @@ fn resize(id: u32, width: u32, height: u32) {
 }
 fn set_throttled(id: u32, throttled: bool) {
     crate::runtime::set_throttled(id, throttled)
+}
+fn application_backgrounded() {
+    crate::runtime::application_backgrounded()
 }
 fn focus(id: u32) {
     crate::runtime::focus(id)

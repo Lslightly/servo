@@ -376,6 +376,12 @@ navigator.geolocation.getCurrentPosition(
 
 AUTH_OK_PAGE = "<html><body style='margin:0;background:#00cc00'>authed</body></html>"
 
+# Served with an explicit freshness lifetime so the HTTP cache stores it; used by
+# the cache-index test, which needs the store to have something to write down.
+CACHEABLE_PAGE = (
+    "<html><body style='margin:0;background:#00cc00'>cacheable<script src='/cacheable.js'></script></body></html>"
+)
+
 # user:passwd -- matches the credentials ControllerPage's onHttpAuthRequest confirms with.
 AUTH_CREDENTIALS = "Basic " + base64.b64encode(b"user:passwd").decode()
 
@@ -384,6 +390,10 @@ class _FixtureHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
         if self.path == "/geo.html":
             self._page(GEO_PAGE)
+        elif self.path == "/cacheable.html":
+            self._page(CACHEABLE_PAGE, cacheable=True)
+        elif self.path == "/cacheable.js":
+            self._body(b"window.__cacheable = 1;", "text/javascript", cacheable=True)
         elif self.path == "/auth":
             if self.headers.get("Authorization") == AUTH_CREDENTIALS:
                 self._page(AUTH_OK_PAGE)
@@ -398,11 +408,16 @@ class _FixtureHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def _page(self, html: str) -> None:
-        body = html.encode()
+    def _page(self, html: str, cacheable: bool = False) -> None:
+        self._body(html.encode(), "text/html", cacheable=cacheable)
+
+    def _body(self, body: bytes, content_type: str, cacheable: bool = False) -> None:
         self.send_response(200)
-        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if cacheable:
+            self.send_header("Cache-Control", "max-age=3600")
+            self.send_header("ETag", '"fixture-v1"')
         self.end_headers()
         self.wfile.write(body)
 

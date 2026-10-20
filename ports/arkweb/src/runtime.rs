@@ -25,6 +25,7 @@ use cookie::Cookie;
 use cxx::{CxxString, CxxVector, SharedPtr};
 use dpi::PhysicalSize;
 use log::{LevelFilter, error, info};
+use ohos_abilitykit_sys::runtime::application_context;
 use ohos_ime::{AttachOptions, Ime, ImeProxy, RawTextEditorProxy};
 use ohos_ime_sys::types::InputMethod_EnterKeyType;
 use ohos_vsync::NativeVsync;
@@ -112,6 +113,9 @@ enum Action {
         id: u32,
         throttled: bool,
     },
+    /// The host application is no longer in the foreground. Carries a channel so
+    /// the caller can wait: the application may be frozen once `OnPause` returns.
+    ApplicationBackgrounded(std::sync::mpsc::SyncSender<()>),
     Touch {
         id: u32,
         kind: u8,
@@ -543,6 +547,38 @@ struct ServoThread {
     webviews: HashMap<u32, WebViewEntry>,
 }
 
+/// Where the HTTP cache lives: under `web/` in the application's cache directory,
+/// next to ArkWeb's own data. The system's cache trimming spares that directory,
+/// and Servo stands in for the system webview here. `--user-data-dir` is the
+/// application's base directory, outside `cacheDir`.
+fn http_cache_dir() -> PathBuf {
+    application_cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/data/storage/el2/base/cache"))
+        .join("web")
+        .join("servo")
+        .join("http-cache")
+}
+
+/// The application's cache directory, as its application context reports it.
+#[allow(unsafe_code)]
+fn application_cache_dir() -> Option<PathBuf> {
+    const BUFFER_SIZE: i32 = 256;
+    let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE as usize);
+    let mut written = 0;
+    // SAFETY: the getter writes at most `BUFFER_SIZE` bytes to the buffer and the length it
+    // wrote to `written`, which is clamped to the buffer anyway.
+    unsafe {
+        application_context::OH_AbilityRuntime_ApplicationContextGetCacheDir(
+            buffer.as_mut_ptr().cast(),
+            BUFFER_SIZE,
+            &mut written,
+        )
+        .ok()?;
+        buffer.set_len(written.clamp(0, BUFFER_SIZE) as usize);
+    }
+    String::from_utf8(buffer).ok().map(PathBuf::from)
+}
+
 impl ServoThread {
     /// Build the Servo engine. This is the expensive step (`Servo::new` spins up the constellation,
     /// networking, JS and GPU machinery), split out of [`Self::run`] so a `lazy` LibraryLoaded can
@@ -559,6 +595,9 @@ impl ServoThread {
         // `config_dir` must be set: the OHOS font cache unwraps `opts::get().config_dir`
         // (fonts/platform/freetype/ohos/font_cache.rs) when Servo initializes.
         let opts = Opts {
+            // Without this the store falls back to memory only, which is the opposite
+            // of what a webview embedded in someone else's application wants.
+            http_cache_dir: Some(http_cache_dir()),
             config_dir: Some(config_dir),
             ..Default::default()
         };
@@ -728,6 +767,15 @@ impl ServoThread {
                 // A paused or occluded web component is not visible. A hidden WebView is
                 // not painted and its animations and timers are throttled.
                 self.with_webview(id, |wv| if throttled { wv.hide() } else { wv.show() })
+            },
+            Action::ApplicationBackgrounded(done) => {
+                // A backgrounded application can be killed without further notice,
+                // so give the networking layer a chance to persist first.
+                info!("[arkweb] application_backgrounded");
+                self.servo
+                    .network_manager()
+                    .notify_application_backgrounded();
+                let _ = done.send(());
             },
             Action::Touch {
                 id,
@@ -1688,6 +1736,21 @@ pub fn resize(id: u32, width: u32, height: u32) {
 pub fn set_throttled(id: u32, throttled: bool) {
     guard("set_throttled", || {
         send(Action::SetThrottled { id, throttled })
+    })
+}
+
+/// Bound on how long `OnPause` blocks the ACE UI thread waiting for Servo to
+/// persist. The work is a few kilobytes with no `fsync`; the bound only exists so
+/// a busy Servo thread cannot stall the host application.
+const BACKGROUND_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+pub fn application_backgrounded() {
+    guard("application_backgrounded", || {
+        let (done, wait) = std::sync::mpsc::sync_channel(0);
+        send(Action::ApplicationBackgrounded(done));
+        if wait.recv_timeout(BACKGROUND_FLUSH_TIMEOUT).is_err() {
+            error!("[arkweb] servo did not finish persisting before the background timeout");
+        }
     })
 }
 
