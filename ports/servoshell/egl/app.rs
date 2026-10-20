@@ -425,6 +425,18 @@ impl App {
         warn!("TODO can't stop won't stop");
     }
 
+    /// Tell Servo the embedding application moved to the background.
+    ///
+    /// A backgrounded application can be killed without any further callback, so
+    /// this is the last reliable chance to persist state such as the HTTP cache
+    /// index.
+    pub fn notify_application_backgrounded(&self) {
+        self.state
+            .servo
+            .network_manager()
+            .notify_application_backgrounded();
+    }
+
     /// Go back in history.
     pub fn go_back(&self) {
         self.window()

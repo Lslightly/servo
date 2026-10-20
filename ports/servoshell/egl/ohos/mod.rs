@@ -407,6 +407,9 @@ pub(super) enum ServoAction {
         width: i32,
         height: i32,
     },
+    /// Carries a channel so the caller can wait for the work to finish: the
+    /// application may be frozen shortly after `onBackground` returns.
+    ApplicationBackgrounded(std::sync::mpsc::SyncSender<()>),
     FocusWindow(u32, Vec<u32>),
     CreatePlatformWindow(XComponentWrapper, WindowWrapper),
     RemovePlatformWindow(u32, Vec<u32>),
@@ -417,6 +420,7 @@ impl std::fmt::Debug for ServoAction {
         match self {
             Self::WakeUp => write!(f, "WakeUp"),
             Self::LoadUrl(arg0) => f.debug_tuple("LoadUrl").field(arg0).finish(),
+            Self::ApplicationBackgrounded(..) => write!(f, "ApplicationBackgrounded"),
             Self::GoBack => write!(f, "GoBack"),
             Self::GoForward => write!(f, "GoForward"),
             Self::TouchEvent {
@@ -482,6 +486,10 @@ impl ServoAction {
                 servo.spin_event_loop();
             },
             LoadUrl(url) => servo.load_uri(url.as_str()),
+            ApplicationBackgrounded(done) => {
+                servo.notify_application_backgrounded();
+                let _ = done.send(());
+            },
             GoBack => servo.go_back(),
             GoForward => servo.go_forward(),
             TouchEvent {
@@ -992,6 +1000,30 @@ fn init(exports: Object, env: Env) -> napi_ohos::Result<()> {
 pub fn load_url(url: String) {
     debug!("load url");
     call(ServoAction::LoadUrl(url)).expect("Failed to load url");
+}
+
+/// How long `onApplicationBackground` will block the ability's main thread waiting
+/// for Servo to persist. The work itself is a few kilobytes with no `fsync`, so
+/// this bound exists only so that a busy Servo thread cannot stall the
+/// application; hitting it means something else is wrong.
+const BACKGROUND_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Called from `EntryAbility.onBackground()`.
+///
+/// This blocks until Servo has persisted, because the application can be frozen
+/// and then killed once the callback returns. The alternative would be a
+/// `backgroundTaskManager` transient task, but those are quota'd (10 minutes a
+/// day) and are meant for work measured in seconds; writing a few kilobytes is
+/// better done inline.
+#[napi(js_name = "onApplicationBackground")]
+pub fn on_application_background() {
+    let (done, wait) = std::sync::mpsc::sync_channel(0);
+    if call(ServoAction::ApplicationBackgrounded(done)).is_err() {
+        return;
+    }
+    if wait.recv_timeout(BACKGROUND_FLUSH_TIMEOUT).is_err() {
+        warn!("Servo did not finish persisting before the background timeout");
+    }
 }
 
 #[napi]

@@ -126,5 +126,13 @@ export default class EntryAbility extends UIAbility {
   onBackground() {
     // Ability has back to background
     hilog.info(0x0000, 'testTag', '%{public}s', 'Ability onBackground');
+    // A backgrounded application can be frozen and then killed without any
+    // further callback, so this is the last reliable chance for Servo to persist
+    // state it would otherwise only write on a timer (e.g. the HTTP cache index).
+    try {
+      servoshell.onApplicationBackground();
+    } catch (e) {
+      hilog.warn(0x0000, 'testTag', 'onApplicationBackground failed: %{public}s', JSON.stringify(e));
+    }
   }
 };

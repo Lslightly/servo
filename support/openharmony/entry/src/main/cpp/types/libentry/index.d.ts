@@ -14,3 +14,4 @@ export const focusWebview:(index: number, arkts_ids:number[]) => void;
 export const deleteWebview:(index: number, arkts_ids:number[]) => void;
 export const initServo:(options: InitOpts) => void;
 export const nextWindowId:(arkts_id: number) => void;
+export const onApplicationBackground: () => void;
