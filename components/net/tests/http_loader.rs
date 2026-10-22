@@ -40,7 +40,7 @@ use net::http_loader::{determine_requests_referrer, serialize_origin};
 use net::protocols::ProtocolRegistry;
 use net::resource_thread::{AuthCacheEntry, new_core_resource_thread};
 use net::test::DECODER_BUFFER_SIZE;
-use net::test_util::make_h2_ssl_server;
+use net::test_util::{make_h2_ssl_server, make_tls_server_without_close_notify};
 use net_traits::blob_url_store::UrlWithBlobClaim;
 use net_traits::fetch::fetch_controller::FetchController;
 use net_traits::http_status::HttpStatus;
@@ -63,7 +63,7 @@ use url::Url;
 
 use crate::{
     create_generic_embedder_proxy, create_generic_embedder_proxy_and_receiver, create_http_state,
-    fetch, fetch_with_context, make_body, make_server, make_ssl_server, mock_origin,
+    fetch, fetch_with_context, is_aborted, make_body, make_server, make_ssl_server, mock_origin,
     new_fetch_context, receive_credential_prompt_msgs, replace_host_table, spawn_blocking_task,
 };
 
@@ -2012,6 +2012,62 @@ fn collect_all_network_events(devtools_port: &Receiver<DevtoolsControlMsg>) -> V
         }
     }
     events
+}
+
+#[test]
+fn test_body_that_ends_with_its_tls_connection_without_close_notify_is_complete() {
+    for response in [
+        &b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nuntil close"[..],
+        // A transfer coding that does not end with chunked is read until the connection closes,
+        // whatever the `Content-Length`.
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\nConnection: close\r\n\r\nuntil close",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, identity\r\nContent-Length: 100\r\n\r\nuntil close",
+    ] {
+        let (server, url) = make_tls_server_without_close_notify(response);
+        let mut context = new_fetch_context(None, None);
+        for certificate in server.certificates.as_ref().unwrap().iter() {
+            context.state.override_manager.add_override(certificate);
+        }
+        let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+            .origin(url.origin())
+            .pipeline_id(Some(TEST_PIPELINE_ID))
+            .policy_container(Default::default())
+            .build();
+
+        let response = fetch_with_context(request, &mut context);
+        server.close();
+        assert!(!response.is_network_error());
+        assert!(!is_aborted(&response));
+        assert_eq!(
+            *response.actual_response().body.lock(),
+            ResponseBody::Done(b"until close".to_vec())
+        );
+    }
+}
+
+#[test]
+fn test_truncated_body_that_ends_with_its_tls_connection_is_aborted() {
+    for response in [
+        &b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort"[..],
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\n5\r\nshort\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\nTransfer-Encoding: gzip, CHUNKED\r\n\r\n5\r\nshort\r\n",
+    ] {
+        let (server, url) = make_tls_server_without_close_notify(response);
+        let mut context = new_fetch_context(None, None);
+        for certificate in server.certificates.as_ref().unwrap().iter() {
+            context.state.override_manager.add_override(certificate);
+        }
+        let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+            .origin(url.origin())
+            .pipeline_id(Some(TEST_PIPELINE_ID))
+            .policy_container(Default::default())
+            .build();
+
+        let response = fetch_with_context(request, &mut context);
+        server.close();
+        assert!(is_aborted(&response));
+    }
 }
 
 #[test]

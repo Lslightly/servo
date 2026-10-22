@@ -23,6 +23,7 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use servo_default_resources as _;
 use servo_url::ServoUrl;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{self, TlsAcceptor};
 
@@ -213,16 +214,7 @@ where
     let url_string = format!("http://localhost:{}", listener.local_addr().unwrap().port());
     let url = UrlWithBlobClaim::new(ServoUrl::parse(&url_string).unwrap(), None);
 
-    let certificates = load_certificates_from_pem().expect("Invalid certificate");
-    let key = load_private_key_from_file().expect("Invalid key");
-
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certificates.clone(), key)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
-        .expect("Could not create rustls ServerConfig");
-    config.alpn_protocols = alpn_protocols;
-    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let (acceptor, certificates) = tls_acceptor(alpn_protocols);
 
     let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
     let server = async move {
@@ -270,6 +262,73 @@ where
         }
     };
 
+    spawn_task(server);
+
+    (
+        Server {
+            close_channel: tx,
+            certificates: Some(certificates),
+        },
+        url,
+    )
+}
+
+/// The acceptor of the test TLS servers, offering `alpn_protocols`, and their certificates.
+fn tls_acceptor(alpn_protocols: Vec<Vec<u8>>) -> (TlsAcceptor, Vec<CertificateDer<'static>>) {
+    let certificates = load_certificates_from_pem().expect("Invalid certificate");
+    let key = load_private_key_from_file().expect("Invalid key");
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates.clone(), key)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
+        .expect("Could not create rustls ServerConfig");
+    config.alpn_protocols = alpn_protocols;
+    (TlsAcceptor::from(Arc::new(config)), certificates)
+}
+
+/// A TLS server that answers each request with `response`, written as is, and then closes the
+/// connection without a TLS close_notify. Returns an `https` URL.
+pub fn make_tls_server_without_close_notify(response: &'static [u8]) -> (Server, UrlWithBlobClaim) {
+    if !async_runtime_initialized() {
+        let _ = &*ASYNC_RUNTIME;
+    }
+    let listener = StdTcpListener::bind("[::0]:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let listener = spawn_blocking_task(async move { TcpListener::from_std(listener).unwrap() });
+    let url_string = format!(
+        "https://localhost:{}",
+        listener.local_addr().unwrap().port()
+    );
+    let url = UrlWithBlobClaim::new(ServoUrl::parse(&url_string).unwrap(), None);
+    let (acceptor, certificates) = tls_acceptor(vec![]);
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+    let server = async move {
+        loop {
+            let stream = tokio::select! {
+                stream = listener.accept() => stream.unwrap().0,
+                _ = &mut rx => break
+            };
+            let acceptor = acceptor.clone();
+            spawn_task(async move {
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut buffer = [0; 1024];
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(length) => request.extend_from_slice(&buffer[..length]),
+                    }
+                }
+                let _ = stream.write_all(response).await;
+                let _ = stream.flush().await;
+                // Dropping the stream closes the connection without a close_notify.
+            });
+        }
+    };
     spawn_task(server);
 
     (

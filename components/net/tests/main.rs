@@ -207,6 +207,11 @@ fn fetch_with_cors_cache(request: Request, cache: &mut CorsCache) -> Response {
     response
 }
 
+/// Whether the body of a response from `fetch_with_context` ended before it was complete.
+pub(crate) fn is_aborted(response: &Response) -> bool {
+    response.aborted.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub(crate) fn mock_origin() -> ImmutableOrigin {
     ServoUrl::parse("http://servo.org").unwrap().origin()
 }

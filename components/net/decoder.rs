@@ -29,9 +29,9 @@ use futures::{Future, Stream};
 use futures_util::StreamExt;
 use headers::{ContentLength, HeaderMapExt};
 use http_body_util::BodyExt;
-use hyper::Response;
 use hyper::body::Body;
 use hyper::header::{CONTENT_ENCODING, HeaderValue, TRANSFER_ENCODING};
+use hyper::{Response, Version};
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
 use tokio_util::codec::{BytesCodec, FramedRead};
@@ -151,13 +151,9 @@ impl Decoder {
     ///
     /// This decoder will emit the underlying bytes as-is.
     #[inline]
-    fn plain_text(
-        body: BodySource,
-        is_secure_scheme: bool,
-        content_length: Option<ContentLength>,
-    ) -> Decoder {
+    fn plain_text(body: BodySource, is_secure_scheme: bool, length: BodyLength) -> Decoder {
         Decoder {
-            inner: Inner::PlainText(BodyStream::new(body, is_secure_scheme, content_length)),
+            inner: Inner::PlainText(BodyStream::new(body, is_secure_scheme, length)),
         }
     }
 
@@ -169,11 +165,11 @@ impl Decoder {
         body: BodySource,
         type_: DecoderType,
         is_secure_scheme: bool,
-        content_length: Option<ContentLength>,
+        length: BodyLength,
     ) -> Decoder {
         Decoder {
             inner: Inner::Pending(Pending {
-                body: BodyStream::new(body, is_secure_scheme, content_length).peekable(),
+                body: BodyStream::new(body, is_secure_scheme, length).peekable(),
                 type_,
             }),
         }
@@ -192,19 +188,12 @@ impl Decoder {
     /// Uses the correct variant by inspecting the Content-Encoding header.
     pub fn detect(response: Response<BoxedBody>, is_secure_scheme: bool) -> Response<Decoder> {
         let decoder = DecoderType::detect(response.headers());
-        let content_length = response.headers().typed_get::<ContentLength>();
+        let length = BodyLength::of(&response);
         match decoder {
-            Some(type_) => response.map(|r| {
-                Decoder::pending(
-                    BodySource::Hyper(r),
-                    type_,
-                    is_secure_scheme,
-                    content_length,
-                )
-            }),
-            None => response.map(|r| {
-                Decoder::plain_text(BodySource::Hyper(r), is_secure_scheme, content_length)
-            }),
+            Some(type_) => response
+                .map(|r| Decoder::pending(BodySource::Hyper(r), type_, is_secure_scheme, length)),
+            None => response
+                .map(|r| Decoder::plain_text(BodySource::Hyper(r), is_secure_scheme, length)),
         }
     }
 
@@ -216,8 +205,8 @@ impl Decoder {
     ) -> Decoder {
         let source = BodySource::Stream(stream);
         match type_ {
-            Some(type_) => Decoder::pending(source, type_, false, None),
-            None => Decoder::plain_text(source, false, None),
+            Some(type_) => Decoder::pending(source, type_, false, BodyLength::Unknown),
+            None => Decoder::plain_text(source, false, BodyLength::Unknown),
         }
     }
 }
@@ -322,10 +311,57 @@ enum BodySource {
     Stream(BoxStream<'static, io::Result<Bytes>>),
 }
 
+/// How the end of a network body is delimited.
+#[derive(Clone, Copy)]
+enum BodyLength {
+    /// By a `Content-Length`.
+    Known(u64),
+    /// By the end of the connection: an HTTP/1 body with a `Transfer-Encoding` that does not end
+    /// with chunked, or with neither a `Transfer-Encoding` nor a `Content-Length`.
+    UntilClose,
+    /// By the framing of the protocol: a chunked transfer coding, HTTP/2 or HTTP/3, or a body
+    /// that did not come from the network.
+    Unknown,
+}
+
+impl BodyLength {
+    /// The framing hyper reads the body with: in HTTP/1, a `Transfer-Encoding` takes precedence
+    /// over a `Content-Length`, and only its last coding decides whether the body is chunked.
+    fn of<B>(response: &Response<B>) -> BodyLength {
+        let http1 = response.version() <= Version::HTTP_11;
+        if http1 &&
+            let Some(codings) = response
+                .headers()
+                .get_all(TRANSFER_ENCODING)
+                .iter()
+                .next_back()
+        {
+            let chunked = codings
+                .to_str()
+                .ok()
+                .and_then(|codings| codings.rsplit(',').next())
+                .is_some_and(|coding| coding.trim().eq_ignore_ascii_case("chunked"));
+            return if chunked {
+                BodyLength::Unknown
+            } else {
+                BodyLength::UntilClose
+            };
+        }
+        if let Some(content_length) = response.headers().typed_get::<ContentLength>() {
+            return BodyLength::Known(content_length.0);
+        }
+        if http1 {
+            BodyLength::UntilClose
+        } else {
+            BodyLength::Unknown
+        }
+    }
+}
+
 struct BodyStream {
     body: BodySource,
     is_secure_scheme: bool,
-    content_length: Option<ContentLength>,
+    length: BodyLength,
     total_read: u64,
 }
 
@@ -338,20 +374,16 @@ impl BodyStream {
                     .boxed(),
             ),
             is_secure_scheme: false,
-            content_length: None,
+            length: BodyLength::Unknown,
             total_read: 0,
         }
     }
 
-    fn new(
-        body: BodySource,
-        is_secure_scheme: bool,
-        content_length: Option<ContentLength>,
-    ) -> Self {
+    fn new(body: BodySource, is_secure_scheme: bool, length: BodyLength) -> Self {
         BodyStream {
             body,
             is_secure_scheme,
-            content_length,
+            length,
             total_read: 0,
         }
     }
@@ -378,10 +410,17 @@ impl Stream for BodyStream {
                 // an error of type std::io::Error with ErrorKind::UnexpectedEof.
                 // https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof
                 //
-                // The error can be safely ignored if we known that all content was received or is explicitly
-                // set in preferences.
-                let all_content_read = self.content_length.is_some_and(|c| c.0 == self.total_read);
-                if self.is_secure_scheme && all_content_read {
+                // The error can be safely ignored if we know that all content was received.
+                //
+                // A body that ends with its connection is only complete with a close_notify
+                // (RFC 9112, section 9.8), but many servers close without one. Like Chromium and
+                // Firefox, take such a close as the end of the body.
+                let close_ends_body = match self.length {
+                    BodyLength::Known(length) => length == self.total_read,
+                    BodyLength::UntilClose => true,
+                    BodyLength::Unknown => false,
+                };
+                if self.is_secure_scheme && close_ends_body {
                     let source = err.source();
                     let is_unexpected_eof = source
                         .and_then(|e| e.downcast_ref::<io::Error>())
