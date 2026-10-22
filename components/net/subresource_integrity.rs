@@ -9,7 +9,6 @@ use std::sync::LazyLock;
 use aws_lc_rs::digest::{self};
 use base64::Engine;
 use net_traits::response::{Response, ResponseBody, ResponseType};
-use parking_lot::MutexGuard;
 use regex::Regex;
 
 type StaticCharVec = &'static [char];
@@ -141,17 +140,16 @@ pub fn get_strongest_metadata<'a>(integrity_metadata_list: Vec<SriEntry<'a>>) ->
 
 /// <https://w3c.github.io/webappsec-subresource-integrity/#apply-algorithm-to-response>
 fn apply_algorithm_to_response(
-    body: MutexGuard<ResponseBody>,
+    body: &ResponseBody,
     algorithm: &'static digest::Algorithm,
 ) -> String {
-    if let ResponseBody::Done(ref vec) = *body {
-        let response_digest = digest::digest(algorithm, vec);
+    if let Some(bytes) = body.bytes() {
+        let response_digest = digest::digest(algorithm, bytes);
         base64::engine::general_purpose::STANDARD.encode(response_digest)
     } else {
-        // There is nothing to digest: a null body status leaves the body empty, and
-        // a streamed body is delivered to the consumer rather than retained. Return
-        // a digest that cannot match, so the integrity check fails rather than the
-        // process.
+        // There is nothing to digest: a null body status leaves the body null, and a body
+        // that is still being received is not known as a whole. Return a digest that
+        // cannot match, so the integrity check fails rather than the process.
         log::debug!("integrity check on a response with no retained body");
         String::new()
     }
@@ -182,7 +180,7 @@ pub fn is_response_integrity_valid(integrity_metadata: &str, response: &Response
     // Step 5
     let metadata: Vec<SriEntry> = get_strongest_metadata(parsed_metadata_list);
     for item in metadata {
-        let body = response.body.lock();
+        let body = &response.actual_response().body;
         let digest = item.val;
 
         let hashed = match item.algorithm {

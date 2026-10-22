@@ -5,7 +5,6 @@
 use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::sync::Arc as StdArc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_recursion::async_recursion;
@@ -36,6 +35,7 @@ use ipc_channel::router::ROUTER;
 use log::{debug, error, info, log_enabled, warn};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use net_traits::blob_url_store::UrlWithBlobClaim;
+use net_traits::body_stream::{BodyEnd, body_channel};
 use net_traits::fetch::headers::get_value_from_header_list;
 use net_traits::http_status::HttpStatus;
 use net_traits::policy_container::{EmbedderPolicyValue, RequestPolicyContainer};
@@ -95,8 +95,7 @@ use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::FetchParams;
 use crate::fetch::headers::{SecFetchDest, SecFetchMode, SecFetchSite, SecFetchUser};
 use crate::fetch::methods::{
-    Data, DoneChannel, FetchContext, FetchFlowState, SuspendedFetches, Target, fetch, main_fetch,
-    retains_whole_body,
+    FetchContext, FetchFlowState, SuspendedFetches, Target, fetch, main_fetch,
 };
 use crate::hsts::HstsList;
 use crate::http_cache::{CacheTransaction, HttpCache, RevalidationGuard};
@@ -894,11 +893,8 @@ pub(crate) async fn http_fetch(
     cors_preflight_flag: bool,
     authentication_fetch_flag: bool,
     target: Target<'async_recursion>,
-    done_chan: &mut DoneChannel,
     context: &FetchContext,
 ) -> Response {
-    // This is a new async fetch, reset the channel we are waiting on
-    *done_chan = None;
     // Step 1. Let request be fetchParams’s request.
     let request = &mut fetch_params.request;
 
@@ -980,7 +976,6 @@ pub(crate) async fn http_fetch(
             fetch_params,
             authentication_fetch_flag,
             cors_flag,
-            done_chan,
             context,
         )
         .await;
@@ -1068,15 +1063,7 @@ pub(crate) async fn http_fetch(
 
                 // Step 6.3."follow".2. Set response to the result of running HTTP-redirect fetch
                 // given fetchParams and response.
-                http_redirect_fetch(
-                    fetch_params,
-                    response,
-                    cors_flag,
-                    target,
-                    done_chan,
-                    context,
-                )
-                .await
+                http_redirect_fetch(fetch_params, response, cors_flag, target, context).await
             },
         };
     }
@@ -1214,7 +1201,6 @@ pub async fn http_redirect_fetch(
     mut response: Response,
     cors_flag: bool,
     target: Target<'async_recursion>,
-    done_chan: &mut DoneChannel,
     context: &FetchContext,
 ) -> Response {
     let mut redirect_end_timer = RedirectEndTimer(Some(fetch_params.timing_info.clone()));
@@ -1348,8 +1334,11 @@ pub async fn http_redirect_fetch(
     // Step 21: If request’s redirect mode is "manual", then...
     let recursive_flag = request.redirect_mode != RedirectMode::Manual;
 
+    // Discard the body of the redirect rather than queue it while the next request runs.
+    drop(response);
+
     // Step 22: Return the result of running main fetch given fetchParams and recursive.
-    let fetch_response = main_fetch(fetch_params, recursive_flag, target, done_chan, context).await;
+    let fetch_response = main_fetch(fetch_params, recursive_flag, target, context).await;
 
     // TODO: timing allow check
     fetch_params
@@ -1369,7 +1358,6 @@ async fn http_network_or_cache_fetch(
     fetch_params: &mut FetchParams,
     authentication_fetch_flag: bool,
     cors_flag: bool,
-    done_chan: &mut DoneChannel,
     context: &FetchContext,
 ) -> Response {
     // Step 2. Let httpFetchParams be null.
@@ -1613,7 +1601,6 @@ async fn http_network_or_cache_fetch(
         .read(
             http_request,
             context.cancellation_listener.subscribe(),
-            done_chan,
             &mut revalidating_flag,
         )
         .await;
@@ -1642,7 +1629,6 @@ async fn http_network_or_cache_fetch(
             http_fetch_params,
             include_credentials,
             &mut cache_transaction,
-            done_chan,
             context,
         )
         .await;
@@ -1661,9 +1647,6 @@ async fn http_network_or_cache_fetch(
 
         // Step 10.4 If the revalidatingFlag is set and forwardResponse’s status is 304, then:
         if revalidating_flag && forward_response.status == StatusCode::NOT_MODIFIED {
-            // Ensure done_chan is None, since the network response will be replaced by the
-            // revalidated stored one.
-            *done_chan = None;
             response = context
                 .state
                 .http_cache
@@ -1671,7 +1654,6 @@ async fn http_network_or_cache_fetch(
                     &mut cache_transaction,
                     &http_fetch_params.request,
                     &forward_response,
-                    done_chan,
                 )
                 .await;
 
@@ -1684,13 +1666,11 @@ async fn http_network_or_cache_fetch(
                 let http_request = &mut http_fetch_params.request;
                 http_request.headers.remove(header::IF_NONE_MATCH);
                 http_request.headers.remove(header::IF_MODIFIED_SINCE);
-                *done_chan = None;
                 response = Some(
                     http_network_fetch(
                         http_fetch_params,
                         include_credentials,
                         &mut cache_transaction,
-                        done_chan,
                         context,
                     )
                     .await,
@@ -1774,16 +1754,14 @@ async fn http_network_or_cache_fetch(
             };
         }
 
-        // Make sure this is set to None,
-        // since we're about to start a new `http_network_or_cache_fetch`.
-        *done_chan = None;
+        // Discard the body of the response being replaced rather than queue it.
+        response.body = ResponseBody::Null;
 
         // Step 14.4 Set response to the result of running HTTP-network-or-cache fetch given fetchParams and true.
         response = http_network_or_cache_fetch(
             fetch_params,
             true, /* authentication flag */
             cors_flag,
-            done_chan,
             context,
         )
         .await;
@@ -1830,16 +1808,14 @@ async fn http_network_or_cache_fetch(
             auth_cache.entries.insert(key, entry);
         }
 
-        // Make sure this is set to None,
-        // since we're about to start a new `http_network_or_cache_fetch`.
-        *done_chan = None;
+        // Discard the body of the response being replaced rather than queue it.
+        response.body = ResponseBody::Null;
 
         // Step 15.5 Set response to the result of running HTTP-network-or-cache fetch given fetchParams.
         response = http_network_or_cache_fetch(
             fetch_params,
             false, /* authentication flag */
             cors_flag,
-            done_chan,
             context,
         )
         .await;
@@ -2040,31 +2016,12 @@ impl Drop for ResponseEndTimer {
     }
 }
 
-/// Mark a body that will not receive any more data as complete. Bodies that are
-/// accumulated for a consumer inside net keep their bytes; streamed bodies are
-/// left alone, since nothing retained them.
-fn complete_response_body_in_place(body: &mut ResponseBody) {
-    if let ResponseBody::Receiving(bytes) = body {
-        let mut bytes = std::mem::take(bytes);
-        bytes.shrink_to_fit();
-        *body = ResponseBody::Done(bytes);
-    }
-}
-
-/// Drop what has been accumulated so far for a body whose fetch failed or was cancelled.
-fn discard_response_body(body: &mut ResponseBody) {
-    if matches!(body, ResponseBody::Receiving(_)) {
-        *body = ResponseBody::Done(Vec::new());
-    }
-}
-
 /// [HTTP network fetch](https://fetch.spec.whatwg.org/#http-network-fetch)
 #[servo_tracing::instrument(skip_all,fields(url=fetch_params.request.url().as_str()))]
 async fn http_network_fetch(
     fetch_params: &mut FetchParams,
     credentials_flag: bool,
     cache_transaction: &mut CacheTransaction,
-    done_chan: &mut DoneChannel,
     context: &FetchContext,
 ) -> Response {
     let mut response_end_timer = ResponseEndTimer(Some(fetch_params.timing_info.clone()));
@@ -2258,12 +2215,6 @@ async fn http_network_fetch(
         url.is_secure_scheme(),
     );
 
-    let response_body = response.body.clone();
-
-    // We're about to spawn a future to be waited on here
-    let (done_sender, done_receiver) = unbounded_channel();
-    *done_chan = Some((done_sender.clone(), done_receiver));
-
     let cancellation_listener = context.cancellation_listener.clone();
     if cancellation_listener.cancelled() {
         return Response::network_error(NetworkError::LoadCancelled);
@@ -2307,18 +2258,9 @@ async fn http_network_fetch(
         4096
     }
     .min(pref!(network_max_content_length) as usize);
-    let _ = done_sender.send(Data::ContentLength(prealloc_size));
 
-    // The decoded body is only accumulated when a consumer inside the net process
-    // needs it as one piece. Subresource integrity and preloads are the only such
-    // consumers; every other body is streamed to the caller and never retained here,
-    // and the cache keeps its own copy on the encoded side.
-    *response_body.lock() = if retains_whole_body(request) {
-        ResponseBody::Receiving(Vec::with_capacity(prealloc_size))
-    } else {
-        ResponseBody::Streamed
-    };
-    let aborted = response.aborted.clone();
+    let (body_sender, body) = body_channel(Some(prealloc_size));
+    response.body = ResponseBody::Stream(body);
     let suspend_timeout = context.state.suspended_fetches.timeout();
     let network_body = cancellation_listener
         .start_network_body(context.state.suspended_fetches.clone(), url.origin());
@@ -2353,11 +2295,6 @@ async fn http_network_fetch(
                 },
             };
             if cancelled {
-                let mut body = response_body.lock();
-                aborted.store(true, Ordering::Release);
-                discard_response_body(&mut body);
-                drop(body);
-                let _ = done_sender.send(Data::Cancelled);
                 break Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
                     "Fetch aborted",
@@ -2370,10 +2307,9 @@ async fn http_network_fetch(
             };
             match chunk {
                 Some(Ok(chunk)) => {
-                    if let ResponseBody::Receiving(ref mut body) = *response_body.lock() {
-                        body.extend_from_slice(&chunk);
-                    }
-                    let _ = done_sender.send(Data::Payload(chunk));
+                    // When nobody reads the body any more, it is still read to its end, so
+                    // that the connection can be reused and the cache can store it.
+                    let _ = body_sender.send(chunk);
                 },
                 Some(Err(error)) => break Err(error),
                 None => break Ok(()),
@@ -2388,43 +2324,35 @@ async fn http_network_fetch(
                 if let Some(cache_commit) = cache_commit {
                     cache_commit.commit();
                 }
-                let mut body = response_body.lock();
-                complete_response_body_in_place(&mut body);
-                // A streamed body is not retained here; devtools accumulates its own
-                // copy from the chunks in `wait_for_response`.
-                #[cfg(feature = "devtools")]
-                let devtools_response_body = match &*body {
-                    ResponseBody::Done(bytes) if devtools_chan.is_some() => Some(bytes.clone()),
-                    _ => None,
-                };
+                // The body is not retained here; devtools accumulates its own copy from the
+                // chunks in `wait_for_response`.
                 #[cfg(feature = "devtools")]
                 send_response_values_to_devtools(
                     Some(headers),
                     status,
-                    devtools_response_body,
+                    None,
                     CacheState::None,
                     &devtools_request,
                     devtools_chan,
                 );
                 timing.set_attribute(ResourceAttribute::ResponseEnd);
-                let _ = done_sender.send(Data::Done);
+                body_sender.finish(BodyEnd::Complete);
             },
             Err(error) => {
-                // The body is incomplete, so keep the HTTP cache from using it.
-                aborted.store(true, Ordering::Release);
-                if let std::io::ErrorKind::InvalidData = error.kind() {
+                let end = if let std::io::ErrorKind::InvalidData = error.kind() {
                     debug!("Content decompression error for {:?}", request_url);
-                    let _ = done_sender.send(Data::Error(NetworkError::DecompressionError));
-                    discard_response_body(&mut response_body.lock());
-                }
-                if suspended_too_long {
+                    BodyEnd::Failed(NetworkError::DecompressionError)
+                } else if suspended_too_long {
                     debug!("Fetch suspended for too long: {:?}", request_url);
-                    let _ = done_sender.send(Data::Error(NetworkError::ConnectionFailure));
-                }
+                    BodyEnd::Failed(NetworkError::ConnectionFailure)
+                } else {
+                    // A body cut short by the connection is handed over as far as it got,
+                    // like one whose fetch was cancelled.
+                    BodyEnd::Aborted
+                };
                 debug!("finished response for {:?}", request_url);
-                complete_response_body_in_place(&mut response_body.lock());
                 timing.set_attribute(ResourceAttribute::ResponseEnd);
-                let _ = done_sender.send(Data::Done);
+                body_sender.finish(end);
             },
         }
     });
@@ -2442,7 +2370,7 @@ async fn http_network_fetch(
     // Step 13
     // TODO this step isn't possible yet (CSP)
 
-    // Step 14, update the cached response, done via the shared response body.
+    // Step 14, update the cached response, done by the copy that `HttpCache::tee` takes of the body.
 
     // TODO this step isn't possible yet
     // Step 15
@@ -2540,8 +2468,7 @@ async fn cors_preflight_fetch(request: &Request, context: &FetchContext) -> Resp
 
     send_early_httprequest_to_devtools(&preflight, context);
 
-    let response =
-        http_network_or_cache_fetch(&mut fetch_params, false, false, &mut None, context).await;
+    let response = http_network_or_cache_fetch(&mut fetch_params, false, false, context).await;
 
     send_response_to_devtools(&preflight, context, &response, None);
     send_security_info_to_devtools(&preflight, context, &response);

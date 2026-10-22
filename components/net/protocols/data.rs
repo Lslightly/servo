@@ -12,7 +12,7 @@ use net_traits::request::Request;
 use net_traits::response::{Response, ResponseBody};
 use net_traits::{NetworkError, ResourceFetchTiming};
 
-use crate::fetch::methods::{DoneChannel, FetchContext};
+use crate::fetch::methods::FetchContext;
 use crate::protocols::ProtocolHandler;
 
 #[derive(Default)]
@@ -22,7 +22,6 @@ impl ProtocolHandler for DataProtocolHander {
     fn load(
         &self,
         request: &mut Request,
-        _done_chan: &mut DoneChannel,
         _context: &FetchContext,
     ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
         let url = request.current_url();
@@ -35,7 +34,7 @@ impl ProtocolHandler for DataProtocolHander {
                     let content_type = data_url.mime_type().to_string();
                     let mut response =
                         Response::new(url, ResourceFetchTiming::new(request.timing_type()));
-                    *response.body.lock() = ResponseBody::Done(bytes);
+                    response.body = ResponseBody::Bytes(bytes.into());
 
                     if let Ok(content_type_header_value) = HeaderValue::from_str(&content_type) {
                         response

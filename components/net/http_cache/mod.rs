@@ -29,19 +29,17 @@ use http_cache_rules::{
 use log::debug;
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use malloc_size_of_derive::MallocSizeOf as MallocSizeOfDerive;
+use net_traits::body_stream::{BodyEnd, BodySender, body_channel};
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{CacheMode, Request, RequestMode};
 use net_traits::response::{CacheState, Response, ResponseBody};
 use net_traits::{CacheEntryDescriptor, NetworkError, ResourceFetchTiming};
-use parking_lot::Mutex;
-use servo_arc::Arc as ServoArc;
 use servo_config::pref;
-use tokio::sync::mpsc::{UnboundedSender as TokioSender, unbounded_channel as unbounded};
 use tokio::sync::watch;
 
 use crate::connector::BoxedBody;
 use crate::decoder::{Decoder, DecoderType};
-use crate::fetch::methods::{Data, DoneChannel, FetchFlowState, retains_whole_body};
+use crate::fetch::methods::FetchFlowState;
 use crate::http_cache::inflight::{InFlight, InFlightState, InFlightWriter, RevalidationGuards};
 use crate::http_cache::key::EntryId;
 use crate::http_cache::memory_store::MemoryStore;
@@ -171,12 +169,10 @@ impl HttpCache {
         &self,
         request: &mut Request,
         producer: watch::Receiver<FetchFlowState>,
-        done_chan: &mut DoneChannel,
         revalidating_flag: &mut bool,
     ) -> (CacheTransaction, CacheLookup) {
         let mut transaction = self.new_transaction(request, producer);
         let key = transaction.key.clone();
-        *done_chan = None;
         let mut lookup = CacheLookup::default();
 
         if !transaction.storable || request.cache_mode == CacheMode::NoStore {
@@ -218,7 +214,7 @@ impl HttpCache {
                         .policy
                         .presented_fields(&meta.headers, SystemTime::now());
                     match self
-                        .serve(request, id, &meta, headers, done_chan, CacheState::Local)
+                        .serve(request, id, &meta, headers, CacheState::Local)
                         .await
                     {
                         Ok(response) => {
@@ -233,11 +229,9 @@ impl HttpCache {
                             // The entry vanished between the lookup and the open, which
                             // the store is allowed to do. Fall back to the network.
                             self.store.remove(id, meta.stamp).await;
-                            *done_chan = None;
                         },
                         Err(ServeError::RangeNotSatisfiable) => {
                             // Keep the entry: this request just cannot be answered from it.
-                            *done_chan = None;
                         },
                     }
                 },
@@ -337,7 +331,6 @@ impl HttpCache {
         id: EntryId,
         meta: &EntryMeta,
         mut headers: HeaderMap,
-        done_chan: &mut DoneChannel,
         cache_state: CacheState,
     ) -> Result<Response, ServeError> {
         let mut status = meta.status.clone();
@@ -370,15 +363,13 @@ impl HttpCache {
         response.referrer_policy = request.referrer_policy;
         response.cache_state = cache_state;
 
-        let (sender, receiver) = unbounded();
-        *done_chan = Some((sender.clone(), receiver));
-        let accumulate = retains_whole_body(request);
-        *response.body.lock() = if accumulate {
-            ResponseBody::Receiving(Vec::new())
-        } else {
-            ResponseBody::Streamed
-        };
-        spawn_entry_stream(reader, sender, response.body.clone(), accumulate);
+        let length_hint = reader
+            .content_encoding()
+            .is_none()
+            .then(|| reader.len() as usize);
+        let (sender, body) = body_channel(length_hint);
+        response.body = ResponseBody::Stream(body);
+        spawn_entry_stream(reader, sender);
         Ok(response)
     }
 
@@ -392,7 +383,6 @@ impl HttpCache {
         transaction: &mut CacheTransaction,
         request: &Request,
         forward_response: &Response,
-        done_chan: &mut DoneChannel,
     ) -> Option<Response> {
         let (id, meta) = transaction.revalidating.take()?;
         let request_headers = transaction.presented_request_headers(request);
@@ -418,14 +408,7 @@ impl HttpCache {
             // The 304 forbids storing the response, with `no-store` for example: it
             // answers this request, and the entry goes.
             let response = self
-                .serve(
-                    request,
-                    id,
-                    &meta,
-                    freshened.headers,
-                    done_chan,
-                    CacheState::Validated,
-                )
+                .serve(request, id, &meta, freshened.headers, CacheState::Validated)
                 .await
                 .ok();
             self.store.remove(id, meta.stamp).await;
@@ -442,16 +425,9 @@ impl HttpCache {
         let headers = refreshed
             .policy
             .presented_fields(&refreshed.headers, SystemTime::now());
-        self.serve(
-            request,
-            id,
-            &refreshed,
-            headers,
-            done_chan,
-            CacheState::Validated,
-        )
-        .await
-        .ok()
+        self.serve(request, id, &refreshed, headers, CacheState::Validated)
+            .await
+            .ok()
     }
 
     /// Copy a network body into the cache as it is delivered, when the response may
@@ -738,29 +714,15 @@ impl HttpCache {
         let headers = meta
             .policy
             .presented_fields(&meta.headers, SystemTime::now());
-        let mut done_chan = None;
-        let response = self
-            .serve(
-                request,
-                id,
-                &meta,
-                headers,
-                &mut done_chan,
-                CacheState::Local,
-            )
+        let mut response = self
+            .serve(request, id, &meta, headers, CacheState::Local)
             .await
             .ok()?;
-        let (_, mut receiver) = done_chan?;
-        let mut body = Vec::new();
-        while let Some(data) = receiver.recv().await {
-            match data {
-                Data::Payload(chunk) => body.extend_from_slice(&chunk),
-                Data::Done => break,
-                Data::Error(_) | Data::Cancelled => return None,
-                Data::ContentLength(_) => {},
-            }
-        }
-        Some((response, body))
+        let ResponseBody::Stream(body) = response.body.take() else {
+            return None;
+        };
+        let body = body.read_all().await.ok()?;
+        Some((response, body.to_vec()))
     }
 
     /// Invalidate what an unsafe `request` that `response` answered invalidates.
@@ -862,43 +824,24 @@ fn is_cacheable_request(request: &Request) -> bool {
 }
 
 /// Stream a stored entry to the fetch consumer, decoding it on the way.
-fn spawn_entry_stream(
-    reader: BodyReader,
-    sender: TokioSender<Data>,
-    body: ServoArc<Mutex<ResponseBody>>,
-    accumulate: bool,
-) {
+fn spawn_entry_stream(reader: BodyReader, sender: BodySender) {
     let encoding = reader.content_encoding();
-    let stored_len = reader.len();
     tokio::spawn(async move {
-        if encoding.is_none() {
-            let _ = sender.send(Data::ContentLength(stored_len as usize));
-        }
         let mut decoder = Box::pin(Decoder::for_stream(reader.into_stream(), encoding));
         while let Some(item) = decoder.next().await {
             match item {
                 Ok(chunk) => {
-                    if accumulate && let ResponseBody::Receiving(bytes) = &mut *body.lock() {
-                        bytes.extend_from_slice(&chunk);
-                    }
-                    if sender.send(Data::Payload(chunk)).is_err() {
-                        break;
+                    if !sender.send(chunk) {
+                        return;
                     }
                 },
                 Err(error) => {
                     debug!("error reading a cached body: {error}");
-                    let _ = sender.send(Data::Error(NetworkError::DecompressionError));
-                    break;
+                    sender.finish(BodyEnd::Failed(NetworkError::DecompressionError));
+                    return;
                 },
             }
         }
-        {
-            let mut body = body.lock();
-            if let ResponseBody::Receiving(bytes) = &mut *body {
-                let bytes = std::mem::take(bytes);
-                *body = ResponseBody::Done(bytes);
-            }
-        }
-        let _ = sender.send(Data::Done);
+        sender.finish(BodyEnd::Complete);
     });
 }

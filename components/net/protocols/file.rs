@@ -9,12 +9,12 @@ use std::pin::Pin;
 
 use headers::{ContentLength, ContentRange, ContentType, HeaderMapExt, Range};
 use http::Method;
+use net_traits::body_stream::body_channel;
 use net_traits::request::Request;
 use net_traits::response::{Response, ResponseBody};
 use net_traits::{NetworkError, ResourceFetchTiming};
-use tokio::sync::mpsc::unbounded_channel;
 
-use crate::fetch::methods::{DoneChannel, FetchContext};
+use crate::fetch::methods::FetchContext;
 use crate::filemanager_thread::FILE_CHUNK_SIZE;
 use crate::local_directory_listing;
 use crate::protocols::{
@@ -28,7 +28,6 @@ impl ProtocolHandler for FileProtocolHander {
     fn load<'a>(
         &'a self,
         request: &'a mut Request,
-        done_chan: &mut DoneChannel,
         context: &FetchContext,
     ) -> Pin<Box<dyn Future<Output = Response> + Send + 'a>> {
         let url = request.current_url();
@@ -93,17 +92,11 @@ impl ProtocolHandler for FileProtocolHander {
                 let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
                 response.headers.typed_insert(ContentType::from(mime));
 
-                // Setup channel to receive cross-thread messages about the file fetch
-                // operation.
-                let (mut done_sender, done_receiver) = unbounded_channel();
-                *done_chan = Some((done_sender.clone(), done_receiver));
-
-                *response.body.lock() = ResponseBody::Receiving(vec![]);
-
+                let (sender, body) = body_channel(None);
+                response.body = ResponseBody::Stream(body);
                 context.filemanager.fetch_file_in_chunks(
-                    &mut done_sender,
+                    sender,
                     reader,
-                    response.body.clone(),
                     context.cancellation_listener.clone(),
                     range,
                 );

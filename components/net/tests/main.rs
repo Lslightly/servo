@@ -163,10 +163,14 @@ impl FetchTaskTarget for FetchResponseCollector {
     }
     /// Fired when the response is fully fetched
     fn process_response_eof(&mut self, _: &Request, response: &Response) {
-        let response = response.clone();
-        let body = &response.actual_response().body;
-        if matches!(&*body.lock(), ResponseBody::Streamed) {
-            *body.lock() = ResponseBody::Done(std::mem::take(&mut self.body));
+        let mut response = response
+            .try_clone()
+            .expect("a body is handed over before the end of the response");
+        if !response.is_network_error() {
+            let body = &mut response.actual_response_mut().body;
+            if body.bytes().is_none() {
+                *body = ResponseBody::Bytes(std::mem::take(&mut self.body).into());
+            }
         }
         let _ = self.sender.take().unwrap().send(response);
     }
@@ -209,7 +213,16 @@ fn fetch_with_cors_cache(request: Request, cache: &mut CorsCache) -> Response {
 
 /// Whether the body of a response from `fetch_with_context` ended before it was complete.
 pub(crate) fn is_aborted(response: &Response) -> bool {
-    response.aborted.load(std::sync::atomic::Ordering::SeqCst)
+    response.aborted
+}
+
+/// The body of a response from `fetch_with_context`.
+pub(crate) fn body_of(response: &Response) -> &[u8] {
+    response
+        .actual_response()
+        .body
+        .bytes()
+        .expect("the body is not complete")
 }
 
 pub(crate) fn mock_origin() -> ImmutableOrigin {

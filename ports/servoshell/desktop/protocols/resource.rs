@@ -14,10 +14,9 @@ use std::pin::Pin;
 
 use headers::{ContentType, HeaderMapExt};
 use servo::protocol_handler::{
-    DoneChannel, FILE_CHUNK_SIZE, FetchContext, NetworkError, ProtocolHandler, RelativePos,
-    Request, ResourceFetchTiming, Response, ResponseBody,
+    FILE_CHUNK_SIZE, FetchContext, NetworkError, ProtocolHandler, RelativePos, Request,
+    ResourceFetchTiming, Response, ResponseBody, body_channel,
 };
-use tokio::sync::mpsc::unbounded_channel;
 
 #[derive(Default)]
 pub struct ResourceProtocolHandler {}
@@ -25,7 +24,6 @@ pub struct ResourceProtocolHandler {}
 impl ResourceProtocolHandler {
     pub fn response_for_path(
         request: &mut Request,
-        done_chan: &mut DoneChannel,
         context: &FetchContext,
         path: &str,
     ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
@@ -62,17 +60,11 @@ impl ResourceProtocolHandler {
             let mime = mime_guess::from_path(file_path).first_or_octet_stream();
             response.headers.typed_insert(ContentType::from(mime));
 
-            // Setup channel to receive cross-thread messages about the file fetch
-            // operation.
-            let (mut done_sender, done_receiver) = unbounded_channel();
-            *done_chan = Some((done_sender.clone(), done_receiver));
-
-            *response.body.lock() = ResponseBody::Receiving(vec![]);
-
+            let (sender, body) = body_channel(None);
+            response.body = ResponseBody::Stream(body);
             context.filemanager.fetch_file_in_chunks(
-                &mut done_sender,
+                sender,
                 reader,
-                response.body.clone(),
                 context.cancellation_listener.clone(),
                 RelativePos::full_range(),
             );
@@ -92,7 +84,6 @@ impl ProtocolHandler for ResourceProtocolHandler {
     fn load(
         &self,
         request: &mut Request,
-        done_chan: &mut DoneChannel,
         context: &FetchContext,
     ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
         let url = request.current_url();
@@ -100,6 +91,6 @@ impl ProtocolHandler for ResourceProtocolHandler {
         // TODO: Check referrer.
         //       We unexpectedly get `NoReferrer` for all requests from the newtab page.
 
-        Self::response_for_path(request, done_chan, context, url.path())
+        Self::response_for_path(request, context, url.path())
     }
 }

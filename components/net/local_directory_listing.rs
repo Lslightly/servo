@@ -43,7 +43,7 @@ pub(crate) async fn fetch(request: &mut Request, url: ServoUrl, path_buf: PathBu
 
     let mut response = Response::new(url, ResourceFetchTiming::new(request.timing_type()));
     response.headers.typed_insert(ContentType::html());
-    *response.body.lock() = ResponseBody::Done(output.into_bytes());
+    response.body = ResponseBody::Bytes(output.into_bytes().into());
 
     response
 }

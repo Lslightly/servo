@@ -899,7 +899,6 @@ impl CoreResourceManager {
                         response,
                         true,
                         &mut sender,
-                        &mut None,
                         &context,
                     )
                     .await;

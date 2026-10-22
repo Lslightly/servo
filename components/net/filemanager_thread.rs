@@ -17,7 +17,9 @@ use embedder_traits::{
 use headers::{ContentLength, ContentRange, ContentType, HeaderMap, HeaderMapExt, Range};
 use log::warn;
 use mime::Mime;
+use net_traits::NetworkError;
 use net_traits::blob_url_store::{BlobBuf, BlobTokenCommunicator, BlobURLStoreError};
+use net_traits::body_stream::{BodyEnd, BodySender, body_channel};
 use net_traits::filemanager_thread::{
     FileManagerResult, FileManagerThreadError, FileManagerThreadMsg, FileTokenCheck,
     GetTokenForFileReply, ReadFileProgress, RelativePos,
@@ -26,17 +28,15 @@ use net_traits::response::{Response, ResponseBody};
 use parking_lot::{Mutex, RwLock};
 use profile_traits::generic_callback::GenericCallback;
 use rustc_hash::{FxHashMap, FxHashSet};
-use servo_arc::Arc as ServoArc;
 use servo_base::generic_channel::GenericSender;
 use servo_url::ImmutableOrigin;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::mpsc::UnboundedSender as TokioSender;
 use tokio::task::yield_now;
 use uuid::Uuid;
 
 use crate::async_runtime::spawn_task;
 use crate::embedder::NetToEmbedderMsg;
-use crate::fetch::methods::{CancellationListener, Data, RangeRequestBounds};
+use crate::fetch::methods::{CancellationListener, RangeRequestBounds};
 use crate::protocols::get_range_request_bounds;
 
 pub const FILE_CHUNK_SIZE: usize = 32768; // 32 KB
@@ -123,10 +123,8 @@ impl FileManager {
     /// Read a file for the Fetch implementation.
     /// It gets the required headers synchronously and reads the actual content
     /// in a separate thread.
-    #[expect(clippy::too_many_arguments)]
     pub(crate) fn fetch_file(
         &self,
-        done_sender: &mut TokioSender<Data>,
         cancellation_listener: Arc<CancellationListener>,
         id: Uuid,
         file_token: &FileTokenCheck,
@@ -135,7 +133,6 @@ impl FileManager {
         range: Option<Range>,
     ) -> Result<(), BlobURLStoreError> {
         self.fetch_blob_buf(
-            done_sender,
             cancellation_listener,
             &id,
             file_token,
@@ -207,72 +204,65 @@ impl FileManager {
 
     pub fn fetch_file_in_chunks(
         &self,
-        done_sender: &mut TokioSender<Data>,
+        sender: BodySender,
         mut reader: BufReader<File>,
-        res_body: ServoArc<Mutex<ResponseBody>>,
         cancellation_listener: Arc<CancellationListener>,
         range: RelativePos,
     ) {
-        let done_sender = done_sender.clone();
         spawn_task(async move {
+            let mut sent = 0;
             loop {
                 if cancellation_listener.cancelled() {
-                    *res_body.lock() = ResponseBody::Done(vec![]);
-                    let _ = done_sender.send(Data::Cancelled);
+                    sender.finish(BodyEnd::Aborted);
                     return;
                 }
-                let length = {
-                    let buffer = reader.fill_buf().unwrap();
-                    let mut buffer_len = buffer.len();
-                    if let ResponseBody::Receiving(ref mut body) = *res_body.lock() {
-                        let offset = usize::min(
-                            {
-                                if let Some(end) = range.end {
-                                    // HTTP Range requests are specified with closed ranges,
-                                    // while Rust uses half-open ranges. We add +1 here so
-                                    // we don't skip the last requested byte.
-                                    let remaining_bytes =
-                                        end as usize - range.start as usize - body.len() + 1;
-                                    if remaining_bytes <= FILE_CHUNK_SIZE {
-                                        // This is the last chunk so we set buffer
-                                        // len to 0 to break the reading loop.
-                                        buffer_len = 0;
-                                        remaining_bytes
-                                    } else {
-                                        FILE_CHUNK_SIZE
-                                    }
-                                } else {
-                                    FILE_CHUNK_SIZE
-                                }
-                            },
-                            buffer.len(),
-                        );
-                        let chunk = &buffer[0..offset];
-                        body.extend_from_slice(chunk);
-                        let _ = done_sender.send(Data::Payload(Bytes::copy_from_slice(chunk)));
-                    }
-                    buffer_len
+                let buffer = match reader.fill_buf() {
+                    Ok(buffer) => buffer,
+                    Err(error) => {
+                        sender.finish(BodyEnd::Failed(NetworkError::ResourceLoadError(
+                            error.to_string(),
+                        )));
+                        return;
+                    },
                 };
-                if length == 0 {
-                    let mut body = res_body.lock();
-                    let completed_body = match *body {
-                        ResponseBody::Receiving(ref mut body) => std::mem::take(body),
-                        _ => vec![],
-                    };
-                    *body = ResponseBody::Done(completed_body);
-                    let _ = done_sender.send(Data::Done);
-                    break;
+                let mut buffer_len = buffer.len();
+                let offset = usize::min(
+                    {
+                        if let Some(end) = range.end {
+                            // HTTP Range requests are specified with closed ranges,
+                            // while Rust uses half-open ranges. We add +1 here so
+                            // we don't skip the last requested byte.
+                            let remaining_bytes = end as usize - range.start as usize - sent + 1;
+                            if remaining_bytes <= FILE_CHUNK_SIZE {
+                                // This is the last chunk so we set buffer
+                                // len to 0 to break the reading loop.
+                                buffer_len = 0;
+                                remaining_bytes
+                            } else {
+                                FILE_CHUNK_SIZE
+                            }
+                        } else {
+                            FILE_CHUNK_SIZE
+                        }
+                    },
+                    buffer.len(),
+                );
+                if !sender.send(Bytes::copy_from_slice(&buffer[0..offset])) {
+                    return;
                 }
-                reader.consume(length);
+                sent += offset;
+                if buffer_len == 0 {
+                    sender.finish(BodyEnd::Complete);
+                    return;
+                }
+                reader.consume(buffer_len);
                 yield_now().await
             }
         });
     }
 
-    #[expect(clippy::too_many_arguments)]
     fn fetch_blob_buf(
         &self,
-        done_sender: &mut TokioSender<Data>,
         cancellation_listener: Arc<CancellationListener>,
         id: &Uuid,
         file_token: &FileTokenCheck,
@@ -315,11 +305,7 @@ impl FileManager {
                     content_range,
                 );
 
-                let mut bytes = vec![];
-                bytes.extend_from_slice(buf.bytes.index(range));
-
-                let _ = done_sender.send(Data::Payload(Bytes::copy_from_slice(&bytes)));
-                let _ = done_sender.send(Data::Done);
+                response.body = ResponseBody::Bytes(Bytes::copy_from_slice(buf.bytes.index(range)));
 
                 Ok(())
             },
@@ -369,13 +355,9 @@ impl FileManager {
                     content_range,
                 );
 
-                self.fetch_file_in_chunks(
-                    &mut done_sender.clone(),
-                    reader,
-                    response.body.clone(),
-                    cancellation_listener,
-                    range,
-                );
+                let (sender, body) = body_channel(None);
+                response.body = ResponseBody::Stream(body);
+                self.fetch_file_in_chunks(sender, reader, cancellation_listener, range);
 
                 Ok(())
             },
@@ -386,7 +368,6 @@ impl FileManager {
                     RelativePos::full_range().slice_inner(&inner_rel_pos),
                 );
                 self.fetch_blob_buf(
-                    done_sender,
                     cancellation_listener,
                     &parent_id,
                     file_token,

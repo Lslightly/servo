@@ -9,12 +9,11 @@ use hyper_serde::Serde;
 use mime::{self, Mime};
 use net_traits::blob_url_store::UrlWithBlobClaim;
 use net_traits::request::Referrer;
-use net_traits::response::ResponseBody;
 use net_traits::{FetchMetadata, FilteredMetadata, NetworkError};
 use servo_base::id::TEST_WEBVIEW_ID;
 use servo_url::ServoUrl;
 
-use crate::fetch;
+use crate::{body_of, fetch};
 
 #[cfg(test)]
 fn assert_parse(
@@ -53,13 +52,7 @@ fn assert_parse(
             assert_eq!(metadata.content_type.map(Serde::into_inner), content_type);
             assert_eq!(metadata.charset.as_ref().map(String::deref), charset);
 
-            let resp_body = response.body.lock();
-            match *resp_body {
-                ResponseBody::Done(ref val) => {
-                    assert_eq!(val, &data);
-                },
-                _ => panic!(),
-            }
+            assert_eq!(body_of(&response), data);
         },
         None => {
             assert!(response.is_network_error());

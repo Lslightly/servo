@@ -60,7 +60,7 @@ fn test_get_strongest_metadata_different_algorithm() {
 #[test]
 fn test_response_integrity_valid() {
     let url: ServoUrl = ServoUrl::parse("http://servo.org").unwrap();
-    let response: Response = Response::new(
+    let mut response: Response = Response::new(
         url,
         ResourceFetchTiming::new(ResourceTimingType::Navigation),
     );
@@ -69,14 +69,14 @@ fn test_response_integrity_valid() {
         "sha384-H8BRh8j48O9oYatfu5AZzq6A9RINhZO5H16dQZngK7T62em8MUt1FLm52t+eX6xO";
     let response_body = "alert('Hello, world.');".to_owned().into_bytes();
 
-    *response.body.lock() = ResponseBody::Done(response_body);
+    response.body = ResponseBody::Bytes(response_body.into());
     assert!(is_response_integrity_valid(integrity_metadata, &response));
 }
 
 #[test]
 fn test_response_integrity_invalid() {
     let url: ServoUrl = ServoUrl::parse("http://servo.org").unwrap();
-    let response: Response = Response::new(
+    let mut response: Response = Response::new(
         url,
         ResourceFetchTiming::new(ResourceTimingType::Navigation),
     );
@@ -85,6 +85,6 @@ fn test_response_integrity_invalid() {
         "sha256-H8BRh8j48O9oYatfu5AZzq6A9RINhZO5H16dQZngK7T62em8MUt1FLm52t+eX6xO";
     let response_body = "alert('Hello, world.');".to_owned().into_bytes();
 
-    *response.body.lock() = ResponseBody::Done(response_body);
+    response.body = ResponseBody::Bytes(response_body.into());
     assert!(!is_response_integrity_valid(integrity_metadata, &response));
 }

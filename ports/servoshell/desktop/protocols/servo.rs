@@ -16,8 +16,8 @@ use std::pin::Pin;
 use headers::{ContentType, HeaderMapExt};
 use servo::UserAgentPlatform;
 use servo::protocol_handler::{
-    DoneChannel, FetchContext, NetworkError, ProtocolHandler, Request, ResourceFetchTiming,
-    Response, ResponseBody,
+    FetchContext, NetworkError, ProtocolHandler, Request, ResourceFetchTiming, Response,
+    ResponseBody,
 };
 
 use crate::desktop::protocols::resource::ResourceProtocolHandler;
@@ -38,38 +38,25 @@ impl ProtocolHandler for ServoProtocolHandler {
     fn load(
         &self,
         request: &mut Request,
-        done_chan: &mut DoneChannel,
         context: &FetchContext,
     ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
         let url = request.current_url();
 
         match url.path() {
-            "config" => ResourceProtocolHandler::response_for_path(
-                request,
-                done_chan,
-                context,
-                "/config.html",
-            ),
-            "newtab" => ResourceProtocolHandler::response_for_path(
-                request,
-                done_chan,
-                context,
-                "/newtab.html",
-            ),
+            "config" => {
+                ResourceProtocolHandler::response_for_path(request, context, "/config.html")
+            },
+            "newtab" => {
+                ResourceProtocolHandler::response_for_path(request, context, "/newtab.html")
+            },
 
-            "preferences" => ResourceProtocolHandler::response_for_path(
-                request,
-                done_chan,
-                context,
-                "/preferences.html",
-            ),
+            "preferences" => {
+                ResourceProtocolHandler::response_for_path(request, context, "/preferences.html")
+            },
 
-            "license" => ResourceProtocolHandler::response_for_path(
-                request,
-                done_chan,
-                context,
-                "/license.html",
-            ),
+            "license" => {
+                ResourceProtocolHandler::response_for_path(request, context, "/license.html")
+            },
 
             "experimental-preferences" => {
                 let pref_list = EXPERIMENTAL_PREFS
@@ -101,6 +88,6 @@ fn json_response(
         ResourceFetchTiming::new(request.timing_type()),
     );
     response.headers.typed_insert(ContentType::json());
-    *response.body.lock() = ResponseBody::Done(body.into_bytes());
+    response.body = ResponseBody::Bytes(body.into_bytes().into());
     Box::pin(std::future::ready(response))
 }

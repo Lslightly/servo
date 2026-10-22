@@ -7,8 +7,7 @@ use std::pin::Pin;
 
 use headers::{ContentType, HeaderMapExt};
 use servo::protocol_handler::{
-    DoneChannel, FetchContext, HttpStatus, ProtocolHandler, Request, ResourceFetchTiming, Response,
-    ResponseBody,
+    FetchContext, HttpStatus, ProtocolHandler, Request, ResourceFetchTiming, Response, ResponseBody,
 };
 
 #[derive(Default)]
@@ -19,7 +18,6 @@ impl ProtocolHandler for UrlInfoProtocolHander {
     fn load(
         &self,
         request: &mut Request,
-        _done_chan: &mut DoneChannel,
         _context: &FetchContext,
     ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
         let url = request.current_url();
@@ -34,7 +32,7 @@ impl ProtocolHandler for UrlInfoProtocolHander {
             url.query()
         );
         let mut response = Response::new(url, ResourceFetchTiming::new(request.timing_type()));
-        *response.body.lock() = ResponseBody::Done(content.as_bytes().to_vec());
+        response.body = ResponseBody::Bytes(content.into_bytes().into());
         response.headers.typed_insert(ContentType::text());
         response.status = HttpStatus::default();
 

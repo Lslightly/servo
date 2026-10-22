@@ -4,16 +4,15 @@
 
 //! The [Response](https://fetch.spec.whatwg.org/#responses) object
 //! resulting from a [fetch operation](https://fetch.spec.whatwg.org/#concept-fetch)
-use std::sync::atomic::AtomicBool;
-
+use bytes::Bytes;
 use http::HeaderMap;
 use hyper_serde::Serde;
+use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use malloc_size_of_derive::MallocSizeOf;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use servo_arc::Arc;
 use servo_url::ServoUrl;
 
+use crate::body_stream::BodyReceiver;
 use crate::fetch::headers::extract_mime_type_as_mime;
 use crate::http_status::HttpStatus;
 use crate::resource_fetch_timing::{ResourceFetchTimingContainer, ResourceTimingType};
@@ -41,25 +40,49 @@ pub enum TerminationReason {
     Timeout,
 }
 
-/// The response body can still be pushed to after fetch
-/// This provides a way to store unfinished response bodies
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+/// [Body](https://fetch.spec.whatwg.org/#concept-body) of a response.
+#[derive(Debug, Default)]
 pub enum ResponseBody {
-    Empty, // XXXManishearth is this necessary, or is Done(vec![]) enough?
-    #[serde(with = "serde_bytes")]
-    Receiving(Vec<u8>),
-    #[serde(with = "serde_bytes")]
-    Done(Vec<u8>),
-    /// The body is delivered to the consumer chunk by chunk and is not retained
-    /// anywhere in the net process.
-    Streamed,
+    /// A null body.
+    #[default]
+    Null,
+    /// A body whose bytes are all known.
+    Bytes(Bytes),
+    /// A body that is still being received. Dropping it discards the rest of the body.
+    Stream(BodyReceiver),
 }
 
 impl ResponseBody {
-    pub fn is_done(&self) -> bool {
-        match *self {
-            ResponseBody::Done(..) | ResponseBody::Streamed => true,
-            ResponseBody::Empty | ResponseBody::Receiving(..) => false,
+    pub fn is_null(&self) -> bool {
+        matches!(self, ResponseBody::Null)
+    }
+
+    /// The bytes of a body that is known as a whole.
+    pub fn bytes(&self) -> Option<&Bytes> {
+        match self {
+            ResponseBody::Bytes(bytes) => Some(bytes),
+            ResponseBody::Null | ResponseBody::Stream(_) => None,
+        }
+    }
+
+    pub fn take(&mut self) -> ResponseBody {
+        std::mem::take(self)
+    }
+
+    fn try_clone(&self) -> Option<ResponseBody> {
+        match self {
+            ResponseBody::Null => Some(ResponseBody::Null),
+            ResponseBody::Bytes(bytes) => Some(ResponseBody::Bytes(bytes.clone())),
+            ResponseBody::Stream(_) => None,
+        }
+    }
+}
+
+impl MallocSizeOf for ResponseBody {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        match self {
+            ResponseBody::Bytes(bytes) => bytes.size_of(ops),
+            ResponseBody::Null | ResponseBody::Stream(_) => 0,
         }
     }
 }
@@ -96,7 +119,7 @@ pub struct ResponseInit {
 }
 
 /// A [Response](https://fetch.spec.whatwg.org/#concept-response) as defined by the Fetch spec
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct Response {
     pub response_type: ResponseType,
     pub termination_reason: Option<TerminationReason>,
@@ -108,8 +131,8 @@ pub struct Response {
         serialize_with = "::hyper_serde::serialize"
     )]
     pub headers: HeaderMap,
-    #[conditional_malloc_size_of]
-    pub body: Arc<Mutex<ResponseBody>>,
+    #[serde(skip)]
+    pub body: ResponseBody,
     pub cache_state: CacheState,
     pub tls_security_info: Option<TlsSecurityInfo>,
     pub referrer: Option<ServoUrl>,
@@ -128,8 +151,7 @@ pub struct Response {
     /// <https://fetch.spec.whatwg.org/#concept-response-aborted>
     ///
     /// Also set when the body failed before its end.
-    #[conditional_malloc_size_of]
-    pub aborted: Arc<AtomicBool>,
+    pub aborted: bool,
     /// track network metrics
     pub resource_timing: ResourceFetchTimingContainer,
 
@@ -150,7 +172,7 @@ impl Response {
             url_list: vec![],
             status: HttpStatus::default(),
             headers: HeaderMap::new(),
-            body: Arc::new(Mutex::new(ResponseBody::Empty)),
+            body: ResponseBody::Null,
             cache_state: CacheState::None,
             tls_security_info: None,
             referrer: None,
@@ -159,7 +181,7 @@ impl Response {
             location_url: None,
             internal_response: None,
             return_internal: true,
-            aborted: Arc::new(AtomicBool::new(false)),
+            aborted: false,
             resource_timing: resource_timing.into(),
             range_requested: false,
             request_includes_credentials: true,
@@ -184,7 +206,7 @@ impl Response {
             url_list: vec![],
             status: HttpStatus::new_error(),
             headers: HeaderMap::new(),
-            body: Arc::new(Mutex::new(ResponseBody::Empty)),
+            body: ResponseBody::Null,
             cache_state: CacheState::None,
             tls_security_info: None,
             referrer: None,
@@ -193,7 +215,7 @@ impl Response {
             location_url: None,
             internal_response: None,
             return_internal: true,
-            aborted: Arc::new(AtomicBool::new(false)),
+            aborted: false,
             resource_timing: ResourceFetchTiming::new(ResourceTimingType::Error).into(),
             range_requested: false,
             request_includes_credentials: true,
@@ -250,6 +272,44 @@ impl Response {
         &self.resource_timing
     }
 
+    /// A copy of this response, unless it or its internal response has a body that is still
+    /// being received, which cannot be copied.
+    pub fn try_clone(&self) -> Option<Response> {
+        let mut response = self.clone_without_body();
+        response.body = self.body.try_clone()?;
+        response.internal_response = match &self.internal_response {
+            Some(internal_response) => Some(Box::new(internal_response.try_clone()?)),
+            None => None,
+        };
+        Some(response)
+    }
+
+    /// A copy of this response with a null body and no internal response.
+    fn clone_without_body(&self) -> Response {
+        Response {
+            response_type: self.response_type.clone(),
+            termination_reason: self.termination_reason,
+            url: self.url.clone(),
+            url_list: self.url_list.clone(),
+            status: self.status.clone(),
+            headers: self.headers.clone(),
+            body: ResponseBody::Null,
+            cache_state: self.cache_state,
+            tls_security_info: self.tls_security_info.clone(),
+            referrer: self.referrer.clone(),
+            redirect_taint: self.redirect_taint,
+            referrer_policy: self.referrer_policy,
+            cors_exposed_header_name_list: self.cors_exposed_header_name_list.clone(),
+            location_url: self.location_url.clone(),
+            internal_response: None,
+            return_internal: self.return_internal,
+            aborted: self.aborted,
+            resource_timing: self.resource_timing.clone(),
+            range_requested: self.range_requested,
+            request_includes_credentials: self.request_includes_credentials,
+        }
+    }
+
     /// Convert to a filtered response, of type `filter_type`.
     /// Do not use with type Error or Default
     pub fn to_filtered(self, filter_type: ResponseType) -> Response {
@@ -266,7 +326,8 @@ impl Response {
 
         // This is ok as we always set the `response.headers` in all branches in the following.
         let old_headers = std::mem::take(&mut old_response.headers);
-        let mut response = old_response.clone();
+        // The body stays with the internal response.
+        let mut response = old_response.clone_without_body();
         response.response_type = filter_type;
 
         match response.response_type {
@@ -320,14 +381,12 @@ impl Response {
                 response.url = None;
                 response.headers = HeaderMap::new();
                 response.status = HttpStatus::new_error();
-                response.body = Arc::new(Mutex::new(ResponseBody::Empty));
                 response.cache_state = CacheState::None;
             },
 
             ResponseType::OpaqueRedirect => {
                 response.headers = HeaderMap::new();
                 response.status = HttpStatus::new_error();
-                response.body = Arc::new(Mutex::new(ResponseBody::Empty));
                 response.cache_state = CacheState::None;
             },
         }

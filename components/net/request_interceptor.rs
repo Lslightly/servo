@@ -47,7 +47,7 @@ impl RequestInterceptor {
                 sender,
             ));
 
-        // TODO: use done_chan and run in CoreResourceThreadPool.
+        // TODO: stream the body and run in CoreResourceThreadPool.
         let mut accumulated_body = Vec::new();
         while let Some(message) = receiver.recv().await {
             match message {
@@ -73,8 +73,13 @@ impl RequestInterceptor {
                         error!("Received unexpected FinishLoad message");
                         break;
                     };
-                    *response.body.lock() =
-                        ResponseBody::Done(accumulated_body.into_iter().flatten().collect());
+                    response.body = ResponseBody::Bytes(
+                        accumulated_body
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<u8>>()
+                            .into(),
+                    );
                     break;
                 },
                 WebResourceResponseMsg::CancelLoad => {

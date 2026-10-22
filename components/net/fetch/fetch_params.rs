@@ -27,7 +27,7 @@ impl PreloadResponseCandidate {
             PreloadResponseCandidate::None => None,
             // Step 2. Assert: fetchParams’s preloaded response candidate is a response.
             PreloadResponseCandidate::Response(response, preload_id) => {
-                Some((*response.clone(), preload_id.clone()))
+                Some((response.try_clone()?, preload_id.clone()))
             },
             // Step 1. Wait until fetchParams’s preloaded response candidate is not "pending".
             PreloadResponseCandidate::Pending(receiver, preload_id) => receiver
@@ -139,8 +139,9 @@ impl ConsumePreloadedResources for RequestClient {
 
         // Step 10. Otherwise, call onResponseAvailable with entry's response.
         if let Some(response) = preload_entry.response.as_ref() {
+            // A preloaded response holds its whole body, so this copy always succeeds.
             Some(PreloadResponseCandidate::Response(
-                Box::new(response.clone()),
+                Box::new(response.try_clone()?),
                 preload_id.clone(),
             ))
         } else {

@@ -140,9 +140,10 @@ pub mod webxr {
 
 // TODO: The protocol handler interface needs to be cleaned and simplified.
 pub mod protocol_handler {
-    pub use net::fetch::methods::{DoneChannel, FetchContext};
+    pub use net::fetch::methods::FetchContext;
     pub use net::filemanager_thread::FILE_CHUNK_SIZE;
     pub use net::protocols::{ProtocolHandler, ProtocolRegistry};
+    pub use net_traits::body_stream::{BodyEnd, BodySender, body_channel};
     pub use net_traits::filemanager_thread::RelativePos;
     pub use net_traits::http_status::HttpStatus;
     pub use net_traits::request::Request;

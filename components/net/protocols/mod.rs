@@ -15,12 +15,16 @@ use net_traits::blob_url_store::UrlWithBlobClaim;
 use net_traits::filemanager_thread::RelativePos;
 use net_traits::request::Request;
 use net_traits::response::Response;
-use net_traits::{DiscardFetch, NetworkError};
+use net_traits::{
+    DiscardFetch, NetworkError, ResourceAttribute, ResourceFetchTiming,
+    ResourceFetchTimingContainer, ResourceTimeValue,
+};
 use rustc_hash::FxHashMap;
 use servo_url::ServoUrl;
 use url::Position;
 
-use crate::fetch::methods::{DoneChannel, FetchContext, RangeRequestBounds, fetch};
+use crate::fetch::fetch_params::FetchParams;
+use crate::fetch::methods::{FetchContext, RangeRequestBounds, main_fetch};
 
 mod blob;
 mod data;
@@ -48,12 +52,10 @@ pub trait ProtocolHandler: Send + Sync {
     /// http endpoint, it is recommended to a least provide:
     /// - A relevant status code.
     /// - A Content Type.
-    fn load<'a>(
-        &'a self,
-        request: &'a mut Request,
-        done_chan: &mut DoneChannel,
-        context: &FetchContext,
-    ) -> FutureResponse<'a>;
+    ///
+    /// The body is either a `ResponseBody::Bytes`, or a `ResponseBody::Stream` from
+    /// `body_channel`, whose sender then sends the chunks and finishes the body.
+    fn load<'a>(&'a self, request: &'a mut Request, context: &FetchContext) -> FutureResponse<'a>;
 
     /// Specify if resources served by that protocol can be retrieved
     /// with `fetch()` without no-cors mode to allow the caller direct
@@ -178,12 +180,7 @@ struct WebPageContentProtocolHandler {
 
 impl ProtocolHandler for WebPageContentProtocolHandler {
     /// <https://html.spec.whatwg.org/multipage/#protocol-handler-invocation>
-    fn load<'a>(
-        &'a self,
-        request: &'a mut Request,
-        _done_chan: &mut DoneChannel,
-        context: &FetchContext,
-    ) -> FutureResponse<'a> {
+    fn load<'a>(&'a self, request: &'a mut Request, context: &FetchContext) -> FutureResponse<'a> {
         let mut url = request.current_url();
         // Step 1. Assert: inputURL's scheme is normalizedScheme.
         assert!(url.scheme() == self.scheme);
@@ -223,9 +220,21 @@ impl ProtocolHandler for WebPageContentProtocolHandler {
         request
             .url_list
             .push(UrlWithBlobClaim::new(result_url, None));
+
+        // The handler's response is returned without handing its body over, so that the
+        // fetch of the original URL hands it over to its consumer.
         let request2 = request.clone();
         let context2 = context.clone();
-        Box::pin(async move { fetch(request2, &mut DiscardFetch, &context2).await })
+        Box::pin(async move {
+            let timing: ResourceFetchTimingContainer =
+                ResourceFetchTiming::new(request2.timing_type()).into();
+            timing.set_attributes(&[
+                ResourceAttribute::FetchStart,
+                ResourceAttribute::StartTime(ResourceTimeValue::FetchStart),
+            ]);
+            let mut fetch_params = FetchParams::new(request2, timing);
+            main_fetch(&mut fetch_params, true, &mut DiscardFetch, &context2).await
+        })
     }
 }
 

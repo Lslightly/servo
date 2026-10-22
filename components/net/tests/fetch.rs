@@ -38,7 +38,7 @@ use net_traits::http_status::HttpStatus;
 use net_traits::request::{
     Destination, RedirectMode, Referrer, Request, RequestBuilder, RequestMode,
 };
-use net_traits::response::{CacheState, Response, ResponseBody, ResponseType};
+use net_traits::response::{CacheState, Response, ResponseType};
 use net_traits::{
     FetchTaskTarget, IncludeSubdomains, NetworkError, ReferrerPolicy, get_current_locale,
 };
@@ -49,9 +49,9 @@ use uuid::Uuid;
 
 use crate::http_loader::{devtools_response_with_body, expect_devtools_http_request};
 use crate::{
-    DEFAULT_USER_AGENT, create_generic_embedder_proxy, create_generic_embedder_proxy_and_receiver,
-    create_http_state, fetch, fetch_with_context, fetch_with_cors_cache, make_body, make_server,
-    make_ssl_server, mock_origin, new_fetch_context,
+    DEFAULT_USER_AGENT, body_of, create_generic_embedder_proxy,
+    create_generic_embedder_proxy_and_receiver, create_http_state, fetch, fetch_with_context,
+    fetch_with_cors_cache, make_body, make_server, make_ssl_server, mock_origin, new_fetch_context,
 };
 
 // TODO write a struct that impls Handler for storing test values
@@ -115,12 +115,7 @@ fn test_fetch_response_body_matches_const_message() {
     assert!(!fetch_response.is_network_error());
     assert_eq!(fetch_response.response_type, ResponseType::Basic);
 
-    match *fetch_response.body.lock() {
-        ResponseBody::Done(ref body) => {
-            assert_eq!(&**body, MESSAGE);
-        },
-        _ => panic!(),
-    };
+    assert_eq!(body_of(&fetch_response), MESSAGE);
 }
 
 #[test]
@@ -140,15 +135,13 @@ fn test_fetch_aboutblank() {
     assert_eq!(fetch_response.response_type, ResponseType::Opaque);
     assert!(!fetch_response.is_network_error());
     assert_eq!(fetch_response.headers.len(), 0);
-    let resp_body = fetch_response.body.lock();
-    assert_eq!(*resp_body, ResponseBody::Empty);
+    assert!(fetch_response.body.is_null());
 
     // The underlying response behind the filter should
     // have a 0-byte body.
     let actual_response = fetch_response.actual_response();
     assert!(!actual_response.is_network_error());
-    let resp_body = actual_response.body.lock();
-    assert_eq!(*resp_body, ResponseBody::Done(vec![]));
+    assert_eq!(body_of(&fetch_response), b"");
 }
 
 #[test]
@@ -170,7 +163,7 @@ fn test_fetch_blob() {
         /// Fired when the response is fully fetched
         fn process_response_eof(&mut self, _: &Request, response: &Response) {
             assert_eq!(self.buffer, self.expected);
-            let _ = self.sender.send(response.clone());
+            let _ = self.sender.send(response.try_clone().unwrap());
         }
         fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
 
@@ -229,7 +222,7 @@ fn test_fetch_blob() {
     let content_length: ContentLength = fetch_response.headers.typed_get().unwrap();
     assert_eq!(content_length.0, bytes.len() as u64);
 
-    assert_eq!(*fetch_response.body.lock(), ResponseBody::Receiving(vec![]));
+    assert_eq!(body_of(&fetch_response), bytes);
 }
 
 #[test]
@@ -256,8 +249,7 @@ fn test_file() {
 
     assert!(!fetch_response.is_network_error());
     assert_eq!(fetch_response.headers.len(), 0);
-    let resp_body = fetch_response.body.lock();
-    assert_eq!(*resp_body, ResponseBody::Empty);
+    assert!(fetch_response.body.is_null());
 
     // The underlying response behind the filter should
     // have the file's MIME type and contents.
@@ -280,14 +272,7 @@ fn test_file() {
         .0;
     assert_eq!(content_size, file.len() as u64);
 
-    let resp_body = actual_response.body.lock();
-
-    match *resp_body {
-        ResponseBody::Done(ref val) => {
-            assert_eq!(val, &file);
-        },
-        _ => panic!(),
-    }
+    assert_eq!(body_of(&fetch_response), file);
 }
 
 #[test]
@@ -384,10 +369,7 @@ fn test_cors_preflight_fetch() {
     let _ = server.close();
 
     assert!(!fetch_response.is_network_error());
-    match *fetch_response.body.lock() {
-        ResponseBody::Done(ref body) => assert_eq!(&**body, ACK),
-        _ => panic!(),
-    };
+    assert_eq!(body_of(&fetch_response), ACK);
 }
 
 #[test]
@@ -457,14 +439,8 @@ fn test_cors_preflight_cache_fetch() {
     assert_eq!(true, cache.match_method(&wrapped_request2, &Method::GET));
     assert_eq!(true, cache.match_method(&wrapped_request3, &Method::GET));
 
-    match *fetch_response0.body.lock() {
-        ResponseBody::Done(ref body) => assert_eq!(&**body, ACK),
-        _ => panic!(),
-    };
-    match *fetch_response1.body.lock() {
-        ResponseBody::Done(ref body) => assert_eq!(&**body, ACK),
-        _ => panic!(),
-    };
+    assert_eq!(body_of(&fetch_response0), ACK);
+    assert_eq!(body_of(&fetch_response1), ACK);
 }
 
 #[test]
@@ -659,10 +635,7 @@ fn test_fetch_response_is_opaque_filtered() {
     // this also asserts that status message is "the empty byte sequence"
     assert!(fetch_response.status.is_error());
     assert_eq!(fetch_response.headers, HeaderMap::new());
-    match *fetch_response.body.lock() {
-        ResponseBody::Empty => {},
-        _ => panic!(),
-    }
+    assert!(fetch_response.body.is_null());
     match fetch_response.cache_state {
         CacheState::None => {},
         _ => panic!(),
@@ -709,10 +682,7 @@ fn test_fetch_response_is_opaque_redirect_filtered() {
     // this also asserts that status message is "the empty byte sequence"
     assert!(fetch_response.status.is_error());
     assert_eq!(fetch_response.headers, HeaderMap::new());
-    match *fetch_response.body.lock() {
-        ResponseBody::Empty => {},
-        _ => panic!(),
-    }
+    assert!(fetch_response.body.is_null());
     match fetch_response.cache_state {
         CacheState::None => {},
         _ => panic!(),
@@ -1012,7 +982,8 @@ fn test_fetch_with_sri_sucess() {
     let response = fetch(request, None);
 
     let _ = server.close();
-    assert_eq!(response_is_done(&response), true);
+    assert!(!response.is_network_error());
+    assert_eq!(body_of(&response), MESSAGE);
 }
 
 /// `fetch` should return a network error if there is a header `X-Content-Type-Options: nosniff`
@@ -1111,12 +1082,7 @@ fn test_fetch_redirect_count_ceiling() {
     assert!(!fetch_response.is_network_error());
     assert_eq!(fetch_response.response_type, ResponseType::Basic);
 
-    match *fetch_response.body.lock() {
-        ResponseBody::Done(ref body) => {
-            assert_eq!(&**body, MESSAGE);
-        },
-        _ => panic!(),
-    };
+    assert_eq!(body_of(&fetch_response), MESSAGE);
 }
 
 #[test]
@@ -1129,10 +1095,7 @@ fn test_fetch_redirect_count_failure() {
 
     assert!(fetch_response.is_network_error());
 
-    match *fetch_response.body.lock() {
-        ResponseBody::Done(_) | ResponseBody::Receiving(_) => panic!(),
-        _ => {},
-    };
+    assert!(fetch_response.body.is_null());
 }
 
 fn test_fetch_redirect_updates_method_runner(
@@ -1240,24 +1203,6 @@ fn test_fetch_redirect_updates_method() {
     assert_eq!(rx.try_recv().is_err(), true);
 }
 
-fn response_is_done(response: &Response) -> bool {
-    let response_complete = match response.response_type {
-        ResponseType::Default | ResponseType::Basic | ResponseType::Cors => {
-            (*response.body.lock()).is_done()
-        },
-        // if the internal response cannot have a body, it shouldn't block the "done" state
-        ResponseType::Opaque | ResponseType::OpaqueRedirect | ResponseType::Error(..) => true,
-    };
-
-    let internal_complete = if let Some(ref res) = response.internal_response {
-        res.body.lock().is_done()
-    } else {
-        true
-    };
-
-    response_complete && internal_complete
-}
-
 #[test]
 fn test_fetch_async_returns_complete_response() {
     static MESSAGE: &'static [u8] = b"this message should be retrieved in full";
@@ -1275,7 +1220,7 @@ fn test_fetch_async_returns_complete_response() {
     let fetch_response = fetch(request, None);
 
     let _ = server.close();
-    assert_eq!(response_is_done(&fetch_response), true);
+    assert_eq!(body_of(&fetch_response), MESSAGE);
 }
 
 #[test]
@@ -1353,14 +1298,6 @@ fn test_response_cache_status_is_validated() {
     ));
 
     let _ = server.close();
-}
-
-/// The body of a response from `fetch_with_context`.
-fn body_of(response: &Response) -> Vec<u8> {
-    match &*response.actual_response().body.lock() {
-        ResponseBody::Done(body) => body.clone(),
-        _ => panic!("the body is not complete"),
-    }
 }
 
 #[test]
@@ -1552,7 +1489,7 @@ fn test_opaque_filtered_fetch_async_returns_complete_response() {
     let _ = server.close();
 
     assert_eq!(fetch_response.response_type, ResponseType::Opaque);
-    assert_eq!(response_is_done(&fetch_response), true);
+    assert_eq!(body_of(&fetch_response), MESSAGE);
 }
 
 #[test]
@@ -1591,7 +1528,7 @@ fn test_opaque_redirect_filtered_fetch_async_returns_complete_response() {
     let _ = server.close();
 
     assert_eq!(fetch_response.response_type, ResponseType::OpaqueRedirect);
-    assert_eq!(response_is_done(&fetch_response), true);
+    assert_eq!(body_of(&fetch_response), MESSAGE);
 }
 
 #[test]
@@ -1767,13 +1704,11 @@ fn test_fetch_request_intercepted() {
         "The custom header does not exist or has an incorrect value!"
     );
 
-    let body = response.body.lock();
-    match &*body {
-        ResponseBody::Done(data) => {
-            assert_eq!(data, &EXPECTED_BODY, "Body content does not match");
-        },
-        _ => panic!("Expected ResponseBody::Done, but got {:?}", *body),
-    }
+    assert_eq!(
+        body_of(&response),
+        EXPECTED_BODY,
+        "Body content does not match"
+    );
 
     assert_eq!(
         response.status.code(),

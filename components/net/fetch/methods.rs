@@ -3,13 +3,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::{io, mem, str};
 
 use base64::Engine as _;
 use base64::engine::general_purpose;
-use bytes::Bytes;
+use bytes::BytesMut;
 use content_security_policy as csp;
 use embedder_traits::resources::{self, Resource};
 use headers::{AccessControlExposeHeaders, ContentType, HeaderMapExt};
@@ -19,6 +18,7 @@ use ipc_channel::ipc;
 use log::{debug, trace, warn};
 use malloc_size_of_derive::MallocSizeOf;
 use mime::{self, Mime};
+use net_traits::body_stream::{BodyEnd, BodyEvent};
 use net_traits::fetch::headers::{determine_nosniff, extract_mime_type_as_mime};
 use net_traits::filemanager_thread::{FileTokenCheck, RelativePos};
 use net_traits::http_status::HttpStatus;
@@ -44,7 +44,6 @@ use servo_base::generic_channel::CallbackSetter;
 use servo_base::id::PipelineId;
 use servo_config::pref;
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
-use tokio::sync::mpsc::{UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender};
 use tokio::sync::{Mutex as TokioMutex, watch};
 
 use crate::connector::CACertificates;
@@ -61,15 +60,6 @@ use crate::request_interceptor::RequestInterceptor;
 use crate::subresource_integrity::is_response_integrity_valid;
 
 pub type Target<'a> = &'a mut (dyn FetchTaskTarget + Send);
-
-#[derive(Clone, Deserialize, Serialize)]
-pub enum Data {
-    Payload(bytes::Bytes),
-    ContentLength(usize),
-    Done,
-    Cancelled,
-    Error(NetworkError),
-}
 
 pub struct WebSocketChannel {
     pub sender: ProfileGenericCallback<WebSocketNetworkEvent>,
@@ -342,17 +332,6 @@ pub(crate) fn transfers_request_body_stream_to_later_manual_redirect(
             .is_some_and(|status| status.is_redirection())
 }
 
-pub type DoneChannel = Option<(TokioSender<Data>, TokioReceiver<Data>)>;
-
-/// Whether the whole decoded body has to be kept in the net process rather than
-/// only streamed to the consumer.
-///
-/// Subresource integrity has to digest the body before the response is handed on,
-/// and a preloaded response may later be consumed by a fetch that does.
-pub(crate) fn retains_whole_body(request: &Request) -> bool {
-    !request.integrity_metadata.is_empty() || request.preload_id.is_some()
-}
-
 /// [Fetch](https://fetch.spec.whatwg.org#concept-fetch)
 pub async fn fetch(request: Request, target: Target<'_>, context: &FetchContext) -> Response {
     // Step 7. Let timingInfo be a new fetch timing info whose start time
@@ -460,7 +439,7 @@ pub async fn fetch(request: Request, target: Target<'_>, context: &FetchContext)
     let request_id = request.id;
 
     // Step 17: Run main fetch given fetchParams.
-    let response = main_fetch(&mut fetch_params, false, target, &mut None, context).await;
+    let response = main_fetch(&mut fetch_params, false, target, context).await;
 
     if transfers_request_body_stream_to_later_manual_redirect(&fetch_params.request, &response) {
         request_body_stream_closer.disarm();
@@ -582,7 +561,6 @@ pub async fn main_fetch(
     fetch_params: &mut FetchParams,
     recursive_flag: bool,
     target: Target<'_>,
-    done_chan: &mut DoneChannel,
     context: &FetchContext,
 ) -> Response {
     // Step 1: Let request be fetchParam's request.
@@ -776,7 +754,7 @@ pub async fn main_fetch(
                 request.response_tainting = ResponseTainting::Basic;
 
                 // Substep 2. Return the result of running scheme fetch given fetchParams.
-                scheme_fetch(fetch_params, target, done_chan, context).await
+                scheme_fetch(fetch_params, target, context).await
             } else if request.mode == RequestMode::SameOrigin {
                 Response::network_error(NetworkError::CrossOriginResponse)
             } else if request.mode == RequestMode::NoCors {
@@ -788,7 +766,7 @@ pub async fn main_fetch(
                     request.response_tainting = ResponseTainting::Opaque;
 
                     // Substep 3. Return the result of running scheme fetch given fetchParams.
-                    scheme_fetch(fetch_params, target, done_chan, context).await
+                    scheme_fetch(fetch_params, target, context).await
                 }
             } else if !matches!(current_scheme, "http" | "https") {
                 Response::network_error(NetworkError::UnsupportedScheme)
@@ -808,7 +786,7 @@ pub async fn main_fetch(
                 // Substep 2. Let corsWithPreflightResponse be the result of running override fetch
                 // given "http-fetch", fetchParams, and true.
                 let cors_with_preflight_response =
-                    http_fetch(fetch_params, true, true, false, target, done_chan, context).await;
+                    http_fetch(fetch_params, true, true, false, target, context).await;
                 // Substep 3. If corsWithPreflightResponse is a network error, then clear cache entries using request.
                 if cors_with_preflight_response.is_network_error() {
                     context
@@ -824,7 +802,7 @@ pub async fn main_fetch(
                 request.response_tainting = ResponseTainting::CorsTainting;
 
                 // Substep 2. Return the result of running override fetch given "http-fetch" and fetchParams.
-                http_fetch(fetch_params, true, false, false, target, done_chan, context).await
+                http_fetch(fetch_params, true, false, false, target, context).await
             }
         },
     };
@@ -879,7 +857,7 @@ pub async fn main_fetch(
         response = response.to_filtered(response_type);
     }
 
-    let internal_error = {
+    let (internal_error, has_null_body) = {
         // Tests for steps 17 and 18, before step 15 for borrowing concerns.
         let response_is_network_error = response.is_network_error();
         let should_replace_with_nosniff_error = !response_is_network_error &&
@@ -986,29 +964,28 @@ pub async fn main_fetch(
         // disregard any enqueuing toward it (if any).
         // NOTE: We check `internal_response` since we did not mutate `response` in the previous steps.
         let not_network_error = !response_is_network_error && !internal_response.is_network_error();
-        if not_network_error &&
+        let has_null_body = not_network_error &&
             (is_null_body_status(&internal_response.status) ||
-                matches!(request.method, Method::HEAD | Method::CONNECT))
-        {
-            // when Fetch is used only asynchronously, we will need to make sure
-            // that nothing tries to write to the body at this point
-            let mut body = internal_response.body.lock();
-            *body = ResponseBody::Empty;
-        }
+                matches!(request.method, Method::HEAD | Method::CONNECT));
 
-        internal_response.get_network_error().cloned()
+        (
+            internal_response.get_network_error().cloned(),
+            has_null_body,
+        )
     };
 
     // Execute deferred rebinding of response.
     if let Some(error) = internal_error {
         response = Response::network_error(error);
+    } else if has_null_body {
+        response.actual_response_mut().body = ResponseBody::Null;
     }
 
     // Step 19. If response is not a network error and any of the following returns blocked
     let mut response_loaded = false;
     let mut response = if !response.is_network_error() && !request.integrity_metadata.is_empty() {
         // Step 19.1.
-        wait_for_response(request, &mut response, target, done_chan, context).await;
+        wait_for_response(request, &mut response, target, true, context).await;
         response_loaded = true;
 
         // Step 19.2.
@@ -1030,7 +1007,8 @@ pub async fn main_fetch(
         // by sync fetch, but we overload it here for simplicity
         target.process_response(request, &response);
         if !response_loaded {
-            wait_for_response(request, &mut response, target, done_chan, context).await;
+            let retain = request.preload_id.is_some();
+            wait_for_response(request, &mut response, target, retain, context).await;
         }
         // overloaded similarly to process_response
         target.process_response_eof(request, &response);
@@ -1054,7 +1032,9 @@ pub async fn main_fetch(
 
     // Step 23.
     if !response_loaded {
-        wait_for_response(request, &mut response, target, done_chan, context).await;
+        // A preloaded response is kept whole for the fetch that consumes it.
+        let retain = request.preload_id.is_some();
+        wait_for_response(request, &mut response, target, retain, context).await;
     }
 
     // Step 24.
@@ -1069,68 +1049,73 @@ pub async fn main_fetch(
     response
 }
 
+/// Hand the body of `response` over to `target`, and set how it ended on `response`.
+/// With `retain`, the body is also kept in `response` as a whole once it is complete.
 async fn wait_for_response(
     request: &Request,
     response: &mut Response,
     target: Target<'_>,
-    done_chan: &mut DoneChannel,
+    retain: bool,
     context: &FetchContext,
 ) {
-    if let Some(ref mut ch) = *done_chan {
-        #[cfg(feature = "devtools")]
-        let mut devtools_body = context.devtools_chan.as_ref().map(|_| Vec::new());
-        #[cfg(not(feature = "devtools"))]
-        let devtools_body = None;
-        loop {
-            match ch.1.recv().await {
-                Some(Data::ContentLength(length)) => {
-                    target.process_response_length_hint(request, length);
-                },
-                Some(Data::Payload(bytes)) => {
-                    #[cfg(feature = "devtools")]
-                    if let Some(body) = devtools_body.as_mut() {
-                        body.extend(&bytes);
-                    }
-                    target.process_response_chunk(request, bytes);
-                },
-                Some(Data::Error(network_error)) => {
-                    if network_error == NetworkError::DecompressionError {
-                        response.termination_reason = Some(TerminationReason::Fatal);
-                    }
-                    response.set_network_error(network_error);
-
-                    break;
-                },
-                Some(Data::Done) => {
-                    send_response_to_devtools(request, context, response, devtools_body);
-                    break;
-                },
-                Some(Data::Cancelled) => {
-                    response.aborted.store(true, Ordering::Release);
-                    break;
-                },
-
-                None => {
-                    panic!("fetch worker should always send Done before terminating");
-                },
-            }
-        }
-    } else {
-        match *response.actual_response().body.lock() {
-            ResponseBody::Done(ref vec) if !vec.is_empty() => {
-                // in case there was no channel to wait for, the body was
-                // obtained synchronously via scheme_fetch for data/file/about/etc
-                // We should still send the body across as a chunk
-                target.process_response_chunk(request, Bytes::copy_from_slice(vec));
+    let mut receiver = match response.actual_response_mut().body.take() {
+        ResponseBody::Null => return,
+        ResponseBody::Bytes(bytes) => {
+            if !bytes.is_empty() {
+                target.process_response_chunk(request, bytes.clone());
                 #[cfg(feature = "devtools")]
                 if context.devtools_chan.is_some() {
-                    // Now that we've replayed the entire cached body,
-                    // notify the DevTools server with the full Response.
-                    send_response_to_devtools(request, context, response, Some(vec.clone()));
+                    send_response_to_devtools(request, context, response, Some(bytes.to_vec()));
                 }
+            }
+            response.actual_response_mut().body = ResponseBody::Bytes(bytes);
+            return;
+        },
+        ResponseBody::Stream(receiver) => receiver,
+    };
+
+    if let Some(length) = receiver.length_hint() {
+        target.process_response_length_hint(request, length);
+    }
+    let mut retained = retain.then(|| BytesMut::with_capacity(receiver.length_hint().unwrap_or(0)));
+    #[cfg(feature = "devtools")]
+    let mut devtools_body = context.devtools_chan.as_ref().map(|_| Vec::new());
+    #[cfg(not(feature = "devtools"))]
+    let devtools_body = None;
+    loop {
+        match receiver.next().await {
+            BodyEvent::Chunk(bytes) => {
+                #[cfg(feature = "devtools")]
+                if let Some(body) = devtools_body.as_mut() {
+                    body.extend(&bytes);
+                }
+                if let Some(retained) = retained.as_mut() {
+                    retained.extend_from_slice(&bytes);
+                }
+                target.process_response_chunk(request, bytes);
             },
-            ResponseBody::Done(_) | ResponseBody::Empty | ResponseBody::Streamed => {},
-            _ => unreachable!(),
+            BodyEvent::End(BodyEnd::Complete) => {
+                send_response_to_devtools(request, context, response, devtools_body);
+                if let Some(retained) = retained {
+                    response.actual_response_mut().body = ResponseBody::Bytes(retained.freeze());
+                }
+                break;
+            },
+            BodyEvent::End(BodyEnd::Aborted) => {
+                send_response_to_devtools(request, context, response, devtools_body);
+                response.aborted = true;
+                response.actual_response_mut().aborted = true;
+                break;
+            },
+            BodyEvent::End(BodyEnd::Failed(network_error)) => {
+                response.aborted = true;
+                response.actual_response_mut().aborted = true;
+                if network_error == NetworkError::DecompressionError {
+                    response.termination_reason = Some(TerminationReason::Fatal);
+                }
+                response.set_network_error(network_error);
+                break;
+            },
         }
     }
 }
@@ -1172,7 +1157,7 @@ fn create_blank_reply(url: ServoUrl, timing_type: ResourceTimingType) -> Respons
     response
         .headers
         .typed_insert(ContentType::from(mime::TEXT_HTML_UTF_8));
-    *response.body.lock() = ResponseBody::Done(vec![]);
+    response.body = ResponseBody::Bytes(Default::default());
     response.status = HttpStatus::default();
     response
 }
@@ -1182,7 +1167,7 @@ fn create_about_memory(url: ServoUrl, timing_type: ResourceTimingType) -> Respon
     response
         .headers
         .typed_insert(ContentType::from(mime::TEXT_HTML_UTF_8));
-    *response.body.lock() = ResponseBody::Done(resources::read_bytes(Resource::AboutMemoryHTML));
+    response.body = ResponseBody::Bytes(resources::read_bytes(Resource::AboutMemoryHTML).into());
     response.status = HttpStatus::default();
     response
 }
@@ -1253,7 +1238,6 @@ fn handle_allowcert_request(request: &mut Request, context: &FetchContext) -> io
 async fn scheme_fetch(
     fetch_params: &mut FetchParams,
     target: Target<'_>,
-    done_chan: &mut DoneChannel,
     context: &FetchContext,
 ) -> Response {
     // Step 1: If fetchParams is canceled, then return the appropriate network error for fetchParams.
@@ -1278,21 +1262,10 @@ async fn scheme_fetch(
             create_blank_reply(url_and_blob_lock.url(), request.timing_type())
         },
 
-        "http" | "https" => {
-            http_fetch(
-                fetch_params,
-                false,
-                false,
-                false,
-                target,
-                done_chan,
-                context,
-            )
-            .await
-        },
+        "http" | "https" => http_fetch(fetch_params, false, false, false, target, context).await,
 
         _ => match context.protocols.get(scheme) {
-            Some(handler) => handler.load(request, done_chan, context).await,
+            Some(handler) => handler.load(request, context).await,
             None => Response::network_error(NetworkError::UnsupportedScheme),
         },
     }

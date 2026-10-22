@@ -37,21 +37,23 @@ use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
 use net::fetch::methods::{self, CancellationListener, FetchContext, SuspendedFetches};
 use net::http_loader::{determine_requests_referrer, serialize_origin};
-use net::protocols::ProtocolRegistry;
+use net::protocols::{ProtocolHandler, ProtocolRegistry};
 use net::resource_thread::{AuthCacheEntry, new_core_resource_thread};
 use net::test::DECODER_BUFFER_SIZE;
 use net::test_util::{make_h2_ssl_server, make_tls_server_without_close_notify};
 use net_traits::blob_url_store::UrlWithBlobClaim;
+use net_traits::body_stream::{BodyEnd, body_channel};
 use net_traits::fetch::fetch_controller::FetchController;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{
-    CredentialsMode, Destination, Referrer, Request, RequestBuilder, RequestMode,
+    CredentialsMode, Destination, PreloadId, Referrer, Request, RequestBuilder, RequestMode,
     TraversableForUserPrompts, create_request_body_with_content,
 };
 use net_traits::response::{CacheState, Response, ResponseBody};
 use net_traits::{
-    CookieSource, CoreResourceMsg, CoreResourceThread, FetchResponseMsg, FetchTaskTarget,
-    NetworkError, ReferrerPolicy, fetch_async, get_current_locale,
+    CookieSource, CoreResourceMsg, CoreResourceThread, DiscardFetch, FetchResponseMsg,
+    FetchTaskTarget, NetworkError, ReferrerPolicy, ResourceFetchTiming, fetch_async,
+    get_current_locale,
 };
 use parking_lot::{Mutex, RwLock};
 use profile_traits::mem::ProfilerChan as MemProfilerChan;
@@ -62,9 +64,10 @@ use servo_url::{ImmutableOrigin, ServoUrl};
 use url::Url;
 
 use crate::{
-    create_generic_embedder_proxy, create_generic_embedder_proxy_and_receiver, create_http_state,
-    fetch, fetch_with_context, is_aborted, make_body, make_server, make_ssl_server, mock_origin,
-    new_fetch_context, receive_credential_prompt_msgs, replace_host_table, spawn_blocking_task,
+    body_of, create_generic_embedder_proxy, create_generic_embedder_proxy_and_receiver,
+    create_http_state, fetch, fetch_with_context, is_aborted, make_body, make_server,
+    make_ssl_server, mock_origin, new_fetch_context, receive_credential_prompt_msgs,
+    replace_host_table, spawn_blocking_task,
 };
 
 fn assert_cookie_for_domain(
@@ -615,10 +618,7 @@ fn test_load_should_decode_the_response_as_deflate_when_response_headers_have_co
 
     let internal_response = response.internal_response.unwrap();
     assert!(internal_response.status.clone().code().is_success());
-    assert_eq!(
-        *internal_response.body.lock(),
-        ResponseBody::Done(b"Yay!".to_vec())
-    );
+    assert_eq!(body_of(&internal_response), b"Yay!");
 }
 
 #[test]
@@ -651,10 +651,7 @@ fn test_load_should_decode_the_response_as_gzip_when_response_headers_have_conte
 
     let internal_response = response.internal_response.unwrap();
     assert!(internal_response.status.clone().code().is_success());
-    assert_eq!(
-        *internal_response.body.lock(),
-        ResponseBody::Done(b"Yay!".to_vec())
-    );
+    assert_eq!(body_of(&internal_response), b"Yay!");
 }
 
 #[test]
@@ -1289,10 +1286,7 @@ fn test_load_succeeds_with_a_redirect_loop() {
 
     let response = response.to_actual();
     assert_eq!(response.url_list, [url_a.url(), url_b.url(), url_a.url()]);
-    assert_eq!(
-        *response.body.lock(),
-        ResponseBody::Done(b"Success".to_vec())
-    );
+    assert_eq!(body_of(&response), b"Success");
 }
 
 #[test]
@@ -1333,10 +1327,7 @@ fn test_load_follows_a_redirect() {
 
     let internal_response = response.internal_response.unwrap();
     assert!(internal_response.status.clone().code().is_success());
-    assert_eq!(
-        *internal_response.body.lock(),
-        ResponseBody::Done(b"Yay!".to_vec())
-    );
+    assert_eq!(body_of(&internal_response), b"Yay!");
 }
 
 #[test]
@@ -1423,10 +1414,7 @@ fn test_redirect_from_x_to_y_provides_y_cookies_from_y() {
 
     let internal_response = response.internal_response.unwrap();
     assert!(internal_response.status.clone().code().is_success());
-    assert_eq!(
-        *internal_response.body.lock(),
-        ResponseBody::Done(b"Yay!".to_vec())
-    );
+    assert_eq!(body_of(&internal_response), b"Yay!");
 }
 
 #[test]
@@ -1479,10 +1467,7 @@ fn test_redirect_from_x_to_x_provides_x_with_cookie_from_first_response() {
 
     let internal_response = response.internal_response.unwrap();
     assert!(internal_response.status.clone().code().is_success());
-    assert_eq!(
-        *internal_response.body.lock(),
-        ResponseBody::Done(b"Yay!".to_vec())
-    );
+    assert_eq!(body_of(&internal_response), b"Yay!");
 }
 
 #[test]
@@ -2038,10 +2023,7 @@ fn test_body_that_ends_with_its_tls_connection_without_close_notify_is_complete(
         server.close();
         assert!(!response.is_network_error());
         assert!(!is_aborted(&response));
-        assert_eq!(
-            *response.actual_response().body.lock(),
-            ResponseBody::Done(b"until close".to_vec())
-        );
+        assert_eq!(body_of(&response), b"until close");
     }
 }
 
@@ -2259,7 +2241,7 @@ impl FetchTaskTarget for BodyLengthCollector {
             .sender
             .take()
             .unwrap()
-            .send((response.clone(), self.length));
+            .send((response.try_clone().unwrap(), self.length));
     }
     fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
     fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
@@ -2309,10 +2291,7 @@ fn test_large_media_response_is_neither_kept_nor_stored() {
     for expected_request_count in 1..=2 {
         let (response, body_length) = fetch_video(&url, &mut context);
         assert_eq!(body_length, LENGTH);
-        assert!(matches!(
-            &*response.actual_response().body.lock(),
-            ResponseBody::Streamed
-        ));
+        assert!(response.actual_response().body.is_null());
         assert_eq!(request_count.load(Ordering::SeqCst), expected_request_count);
     }
 
@@ -2397,10 +2376,7 @@ fn test_truncated_response_is_not_served_from_cache() {
     let mut context = new_fetch_context(None, None);
 
     let response = fetch_with_context(build_cacheable_request(&url), &mut context);
-    assert_eq!(
-        *response.actual_response().body.lock(),
-        ResponseBody::Done(b"truncated".to_vec())
-    );
+    assert_eq!(body_of(&response), b"truncated");
     assert_eq!(
         stored_response_count(&context, &build_cacheable_request(&url)),
         0
@@ -2451,10 +2427,7 @@ fn test_compressed_response_is_answered_from_cache() {
             matches!(response.cache_state, CacheState::Local),
             from_cache
         );
-        assert_eq!(
-            *response.actual_response().body.lock(),
-            ResponseBody::Done(b"compressed content".to_vec())
-        );
+        assert_eq!(body_of(&response), b"compressed content");
     }
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
 
@@ -3078,7 +3051,7 @@ impl FetchTaskTarget for StreamCollector {
             .sender
             .take()
             .unwrap()
-            .send((response.clone(), self.verifier.take().unwrap()));
+            .send((response.try_clone().unwrap(), self.verifier.take().unwrap()));
     }
     fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
     fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
@@ -3173,7 +3146,7 @@ fn check_suspended_fetch_holds_back_the_server(http2: bool) {
     let listener = fetch.listener.clone();
     let (response, body) = fetch.wait_for_end();
     assert!(!response.is_network_error());
-    assert!(!response.aborted.load(Ordering::SeqCst));
+    assert!(!response.aborted);
     assert!(body.is_intact(STREAM_LENGTH));
     assert_eq!(server.sent(0), STREAM_LENGTH);
     assert_eq!(server.used_http2.load(Ordering::SeqCst), http2);
@@ -3206,7 +3179,7 @@ fn test_cancelling_a_suspended_fetch_ends_it() {
     fetch.listener.cancel();
     let (response, body) = fetch.wait_for_end();
     assert!(cancelled_at.elapsed() < Duration::from_secs(1));
-    assert!(response.aborted.load(Ordering::SeqCst));
+    assert!(response.aborted);
     assert_eq!(body.received, STREAM_CHUNK_SIZE);
 
     let _ = server.server.close();
@@ -3223,7 +3196,7 @@ fn test_cancelling_a_fetch_that_waits_for_the_network_ends_it() {
     fetch.listener.cancel();
     let (response, body) = fetch.wait_for_end();
     assert!(cancelled_at.elapsed() < Duration::from_secs(1));
-    assert!(response.aborted.load(Ordering::SeqCst));
+    assert!(response.aborted);
     assert_eq!(body.received, STREAM_CHUNK_SIZE);
 
     let _ = server.server.close();
@@ -3243,7 +3216,7 @@ fn test_fetch_whose_connection_closes_while_suspended_ends_when_resumed() {
 
     fetch.listener.resume();
     let (response, body) = fetch.wait_for_end();
-    assert!(response.aborted.load(Ordering::SeqCst));
+    assert!(response.aborted);
     assert!(!body.mismatch);
     assert_eq!(body.received, chunks * STREAM_CHUNK_SIZE);
 }
@@ -3323,7 +3296,7 @@ fn test_at_most_two_fetches_per_origin_are_suspended() {
     assert!(fifth.listener.suspend());
 
     let (response, _) = first.wait_for_end();
-    assert!(response.aborted.load(Ordering::SeqCst));
+    assert!(response.aborted);
     let (_, body) = second.wait_for_end();
     assert!(body.is_intact(STREAM_LENGTH));
     for fetch in [fourth, fifth] {
@@ -3544,4 +3517,248 @@ fn test_fetch_controller_suspends_and_resumes_a_fetch() {
         .send(CoreResourceMsg::Exit(exit_sender))
         .unwrap();
     exit_receiver.recv().unwrap();
+}
+
+/// A raw server that reads one request and answers it with `response` once the returned sender
+/// fires. The returned counter counts the requests it has read.
+fn make_raw_held_server(
+    response: &'static [u8],
+) -> (
+    UrlWithBlobClaim,
+    std::sync::mpsc::Sender<()>,
+    Arc<AtomicUsize>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = UrlWithBlobClaim::new(
+        ServoUrl::parse(&format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().unwrap().port()
+        ))
+        .unwrap(),
+        None,
+    );
+    let (release_sender, release) = std::sync::mpsc::channel::<()>();
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_clone = request_count.clone();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut buffer = [0; 1024];
+            let length = stream.read(&mut buffer).unwrap();
+            assert!(length > 0);
+            request.extend_from_slice(&buffer[..length]);
+        }
+        request_count_clone.fetch_add(1, Ordering::SeqCst);
+        let _ = release.recv();
+        let _ = stream.write_all(response);
+    });
+    (url, release_sender, request_count)
+}
+
+#[test]
+fn test_fetch_cancelled_while_its_headers_are_held_ends() {
+    let (url, release, request_count) =
+        make_raw_held_server(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ncomplete");
+    let context = new_fetch_context(None, None);
+    let listener = context.cancellation_listener.clone();
+
+    let fetch = start_fetch(build_cacheable_request(&url), context);
+    wait_until(|| request_count.load(Ordering::SeqCst) == 1);
+    listener.cancel();
+    let _ = release.send(());
+    let (response, body_length) = wait_for_fetch(fetch);
+    assert!(response.is_network_error());
+    assert_eq!(body_length, 0);
+}
+
+#[test]
+fn test_body_of_a_response_that_fails_the_cors_check_is_not_delivered() {
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            *response.body_mut() = make_body(b"cross-origin secret".to_vec());
+        };
+    let (server, url) = make_server(handler);
+    let request = RequestBuilder::new(None, url, Referrer::NoReferrer)
+        .mode(RequestMode::CorsMode)
+        .origin(mock_origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .build();
+
+    let (response, body_length) =
+        wait_for_fetch(start_fetch(request, new_fetch_context(None, None)));
+    assert!(response.is_network_error());
+    assert_eq!(body_length, 0);
+    let _ = server.close();
+}
+
+#[test]
+fn test_body_of_a_response_blocked_by_nosniff_is_not_delivered() {
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+            response.headers_mut().insert(
+                HeaderName::from_static("x-content-type-options"),
+                HeaderValue::from_static("nosniff"),
+            );
+            *response.body_mut() = make_body(b"not a script".to_vec());
+        };
+    let (server, url) = make_server(handler);
+    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+        .destination(Destination::Script)
+        .origin(url.origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .build();
+
+    let (response, body_length) =
+        wait_for_fetch(start_fetch(request, new_fetch_context(None, None)));
+    assert!(response.is_network_error());
+    assert_eq!(body_length, 0);
+    let _ = server.close();
+}
+
+/// A protocol handler whose responses have the status `status` and a streamed body, which it
+/// leaves unfinished unless `finish` is set.
+struct StreamingProtocolHandler {
+    status: StatusCode,
+    finish: bool,
+}
+
+impl ProtocolHandler for StreamingProtocolHandler {
+    fn load<'a>(
+        &'a self,
+        request: &'a mut Request,
+        _: &FetchContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + 'a>> {
+        let mut response = Response::new(
+            request.current_url(),
+            ResourceFetchTiming::new(request.timing_type()),
+        );
+        response.status = self.status.into();
+        let (sender, body) = body_channel(None);
+        assert!(sender.send(Bytes::from_static(b"content")));
+        if self.finish {
+            sender.finish(BodyEnd::Complete);
+        }
+        response.body = ResponseBody::Stream(body);
+        Box::pin(std::future::ready(response))
+    }
+
+    fn is_fetchable(&self) -> bool {
+        true
+    }
+}
+
+/// Fetch `scheme:test` from `handler`, and return the response and the number of body bytes
+/// delivered.
+fn fetch_from_protocol_handler(
+    scheme: &str,
+    handler: StreamingProtocolHandler,
+) -> (Response, usize) {
+    let mut registry = ProtocolRegistry::with_internal_protocols();
+    registry.register(scheme, handler).unwrap();
+    let mut context = new_fetch_context(None, None);
+    context.protocols = Arc::new(registry);
+    let url = UrlWithBlobClaim::new(ServoUrl::parse(&format!("{scheme}:test")).unwrap(), None);
+    let request = RequestBuilder::new(None, url, Referrer::NoReferrer)
+        .origin(mock_origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .build();
+    wait_for_fetch(start_fetch(request, context))
+}
+
+#[test]
+fn test_body_of_a_null_body_status_is_not_delivered() {
+    let (response, body_length) = fetch_from_protocol_handler(
+        "nocontent",
+        StreamingProtocolHandler {
+            status: StatusCode::NO_CONTENT,
+            finish: true,
+        },
+    );
+    assert!(!response.is_network_error());
+    assert_eq!(body_length, 0);
+
+    let (response, body_length) = fetch_from_protocol_handler(
+        "content",
+        StreamingProtocolHandler {
+            status: StatusCode::OK,
+            finish: true,
+        },
+    );
+    assert!(!response.is_network_error());
+    assert_eq!(body_length, b"content".len());
+}
+
+#[test]
+fn test_body_whose_producer_stops_without_finishing_ends_the_fetch() {
+    let (response, body_length) = fetch_from_protocol_handler(
+        "unfinished",
+        StreamingProtocolHandler {
+            status: StatusCode::OK,
+            finish: false,
+        },
+    );
+    assert!(response.is_network_error());
+    assert_eq!(body_length, b"content".len());
+}
+
+#[test]
+fn test_navigation_through_a_page_content_protocol_handler_delivers_the_body() {
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            *response.body_mut() = make_body(b"handled".to_vec());
+        };
+    let (server, url) = make_server(handler);
+    let mut registry = ProtocolRegistry::with_internal_protocols();
+    registry
+        .register_page_content_handler("web+test".into(), format!("{}?url=%s", url.as_str()))
+        .unwrap();
+    let mut context = new_fetch_context(None, None);
+    context.protocols = Arc::new(registry);
+    let handler_url = UrlWithBlobClaim::new(ServoUrl::parse("web+test:resource").unwrap(), None);
+    let request = RequestBuilder::new(None, handler_url, Referrer::NoReferrer)
+        .destination(Destination::Document)
+        .mode(RequestMode::Navigate)
+        .origin(mock_origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .build();
+
+    let (response, body_length) = wait_for_fetch(start_fetch(request, context));
+    assert!(!response.is_network_error());
+    assert_eq!(body_length, b"handled".len());
+    let _ = server.close();
+}
+
+#[test]
+fn test_fetch_of_a_preload_keeps_its_body() {
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            *response.body_mut() = make_body(b"preloaded".to_vec());
+        };
+    let (server, url) = make_server(handler);
+    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .preload_id(PreloadId::default())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .build();
+    let context = new_fetch_context(None, None);
+
+    let response =
+        spawn_blocking_task(
+            async move { methods::fetch(request, &mut DiscardFetch, &context).await },
+        );
+    assert_eq!(body_of(&response), b"preloaded");
+    let _ = server.close();
 }

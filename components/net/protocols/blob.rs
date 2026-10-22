@@ -11,11 +11,10 @@ use log::debug;
 use net_traits::blob_url_store::{BlobURLStoreError, parse_blob_url};
 use net_traits::http_status::HttpStatus;
 use net_traits::request::Request;
-use net_traits::response::{Response, ResponseBody};
+use net_traits::response::Response;
 use net_traits::{NetworkError, ResourceFetchTiming};
-use tokio::sync::mpsc::unbounded_channel;
 
-use crate::fetch::methods::{Data, DoneChannel, FetchContext};
+use crate::fetch::methods::FetchContext;
 use crate::protocols::{ProtocolHandler, partial_content, range_not_satisfiable_error};
 
 #[derive(Default)]
@@ -25,7 +24,6 @@ impl ProtocolHandler for BlobProtocolHander {
     fn load(
         &self,
         request: &mut Request,
-        done_chan: &mut DoneChannel,
         context: &FetchContext,
     ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
         let url_and_blob_claim = request.current_url_with_blob_claim();
@@ -62,12 +60,7 @@ impl ProtocolHandler for BlobProtocolHander {
             partial_content(&mut response);
         }
 
-        let (mut done_sender, done_receiver) = unbounded_channel();
-        *done_chan = Some((done_sender.clone(), done_receiver));
-        *response.body.lock() = ResponseBody::Receiving(vec![]);
-
         if let Err(err) = context.filemanager.fetch_file(
-            &mut done_sender,
             context.cancellation_listener.clone(),
             file_id,
             &context.file_token,
@@ -75,7 +68,6 @@ impl ProtocolHandler for BlobProtocolHander {
             &mut response,
             range_header,
         ) {
-            let _ = done_sender.send(Data::Done);
             let err = match err {
                 BlobURLStoreError::InvalidRange => {
                     range_not_satisfiable_error(&mut response);
