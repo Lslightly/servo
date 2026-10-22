@@ -1264,7 +1264,8 @@ impl XMLHttpRequest {
                 self.send_flag.set(false);
                 *self.status.safe_borrow_mut(cx.no_gc()) = HttpStatus::new_error();
                 self.response_headers.safe_borrow_mut(cx.no_gc()).clear();
-                // XXXManishearth set response to NetworkError
+                self.response.safe_borrow_mut(cx.no_gc()).clear();
+                // TODO: Also reset the response URL to that of a network error.
                 self.change_ready_state(cx, XMLHttpRequestState::Done);
                 return_if_fetch_was_terminated!();
 
