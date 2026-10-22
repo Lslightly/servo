@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Navigation timing of a document whose body ends with a network error</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<body>
+<script>
+promise_test(async t => {
+  const iframe = document.createElement("iframe");
+  const loaded = new Promise(resolve => iframe.onload = resolve);
+  iframe.src = "resources/document-network-error.py";
+  document.body.append(iframe);
+  t.add_cleanup(() => iframe.remove());
+  await loaded;
+  assert_equals(iframe.contentDocument.body.textContent, "cut short", "content");
+  const [entry] = iframe.contentWindow.performance.getEntriesByType("navigation");
+  assert_greater_than(entry.fetchStart, 0, "fetchStart");
+  assert_greater_than_equal(entry.requestStart, entry.fetchStart, "requestStart");
+  assert_greater_than(entry.responseEnd, entry.requestStart, "responseEnd");
+}, "A document whose body is cut short keeps the timing of its fetch");
+</script>

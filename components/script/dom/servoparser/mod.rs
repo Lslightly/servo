@@ -1675,33 +1675,30 @@ impl ParserContext {
         let mut realm = enter_auto_realm(cx, &*document);
         let cx = &mut realm;
 
-        if status.is_ok() {
-            // Step 15 of https://html.spec.whatwg.org/multipage/#initialise-the-document-object
+        // Step 15 of https://html.spec.whatwg.org/multipage/#initialise-the-document-object
 
-            // Step 15.1. Let fullTimingInfo be the result of extracting the full timing info
-            // from navigationParams's fetch controller.
-            let mut full_timing_info = timing;
+        // Step 15.1. Let fullTimingInfo be the result of extracting the full timing info
+        // from navigationParams's fetch controller.
+        let mut full_timing_info = timing;
 
-            // Step 15.3. If navigationParams's response's redirect taint is "same-origin", or all of the following are true:
-            //   * navigationParams's request's client is null, or navigationParams's request's referrer is not "no-referrer", and
-            //   * navigation TAO check given navigationParams's response and navigationParams's origin returns success,
-            // then set redirectCount to navigationParams's request's redirect count.
-            //
-            // TODO: Implement the two other bullet points
-            let redirect_count =
-                if self.navigation_params.redirect_taint == RedirectTaint::SameOrigin {
-                    full_timing_info.redirect_count
-                } else {
-                    // Step 15.2. Let redirectCount be 0.
-                    0
-                };
+        // Step 15.3. If navigationParams's response's redirect taint is "same-origin", or all of the following are true:
+        //   * navigationParams's request's client is null, or navigationParams's request's referrer is not "no-referrer", and
+        //   * navigation TAO check given navigationParams's response and navigationParams's origin returns success,
+        // then set redirectCount to navigationParams's request's redirect count.
+        //
+        // TODO: Implement the two other bullet points
+        let redirect_count = if self.navigation_params.redirect_taint == RedirectTaint::SameOrigin {
+            full_timing_info.redirect_count
+        } else {
+            // Step 15.2. Let redirectCount be 0.
+            0
+        };
 
-            // Step 15.4. Create the navigation timing entry for document, given fullTimingInfo, redirectCount,
-            // navigationTimingType, navigationParams's response's service worker timing info,
-            // and navigationParams's response's body info.
-            full_timing_info.redirect_count = redirect_count;
-            document.set_resource_fetch_timing(full_timing_info);
-        }
+        // Step 15.4. Create the navigation timing entry for document, given fullTimingInfo, redirectCount,
+        // navigationTimingType, navigationParams's response's service worker timing info,
+        // and navigationParams's response's body info.
+        full_timing_info.redirect_count = redirect_count;
+        document.set_resource_fetch_timing(full_timing_info);
 
         if let Some(parser) = parser {
             parser.last_chunk_received.set(true);
