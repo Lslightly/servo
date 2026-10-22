@@ -1130,6 +1130,7 @@ async fn wait_for_response(
                 break;
             },
             BodyEvent::End(BodyEnd::Failed(network_error)) => {
+                send_response_to_devtools(request, context, response, devtools_body);
                 set_body_failure(response, network_error);
                 break;
             },

@@ -2028,7 +2028,7 @@ fn test_body_that_ends_with_its_tls_connection_without_close_notify_is_complete(
 }
 
 #[test]
-fn test_truncated_body_that_ends_with_its_tls_connection_is_aborted() {
+fn test_truncated_body_that_ends_with_its_tls_connection_is_a_network_error() {
     for response in [
         &b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort"[..],
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n",
@@ -2048,7 +2048,10 @@ fn test_truncated_body_that_ends_with_its_tls_connection_is_aborted() {
 
         let response = fetch_with_context(request, &mut context);
         server.close();
-        assert!(is_aborted(&response));
+        assert_eq!(
+            response.get_network_error(),
+            Some(&NetworkError::ConnectionFailure)
+        );
     }
 }
 
@@ -2376,7 +2379,10 @@ fn test_truncated_response_is_not_served_from_cache() {
     let mut context = new_fetch_context(None, None);
 
     let response = fetch_with_context(build_cacheable_request(&url), &mut context);
-    assert_eq!(body_of(&response), b"truncated");
+    assert_eq!(
+        response.get_network_error(),
+        Some(&NetworkError::ConnectionFailure)
+    );
     assert_eq!(
         stored_response_count(&context, &build_cacheable_request(&url)),
         0
@@ -3180,6 +3186,7 @@ fn test_cancelling_a_suspended_fetch_ends_it() {
     let (response, body) = fetch.wait_for_end();
     assert!(cancelled_at.elapsed() < Duration::from_secs(1));
     assert!(response.aborted);
+    assert!(!response.is_network_error());
     assert_eq!(body.received, STREAM_CHUNK_SIZE);
 
     let _ = server.server.close();
@@ -3197,6 +3204,7 @@ fn test_cancelling_a_fetch_that_waits_for_the_network_ends_it() {
     let (response, body) = fetch.wait_for_end();
     assert!(cancelled_at.elapsed() < Duration::from_secs(1));
     assert!(response.aborted);
+    assert!(!response.is_network_error());
     assert_eq!(body.received, STREAM_CHUNK_SIZE);
 
     let _ = server.server.close();
@@ -3216,7 +3224,10 @@ fn test_fetch_whose_connection_closes_while_suspended_ends_when_resumed() {
 
     fetch.listener.resume();
     let (response, body) = fetch.wait_for_end();
-    assert!(response.aborted);
+    assert_eq!(
+        response.get_network_error(),
+        Some(&NetworkError::ConnectionFailure)
+    );
     assert!(!body.mismatch);
     assert_eq!(body.received, chunks * STREAM_CHUNK_SIZE);
 }
@@ -3866,8 +3877,64 @@ fn test_body_cut_short_is_not_delivered_for_an_integrity_check() {
     let _ = release.send(());
     let (response, events, _) =
         fetch_events(build_request_with_integrity(&url, INTEGRITY_OF_SCRIPT));
-    assert!(response.is_network_error());
+    assert_eq!(
+        response.get_network_error(),
+        Some(&NetworkError::ConnectionFailure)
+    );
     assert_eq!(events, ["response", "end"]);
+}
+
+#[test]
+fn test_body_cut_short_by_the_connection_is_a_network_error() {
+    for (raw_response, received) in [
+        (
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort"[..],
+            &b"short"[..],
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n100\r\ncut",
+            b"shortcut",
+        ),
+    ] {
+        let (url, release, _) = make_raw_held_server(raw_response);
+        let _ = release.send(());
+        let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+            .origin(url.origin())
+            .pipeline_id(Some(TEST_PIPELINE_ID))
+            .policy_container(Default::default())
+            .build();
+        let (response, events, body) = fetch_events(request);
+        assert_eq!(
+            response.get_network_error(),
+            Some(&NetworkError::ConnectionFailure)
+        );
+        assert_eq!(events.first(), Some(&"response"));
+        assert_eq!(events.last(), Some(&"end"));
+        assert_eq!(body, received);
+    }
+}
+
+#[test]
+fn test_body_cut_short_by_the_connection_is_sent_to_devtools() {
+    let (url, release, _) =
+        make_raw_held_server(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort");
+    let _ = release.send(());
+    let (devtools_sender, devtools_receiver) = unbounded();
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .build();
+    let response = fetch_with_context(request, &mut new_fetch_context(Some(devtools_sender), None));
+    assert!(response.is_network_error());
+    let bodies: Vec<_> = collect_all_network_events(&devtools_receiver)
+        .into_iter()
+        .filter_map(|event| match event {
+            NetworkEvent::HttpResponse(response) => Some(response.body),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(bodies.last(), Some(&Some(Bytes::from_static(b"short"))));
 }
 
 #[test]

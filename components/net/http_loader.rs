@@ -2270,11 +2270,12 @@ async fn http_network_fetch(
         let mut flow_state = cancellation_listener.subscribe();
         let mut suspended_until = None;
         let mut suspended_too_long = false;
+        let mut cancelled = false;
         let result = loop {
             // While suspended, do not poll the body: what is not read is held back
             // by TCP or HTTP/2 flow control, and the body continues with the next byte.
             let state = *flow_state.borrow_and_update();
-            let cancelled = match state {
+            cancelled = match state {
                 FetchFlowState::Cancelled => true,
                 FetchFlowState::Suspended => {
                     let deadline = *suspended_until
@@ -2339,16 +2340,17 @@ async fn http_network_fetch(
                 body_sender.finish(BodyEnd::Complete);
             },
             Err(error) => {
-                let end = if let std::io::ErrorKind::InvalidData = error.kind() {
+                let end = if cancelled {
+                    BodyEnd::Aborted
+                } else if let std::io::ErrorKind::InvalidData = error.kind() {
                     debug!("Content decompression error for {:?}", request_url);
                     BodyEnd::Failed(NetworkError::DecompressionError)
                 } else if suspended_too_long {
                     debug!("Fetch suspended for too long: {:?}", request_url);
                     BodyEnd::Failed(NetworkError::ConnectionFailure)
                 } else {
-                    // A body cut short by the connection is handed over as far as it got,
-                    // like one whose fetch was cancelled.
-                    BodyEnd::Aborted
+                    debug!("Body of {:?} cut short: {error}", request_url);
+                    BodyEnd::Failed(NetworkError::ConnectionFailure)
                 };
                 debug!("finished response for {:?}", request_url);
                 timing.set_attribute(ResourceAttribute::ResponseEnd);
