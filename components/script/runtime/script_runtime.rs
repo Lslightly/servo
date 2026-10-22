@@ -24,9 +24,9 @@ use js::context::JSContext;
 use js::conversions::jsstr_to_string;
 use js::gc::StackGCVector;
 use js::glue::{
-    DispatchablePointer, RUST_js_GetErrorMessage, RegisterScriptEnvironmentPreparer,
-    RunScriptEnvironmentPreparerClosure, SetBuildId, StreamConsumerConsumeChunk,
-    StreamConsumerNoteResponseURLs, StreamConsumerStreamEnd, StreamConsumerStreamError,
+    DispatchablePointer, RegisterScriptEnvironmentPreparer, RunScriptEnvironmentPreparerClosure,
+    SetBuildId, StreamConsumerConsumeChunk, StreamConsumerNoteResponseURLs,
+    StreamConsumerStreamEnd, StreamConsumerStreamError,
 };
 use js::jsapi::{
     AsmJSOption, BuildIdCharVector, CompilationType, Dispatchable_MaybeShuttingDown, GCDescription,
@@ -1233,9 +1233,11 @@ impl StreamConsumer {
         }
     }
 
-    pub(crate) fn stream_error(&self, error_code: usize) {
+    /// Ends the stream because the body ended with a network error, which rejects the
+    /// compilation with the TypeError thrown by `report_stream_error`.
+    pub(crate) fn stream_error(&self) {
         unsafe {
-            StreamConsumerStreamError(self.0, error_code);
+            StreamConsumerStreamError(self.0, STREAM_NETWORK_ERROR);
         }
     }
 
@@ -1351,11 +1353,27 @@ unsafe extern "C" fn consume_stream(
     true
 }
 
+/// The error code `StreamConsumer::stream_error` passes to SpiderMonkey, which hands it back to
+/// `report_stream_error`. SpiderMonkey reserves 0 for out of memory.
+const STREAM_NETWORK_ERROR: usize = 1;
+
+/// SpiderMonkey rejects the compilation with the exception this leaves pending, and leaves the
+/// promise unsettled if there is none.
 #[expect(unsafe_code)]
-unsafe extern "C" fn report_stream_error(_cx: *mut RawJSContext, error_code: usize) {
-    error!("Error initializing StreamConsumer: {:?}", unsafe {
-        RUST_js_GetErrorMessage(ptr::null_mut(), error_code as u32)
-    });
+unsafe extern "C" fn report_stream_error(cx: *mut RawJSContext, error_code: usize) {
+    debug_assert_eq!(error_code, STREAM_NETWORK_ERROR);
+    let mut cx = unsafe {
+        // SAFETY: We are in SM hook
+        JSContext::from_ptr(NonNull::new(cx).expect("JSContext should not be null in SM hook"))
+    };
+    let cx = &mut cx;
+    let mut realm = CurrentRealm::assert(cx);
+    let global = GlobalScope::from_current_realm(&mut realm);
+    throw_dom_exception(
+        cx,
+        &global,
+        Error::Type(c"Network error occurred".to_owned()),
+    );
 }
 
 #[expect(unsafe_code)]

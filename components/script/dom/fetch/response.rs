@@ -114,8 +114,14 @@ impl Response {
     }
 
     pub(crate) fn error_stream(&self, cx: &mut js::context::JSContext, error: Error) {
-        if let Some(body) = self.fetch_body_stream.get() {
+        if let Some(body) = self.fetch_body_stream.get() &&
+            body.is_readable()
+        {
             body.error_native(cx, error);
+        }
+        let stream_consumer = self.stream_consumer.borrow_mut().take();
+        if let Some(stream_consumer) = stream_consumer {
+            stream_consumer.stream_error();
         }
     }
 
@@ -551,8 +557,16 @@ impl Response {
 
     pub(crate) fn stream_chunk(&self, cx: &mut js::context::JSContext, chunk: Bytes) {
         // Note, are these two actually mutually exclusive?
-        if let Some(stream_consumer) = self.stream_consumer.borrow().as_ref() {
-            stream_consumer.consume_chunk(&chunk);
+        let consumed = self
+            .stream_consumer
+            .borrow()
+            .as_ref()
+            .map(|stream_consumer| stream_consumer.consume_chunk(&chunk));
+        if let Some(consumed) = consumed {
+            // SpiderMonkey has ended a consumer that refuses a chunk, which must not be used again.
+            if !consumed {
+                self.stream_consumer.borrow_mut().take();
+            }
         } else if let Some(body) = self.fetch_body_stream.get() {
             body.enqueue_native(cx, chunk.to_vec());
         }

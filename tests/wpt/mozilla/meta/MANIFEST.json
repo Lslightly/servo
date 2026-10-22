@@ -11323,6 +11323,10 @@
       "fb5dbca23808bee44003692cb0e139dd6a22e874",
       []
      ],
+     "wasm-network-error.py": [
+      "c473aaf7fe592f7170d203afb2dee1850903f004",
+      []
+     ],
      "worker-success.js": [
       "327986f34b9b20476b6a7b1189c732a9ea8b9f68",
       []
@@ -15535,6 +15539,31 @@
      [
       null,
       {}
+     ]
+    ],
+    "wasm-streaming-network-error.any.js": [
+     "202926bbd070f579152276ef35d35431566ef999",
+     [
+      "mozilla/wasm-streaming-network-error.any.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker"
+        ]
+       ]
+      }
+     ],
+     [
+      "mozilla/wasm-streaming-network-error.any.worker.html",
+      {
+       "script_metadata": [
+        [
+         "global",
+         "window,dedicatedworker"
+        ]
+       ]
+      }
      ]
     ],
     "weakref.html": [
