@@ -127,6 +127,8 @@ struct EventSourceContext {
     event_type: String,
     data: String,
     last_event_id: String,
+    /// Whether the response was accepted as an event stream and the connection announced.
+    announced: bool,
 }
 
 impl Clone for EventSourceContext {
@@ -142,6 +144,7 @@ impl Clone for EventSourceContext {
             event_type: self.event_type.clone(),
             data: self.data.clone(),
             last_event_id: self.last_event_id.clone(),
+            announced: self.announced,
         }
     }
 }
@@ -196,6 +199,7 @@ impl EventSourceContext {
             event_type: String::new(),
             data: String::new(),
             last_event_id: String::from(event_source.last_event_id.borrow().clone()),
+            announced: false,
         };
         global.task_manager().remote_event_task_source().queue(
             task!(reestablish_the_event_source_onnection: move |cx| {
@@ -228,6 +232,15 @@ impl EventSourceContext {
                 event_source.global().schedule_callback(callback, duration);
             }),
         );
+    }
+
+    /// Step 15.2 of <https://html.spec.whatwg.org/multipage/#dom-eventsource>
+    fn reestablish_the_connection_unless_futile(&self, error: &NetworkError) {
+        if error.is_permanent_failure() {
+            self.fail_the_connection()
+        } else {
+            self.reestablish_the_connection()
+        }
     }
 
     /// <https://html.spec.whatwg.org/multipage/#processField>
@@ -423,17 +436,14 @@ impl FetchResponseListener for EventSourceContext {
                     .ascii_serialization()
                     .into_owned();
                 // Step 15.4 announce the connection and interpret res's body line by line.
+                self.announced = true;
                 self.announce_the_connection();
             },
             Err(error) => {
                 // Step 15.2 if res is a network error, then reestablish the connection, unless
                 // the user agent knows that to be futile, in which case the user agent may
                 // fail the connection.
-                if error.is_permanent_failure() {
-                    self.fail_the_connection()
-                } else {
-                    self.reestablish_the_connection()
-                }
+                self.reestablish_the_connection_unless_futile(&error)
             },
         }
     }
@@ -493,8 +503,12 @@ impl FetchResponseListener for EventSourceContext {
         if matches!(result, encoding_rs::DecoderResult::Malformed(_, _)) {
             self.parse(cx, "\u{FFFD}".chars());
         }
-        if response.is_ok() {
-            self.reestablish_the_connection();
+        match &response {
+            Ok(()) => self.reestablish_the_connection(),
+            // The specification leaves a connection whose body ends with a network error open, but
+            // other browsers reestablish it.
+            Err(error) if self.announced => self.reestablish_the_connection_unless_futile(error),
+            Err(_) => {},
         }
 
         network_listener::submit_timing(cx, global, &self, &response, &timing);
@@ -659,6 +673,7 @@ impl EventSourceMethods<crate::DomTypeHolder> for EventSource {
             event_type: String::new(),
             data: String::new(),
             last_event_id: String::new(),
+            announced: false,
         };
 
         let task_source = global.task_manager().networking_task_source().into();

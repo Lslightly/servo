@@ -11267,6 +11267,10 @@
       "cb0d6c8b0447959e6bc0b757444e9a80bfd57390",
       []
      ],
+     "eventsource-network-error.py": [
+      "8a5953ab3c8a5e875dd65e89ca8c7c49d67799c5",
+      []
+     ],
      "external.js": [
       "5f0242874cfa47b84af35325ad651690cd9fb790",
       []
@@ -14483,6 +14487,13 @@
      "0ba1ce0d5577de68e5e8ff3acbce52043e7dee43",
      [
       null,
+      {}
+     ]
+    ],
+    "eventsource-network-error.window.js": [
+     "63b227f44da14af3ae5d25c98f4ed7d525f5c155",
+     [
+      "mozilla/eventsource-network-error.window.html",
       {}
      ]
     ],
