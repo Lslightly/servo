@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html class="test-wait">
+<meta charset="utf-8">
+<title>Terminating workers while they create promises in platform code</title>
+<link rel="help" href="https://html.spec.whatwg.org/multipage/workers.html#terminate-a-worker">
+<script>
+  // Each worker keeps calling APIs that create promises, so termination likely stops it inside one
+  // of them. The worker threads may still be stopping after terminate() returns, so the test waits
+  // a little longer.
+  const workers = [];
+  let started = 0;
+  for (let i = 0; i < 8; i++) {
+    const worker = new Worker("support/Worker-create-promises.js");
+    worker.onmessage = async () => {
+      if (++started < workers.length)
+        return;
+      for (const w of workers)
+        w.terminate();
+      const start = performance.now();
+      while (performance.now() - start < 200)
+        await new Promise(resolve => requestAnimationFrame(resolve));
+      document.documentElement.classList.remove("test-wait");
+    };
+    workers.push(worker);
+  }
+</script>

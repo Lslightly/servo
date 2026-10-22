@@ -16867,6 +16867,15 @@
      ]
     ]
    },
+   "workers": {
+    "Worker-terminate-while-creating-promises-crash.html": [
+     "dab5cd7d7d2d469dde532a6fe15b953524e3c865",
+     [
+      null,
+      {}
+     ]
+    ]
+   },
    "xml": {
     "xml-doc-innerHTML-crash.html": [
      "2187c4667b3e7b5cb6e71bf66e4179b245e8fdc0",
@@ -627724,6 +627733,10 @@
      ],
      "Worker-create-common.js": [
       "f0b8efe46bd8c93e5c2af1e239139faae76a16be",
+      []
+     ],
+     "Worker-create-promises.js": [
+      "d14d3a06b119aa83ebf156c6f7c846a44242f203",
       []
      ],
      "Worker-creation-happens-in-parallel.js": [
