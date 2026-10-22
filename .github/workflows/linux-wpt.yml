@@ -124,7 +124,9 @@ jobs:
             --filter-intermittents wpt-filtered-logs/linux/${{ matrix.chunk_id }}.json \
             ${{ inputs.wpt-args }}
         env:
-          GITHUB_CONTEXT: ${{ toJson(github) }}
+          # A push event lists every pushed commit; after a rebase that exceeds the 128 KiB that
+          # Linux allows for one environment variable, and the step cannot start.
+          GITHUB_CONTEXT: ${{ github.event_name == 'push' && '{}' || toJson(github) }}
       - name: Archive results (filtered)
         uses: actions/upload-artifact@v7
         if: ${{ always() }}
@@ -185,6 +187,7 @@ jobs:
             --tag="${{ inputs.name }}-wpt" \
             results/linux/*.json
         env:
-          GITHUB_CONTEXT: ${{ toJson(github) }}
+          # See "Run tests".
+          GITHUB_CONTEXT: ${{ github.event_name == 'push' && '{}' || toJson(github) }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RESULTS: ${{ toJson(needs.*.result) }}

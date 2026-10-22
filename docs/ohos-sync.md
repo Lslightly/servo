@@ -77,13 +77,20 @@ A rebase can go wrong in three ways, and each needs its own evidence:
 
 ```sh
 git fetch upstream main
+gh api "repos/servo/servo/actions/runs?head_sha=$(git rev-parse upstream/main)&event=merge_group" \
+  --jq '.workflow_runs[] | select(.name == "Main") | .conclusion'
 git tag pre-sync/<date> ohos-main
 git tag base/<date> upstream/main
 git worktree add -b ohos-sync-<date> <worktree-dir> ohos-main
 ```
 
-Use a private cargo target dir for the worktree (see the workspace
-`AGENTS.md` if working in the servo-workspace container).
+The base needs a complete WPT run in servo/servo's merge queue, whose results
+[servo-ohos-wpt](https://github.com/openharmony-rs/servo-ohos-wpt) shows as the
+upstream base line: the `gh api` command must print `success`, which means that
+all WPT chunks ran. Otherwise, tag the newest earlier upstream commit for which
+it does as `base/<date>` instead of `upstream/main`.
+
+Use a private cargo target dir for the worktree.
 
 Predict the conflicts before starting, and list the upstream commits that
 touch files the stack touches — this is the briefing for conflict

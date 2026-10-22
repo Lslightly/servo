@@ -16,8 +16,8 @@ Every pull request runs the Linux unit tests and lint. On top of that:
 - WPT tests or expectations: a Linux WPT run of the directories of those tests, with SpiderMonkey
   and QuickJS, or of the whole suites for more than `MAX_DIRECTORIES` directories.
 - Files that no build or test reads, such as documentation: nothing.
-- Anything else: the OHOS and QuickJS builds and the whole Linux WPT suite. The nightly QuickJS
-  workflow runs the whole QuickJS WPT suite.
+- Anything else: the OHOS and QuickJS builds and the whole Linux WPT suite. The whole QuickJS WPT
+  suite runs on every ohos-main push (ohos-main-wpt.yml).
 
 The selections of the changed files add up, so other files that need a full run keep the QuickJS
 WPT run of changed tests or of a changed QuickJS build.

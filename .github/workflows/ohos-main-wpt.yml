@@ -1,0 +1,46 @@
+# Runs the whole WPT suite with SpiderMonkey and with QuickJS on every ohos-main commit, and stores
+# the results in openharmony-rs/servo-ohos-wpt, which shows them with the results of the upstream
+# commit that ohos-main is based on: https://openharmony-rs.github.io/servo-ohos-wpt/
+#
+# The results job takes its token from the `servo-ohos-wpt` environment, which only ohos-main can
+# use.
+name: ohos-main WPT
+on:
+  push:
+    branches: ["ohos-main"]
+  workflow_dispatch:
+
+# One run at a time, so that the results job stores the runs in order. A push waits for the running
+# run; of several waiting pushes, GitHub only keeps the latest.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: Linux
+    uses: ./.github/workflows/linux.yml
+    secrets: inherit
+    with:
+      profile: checked-release
+      wpt: true
+
+  quickjs:
+    name: QuickJS
+    uses: ./.github/workflows/quickjs.yml
+    secrets: inherit
+    with:
+      profile: checked-release
+      wpt: true
+
+  # Stores the configurations whose WPT jobs uploaded the results of all chunks, also if some
+  # tests had unexpected results.
+  results:
+    name: Results
+    needs: [linux, quickjs]
+    if: ${{ !cancelled() }}
+    uses: openharmony-rs/servo-ohos-wpt/.github/workflows/store.yml@main
+    # The called workflow reads the secret from its job's environment, but only if it is passed.
+    secrets:
+      SERVO_OHOS_WPT_TOKEN: ${{ secrets.SERVO_OHOS_WPT_TOKEN }}
+    permissions: {}

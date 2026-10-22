@@ -1,11 +1,10 @@
 # Builds servoshell on the QuickJS mozjs shim (openharmony-rs/servo-quickjs) and runs WPT with it,
 # against the expectations with their `js_engine == "quickjs"` conditions. Pull requests run WPT
 # on the directories of the Linux WPT job, and the whole suite when they change the shim pin
-# (python/servo/pr_jobs.py); the merge queue runs the build and smoketest only.
+# (python/servo/pr_jobs.py); the merge queue runs the build and smoketest only, and ohos-main-wpt.yml
+# the whole suite on every ohos-main push.
 name: QuickJS
 on:
-  schedule:
-    - cron: "30 1 * * *"
   workflow_call:
     inputs:
       profile:
@@ -48,7 +47,7 @@ env:
   # Replaces the servo-quickjs commit pinned in support/quickjs/cargo-config.toml, if set.
   SERVO_QUICKJS_REF: ${{ inputs.servo-quickjs-ref }}
   PROFILE: ${{ inputs.profile || 'release' }}
-  RUN_WPT: ${{ github.event_name == 'schedule' || inputs.wpt }}
+  RUN_WPT: ${{ inputs.wpt }}
 
 jobs:
   build:
@@ -139,7 +138,7 @@ jobs:
   # comments on the pull request.
   wpt:
     needs: build
-    if: ${{ github.event_name == 'schedule' || inputs.wpt }}
+    if: ${{ inputs.wpt }}
     uses: ./.github/workflows/linux-wpt.yml
     with:
       profile: ${{ inputs.profile || 'release' }}
