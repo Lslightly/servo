@@ -3762,3 +3762,191 @@ fn test_fetch_of_a_preload_keeps_its_body() {
     assert_eq!(body_of(&response), b"preloaded");
     let _ = server.close();
 }
+
+/// The integrity metadata of `alert('Hello, world.');`.
+const INTEGRITY_OF_SCRIPT: &str =
+    "sha384-H8BRh8j48O9oYatfu5AZzq6A9RINhZO5H16dQZngK7T62em8MUt1FLm52t+eX6xO";
+
+/// Records what a fetch hands over to its target, in order, and the body it delivers.
+struct EventCollector {
+    sender: Option<tokio::sync::oneshot::Sender<(Response, Vec<&'static str>, Vec<u8>)>>,
+    events: Vec<&'static str>,
+    body: Vec<u8>,
+}
+
+impl FetchTaskTarget for EventCollector {
+    fn process_request_body(&mut self, _: &Request) {}
+    fn process_response(&mut self, _: &Request, _: &Response) {
+        self.events.push("response");
+    }
+    fn process_response_chunk(&mut self, _: &Request, chunk: Bytes) {
+        self.events.push("chunk");
+        self.body.extend_from_slice(&chunk);
+    }
+    fn process_response_eof(&mut self, _: &Request, response: &Response) {
+        self.events.push("end");
+        let _ = self.sender.take().unwrap().send((
+            response.try_clone().unwrap(),
+            std::mem::take(&mut self.events),
+            std::mem::take(&mut self.body),
+        ));
+    }
+    fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
+    fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
+}
+
+/// A request for `url` with `integrity`.
+fn build_request_with_integrity(url: &UrlWithBlobClaim, integrity: &str) -> Request {
+    let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .build();
+    request.integrity_metadata = integrity.to_owned();
+    request
+}
+
+/// Fetch `request`, and return the response, what reached the target and the body it got.
+fn fetch_events(request: Request) -> (Response, Vec<&'static str>, Vec<u8>) {
+    let context = new_fetch_context(None, None);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut target = EventCollector {
+        sender: Some(sender),
+        events: Vec::new(),
+        body: Vec::new(),
+    };
+    spawn_task(async move {
+        methods::fetch(request, &mut target, &context).await;
+    });
+    wait_for_fetch(receiver)
+}
+
+/// Fetch a server's `body` with `integrity`, and return the response, what reached the target and
+/// the body it got.
+fn fetch_with_integrity(
+    body: &'static [u8],
+    integrity: &str,
+) -> (Response, Vec<&'static str>, Vec<u8>) {
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            *response.body_mut() = make_body(body.to_vec());
+        };
+    let (server, url) = make_server(handler);
+    let result = fetch_events(build_request_with_integrity(&url, integrity));
+    let _ = server.close();
+    result
+}
+
+#[test]
+fn test_body_that_fails_its_integrity_check_is_not_delivered() {
+    let (response, events, _) =
+        fetch_with_integrity(b"alert('Hello, Network Error');", INTEGRITY_OF_SCRIPT);
+    assert_eq!(
+        response.get_network_error(),
+        Some(&NetworkError::SubresourceIntegrity)
+    );
+    assert_eq!(events, ["response", "end"]);
+}
+
+#[test]
+fn test_body_that_passes_its_integrity_check_is_delivered_after_the_response() {
+    let (response, events, body) =
+        fetch_with_integrity(b"alert('Hello, world.');", INTEGRITY_OF_SCRIPT);
+    assert!(!response.is_network_error());
+    assert_eq!(events, ["response", "chunk", "end"]);
+    assert_eq!(body, b"alert('Hello, world.');");
+}
+
+#[test]
+fn test_body_cut_short_is_not_delivered_for_an_integrity_check() {
+    let (url, release, _) = make_raw_held_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nalert('Hello, world.');",
+    );
+    let _ = release.send(());
+    let (response, events, _) =
+        fetch_events(build_request_with_integrity(&url, INTEGRITY_OF_SCRIPT));
+    assert!(response.is_network_error());
+    assert_eq!(events, ["response", "end"]);
+}
+
+#[test]
+fn test_null_body_fails_its_integrity_check() {
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            *response.status_mut() = StatusCode::NO_CONTENT;
+        };
+    let (server, url) = make_server(handler);
+    let (response, events, _) =
+        fetch_events(build_request_with_integrity(&url, INTEGRITY_OF_SCRIPT));
+    let _ = server.close();
+    assert_eq!(
+        response.get_network_error(),
+        Some(&NetworkError::SubresourceIntegrity)
+    );
+    assert_eq!(events, ["response", "end"]);
+}
+
+#[test]
+fn test_body_that_fails_to_decode_is_not_delivered_for_an_integrity_check() {
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            *response.body_mut() = make_body(b"not gzip".to_vec());
+        };
+    let (server, url) = make_server(handler);
+    let (response, events, _) =
+        fetch_events(build_request_with_integrity(&url, INTEGRITY_OF_SCRIPT));
+    let _ = server.close();
+    assert_eq!(
+        response.get_network_error(),
+        Some(&NetworkError::DecompressionError)
+    );
+    assert_eq!(events, ["response", "end"]);
+}
+
+#[test]
+fn test_synchronous_fetch_delivers_a_checked_body_after_the_response() {
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            *response.body_mut() = make_body(b"alert('Hello, world.');".to_vec());
+        };
+    let (server, url) = make_server(handler);
+    let mut request = build_request_with_integrity(&url, INTEGRITY_OF_SCRIPT);
+    request.synchronous = true;
+    let (response, events, _) = fetch_events(request);
+    let _ = server.close();
+    assert!(!response.is_network_error());
+    assert_eq!(events, ["response", "chunk", "end"]);
+}
+
+#[test]
+fn test_opaque_response_fails_any_integrity_check() {
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            *response.body_mut() = make_body(b"alert('Hello, world.');".to_vec());
+        };
+    let (server, url) = make_server(handler);
+    for integrity in [INTEGRITY_OF_SCRIPT, "unknown-metadata"] {
+        let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+            .mode(RequestMode::NoCors)
+            .origin(mock_origin())
+            .pipeline_id(Some(TEST_PIPELINE_ID))
+            .policy_container(Default::default())
+            .build();
+        request.integrity_metadata = integrity.to_owned();
+        let (response, events, _) = fetch_events(request);
+        assert_eq!(
+            response.get_network_error(),
+            Some(&NetworkError::SubresourceIntegrity)
+        );
+        assert_eq!(events, ["response", "end"]);
+    }
+    let _ = server.close();
+}

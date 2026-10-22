@@ -981,35 +981,21 @@ pub async fn main_fetch(
         response.actual_response_mut().body = ResponseBody::Null;
     }
 
-    // Step 19. If response is not a network error and any of the following returns blocked
-    let mut response_loaded = false;
     let mut response = if !response.is_network_error() && !request.integrity_metadata.is_empty() {
-        // Step 19.1.
-        wait_for_response(request, &mut response, target, true, context).await;
-        response_loaded = true;
-
-        // Step 19.2.
-        let integrity_metadata = &request.integrity_metadata;
-        if response.termination_reason.is_none() &&
-            !is_response_integrity_valid(integrity_metadata, &response)
-        {
-            Response::network_error(NetworkError::SubresourceIntegrity)
-        } else {
-            response
-        }
+        check_integrity(request, response).await
     } else {
         response
     };
+
+    // A preloaded response is kept whole for the fetch that consumes it.
+    let retain = request.preload_id.is_some();
 
     // Step 20.
     if request.synchronous {
         // process_response is not supposed to be used
         // by sync fetch, but we overload it here for simplicity
         target.process_response(request, &response);
-        if !response_loaded {
-            let retain = request.preload_id.is_some();
-            wait_for_response(request, &mut response, target, retain, context).await;
-        }
+        wait_for_response(request, &mut response, target, retain, context).await;
         // overloaded similarly to process_response
         target.process_response_eof(request, &response);
         return response;
@@ -1031,11 +1017,7 @@ pub async fn main_fetch(
     send_security_info_to_devtools(request, context, &response);
 
     // Step 23.
-    if !response_loaded {
-        // A preloaded response is kept whole for the fetch that consumes it.
-        let retain = request.preload_id.is_some();
-        wait_for_response(request, &mut response, target, retain, context).await;
-    }
+    wait_for_response(request, &mut response, target, retain, context).await;
 
     // Step 24.
     target.process_response_eof(request, &response);
@@ -1047,6 +1029,46 @@ pub async fn main_fetch(
     // Steps 25-27.
     // TODO: remove this line when only asynchronous fetches are used
     response
+}
+
+/// Steps 23.1 to 23.4 of <https://fetch.spec.whatwg.org/#concept-main-fetch>: read the whole body
+/// of `response`, and return the response with that body if it matches the request’s integrity
+/// metadata, or a network error otherwise.
+async fn check_integrity(request: &Request, mut response: Response) -> Response {
+    // The body of an opaque filtered response is null.
+    if matches!(
+        response.response_type,
+        ResponseType::Opaque | ResponseType::OpaqueRedirect
+    ) {
+        return Response::network_error(NetworkError::SubresourceIntegrity);
+    }
+    let bytes = match response.actual_response_mut().body.take() {
+        ResponseBody::Null => return Response::network_error(NetworkError::SubresourceIntegrity),
+        ResponseBody::Bytes(bytes) => bytes,
+        ResponseBody::Stream(receiver) => match receiver.read_all().await {
+            Ok(bytes) => bytes,
+            Err(BodyEnd::Failed(network_error)) => {
+                set_body_failure(&mut response, network_error);
+                return response;
+            },
+            Err(_) => return Response::network_error(NetworkError::SubresourceIntegrity),
+        },
+    };
+    response.actual_response_mut().body = ResponseBody::Bytes(bytes);
+    if !is_response_integrity_valid(&request.integrity_metadata, &response) {
+        return Response::network_error(NetworkError::SubresourceIntegrity);
+    }
+    response
+}
+
+/// Make `response` a network error, because its body failed with `network_error`.
+fn set_body_failure(response: &mut Response, network_error: NetworkError) {
+    response.aborted = true;
+    response.actual_response_mut().aborted = true;
+    if network_error == NetworkError::DecompressionError {
+        response.termination_reason = Some(TerminationReason::Fatal);
+    }
+    response.set_network_error(network_error);
 }
 
 /// Hand the body of `response` over to `target`, and set how it ended on `response`.
@@ -1108,12 +1130,7 @@ async fn wait_for_response(
                 break;
             },
             BodyEvent::End(BodyEnd::Failed(network_error)) => {
-                response.aborted = true;
-                response.actual_response_mut().aborted = true;
-                if network_error == NetworkError::DecompressionError {
-                    response.termination_reason = Some(TerminationReason::Fatal);
-                }
-                response.set_network_error(network_error);
+                set_body_failure(response, network_error);
                 break;
             },
         }

@@ -147,9 +147,8 @@ fn apply_algorithm_to_response(
         let response_digest = digest::digest(algorithm, bytes);
         base64::engine::general_purpose::STANDARD.encode(response_digest)
     } else {
-        // There is nothing to digest: a null body status leaves the body null, and a body
-        // that is still being received is not known as a whole. Return a digest that
-        // cannot match, so the integrity check fails rather than the process.
+        // There is nothing to digest. Return a digest that cannot match, so the integrity
+        // check fails rather than the process.
         log::debug!("integrity check on a response with no retained body");
         String::new()
     }
