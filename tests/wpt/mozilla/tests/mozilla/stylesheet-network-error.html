@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>A style sheet whose body ends with a network error is a failure</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<div id="target"></div>
+<script>
+function load(t, element) {
+  const event = new Promise(resolve => {
+    element.onload = element.onerror = e => resolve(e.type);
+  });
+  document.head.append(element);
+  t.add_cleanup(() => element.remove());
+  return event;
+}
+
+for (const [error, description] of [
+  ["decode", "fails to decode"],
+  ["cut-short", "is cut short"],
+]) {
+  promise_test(async t => {
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = `resources/stylesheet-network-error.py?error=${error}&from=link`;
+    assert_equals(await load(t, link), "error", "event");
+    assert_equals(getComputedStyle(document.getElementById("target")).color, "rgb(0, 0, 0)",
+                  "color");
+  }, `A link fires error and applies no style when the body of its style sheet ${description}`);
+
+  promise_test(async t => {
+    const style = document.createElement("style");
+    style.textContent =
+      `@import url("resources/stylesheet-network-error.py?error=${error}&from=import");`;
+    assert_equals(await load(t, style), "error", "event");
+    assert_equals(getComputedStyle(document.getElementById("target")).color, "rgb(0, 0, 0)",
+                  "color");
+  }, `A style element fires error and applies no style when the body of an imported style sheet ${description}`);
+}
+</script>

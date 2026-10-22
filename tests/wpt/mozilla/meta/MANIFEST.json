@@ -11323,6 +11323,10 @@
       "8faa57c0c47c4fdf27c052d059b28ee1088235e9",
       []
      ],
+     "stylesheet-network-error.py": [
+      "1d025bac32fb5e5a51eb982027f8690c7ccfa55d",
+      []
+     ],
      "video.mp4": [
       "fb5dbca23808bee44003692cb0e139dd6a22e874",
       []
@@ -15433,6 +15437,13 @@
     ],
     "style-remove-prop.html": [
      "07b319bb67ec2a4fe234a6ba98ddd17fc090d593",
+     [
+      null,
+      {}
+     ]
+    ],
+    "stylesheet-network-error.html": [
+     "264085b73ad8b1f7b0a3de6d9f8a1a3de9adf3ce",
      [
       null,
       {}

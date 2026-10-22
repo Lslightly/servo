@@ -418,7 +418,10 @@ impl FetchResponseListener for StylesheetContext {
             }
         }
 
-        if metadata.status != http::StatusCode::OK {
+        // https://html.spec.whatwg.org/multipage/#fetch-and-process-the-linked-resource
+        // > If bodyBytes is null or failure, or response's status is not an ok status, set
+        // > success to false.
+        if status.is_err() || metadata.status != http::StatusCode::OK {
             let empty_stylesheet = self.empty_stylesheet(&document);
             self.do_post_parse_tasks(false, empty_stylesheet, cx);
             return;
