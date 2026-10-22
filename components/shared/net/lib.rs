@@ -53,6 +53,7 @@ use crate::request::{Request, RequestBuilder};
 use crate::response::{Response, ResponseInit};
 
 pub mod blob_url_store;
+pub mod body_stream;
 pub mod fetch;
 pub mod filemanager_thread;
 pub mod http_status;

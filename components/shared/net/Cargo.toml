@@ -53,13 +53,14 @@ servo-url = { workspace = true }
 servo_arc = { workspace = true }
 sys-locale = { workspace = true }
 rustls = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 url = { workspace = true }
 uuid = { workspace = true }
 webrender_api = { workspace = true }
 
 [dev-dependencies]
 servo-default-resources = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
 
 [lints]
 workspace = true
