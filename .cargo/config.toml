@@ -56,3 +56,4 @@ CXX_aarch64_pc_windows_msvc = "clang-cl.exe"
 
 [build]
 rustdocflags = ["--document-private-items"]
+rustflags = ["--cfg", "feature=\"js-quickjs\""]

@@ -470,6 +470,7 @@ codegen-units = 1
 # OpenHarmony fork with FreeType 2.14.3, mmap-backed streams and ABI fixes; see
 # third_party/patches/freetype-sys/update.sh.
 freetype-sys = { path = "third_party/freetype-sys" }
+mozjs = { path = "servo-quickjs/mozjs" }
 # Stylo at the version required above with the OpenHarmony patches applied; see
 # third_party/patches/stylo/update.sh.
 selectors = { path = "third_party/stylo/selectors" }
