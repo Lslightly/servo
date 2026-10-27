@@ -34,3 +34,4 @@ RUSTC_BOOTSTRAP = "crown,script,script_webcrypto,script_webgpu,script_bindings,s
 
 [build]
 rustdocflags = ["--document-private-items"]
+rustflags = ["--cfg", "feature=\"js-quickjs\""]

@@ -14,6 +14,8 @@ mod crash_handler;
 pub(crate) mod desktop;
 #[cfg(any(target_os = "android", target_env = "ohos"))]
 mod egl;
+#[cfg(all(feature = "tracing", not(target_os = "android")))]
+mod event_flame;
 #[cfg(not(target_os = "android"))]
 mod headless_event_loop;
 #[cfg(not(target_os = "android"))]
@@ -84,6 +86,21 @@ pub fn init_tracing(filter_directives: Option<&str>) {
             subscriber.with(HitraceLayer::default())
         };
 
+        // With `SERVO_EVENT_FLAME_DIR` set, record the `mozjs_gc` events (retain/release/adopt
+        // of reference-counted values) and write one folded stack file per object into that
+        // directory. The layer is always added, but does nothing when the variable is unset.
+        #[cfg(not(target_os = "android"))]
+        let (subscriber, event_flame_enabled) = match event_flame::EventFlameLayer::from_env() {
+            Some((layer, guard)) => {
+                event_flame::install(guard);
+                (subscriber.with(layer), true)
+            }
+            None => {
+                let (layer, _) = event_flame::EventFlameLayer::disabled();
+                (subscriber.with(layer), false)
+            }
+        };
+
         // Filter events and spans by the directives in SERVO_TRACING, using EnvFilter as a global filter.
         // <https://docs.rs/tracing-subscriber/0.3.18/tracing_subscriber/layer/index.html#global-filtering>
         let filter_builder = tracing_subscriber::EnvFilter::builder()
@@ -94,6 +111,18 @@ pub fn init_tracing(filter_directives: Option<&str>) {
             filter_builder
                 .with_env_var("SERVO_TRACING")
                 .from_env_lossy()
+        };
+
+        // The default directive is OFF, so enable the target we record explicitly.
+        #[cfg(not(target_os = "android"))]
+        let filter = if event_flame_enabled {
+            filter.add_directive(
+                format!("{}=trace", event_flame::TARGET)
+                    .parse()
+                    .expect("valid tracing directive"),
+            )
+        } else {
+            filter
         };
 
         let subscriber = subscriber.with(filter);
