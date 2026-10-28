@@ -11,6 +11,9 @@
 每次运行会先清掉上次的产物（目录下的 *.svg 和输出 HTML），**清空前必须
 人工确认**；`--yes` 跳过确认（脚本/CI 用），`--keep` 不清空。
 
+同时在输出目录写 `meta.json`：servo-ohos / servo-quickjs 的 commit、分支、
+remote 和本次运行的相关环境变量，方便复现。
+
 用法:
     ./event_flame_to_html.py ./flame
     ./event_flame_to_html.py ./flame -o flame.html
@@ -22,10 +25,13 @@
 
 import argparse
 import html
+import json
 import os
+import platform
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -80,6 +86,79 @@ def object_style(width: str, height: str) -> str:
 def relative_url(path: Path, start: Path) -> str:
     """HTML 里的相对路径；统一用 `/`。"""
     return Path(os.path.relpath(path, start)).as_posix()
+
+
+def git(repo: Path, *args: str) -> str | None:
+    """在 `repo` 里跑一条 git 命令；失败返回 None。"""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def repo_info(repo: Path) -> dict:
+    """记录复现所需的仓库信息：commit、分支、是否脏、remote。
+
+    不是 git 仓库时 `git` 返回 None，这里照样输出结构，避免脚本中断。
+    """
+    remotes = git(repo, "remote", "-v")
+    is_repo = git(repo, "rev-parse", "--git-dir") is not None
+    return {
+        "path": str(repo),
+        "is_git_repo": is_repo,
+        "commit": git(repo, "rev-parse", "HEAD"),
+        "commit_date": git(repo, "show", "-s", "--format=%cI", "HEAD"),
+        "branch": git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
+        "dirty": bool(git(repo, "status", "--porcelain", "--untracked-files=no")),
+        "remotes": remotes.splitlines() if remotes else [],
+    }
+
+
+def write_meta(
+    directory: Path, servo_quickjs: Path | None, repro_script: Path | None
+) -> Path:
+    """在输出目录写 meta.json：两个仓库的版本信息 + 复现脚本 + 本次运行的环境。"""
+    script_dir = Path(__file__).resolve().parent
+    toplevel = git(script_dir, "rev-parse", "--show-toplevel")
+    servo_ohos = Path(toplevel) if toplevel else script_dir
+    quickjs = servo_quickjs or (servo_ohos.parent / "servo-quickjs")
+
+    # 默认找 servo-ohos 根目录下的 event_flame.sh。
+    script = repro_script or (servo_ohos / "event_flame.sh")
+
+    # 影响输出内容的变量，复现时照着设。
+    env = {
+        name: value
+        for name, value in sorted(os.environ.items())
+        if name.startswith("SERVO_EVENT_FLAME") or name == "SERVO_TRACING"
+    }
+    meta = {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "host": platform.node(),
+        "command": " ".join([Path(sys.argv[0]).name, *sys.argv[1:]]),
+        "env": env,
+        "repro_script": {
+            "path": str(script.resolve()),
+            "exists": script.is_file(),
+        },
+        "repos": {
+            "servo-ohos": repo_info(servo_ohos),
+            "servo-quickjs": repo_info(quickjs),
+        },
+    }
+
+    path = directory / "meta.json"
+    path.write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return path
 
 
 def existing_outputs(directory: Path, output: Path) -> list[Path]:
@@ -160,6 +239,16 @@ def main() -> int:
     )
     parser.add_argument("--title", default="Event Flame", help="HTML 标题")
     parser.add_argument(
+        "--servo-quickjs",
+        type=Path,
+        help="servo-quickjs 仓库路径；默认取 servo-ohos 的同级目录",
+    )
+    parser.add_argument(
+        "--script",
+        type=Path,
+        help="复现脚本路径，写进 meta.json；默认是 servo-ohos/event_flame.sh",
+    )
+    parser.add_argument(
         "--yes",
         "-y",
         action="store_true",
@@ -214,7 +303,9 @@ def main() -> int:
         build_html(args.directory, entries, output.parent.resolve(), args.title),
         encoding="utf-8",
     )
+    meta = write_meta(args.directory, args.servo_quickjs, args.script)
     print(f"{len(entries)}/{len(files)} 个文件写入 {output}（SVG 同名放在 folded 旁边）")
+    print(f"版本信息写入 {meta}")
     return 0
 
 

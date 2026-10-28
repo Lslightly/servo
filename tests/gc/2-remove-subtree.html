@@ -1,0 +1,27 @@
+<html>
+    <body>
+        <div id="d3">
+            <p>d3</p>
+            <div id="d4">
+                <p>d4</p>
+                <div id="d5"><p>d5</p></div>
+            </div>
+        </div>
+    </body>
+    <script>
+        let var_d3 = document.getElementById("d3");
+        let var_d4 = document.getElementById("d4");
+        console.log("before remove child");
+        let tmp = var_d3.removeChild(var_d4);
+        console.log("after remove child");
+
+        void var_d3.offsetHeight;
+
+        console.log("after gc");
+    </script>
+    <script>
+        setTimeout(() => {
+            window.close()
+        }, 5000);
+    </script>
+</html>
