@@ -1,12 +1,12 @@
 # Runs WPT on the DAYU200 board of the self-hosted runner labelled servo-ohos-dayu200, with the
-# headless servoshell of `./mach build --ohos --headless-binary`. There are no expectations for
-# OpenHarmony yet, so the tests never fail the run.
+# headless servoshell of `./mach build --ohos --headless-binary`. It tests the configuration of
+# GenUI: QuickJS and the RDB storage backend, like `just genui-min`, but with the WebDriver server
+# that WPT needs. There are no expectations for OpenHarmony yet, so the tests never fail the run.
 #
 # Every night, unless servo-ohos-wpt has a run of the ohos-main commit already, it runs the
 # nightly subset of WPT and stores the results in openharmony-rs/servo-ohos-wpt as
-# `ohos-dayu200-spidermonkey`. All of
-# WPT would take the board about a day. Otherwise it runs on request only: pull requests must not
-# reach the board.
+# `ohos-dayu200-quickjs`. All of WPT would take the board about 14 hours. Otherwise it runs on
+# request only: pull requests must not reach the board.
 name: OpenHarmony device WPT
 on:
   schedule:
@@ -36,13 +36,19 @@ env:
   RUST_BACKTRACE: 1
   SHELL: /bin/bash
   CARGO_INCREMENTAL: 0
-  # About 9,000 tests, which take the board about three hours. The stored runs have to keep to
-  # one subset for their scores to be comparable.
   # The configuration of the stored runs, as in the results job.
-  RESULTS_CONFIG: ohos-dayu200-spidermonkey
+  RESULTS_CONFIG: ohos-dayu200-quickjs
+  # About 17,500 tests of what generated UI uses: layout, text and fonts, rendering, canvas (for
+  # charts), animations, images, forms, touch input, storage and the network. They take the board
+  # about four hours. The stored runs have to keep to one subset for their scores to be comparable.
   NIGHTLY_TESTS: >-
-    /infrastructure /dom /url /fetch/api /css/css-flexbox /css/css-grid /css/css-text
-    /css/css-backgrounds /css/css-fonts
+    /infrastructure /dom /url /fetch /xhr /eventsource /IndexedDB /webstorage
+    /css/css-flexbox /css/css-grid /css/css-text /css/css-text-decor /css/css-fonts
+    /css/css-backgrounds /css/css-color /css/css-images /css/css-masking /css/compositing
+    /css/filter-effects /css/css-transforms /css/css-animations /css/css-transitions
+    /css/css-position /css/mediaqueries /intersection-observer /resize-observer
+    /html/canvas/element /html/semantics/embedded-content/the-img-element /html/semantics/forms
+    /pointerevents /touch-events /uievents
 
 jobs:
   setup:
@@ -133,10 +139,14 @@ jobs:
         run: |
           echo "OHOS_SDK_NATIVE=$OHOS_SDK_NATIVE" >> "$GITHUB_ENV"
           echo "OHOS_BASE_SDK_HOME=$OHOS_BASE_SDK_HOME" >> "$GITHUB_ENV"
+      # The default features with the RDB storage backend instead of SQLite. `--js-engine quickjs`
+      # changes Cargo.lock, so the build is not `--locked`.
       - name: Build
         env:
           PROFILE: ${{ needs.setup.outputs.profile }}
-        run: ./mach build --locked --ohos --headless-binary --profile "$PROFILE"
+        run: |
+          ./mach build --ohos --headless-binary --profile "$PROFILE" --js-engine quickjs \
+            --no-default-features --features "base ohos-rdb-backend"
       - name: Upload the headless servoshell
         uses: actions/upload-artifact@v7
         with:
@@ -168,7 +178,7 @@ jobs:
         run: |
           mkdir -p wpt-full-logs/linux/wptreport
           # shellcheck disable=SC2086 # TESTS holds several paths.
-          ./mach test-wpt --ohos --profile "$PROFILE" --processes 2 --always-succeed \
+          ./mach test-wpt --ohos --profile "$PROFILE" --js-engine quickjs --processes 2 --always-succeed \
             --log-raw wpt-full-logs/raw.log --log-wptreport wpt-full-logs/linux/wptreport/1.json \
             $TESTS
       # wptrunner gives up on the remaining tests when it can't start Servo again, e.g. after the
@@ -213,7 +223,7 @@ jobs:
       SERVO_OHOS_WPT_TOKEN: ${{ secrets.SERVO_OHOS_WPT_TOKEN }}
     with:
       # RESULTS_CONFIG; `with` can't read env.
-      artifacts: '{"ohos-dayu200-spidermonkey": "wpt-full-logs-ohos-dayu200"}'
+      artifacts: '{"ohos-dayu200-quickjs": "wpt-full-logs-ohos-dayu200"}'
       chunks: 1
       upstream: false
     permissions: {}
