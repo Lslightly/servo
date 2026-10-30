@@ -1,23 +1,50 @@
 <html>
     <body>
         <div id="d3">
-            <p>d3</p>
+            <p>p3</p>
             <div id="d4">
-                <p>d4</p>
-                <div id="d5"><p>d5</p></div>
+                <p>p4</p>
+                <div id="d5"><p>p5</p></div>
             </div>
         </div>
     </body>
     <script>
         let var_d3 = document.getElementById("d3");
         let var_d4 = document.getElementById("d4");
-        console.log("before remove child");
-        let tmp = var_d3.removeChild(var_d4);
-        console.log("after remove child");
+        let var_d5 = document.getElementById("d5");
 
+        function batch_print(prefix) {
+            console.log(prefix + ", d3:", runtime.qjs_refcount(var_d3));
+            console.log(prefix + ", d4:", runtime.qjs_refcount(var_d4));
+            console.log(prefix + ", d5:", runtime.qjs_refcount(var_d5));
+        }
+        
+        batch_print("ref count(after getElementById)");
+        // d3 d4 d5
+        // 13 13 9
+        
+        let tmp = var_d3.removeChild(var_d4);
+
+        batch_print("after removeChild");
+        // d3 d4 d5
+        // 12 10 7
+
+        tmp = null;
+        console.log("d4 ref count(after tmp=null)", runtime.qjs_refcount(var_d4)); // 9
+
+        // force reflow
         void var_d3.offsetHeight;
 
-        console.log("after gc");
+        batch_print("after trigger reflow");
+        // d3 d4 d5
+        // 11 8  6
+
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+
+        batch_print("after drain_pool and qjs_gc")
+        // d3 d4 d5
+        // 9  6  4
     </script>
     <script>
         setTimeout(() => {
