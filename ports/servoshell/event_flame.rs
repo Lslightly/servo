@@ -410,9 +410,38 @@ fn stack_of(backtrace: &Backtrace, prefix: &str, leaf: &str, kind: &str) -> Stri
 /// 一帧的显示名：`函数名 (文件:行)`；没有行号信息时退回函数名。
 fn frame_label(name: &str, symbol: &backtrace::BacktraceSymbol) -> String {
     match (symbol.filename(), symbol.lineno()) {
-        (Some(file), Some(line)) => format!("{name} ({}:{line})", file.display()),
+        (Some(file), Some(line)) => format!("{name} ({}:{line})", short_path(file)),
         _ => name.to_owned(),
     }
+}
+
+/// 本 workspace 的根目录（`.../servo-ohos`），编译期固定。
+///
+/// `CARGO_MANIFEST_DIR` 是 `.../servo-ohos/ports/servoshell`。
+fn workspace_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent() // ports
+        .and_then(Path::parent) // servo-ohos
+        .unwrap_or_else(|| Path::new(""))
+}
+
+/// 去掉路径前面对排查没用的目录前缀，只留下相对 workspace 的路径。
+///
+/// - `.../servo-ohos/components/script/x.rs` -> `components/script/x.rs`
+/// - `.../qjs-diff/servo-quickjs/mozjs/src/x.rs` -> `servo-quickjs/mozjs/src/x.rs`
+/// - 其它（标准库、target 下的生成代码等）原样保留。
+fn short_path(path: &Path) -> String {
+    let root = workspace_root();
+    if let Ok(rel) = path.strip_prefix(root) {
+        return rel.display().to_string();
+    }
+    // `servo-quickjs` 与 workspace 平级，退一级再试。
+    if let Some(parent) = root.parent() {
+        if let Ok(rel) = path.strip_prefix(parent) {
+            return rel.display().to_string();
+        }
+    }
+    path.display().to_string()
 }
 
 /// 去掉栈顶（最内层）连续的 tracing 内部帧。

@@ -4358,7 +4358,12 @@ impl Window {
             close_watcher_manager: CloseWatcherManager::new(),
         });
 
-        WindowBinding::Wrap::<crate::DomTypeHolder>(cx, &origin, win)
+        let window = WindowBinding::Wrap::<crate::DomTypeHolder>(cx, &origin, win);
+        script_bindings::quickjs_runtime_helper::init_runtime_helper(
+            cx,
+            window.reflector().get_jsobject(),
+        );
+        window
     }
 
     pub(crate) fn task_manager(&self) -> Rc<TaskManager> {
