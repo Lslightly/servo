@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<body>
+<div id="parent"></div>
+<script>
+  console.log("refcount(div id=parent):", window.runtime.qjs_refcount(document.getElementById("parent")));
+  var parent = document.getElementById("parent");
+  console.log("refcount(parent JSValue):", window.runtime.qjs_refcount(parent));
+  var child = document.createElement("div");
+  console.log("after create:", window.runtime.qjs_refcount(child))
+  child.textContent = "hello";
+  console.log("after textContent = \"hello\":", window.runtime.qjs_refcount(child))
+  let tmp = parent.appendChild(child);
+  console.log("after appendChild:", window.runtime.qjs_refcount(child))
+  tmp = null;
+  console.log("after set result as null:", window.runtime.qjs_refcount(child))
+  window.runtime.drain_pool();
+  console.log("after drain_pool refcount(child element):", window.runtime.qjs_refcount(child));
+  console.log("after drain_pool refcount(id=parent):", window.runtime.qjs_refcount(parent));
+  window.close();
+</script>
+</body>
+</html>

@@ -41,6 +41,7 @@ pub mod num;
 pub mod permanent_root;
 pub mod principals;
 pub mod proxyhandler;
+pub mod quickjs_runtime_helper;
 pub mod realms;
 pub mod record;
 pub mod refcounted;

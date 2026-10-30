@@ -29,6 +29,15 @@ With `cargo nextest` please note that `--profile` refers to the nextest profile 
 
 The style guide is available in the servo book at <https://book.servo.org/contributing/style-guide.html>.
 
+### MozJS / GC 计数
+
+本 fork 的 `servo-quickjs` 用引用计数 + autorelease pool 管理 JS 对象。
+**只有 4 个接口能进 pool：`adopt`、`retain`、`retain_stored`、`release_object`。**
+判断某段代码会不会改 JS 计数时，先查这份清单，不要凭函数名猜：
+
+- @../servo-quickjs-GC-pool接口调用点.md —— 4 个接口的语义 + 调用它们的 API 完整清单
+- @../servo-quickjs-GC.md —— GC 整体流程
+
 ## Web Standards
 
 Servo is a web-rendering engine, and thus should adhere to the web specifications. There is not a single file, but many documents.
