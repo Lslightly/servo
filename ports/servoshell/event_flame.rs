@@ -65,8 +65,6 @@ type Key = (i32, usize);
 struct EventRecord {
     /// 事件名，作为火焰图最内层的叶子。
     leaf: String,
-    /// 操作类型，作为叶子上面那一层虚拟帧：`retain` / `release` / `drain`。
-    kind: String,
     /// 未解析的调用栈；等到 flush 再解析符号。
     backtrace: Backtrace,
 }
@@ -103,7 +101,6 @@ impl State {
         key: Key,
         at: Instant,
         leaf: &str,
-        kind: &str,
         backtrace: Option<Backtrace>,
     ) {
         if !self.objects.contains_key(&key) {
@@ -133,7 +130,6 @@ impl State {
         }
         object.events.push(EventRecord {
             leaf: leaf.to_owned(),
-            kind: kind.to_owned(),
             backtrace: backtrace.expect("timeline events carry a backtrace"),
         });
     }
@@ -293,8 +289,6 @@ where
         }
         let at = Instant::now();
         let leaf = event_name(event.metadata().name(), fields.message.as_deref());
-        // 虚拟帧的类型：mozjs 显式给了 `kind` 就用它，否则按事件名推导。
-        let kind = fields.kind.unwrap_or_else(|| kind_of(&leaf).to_owned());
         let backtrace = Backtrace::new_unresolved();
 
         self.state
@@ -304,7 +298,6 @@ where
                 (tag as i32, ptr as usize),
                 at,
                 &leaf,
-                &kind,
                 Some(backtrace),
             );
     }
@@ -364,7 +357,6 @@ fn write_object(path: &Path, object: &ObjectTrace, frame_prefix: &str) -> std::i
             &events[i].backtrace,
             frame_prefix,
             &events[i].leaf,
-            &events[i].kind,
         );
         // 每个事件一格。间隔时间在按对象分组后参考价值低（见模块文档），
         // 固定 1 可以让每格的宽度只表示「一个事件」。
@@ -374,7 +366,7 @@ fn write_object(path: &Path, object: &ObjectTrace, frame_prefix: &str) -> std::i
 }
 
 /// 从 backtrace 里提取「由外到内」的应用栈帧，并接上事件名和操作类型。
-fn stack_of(backtrace: &Backtrace, prefix: &str, leaf: &str, kind: &str) -> String {
+fn stack_of(backtrace: &Backtrace, prefix: &str, leaf: &str) -> String {
     let mut frames = Vec::new();
 
     // backtrace.frames() 是从当前函数往外：on_event -> ... -> main。
@@ -474,18 +466,6 @@ fn is_tracing_frame(name: &str) -> bool {
         || name.contains("{{closure")
 }
 
-/// 事件名对应的操作类型，用作最顶层的虚拟帧。
-fn kind_of(leaf: &str) -> &'static str {
-    match leaf {
-        "retain_object" => "retain",
-        "push_to_defer_pool" | "release_JS_FreeValue" => "release",
-        "JS_FreeValue_object_pool" | DROPPED => "drain",
-        // `retain_borrowed_pool` / `retain_root_pool` / `adopt_result_pool` 自带名字，
-        // 不再套 kind 帧。
-        _ => "",
-    }
-}
-
 /// 事件名：显式命名的事件用名字；`trace!("...")` 的 metadata 名是
 /// `event file:line`，此时退回 message。
 fn event_name(meta_name: &str, message: Option<&str>) -> String {
@@ -504,8 +484,6 @@ struct EventFields<'a> {
     tag: Option<i64>,
     /// `ptr = ...` 字段。
     ptr: Option<u64>,
-    /// `kind = "retain" | "release" | "drain"` 字段（目前 mozjs 不传）。
-    kind: Option<String>,
     /// 类名过滤条件（`SERVO_EVENT_FLAME_CLASS`）；`None` 时不关心 `class` 字段。
     class_filter: Option<&'a str>,
     /// `class = "HTMLDivElement" | ""` 是否包含 `class_filter`。
@@ -516,7 +494,6 @@ impl Visit for EventFields<'_> {
     fn record_str(&mut self, field: &Field, value: &str) {
         match field.name() {
             "message" => self.message = Some(value.to_string()),
-            "kind" => self.kind = Some(value.to_string()),
             // 只比较，不复制：没有过滤条件时什么都不做。
             "class" => {
                 self.class_matches = self
