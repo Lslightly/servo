@@ -53,12 +53,6 @@ use tracing_subscriber::layer::{Context, Layer};
 /// mozjs 发出、本 layer 收集的 tracing target。mozjs 里的事件也用这个字面量。
 pub const TARGET: &str = "mozjs_gc";
 
-/// mozjs 在最后一个引用消失时发出的标记事件（同时记入时间线，用于结束该对象）。
-const DROPPED: &str = "drop_object_pool";
-
-/// 默认缓存多少个对象。
-const DEFAULT_OBJECTS: usize = 20;
-
 /// 对象标识：`(JSValue tag, ptr)`。不同 tag 的 ptr 可能撞号，必须带上 tag。
 type Key = (i32, usize);
 
@@ -66,85 +60,58 @@ struct EventRecord {
     /// 事件名，作为火焰图最内层的叶子。
     leaf: String,
     /// 未解析的调用栈；等到 flush 再解析符号。
-    backtrace: Backtrace,
+    backtrace: Arc<Backtrace>,
 }
 
 /// 一个对象的事件时间线。
 struct ObjectTrace {
     /// 输出文件名用的序号。
     id: u64,
-    /// 第一次看到它的时刻，缓存淘汰时用来比较。
-    created: Instant,
-    /// 最后一个引用消失的时刻；`Some` 表示可以被优先替换。
-    dropped: Option<Instant>,
     events: Vec<EventRecord>,
 }
 
 struct State {
     objects: HashMap<Key, ObjectTrace>,
-    capacity: usize,
     next_id: u64,
 }
 
 impl State {
-    fn new(capacity: usize) -> Self {
+    fn new() -> Self {
         Self {
             objects: HashMap::new(),
-            capacity,
             next_id: 1,
         }
     }
 
-    /// 记录一个事件；`leaf == DROPPED` 时同时标记对象已释放（也记入时间线）。
-    fn record(
-        &mut self,
-        key: Key,
-        at: Instant,
-        leaf: &str,
-        backtrace: Option<Backtrace>,
-    ) {
+    /// 记录属于某个对象的事件。
+    fn record(&mut self, key: Key, leaf: &str, backtrace: Arc<Backtrace>) {
         if !self.objects.contains_key(&key) {
-            if self.objects.len() >= self.capacity {
-                self.evict();
-            }
             let id = self.next_id;
             self.next_id += 1;
             self.objects.insert(
                 key,
                 ObjectTrace {
                     id,
-                    created: at,
-                    dropped: None,
                     events: Vec::new(),
                 },
             );
         }
 
         let object = self.objects.get_mut(&key).expect("just inserted");
-        if leaf == DROPPED {
-            // 已释放：记下时间，供缓存优先淘汰。
-            object.dropped = Some(at);
-        } else {
-            // 还活着（或者 pool 里的最后一个引用尚未 drain）：清掉上一次的释放标记。
-            object.dropped = None;
-        }
         object.events.push(EventRecord {
             leaf: leaf.to_owned(),
-            backtrace: backtrace.expect("timeline events carry a backtrace"),
+            backtrace,
         });
     }
 
-    /// 缓存满了：优先丢已释放的对象；否则丢创建时间最晚的，保住长生命周期对象。
-    fn evict(&mut self) {
-        let victim = self
-            .objects
-            .iter()
-            .filter(|(_, object)| object.dropped.is_some())
-            .min_by_key(|(_, object)| object.created)
-            .or_else(|| self.objects.iter().max_by_key(|(_, object)| object.created))
-            .map(|(key, _)| *key);
-        if let Some(key) = victim {
-            self.objects.remove(&key);
+    /// 记录一个公共事件（没有 `tag`/`ptr`）：它没有归属对象，直接追加到每个
+    /// 已记录对象的时间线里。
+    fn record_public(&mut self, leaf: &str, backtrace: &Arc<Backtrace>) {
+        for object in self.objects.values_mut() {
+            object.events.push(EventRecord {
+                leaf: leaf.to_owned(),
+                backtrace: Arc::clone(backtrace),
+            });
         }
     }
 }
@@ -179,9 +146,8 @@ impl EventFlameLayer {
         dir: impl Into<PathBuf>,
         target: impl Into<String>,
         frame_prefix: impl Into<String>,
-        capacity: usize,
     ) -> (Self, FlushGuard) {
-        let state = Arc::new(Mutex::new(State::new(capacity.max(1))));
+        let state = Arc::new(Mutex::new(State::new()));
         let layer = Self {
             target: target.into(),
             state: Arc::clone(&state),
@@ -199,7 +165,7 @@ impl EventFlameLayer {
 
     /// 未启用时的占位 layer：类型不变，便于无条件加进 subscriber。
     pub fn disabled() -> (Self, FlushGuard) {
-        let state = Arc::new(Mutex::new(State::new(1)));
+        let state = Arc::new(Mutex::new(State::new()));
         let layer = Self {
             target: String::new(),
             state: Arc::clone(&state),
@@ -220,7 +186,6 @@ impl EventFlameLayer {
     /// - `SERVO_EVENT_FLAME_DIR`：输出目录，不存在时会创建；设置为空字符串时用当前目录。
     ///   未设置则返回 `None`（不记录）。
     /// - `SERVO_EVENT_FLAME_PREFIX`：只保留以该前缀开头的栈帧。
-    /// - `SERVO_EVENT_FLAME_OBJECTS`：缓存多少个对象，默认 20。
     /// - `SERVO_EVENT_FLAME_CLASS`：只记录类名包含该字符串的对象（如 `HTMLDivElement`）。
     pub fn from_env() -> Option<(Self, FlushGuard)> {
         let dir = std::env::var_os("SERVO_EVENT_FLAME_DIR")?;
@@ -230,14 +195,10 @@ impl EventFlameLayer {
             PathBuf::from(dir)
         };
         let prefix = std::env::var("SERVO_EVENT_FLAME_PREFIX").unwrap_or_default();
-        let capacity = std::env::var("SERVO_EVENT_FLAME_OBJECTS")
-            .ok()
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(DEFAULT_OBJECTS);
         let class_filter = std::env::var("SERVO_EVENT_FLAME_CLASS")
             .ok()
             .filter(|class| !class.is_empty());
-        let (mut layer, guard) = Self::with_dir(dir, TARGET, prefix, capacity);
+        let (mut layer, guard) = Self::with_dir(dir, TARGET, prefix);
         layer.class_filter = class_filter;
         Some((layer, guard))
     }
@@ -280,26 +241,27 @@ where
             ..Default::default()
         };
         event.record(&mut fields);
-        let (Some(tag), Some(ptr)) = (fields.tag, fields.ptr) else {
-            return;
-        };
-        // 先按类名过滤，再抓栈：不关心的事件不付抓栈的代价。
-        if self.class_filter.is_some() && !fields.class_matches {
-            return;
-        }
-        let at = Instant::now();
-        let leaf = event_name(event.metadata().name(), fields.message.as_deref());
-        let backtrace = Backtrace::new_unresolved();
 
-        self.state
-            .lock()
-            .expect("event flame lock poisoned")
-            .record(
-                (tag as i32, ptr as usize),
-                at,
-                &leaf,
-                Some(backtrace),
-            );
+        // 没有 `tag`/`ptr` 的是公共事件：它们不属于任何对象，记录后追加到每个
+        // 已记录对象的时间线里，所以不做类名过滤。
+        let key = match (fields.tag, fields.ptr) {
+            (Some(tag), Some(ptr)) => {
+                // 先按类名过滤，再抓栈：不关心的事件不付抓栈的代价。
+                if self.class_filter.is_some() && !fields.class_matches {
+                    return;
+                }
+                Some((tag as i32, ptr as usize))
+            },
+            _ => None,
+        };
+        let leaf = event_name(event.metadata().name(), fields.message.as_deref());
+        let backtrace = Arc::new(Backtrace::new_unresolved());
+
+        let mut state = self.state.lock().expect("event flame lock poisoned");
+        match key {
+            Some(key) => state.record(key, &leaf, backtrace),
+            None => state.record_public(&leaf, &backtrace),
+        };
     }
 }
 
@@ -322,10 +284,29 @@ impl Drop for FlushGuard {
         }
 
         let mut written = 0;
+        // 统一解析符号。这一步比较慢，但此时已经不在事件的热路径上。
+        //
+        // 公共事件的 backtrace 在多个对象间共享同一个 `Arc`，而 `resolve` 需要
+        // `&mut Backtrace`，所以按指针去重：每个不同的 backtrace 只解析一次
+        // （符号解析是最慢的部分），共享的事件都换成解析后的那一份。
+        let mut resolved: HashMap<*const Backtrace, Arc<Backtrace>> = HashMap::new();
         for object in state.objects.values_mut() {
-            // 统一解析符号。这一步比较慢，但此时已经不在事件的热路径上。
             for event in &mut object.events {
-                event.backtrace.resolve();
+                let key = Arc::as_ptr(&event.backtrace);
+                if let Some(backtrace) = resolved.get(&key) {
+                    event.backtrace = Arc::clone(backtrace);
+                    continue;
+                }
+                if let Some(backtrace) = Arc::get_mut(&mut event.backtrace) {
+                    // 独占：原地解析，不用复制。
+                    backtrace.resolve();
+                } else {
+                    // 共享：复制一份再解析。
+                    let mut backtrace = (*event.backtrace).clone();
+                    backtrace.resolve();
+                    event.backtrace = Arc::new(backtrace);
+                }
+                resolved.insert(key, Arc::clone(&event.backtrace));
             }
             let path = output_path(&self.dir, object.id);
             match write_object(&path, object, &self.frame_prefix) {
@@ -353,11 +334,7 @@ fn write_object(path: &Path, object: &ObjectTrace, frame_prefix: &str) -> std::i
     // 按时间**倒序**写：inferno 的 --flamechart 内部会把输入反转一次，
     // 反转后左边最早、右边最晚。
     for i in (0..events.len()).rev() {
-        let stack = stack_of(
-            &events[i].backtrace,
-            frame_prefix,
-            &events[i].leaf,
-        );
+        let stack = stack_of(&events[i].backtrace, frame_prefix, &events[i].leaf);
         // 每个事件一格。间隔时间在按对象分组后参考价值低（见模块文档），
         // 固定 1 可以让每格的宽度只表示「一个事件」。
         writeln!(out, "{stack} 1")?;

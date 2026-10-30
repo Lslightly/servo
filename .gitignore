@@ -81,4 +81,4 @@ justfile
 # devcontainer
 devcontainer-lock.json
 
-flames
+flames*
