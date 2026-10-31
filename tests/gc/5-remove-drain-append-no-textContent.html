@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <div id="parent"></div>
+    <script>
+      // 与 4-remove-drain-append.html 相同，但去掉 node.textContent：
+      // 文本子节点会通过 parent 指针（servo 侧 Dom）反引用本节点 +1，
+      // 去掉后 detached 计数应只剩 JS 变量的那 1 份，便于判读。
+      var parent = document.getElementById("parent");
+      var node = document.createElement("div");
+      var tmp;
+
+      // ---- task 1：上树，记录下树前计数 ----
+      tmp = parent.appendChild(node);
+      tmp = null;
+      void node.offsetHeight;
+      window.runtime.drain_pool();
+      var countBefore = window.runtime.qjs_refcount(node);
+      console.log("[task1] attached count =", countBefore);
+
+      // ---- task 1：下树 + drain ----
+      tmp = parent.removeChild(node);
+      tmp = null;
+      void node.offsetHeight;
+      window.runtime.drain_pool();
+      window.runtime.qjs_gc(); // 下树后强制 QuickJS GC，看是否误回收
+      console.log(
+        "[task1] detached count after drain+gc =",
+        window.runtime.qjs_refcount(node)
+      );
+
+      // ---- task 2：另一个任务里重新上树 ----
+      setTimeout(function () {
+        tmp = parent.appendChild(node);
+        tmp = null;
+        void node.offsetHeight;
+        window.runtime.drain_pool();
+        var countAfter = window.runtime.qjs_refcount(node);
+        console.log("[task2] re-attached count =", countAfter);
+
+        if (countBefore === countAfter) {
+          console.log(
+            "[PASS] count before detach == count after re-attach:",
+            countBefore
+          );
+        } else {
+          console.log(
+            "[FAIL] count mismatch: before =",
+            countBefore,
+            ", after =",
+            countAfter
+          );
+        }
+        window.close();
+      }, 0);
+    </script>
+  </body>
+</html>
