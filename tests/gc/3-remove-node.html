@@ -1,0 +1,28 @@
+<html>
+    <body>
+        <div id="d3">
+            <p>p3</p>
+            <div id="d4"></div>
+        </div>
+    </body>
+    <script>
+        let var_d3 = document.getElementById("d3");
+        let var_d4 = document.getElementById("d4");
+        let tmp = var_d3.removeChild(var_d4);
+
+        tmp = null;
+        var_d4 = null;
+
+        // force reflow
+        void var_d3.offsetHeight;
+
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+    </script>
+    <script>
+        console.log("after drain_pool and qjs_gc");
+        window.setTimeout(() => {
+            window.close();
+        }, 1000);
+    </script>
+</html>
