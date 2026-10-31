@@ -39,12 +39,19 @@
         // d3 d4 d5
         // 11 8  6
 
-        window.runtime.drain_pool();
-        window.runtime.qjs_gc();
+        var_d4 = null;
+        var_d5 = null;
+
+        window.runtime.drain_pool(); // can't drop d4 and d5
+        // quickjs GC will mark DOM object's corresponding JSObject by the path
+        // mark_children(QuickJS) -> gc_mark(Rust) -> trace(tracer{runtime, mark_func}, object)
+        // -> CallObjectTracer -> Tracer::mark(tracer, object) -> JS_MarkValue(runtime, object, mark_func)
+        // here mark_func is gc_decref_child
+        window.runtime.qjs_gc();     // can drop d4 and d5 by quickjs GC
 
         batch_print("after drain_pool and qjs_gc")
         // d3 d4 d5
-        // 9  6  4
+        // 9  -1 -1(d4, d5 is null)
     </script>
     <script>
         setTimeout(() => {
