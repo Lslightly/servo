@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <div id="parent"></div>
+    <script>
+      // 目的：单个节点下树 → drain_pool → 在另一个 task 重新上树。
+      // 检查「下树前的计数」与「重新上树后的计数」是否相同，
+      // 也就是 drain_pool 之后这个对象没有被误回收/误释放。
+      //
+      // JS 侧引用必须两侧一致，否则计数天然对不上：
+      //   - node / parent 各只有一个 JS 变量持有它（各 +1）。
+      //   - appendChild / removeChild 的返回值先接住再显式置 null，强制丢弃那份额外 +1。
+      //   - console.log 只打印数字，不打印节点本身。
+      var parent = document.getElementById("parent");
+      var node = document.createElement("div");
+      node.textContent = "hello";
+      var tmp;
+
+      // ---- task 1：上树，记录下树前计数 ----
+      tmp = parent.appendChild(node);
+      tmp = null; // 显式丢弃返回值那份引用
+      void node.offsetHeight; // 强制 reflow，先让布局侧引用建立
+      window.runtime.drain_pool(); // 清掉上面调用攒下的池尾，读数才稳定
+      var countBefore = window.runtime.qjs_refcount(node);
+      console.log("[task1] attached count =", countBefore);
+
+      // ---- task 1：下树 + drain ----
+      tmp = parent.removeChild(node);
+      tmp = null; // 显式丢弃返回值那份引用
+      void node.offsetHeight; // 强制 reflow，先让布局侧引用建立
+      window.runtime.drain_pool();
+      window.runtime.qjs_gc(); // 下树后强制 QuickJS GC，看是否误回收
+      console.log(
+        "[task1] detached count after drain+gc =",
+        window.runtime.qjs_refcount(node)
+      );
+
+      // ---- task 2：另一个任务里重新上树 ----
+      setTimeout(function () {
+        tmp = parent.appendChild(node);
+        tmp = null; // 显式丢弃返回值那份引用
+        void node.offsetHeight;
+        window.runtime.drain_pool();
+        var countAfter = window.runtime.qjs_refcount(node);
+        console.log("[task2] re-attached count =", countAfter);
+
+        if (countBefore === countAfter) {
+          console.log(
+            "[PASS] count before detach == count after re-attach:",
+            countBefore
+          );
+        } else {
+          console.log(
+            "[FAIL] count mismatch: before =",
+            countBefore,
+            ", after =",
+            countAfter
+          );
+        }
+        window.close();
+      }, 0);
+    </script>
+  </body>
+</html>
