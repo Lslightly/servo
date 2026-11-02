@@ -1,0 +1,65 @@
+<html>
+    <body>
+        <script>
+            /*
+             * 目的：控制组。纯 JS 堆里的环，QuickJS 的循环收集器应该能收。
+             *       用来区分「DOM 跨堆环收不了」和「循环收集器本身坏了」。
+             *
+             * 三组对象：
+             *   A / B：互相引用（JS 属性边），都是 createElement 出来的，从未插入文档。
+             *   C    ：单独一个，不参与环，作为「清掉变量就能收」的对照。
+             *          注意：C 不能加 textContent / 子节点，否则它自己也会形成父子环。
+             *
+             * 正确情况（机制无误时应看到）：
+             *   - C 在变量置 null 后计数归 0，出现 drop_object_pool。
+             *   - A / B 在变量置 null 后不会归零（环内的边互相撑住），
+             *     但在 qjs_gc 之后应被循环收集器回收，出现 drop_object_pool。
+             *   - JS_FreeRuntime 的最终 dump 里 A / B / C 都不应出现。
+             *
+             * 判据：
+             *   如果 A / B 只在 JS_FreeRuntime 的 dump 里出现，
+             *   说明 QuickJS 的环收集对这一类对象没有生效。
+             *   问题不在 DOM 边，要先查 qjs_gc 的实现 / 触发条件。
+             */
+            let a = document.createElement("div");
+            let b = document.createElement("div");
+            let c = document.createElement("div");
+
+            a.peer = b;
+            b.peer = a;
+            a.self = a;
+
+            // C 保持空节点：一旦有 Text/Element 子节点，C 自己也会形成父子环，
+            // 就不能再作为「无环对象」的对照。
+
+            // expando 是否真的写上了；若为 false，说明 DOM 包装对象不可扩展，
+            // 这个控制组无效。
+            console.log("expando works (should be true):", a.peer === b && b.peer === a);
+
+            console.log("before null, a:", window.runtime.qjs_refcount(a));
+            console.log("before null, b:", window.runtime.qjs_refcount(b));
+            console.log("before null, c:", window.runtime.qjs_refcount(c));
+
+            a = null;
+            b = null;
+            c = null;
+
+            window.runtime.drain_pool();
+
+            // 正确情况：此时 C 已被回收；A / B 还活着（环）。
+            console.log("after drain_pool; check the final dump for c");
+
+            window.runtime.qjs_gc();
+
+            // 正确情况：此时 A / B 已被循环收集器回收。
+            // 最终 dump（JS_FreeRuntime）里三者都不应出现。
+            console.log("after qjs_gc; check the final dump for a / b / c");
+        </script>
+        <script>
+            console.log("wait for the final dump at JS_FreeRuntime");
+            window.setTimeout(() => {
+                window.close();
+            }, 1000);
+        </script>
+    </body>
+</html>

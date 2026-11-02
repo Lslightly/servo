@@ -1,0 +1,99 @@
+<html>
+    <body>
+        <div id="form-host">
+            <form id="f"></form>
+            <input id="i" form="f">
+        </div>
+        <div id="template-host">
+            <template id="t"></template>
+        </div>
+        <div id="shadow-host"></div>
+    </body>
+    <script>
+        /*
+         * 目的：验证三类「节点内部 / 跨节点强引用」在下树后是否被拆掉。
+         *
+         * 1. form 与控件的 form owner：
+         *    input 用 form="f" 关联，与 form 不是父子关系，
+         *    单独删掉两者，检查 form -> controls 与 input -> form 的环。
+         *    （故意不让 input 成为 form 的子节点，避免和父子环混在一起。）
+         *
+         * 2. template 与 content：
+         *    template.content 是一个 DocumentFragment，由 template 持有。
+         *    故意让 content 为空：一旦 content 里有子节点，
+         *    content -> child 与 child.parent_node -> content 会先形成父子环，
+         *    就分不清泄漏是 template 持有的，还是 content 内部的。
+         *
+         * 3. shadow host 与 shadow root：
+         *    host -> shadow_root 与 shadow_root -> host 都是强引用。
+         *    同样让 shadow root 保持为空，只测 host <-> root 这一对边。
+         *
+         * 正确情况（机制无误时应看到）：
+         *   - form 和 input 都能被 drop_object_pool（form owner 边被拆除）。
+         *   - template、它的 content、content 里的节点都能被 drop_object_pool。
+         *   - shadow host、shadow root、shadow 内节点都能被 drop_object_pool。
+         *   - JS_FreeRuntime 的最终 dump 里不应再有它们。
+         *
+         * 判据：
+         *   任意一组只在 JS_FreeRuntime 的 dump 里出现，就说明该类内部边
+         *   在下树时没有被拆，和父子环是同一类问题。
+         */
+
+        // ---- 1. form owner ----
+        let formHost = document.getElementById("form-host");
+        let form = document.getElementById("f");
+        let input = document.getElementById("i");
+        console.log("input.form is form (should be true):", input.form === form);
+        console.log("form elements contain input (should be true):",
+            Array.prototype.indexOf.call(form.elements, input) !== -1);
+
+        formHost.removeChild(form);
+        formHost.removeChild(input);
+        form = null;
+        input = null;
+        formHost = null;
+
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+        console.log("form case: check the final dump for the form and input");
+
+        // ---- 2. template content ----
+        let templateHost = document.getElementById("template-host");
+        let template = document.getElementById("t");
+        let content = template.content;
+        console.log("template content children (should be 0):", content.childNodes.length);
+
+        templateHost.removeChild(template);
+        template = null;
+        content = null;
+        templateHost = null;
+
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+        console.log("template case: check the final dump for template / content");
+
+        // ---- 3. shadow DOM ----
+        let shadowHost = document.getElementById("shadow-host");
+        let shadowRoot = shadowHost.attachShadow({ mode: "open" });
+        // shadow root 保持为空，避免 shadow 内部再出现父子环。
+        console.log("shadow root children (should be 0):", shadowRoot.childNodes.length);
+        console.log("shadow root host is shadowHost (should be true):",
+            shadowRoot.host === shadowHost);
+
+        document.body.removeChild(shadowHost);
+        shadowHost = null;
+        shadowRoot = null;
+
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+        console.log("shadow case: check the final dump for host / shadow root");
+
+        console.log("after all cases; check the final dump at JS_FreeRuntime");
+    </script>
+    <script>
+        console.log("wait for the final dump at JS_FreeRuntime");
+        window.setTimeout(() => {
+            window.close();
+        }, 1000);
+    </script>
+</html>

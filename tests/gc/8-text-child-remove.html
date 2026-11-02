@@ -1,0 +1,54 @@
+<html>
+    <body>
+        <div id="d3"><div id="d4">hello</div></div>
+    </body>
+    <script>
+        /*
+         * 目的：被删节点的子节点是 Text 时，是否仍然泄漏。
+         *
+         * 2 号样例的子节点是 Element。如果 Text 子节点也触发同一组边，
+         * 那几乎所有真实元素（默认带文本或空白 Text 子节点）下树都会泄漏。
+         *
+         * 正确情况（机制无误时应看到）：
+         *   - removeChild(d4) + 清空 JS 变量后，d4 和它的 Text 子节点
+         *     都应在 drain_pool / qjs_gc 内被 drop_object_pool 回收。
+         *   - JS_FreeRuntime 的最终 dump 里不再有 d4。
+         *
+         * 判据：
+         *   如果 d4 只在 JS_FreeRuntime 的 dump 里出现，
+         *   与 2 号同因：
+         *     d4.first_child -> text
+         *     d4.last_child  -> text
+         *     text.parent_node -> d4
+         *   这三条强边在 removeChild 后仍然存在。
+         */
+        let var_d3 = document.getElementById("d3");
+        let var_d4 = document.getElementById("d4");
+        let var_text = var_d4.firstChild;
+
+        console.log("d4 refcount:", window.runtime.qjs_refcount(var_d4));
+        console.log("text nodeType (3 = TEXT_NODE):", var_text.nodeType);
+
+        let tmp = var_d3.removeChild(var_d4);
+
+        console.log("after removeChild, d4 refcount:", window.runtime.qjs_refcount(var_d4));
+
+        tmp = null;
+        var_text = null;
+        var_d4 = null;
+
+        void var_d3.offsetHeight; // force reflow
+
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+
+        // d4 正确情况下已释放，不能再调用 qjs_refcount。
+        console.log("after drain_pool and qjs_gc, d3:", window.runtime.qjs_refcount(var_d3));
+    </script>
+    <script>
+        console.log("wait for the final dump at JS_FreeRuntime");
+        window.setTimeout(() => {
+            window.close();
+        }, 1000);
+    </script>
+</html>
