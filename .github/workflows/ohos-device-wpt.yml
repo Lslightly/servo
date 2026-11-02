@@ -1,12 +1,13 @@
-# Runs WPT on the DAYU200 board of the self-hosted runner labelled servo-ohos-dayu200, with the
-# headless servoshell of `./mach build --ohos --headless-binary`. It tests the configuration of
-# GenUI: QuickJS and the RDB storage backend, like `just genui-min`, but with the WebDriver server
-# that WPT needs. There are no expectations for OpenHarmony yet, so the tests never fail the run.
+# Runs WPT on the DAYU200 boards of the self-hosted runners labelled servo-ohos-dayu200, one chunk
+# per board, with the headless servoshell of `./mach build --ohos --headless-binary`. It tests the
+# configuration of GenUI: QuickJS and the RDB storage backend, like `just genui-min`, but with the
+# WebDriver server that WPT needs. There are no expectations for OpenHarmony yet, so the tests
+# never fail the run.
 #
 # Every night, unless servo-ohos-wpt has a run of the ohos-main commit already, it runs the
 # nightly subset of WPT and stores the results in openharmony-rs/servo-ohos-wpt as
-# `ohos-dayu200-quickjs`. All of WPT would take the board about 14 hours. Otherwise it runs on
-# request only: pull requests must not reach the board.
+# `ohos-dayu200-quickjs`. All of WPT would take a board about 14 hours. Otherwise it runs on
+# request only: pull requests must not reach the boards.
 name: OpenHarmony device WPT
 on:
   schedule:
@@ -27,7 +28,7 @@ on:
         type: boolean
         default: false
 
-# The runner has one board. Of several waiting runs, GitHub only keeps the latest.
+# A run takes every board. Of several waiting runs, GitHub only keeps the latest.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
@@ -38,9 +39,9 @@ env:
   CARGO_INCREMENTAL: 0
   # The configuration of the stored runs, as in the results job.
   RESULTS_CONFIG: ohos-dayu200-quickjs
-  # About 17,500 tests of what generated UI uses: layout, text and fonts, rendering, canvas (for
-  # charts), animations, images, forms, touch input, storage and the network. They take the board
-  # about four hours. The stored runs have to keep to one subset for their scores to be comparable.
+  # About 17,900 tests of what generated UI uses: layout, text and fonts, rendering, canvas (for
+  # charts), animations, images, forms, touch input, storage and the network. They take one board
+  # about three hours. The stored runs have to keep to one subset for their scores to be comparable.
   NIGHTLY_TESTS: >-
     /infrastructure /dom /url /fetch /xhr /eventsource /IndexedDB /webstorage
     /css/css-flexbox /css/css-grid /css/css-text /css/css-text-decor /css/css-fonts
@@ -154,11 +155,16 @@ jobs:
           path: target/aarch64-unknown-linux-ohos/${{ needs.setup.outputs.profile }}/servoshell-headless
           if-no-files-found: error
 
+  # One chunk per board, as many as `--total-chunks` and the results job's `chunks`.
   wpt:
-    name: WPT on the DAYU200
+    name: WPT on a DAYU200, chunk ${{ matrix.chunk }}
     needs: [setup, build]
     timeout-minutes: 480
     runs-on: servo-ohos-dayu200
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: [1, 2]
     permissions:
       contents: read
     steps:
@@ -169,24 +175,29 @@ jobs:
         with:
           name: servoshell-headless-aarch64-unknown-linux-ohos
           path: target/aarch64-unknown-linux-ohos/${{ needs.setup.outputs.profile }}/servoshell-headless
-      # With one board attached, the runner finds it without --ohos-device. The report has the
-      # layout that servo-ohos-wpt's store.yml expects: one chunk.
+      # The runner's container only has its own board, so the runner finds it without
+      # --ohos-device. The reports have the layout that servo-ohos-wpt's store.yml expects.
       - name: Run the tests
         env:
           PROFILE: ${{ needs.setup.outputs.profile }}
           TESTS: ${{ needs.setup.outputs.tests }}
+          CHUNK: ${{ matrix.chunk }}
         run: |
-          mkdir -p wpt-full-logs/linux/wptreport
+          mkdir -p wpt-full-logs/raw wpt-full-logs/linux/wptreport
           # shellcheck disable=SC2086 # TESTS holds several paths.
           ./mach test-wpt --ohos --profile "$PROFILE" --js-engine quickjs --processes 2 --always-succeed \
-            --log-raw wpt-full-logs/raw.log --log-wptreport wpt-full-logs/linux/wptreport/1.json \
+            --total-chunks 2 --this-chunk "$CHUNK" \
+            --log-raw "wpt-full-logs/raw/$CHUNK.log" \
+            --log-wptreport "wpt-full-logs/linux/wptreport/$CHUNK.json" \
             $TESTS
       # wptrunner gives up on the remaining tests when it can't start Servo again, e.g. after the
       # board rebooted, and `--always-succeed` hides that. A partial run must not be stored, as its
       # scores aren't comparable.
       - name: Check that all tests ran
+        env:
+          CHUNK: ${{ matrix.chunk }}
         run: |
-          uv run --no-project python - wpt-full-logs/raw.log <<'EOF'
+          uv run --no-project python - "wpt-full-logs/raw/$CHUNK.log" <<'EOF'
           import json
           import sys
 
@@ -207,16 +218,31 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: wpt-full-logs-ohos-dayu200
+          name: wpt-full-logs-ohos-dayu200-${{ matrix.chunk }}
           path: wpt-full-logs
           if-no-files-found: error
+
+  merge:
+    name: Merge the WPT results
+    needs: wpt
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - uses: actions/upload-artifact/merge@v7
+        with:
+          name: wpt-full-logs-ohos-dayu200
+          pattern: wpt-full-logs-ohos-dayu200-*
+          delete-merged: true
 
   # The called workflow takes its token from the `servo-ohos-wpt` environment, which only ohos-main
   # can use.
   results:
     name: Results
-    needs: [setup, wpt]
-    if: ${{ needs.setup.outputs.store == 'true' && needs.wpt.result == 'success' }}
+    needs: [setup, wpt, merge]
+    if: >-
+      ${{ needs.setup.outputs.store == 'true' && needs.wpt.result == 'success' &&
+      needs.merge.result == 'success' }}
     uses: openharmony-rs/servo-ohos-wpt/.github/workflows/store.yml@main
     # The called workflow reads the secret from its job's environment, but only if it is passed.
     secrets:
@@ -224,6 +250,6 @@ jobs:
     with:
       # RESULTS_CONFIG; `with` can't read env.
       artifacts: '{"ohos-dayu200-quickjs": "wpt-full-logs-ohos-dayu200"}'
-      chunks: 1
+      chunks: 2
       upstream: false
     permissions: {}
