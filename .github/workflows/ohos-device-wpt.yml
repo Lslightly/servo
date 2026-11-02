@@ -39,16 +39,21 @@ env:
   CARGO_INCREMENTAL: 0
   # The configuration of the stored runs, as in the results job.
   RESULTS_CONFIG: ohos-dayu200-quickjs
-  # About 17,900 tests of what generated UI uses: layout, text and fonts, rendering, canvas (for
-  # charts), animations, images, forms, touch input, storage and the network. They take one board
-  # about three hours. The stored runs have to keep to one subset for their scores to be comparable.
+  # About 36,000 tests of what generated UI uses: layout, text and fonts, rendering, SVG and canvas
+  # (for charts), animations, images, forms, touch input, storage, markup parsing, scripts and
+  # timers, and the network with streamed responses. They take one board about six hours. The
+  # stored runs have to keep to one subset for their scores to be comparable.
   NIGHTLY_TESTS: >-
-    /infrastructure /dom /url /fetch /xhr /eventsource /IndexedDB /webstorage
-    /css/css-flexbox /css/css-grid /css/css-text /css/css-text-decor /css/css-fonts
+    /infrastructure /dom /url /fetch /xhr /eventsource /IndexedDB /webstorage /encoding /streams
+    /css/CSS2 /css/css-flexbox /css/css-grid /css/css-text /css/css-text-decor /css/css-fonts
     /css/css-backgrounds /css/css-color /css/css-images /css/css-masking /css/compositing
     /css/filter-effects /css/css-transforms /css/css-animations /css/css-transitions
-    /css/css-position /css/mediaqueries /intersection-observer /resize-observer
+    /css/css-position /css/mediaqueries /css/css-ui /css/css-overflow /css/selectors
+    /css/css-sizing /css/css-values /css/css-conditional /css/css-pseudo /css/css-tables
+    /css/css-align /css/css-borders /css/cssom /css/css-variables /css/cssom-view /css/css-lists
+    /svg /intersection-observer /resize-observer
     /html/canvas/element /html/semantics/embedded-content/the-img-element /html/semantics/forms
+    /html/semantics/scripting-1 /html/syntax /html/dom /html/webappapis /html/rendering
     /pointerevents /touch-events /uievents
 
 jobs:
