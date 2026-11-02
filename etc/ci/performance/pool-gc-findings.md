@@ -5,8 +5,8 @@
 - 构建：`QJS_POOL_STATS=1` 的 **debug** servoshell（`target/pool-stats/debug`），未优化，绝对耗时偏大；比例仍有参考价值。
 - 运行：直接打开页面 + `--headless`，12 s 后 `SIGKILL`；`QJS_POOL_STATS_SNAPSHOT_MS=1000`，`QJS_POOL_STATS_SAMPLE=0`。
 - 页面直接打开时 `htmlrunner.js` 回退为 `test(name, fn){ fn(); }`，每个测试只跑一遍。
-- 数字抄自各页报告的 `## 结论` 块；GC 次数用 `QJS_GC_STATS=1` 统计 `^qjs-gc:` 行数，为 0。
-- `drain%` 的分母是墙钟时间（含空闲），是上限，不是 CPU 占比。
+- drain 数字抄自各页报告的 `## 结论` 块；`elapsed_ms` 不在报告里，取自对应 JSONL 最后一行的 `elapsed_ms`。GC 次数用 `QJS_GC_STATS=1` 统计 `^qjs-gc:` 行数，为 0。
+- `drain%` 的分母是墙钟时间（含空闲），且 `elapsed_ms` 停在最后一帧（早于 12 s 的 `SIGKILL`）；分子分母口径不同，只作数量级参考，不是 CPU 占比。
 
 | page | elapsed_ms | drain_ms | drain% | 主导 ctx | max drain ms | GC 次数 | GC max ms |
 |---|---:|---:|---:|---|---:|---:|---:|
@@ -18,10 +18,11 @@
 
 ## 候选优化点（按计划阈值排序）
 
-1. **池侧优先：单次 `task` drain 24–28 ms，5 个页面都出现。**
-   - `task` 占各页 drain 时间 92.8%–99.9%，一次 drain 释放约 20 400 个值。
-   - `ns/value` = 1.27–1.52 µs（debug 构建）；即慢在“单个值释放”或“一次释放太多”，不是调用次数。
-   - 下一步：用 release 构建复测，排除 debug 放大；再看这 20k 值的 kind/fate 分布，确认是否一次清空整棵 DOM 子树。
+1. **池侧优先：单次 `task` drain 23.7–28.5 ms，5 个页面都出现。**
+   - `task` 占 drain 时间：4 个页面为 92.8%–99.9%；jslib-modify-jquery 是 `native_call` 58.2%、`task` 40.2%。
+   - 慢的是单次长 drain，不是调用次数：dom-attr 最后一个窗口里 `task` 的 7 次调用（3 次空）共释放 19 502 个值、24.8 ms，最长一次 24.6 ms。
+   - `ns/value` = 1.27–1.52 µs（debug 构建）。可能是“单个值释放贵”，也可能是“一次释放太多”；现有 JSONL 只有累计值，分不开这两种。
+   - 下一步：用 release 构建复测；再给 `task` 的每次 drain 记录释放个数，确认是否一次清空整棵 DOM 子树。
 
 2. **jslib-modify-jquery 的 `native_call` 长尾。**
    - 4 994 次调用，合计 44.6 ms（58.2%），mean 8.92 µs，单次 max 21.3 ms。

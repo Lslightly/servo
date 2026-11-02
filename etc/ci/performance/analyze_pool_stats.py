@@ -37,6 +37,7 @@ import gzip
 import json
 import math
 import re
+import shlex
 import sys
 
 HIST_BUCKETS = 252
@@ -191,7 +192,7 @@ def conclusions(records, rows, windows):
     if len(elapsed) == len(records) and sum(elapsed) > 0:
         share = 100 * total_ms / sum(elapsed)
         first = (f"1. 总 drain {total_ms:.1f} ms，占运行时间 {share:.1f}%"
-                 f"（分母为墙钟时间，含空闲，是上限）。")
+                 f"（分母为墙钟时间，含空闲且只到最后一帧，仅作参考）。")
     else:
         first = f"1. 总 drain {total_ms:.1f} ms；缺 `elapsed_ms`，无法算占比。"
 
@@ -221,7 +222,7 @@ def conclusions(records, rows, windows):
     return "\n".join([first, second, third, fourth, fifth])
 
 
-def source_section(paths, commands, records):
+def source_section(paths, commands, records, report="report.md"):
     lines = ["1. 生成 `stats.jsonl` 的 servoshell 命令：", ""]
     if commands:
         for cmd in commands:
@@ -229,7 +230,8 @@ def source_section(paths, commands, records):
     else:
         lines += ["```sh", "# 用 --source 传入本页的 servoshell 命令", "```", ""]
     analysis = (f"python3 etc/ci/performance/analyze_pool_stats.py "
-                f"--report report.md " + " ".join(paths))
+                f"--report {shlex.quote(report)} "
+                + " ".join(shlex.quote(p) for p in paths))
     lines += ["2. 生成这份报告：", "", "```sh", analysis, "```", ""]
     if all(r.get("sample_every") == 0 for r in records):
         lines += ["3. `sample_every = 0`：采样回溯已关闭，`samples` 为空。"]
@@ -362,7 +364,7 @@ def main():
     # Co-variation between counts and drain time, over snapshot deltas.
     windows = delta_windows(history)
     conclusion = conclusions(records, rows, windows)
-    source = source_section(args.paths, args.source, records)
+    source = source_section(args.paths, args.source, records, args.report or "report.md")
     pairs = [
         ("API calls vs drain time", "api_total", "drain_ns"),
         ("pool pushes vs drain time", "pushes", "drain_ns"),
