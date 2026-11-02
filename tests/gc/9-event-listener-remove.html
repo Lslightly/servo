@@ -1,0 +1,89 @@
+<html>
+    <body>
+        <div id="host">
+            <div id="leaf-self"></div>
+            <div id="leaf-plain"></div>
+            <div id="leaf-unlisten"></div>
+        </div>
+    </body>
+    <script>
+        /*
+         * 目的：验证「事件监听回调」是不是树外持有者。
+         *
+         * 三个叶子节点，分别验证：
+         *   leaf-self     : 监听回调捕获节点自己
+         *                   （跨堆环：Rust 节点 -> JS 回调 -> JS 节点包装）
+         *   leaf-plain    : 监听回调不捕获节点
+         *   leaf-unlisten : 下树后先 removeEventListener，再 drain
+         *
+         * 注意：JS 闭包捕获的是「变量绑定」，不是值。
+         * 所以这里用 IIFE 参数把节点值捕获进闭包作用域，
+         * 这样外层变量置 null 时，闭包里的值不会被一起置空。
+         *
+         * 正确情况（机制无误时应看到）：
+         *   - leaf-plain：下树并清空 JS 变量后，应被 drop_object_pool。
+         *   - leaf-unlisten：监听已移除，同样应被 drop_object_pool。
+         *   - leaf-self：节点、回调、节点构成环。
+         *     如果跨堆环能被收集，它也应在 drain_pool / qjs_gc 内被回收。
+         *   - JS_FreeRuntime 的最终 dump 里三者都不应出现。
+         *
+         * 判据：
+         *   如果 leaf-self 只出现在 JS_FreeRuntime 的 dump 里，
+         *   说明 Rust 侧持有的 JS 回调是外部根，QuickJS 看不到
+         *   「Rust 节点 -> JS 回调 -> JS 节点」这条边。
+         */
+        let host = document.getElementById("host");
+        let leafSelf = document.getElementById("leaf-self");
+        let leafPlain = document.getElementById("leaf-plain");
+        let leafUnlisten = document.getElementById("leaf-unlisten");
+
+        // 回调捕获节点自己（通过 IIFE 参数，保住这份值）
+        (function (node) {
+            leafSelf.addEventListener("ping", function onPing() {
+                void node; // 闭包持有 node
+            });
+        })(leafSelf);
+
+        // 回调不捕获节点
+        leafPlain.addEventListener("ping", function onPing() {
+            return 1;
+        });
+
+        // 回调捕获节点，但下树后会移除监听
+        let unlistenHandler;
+        (function (node) {
+            unlistenHandler = function onPing() {
+                void node;
+            };
+            leafUnlisten.addEventListener("ping", unlistenHandler);
+        })(leafUnlisten);
+
+        console.log("before removal, leaf-self:", window.runtime.qjs_refcount(leafSelf));
+        console.log("before removal, leaf-plain:", window.runtime.qjs_refcount(leafPlain));
+        console.log("before removal, leaf-unlisten:", window.runtime.qjs_refcount(leafUnlisten));
+
+        host.removeChild(leafSelf);
+        host.removeChild(leafPlain);
+        host.removeChild(leafUnlisten);
+
+        // 只针对 leaf-unlisten 移除监听
+        leafUnlisten.removeEventListener("ping", unlistenHandler);
+
+        leafSelf = null;
+        leafPlain = null;
+        leafUnlisten = null;
+        unlistenHandler = null;
+        host = null;
+
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+
+        console.log("after drain_pool and qjs_gc; check the final dump for leaf-* nodes");
+    </script>
+    <script>
+        console.log("wait for the final dump at JS_FreeRuntime");
+        window.setTimeout(() => {
+            window.close();
+        }, 1000);
+    </script>
+</html>

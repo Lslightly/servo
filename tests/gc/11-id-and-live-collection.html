@@ -1,0 +1,72 @@
+<html>
+    <body>
+        <div id="host"><div id="a"></div><div id="b"></div></div>
+    </body>
+    <script>
+        /*
+         * 目的：验证两种「集合类」树外持有者：
+         *   1. document 的 id 表：节点下树后 getElementById 不应再返回它。
+         *   2. live HTMLCollection（host.children）：不应保活已经移除的成员。
+         *   3. 静态 NodeList（querySelectorAll）：应该保活成员，释放后应能回收。
+         *
+         * 正确情况（机制无误时应看到）：
+         *   - removeChild(a) 后，getElementById("a") 返回 null。
+         *     若仍返回 a，说明 id 表是强持有，这是规范错误 + 泄漏。
+         *   - liveChildren 在移除后长度减 1；a 清空变量后应被 drop_object_pool。
+         *   - staticList 持有 b：b 清空变量后仍存活（正确保活）；
+         *     staticList 和 held 置 null 后，b 应被 drop_object_pool。
+         *
+         * 判据：
+         *   以 JS_FreeRuntime 的最终 dump 为准：
+         *     - a 不应出现；
+         *     - b 在释放静态列表之前应出现，之后不应出现。
+         */
+        let host = document.getElementById("host");
+        let a = document.getElementById("a");
+        let b = document.getElementById("b");
+
+        let liveChildren = host.children;
+        console.log("live children before removal (should be 2):", liveChildren.length);
+
+        host.removeChild(a);
+        console.log("live children after removal (should be 1):", liveChildren.length);
+        console.log("getElementById(a) after removal (should be null):",
+            document.getElementById("a"));
+
+        a = null;
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+
+        // 正确情况：a 已经被回收，最终 dump 里不应再出现。
+        console.log("after first drain/gc; check the final dump for id=a");
+
+        let staticList = host.querySelectorAll("div"); // 静态快照，此时包含 b
+        console.log("static list length (should be 1):", staticList.length);
+
+        host.removeChild(b);
+        let held = staticList[0];
+        console.log("static list still holds b (should be true):", held === b);
+
+        b = null;
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+
+        // 正确情况：b 仍存活，因为 staticList / held 还引用它。
+        console.log("after second drain/gc, b refcount:",
+            window.runtime.qjs_refcount(held));
+
+        held = null;
+        staticList = null;
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+
+        // 正确情况：此时 b 应被回收，最终 dump 里不应再出现。
+        console.log("after releasing static list; check the final dump for id=b");
+    </script>
+    <script>
+        console.log("wait for the final dump at JS_FreeRuntime");
+        window.setTimeout(() => {
+            window.close();
+        }, 1000);
+    </script>
+</html>

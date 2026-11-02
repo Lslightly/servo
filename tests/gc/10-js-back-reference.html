@@ -1,0 +1,57 @@
+<html>
+    <body>
+        <div id="host"><div id="target"></div></div>
+    </body>
+    <script>
+        /*
+         * 目的：验证 JS 属性（expando）引用下树节点时的两条路径：
+         *   1. live 节点通过 JS 属性引用下树节点：应正确保活。
+         *   2. delete 掉这条属性后：应能回收。
+         *
+         * 正确情况（机制无误时应看到）：
+         *   - host.removeChild(target)、target = null 后，
+         *     target 仍被 host.removedRef 引用，应该存活。
+         *     这是「正确保活」，最终 dump 里出现 target 是正常的。
+         *     如果这时 target 就被回收，说明 JS -> JS 边没有被计数，
+         *     属于提前释放（比泄漏更严重）。
+         *   - delete host.removedRef 后，target 应被 drop_object_pool 回收，
+         *     最终 dump 里不再有 target。
+         *
+         * 判据：
+         *   如果 delete 之后 target 仍只在 JS_FreeRuntime 的 dump 里出现，
+         *   说明属性删除没有把计数减回去，或还有别的树外持有者。
+         */
+        let host = document.getElementById("host");
+        let target = document.getElementById("target");
+
+        host.removedRef = target;
+        console.log("expando works (should be true):", host.removedRef === target);
+
+        host.removeChild(target);
+        target = null;
+
+        console.log("target refcount while reachable from host:",
+            window.runtime.qjs_refcount(host.removedRef));
+
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+
+        // 正确情况：target 仍存活（被 live 的 host 的 JS 属性引用）。
+        console.log("after first drain/gc, target refcount:",
+            window.runtime.qjs_refcount(host.removedRef));
+
+        delete host.removedRef;
+
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+
+        // 正确情况：此时 target 已被释放，不能再调用 qjs_refcount(target)。
+        console.log("after delete + drain/gc; check the final dump for target");
+    </script>
+    <script>
+        console.log("wait for the final dump at JS_FreeRuntime");
+        window.setTimeout(() => {
+            window.close();
+        }, 1000);
+    </script>
+</html>

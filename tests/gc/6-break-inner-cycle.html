@@ -1,0 +1,71 @@
+<html>
+    <body>
+        <div id="d3">
+            <p>p3</p>
+            <div id="d4"><div id="d5"></div></div>
+        </div>
+    </body>
+    <script>
+        /*
+         * 目的：验证「下树子树内部的父子环」是不是 2 号泄漏的唯一原因。
+         *
+         * 步骤：
+         *   1. d3.removeChild(d4)：只拆 d4 与 d3 之间的边。
+         *   2. 循环清空 d4 的所有子节点（包括空白 Text 节点）：
+         *      每调一次 removeChild，就拆掉一组
+         *        parent.first_child / last_child -> child
+         *        child.parent_node -> parent
+         *      2 号泄漏时，这些边一条都没拆。
+         *   3. d4、d5 的 JS 变量全部置 null，再 drain_pool + qjs_gc。
+         *
+         * 正确情况（机制无误时应看到）：
+         *   - d4 和 d5 的计数都归 0，日志中出现它们的 drop_object_pool。
+         *   - JS_FreeRuntime 的最终 dump 里不再有 d4 / d5。
+         *   - d3 仍在文档树里，最终 dump 里应还能看到 d3（这是正常存活）。
+         *
+         * 判据：
+         *   如果 d4 仍然只在 JS_FreeRuntime 的 dump 里出现，
+         *   说明父子环不是唯一持有者，还要查 style/layout 数据、id 表、
+         *   listener 等树外引用。
+         */
+        let var_d3 = document.getElementById("d3");
+        let var_d4 = document.getElementById("d4");
+        let var_d5 = document.getElementById("d5");
+
+        function batch_print(prefix) {
+            console.log(prefix + ", d3:", window.runtime.qjs_refcount(var_d3));
+            console.log(prefix + ", d4:", window.runtime.qjs_refcount(var_d4));
+            console.log(prefix + ", d5:", window.runtime.qjs_refcount(var_d5));
+        }
+
+        batch_print("after getElementById");
+
+        let tmp = var_d3.removeChild(var_d4);   // 拆 d4 与 d3
+        tmp = null;
+        while (var_d4.firstChild) {             // 拆 d4 与所有子节点（含空白 Text）
+            tmp = var_d4.removeChild(var_d4.firstChild);
+            tmp = null;
+        }
+        tmp = null;
+
+        batch_print("after removing d4 and all its children");
+
+        var_d5 = null;
+        var_d4 = null;
+
+        void var_d3.offsetHeight;               // force reflow
+
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+
+        // d4/d5 正确情况下已经释放，不能再对它们调用 qjs_refcount。
+        // 这里只打印仍然存活的 d3。
+        console.log("after drain_pool and qjs_gc, d3:", window.runtime.qjs_refcount(var_d3));
+    </script>
+    <script>
+        console.log("wait for the final dump at JS_FreeRuntime");
+        window.setTimeout(() => {
+            window.close();
+        }, 1000);
+    </script>
+</html>
