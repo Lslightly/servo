@@ -56,3 +56,9 @@ class SourceSectionTest(unittest.TestCase):
         self.assertIn("```sh", text)
         self.assertIn("QJS_POOL_STATS_SAMPLE=0 ./servoshell page.html", text)
         self.assertIn("analyze_pool_stats.py", text)
+
+    def test_source_quotes_paths_and_report(self):
+        text = a.source_section(["dir/a b.jsonl"], [], [record()],
+                                report="out/report p.md")
+        self.assertIn("--report 'out/report p.md'", text)
+        self.assertIn("'dir/a b.jsonl'", text)
