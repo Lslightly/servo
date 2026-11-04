@@ -44,6 +44,26 @@ ASAN_LEAK_SUPPRESSION_FILE = "support/suppressed_leaks_for_asan.txt"
 JS_ENGINES = ["spidermonkey", "quickjs"]
 # The Cargo configuration of `--js-engine quickjs`, with the pinned servo-quickjs commit.
 QUICKJS_CARGO_CONFIG = "support/quickjs/cargo-config.toml"
+# The features of servoshell that enable `devtools`.
+DEVTOOLS_FEATURES = {"default", "default_base", "base", "default_tooling", "devtools"}
+
+
+def may_have_devtools(features: list[str], cargo_args: list[str]) -> bool:
+    """Whether a build may have the `devtools` feature: not if it has no default features and selects
+    none that enable it."""
+    if "--no-default-features" not in cargo_args or "--all-features" in cargo_args:
+        return True
+    # mach's `--features` keeps a quoted list as one item, as Cargo's does.
+    selected = list(features)
+    for i, arg in enumerate(cargo_args):
+        if arg in ("--features", "-F") and i + 1 < len(cargo_args):
+            selected.append(cargo_args[i + 1])
+        elif arg.startswith("--features="):
+            selected.append(arg.removeprefix("--features="))
+        elif arg.startswith("-F"):
+            selected.append(arg.removeprefix("-F"))
+    names = " ".join(selected).replace(",", " ").split()
+    return any(name.split("/")[-1] in DEVTOOLS_FEATURES for name in names)
 
 
 @dataclass
@@ -838,6 +858,11 @@ class CommandBase(object):
             if self.config["build"]["dom-backtrace"]:
                 features.append("js_backtrace")
             args += ["--features", " ".join(features)]
+
+        if self.js_engine == "quickjs":
+            # servo-quickjs builds its debugger, which devtools need, only when asked: Servo can't
+            # enable a feature of it that SpiderMonkey's mozjs doesn't have.
+            env["SERVO_QUICKJS_DEBUGGER"] = "1" if may_have_devtools(features, cargo_args) else "0"
 
         if with_debug_assertions or self.config["build"]["debug-assertions"]:
             env["RUSTFLAGS"] = env.get("RUSTFLAGS", "") + " -C debug_assertions"

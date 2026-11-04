@@ -14,12 +14,10 @@ use dom_struct::dom_struct;
 use embedder_traits::ScriptToEmbedderChan;
 use embedder_traits::resources::{self, Resource};
 use js::context::JSContext;
-#[cfg(not(feature = "js-quickjs"))]
 use js::rust::wrappers2::JS_DefineDebuggerObject;
 use net_traits::ResourceThreads;
 use profile_traits::{mem, time};
 use script_bindings::interfaces::HasOrigin;
-#[cfg(not(feature = "js-quickjs"))]
 use script_bindings::reflector::DomObject;
 use servo_base::generic_channel::{GenericCallback, GenericSender, channel};
 use servo_base::id::{Index, PipelineId, PipelineNamespaceId, WorkerId};
@@ -90,7 +88,7 @@ impl DebuggerGlobalScope {
     ///   pipeline ids, and they may contain debuggees from more than one pipeline
     /// - in web worker threads, it should be set to the pipeline id of the page that created the thread, because
     ///   those threads can’t generate pipeline ids, and they only contain one debuggee from one pipeline
-    #[cfg_attr(not(feature = "js-quickjs"), expect(unsafe_code))]
+    #[expect(unsafe_code)]
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         debugger_pipeline_id: PipelineId,
@@ -136,7 +134,6 @@ impl DebuggerGlobalScope {
         let mut realm = enter_auto_realm(cx, &*global);
         let mut realm = realm.current_realm();
         define_all_exposed_interfaces(&mut realm, global.upcast());
-        #[cfg(not(feature = "js-quickjs"))]
         assert!(unsafe {
             // Invariants: `obj` must be a handle to a JS global object.
             JS_DefineDebuggerObject(&mut realm, global.global_scope.reflector().get_jsobject())
@@ -154,10 +151,6 @@ impl DebuggerGlobalScope {
     }
 
     pub(crate) fn execute(&self, cx: &mut JSContext) {
-        // QuickJS has no Debugger API.
-        if cfg!(feature = "js-quickjs") {
-            return;
-        }
         let mut realm = enter_auto_realm(cx, self);
         let cx = &mut realm.current_realm();
 

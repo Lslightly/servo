@@ -4,5 +4,10 @@
 # Bump the commit with mozjs at each sync, so that older commits keep building with the shim they
 # were tested with. The shim's version must match the mozjs version that Cargo.toml requires, or
 # Cargo leaves the patch unused.
+# servo-quickjs builds its debugger, which devtools need, only when asked. mach sets the variable
+# for each build, after the features; this default covers Cargo commands run without mach.
+[env]
+SERVO_QUICKJS_DEBUGGER = "1"
+
 [patch.crates-io]
-mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "ae9eb96c65821a35d51e20c6e1e24e7479fc2fb1" }
+mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "6ac4a17b197264851600edb124c7ef2b508c8f90" }

@@ -2352,6 +2352,11 @@ impl ScriptThread {
         let mut cx = unsafe { js::context::JSContext::from_ptr(js::rust::Runtime::get().unwrap()) };
 
         while self.debugger_paused.get() {
+            // QuickJS: release what each message kept alive in the autorelease pool, instead of
+            // when the paused task ends.
+            #[cfg(feature = "js-quickjs")]
+            #[allow(unsafe_code)]
+            let _pool_scope = unsafe { js::quickjs::AutoreleasePoolScope::new() };
             match self.receivers.devtools_server_receiver.recv() {
                 Ok(Ok(msg)) => self.handle_msg_from_devtools(&mut cx, msg),
                 _ => {
