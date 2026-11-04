@@ -1,8 +1,8 @@
-# Builds servoshell on the QuickJS mozjs shim (openharmony-rs/servo-quickjs) and runs WPT with it,
-# against the expectations with their `js_engine == "quickjs"` conditions. Pull requests run WPT
-# on the directories of the Linux WPT job, and the whole suite when they change the shim pin
-# (python/servo/pr_jobs.py); the merge queue runs the build and smoketest only, and ohos-main-wpt.yml
-# the whole suite on every ohos-main push.
+# Builds servoshell on the QuickJS mozjs shim (openharmony-rs/servo-quickjs), and runs the devtools
+# tests and WPT with it, against the expectations with their `js_engine == "quickjs"` conditions.
+# Pull requests run WPT on the directories of the Linux WPT job, and the whole suite when they change
+# the shim pin (python/servo/pr_jobs.py); the merge queue runs the build, smoketest and devtools
+# tests only, and ohos-main-wpt.yml the whole suite on every ohos-main push.
 name: QuickJS
 on:
   workflow_call:
@@ -133,6 +133,11 @@ jobs:
           name: ${{ env.PROFILE }}-binary-quickjs
           path: target/${{ env.PROFILE }}/servo-tech-demo.tar.gz
           if-no-files-found: error
+      # The devtools' debugger runs on the shim's emulation of SpiderMonkey's Debugger API. After
+      # the WPT artifact, so that a failure here doesn't skip WPT.
+      - name: Devtools tests
+        timeout-minutes: 15
+        run: ./mach test-devtools --profile "$PROFILE"
 
   # Takes the token of the caller, like the Linux WPT job: its report creates a check run and
   # comments on the pull request.

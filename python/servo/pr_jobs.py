@@ -12,7 +12,8 @@
 Every pull request runs the Linux unit tests and lint. On top of that:
 
 - OHOS code: the OHOS build. The Linux WPT run never executes that code.
-- The QuickJS workflow or the servo-quickjs pin: the QuickJS build and the whole QuickJS WPT suite.
+- The QuickJS workflow or the servo-quickjs pin: the QuickJS build, its devtools tests and the whole
+  QuickJS WPT suite.
 - WPT tests or expectations: a Linux WPT run of the directories of those tests, with SpiderMonkey
   and QuickJS, or of the whole suites for more than `MAX_DIRECTORIES` directories.
 - Files that no build or test reads, such as documentation: nothing.
