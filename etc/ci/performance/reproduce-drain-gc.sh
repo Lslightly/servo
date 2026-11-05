@@ -19,7 +19,8 @@
 # Dromaeo pages are opened directly, so htmlrunner.js runs each test once and
 # the process never exits; the timeout is the stop condition.
 # tests/gc pages exit on their own (they call window.close()); the timeout is
-# only a safety net, because a SIGKILLed process writes no drain stats.
+# only a safety net. Each drain is written immediately, so a SIGKILLed process
+# keeps the records written before the kill.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -81,7 +82,7 @@ for case_path in $CASES; do
     *) echo "  warning: servoshell exited with $status before the timeout" >&2 ;;
   esac
   if [ ! -s "$stats" ]; then
-    echo "  warning: no JSONL written (tests/gc pages must exit on their own; Dromaeo pages are killed)" >&2
+    echo "  warning: no drain record written (the page ran no JS, or died too early)" >&2
     continue
   fi
 
@@ -95,7 +96,7 @@ for case_path in $CASES; do
 done
 
 if [ -f "$MERGER" ]; then
-  "$PYTHON" "$MERGER" "$OUT"
+  "$PYTHON" "$MERGER" "$OUT" --wall
 fi
 
 echo "outputs: $OUT"
