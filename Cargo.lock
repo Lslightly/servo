@@ -9472,7 +9472,7 @@ dependencies = [
  "egui-file-dialog",
  "egui-winit",
  "egui_glow",
- "env_filter 0.1.4",
+ "env_filter 2.0.0",
  "euclid",
  "gilrs",
  "glow",
