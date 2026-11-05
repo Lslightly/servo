@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <div id="parent"></div>
+    <script>
+      /*
+       * 目的：节点很少，但在**一次 native call** 内产生大量 Dom::clone，
+       * 让 pool 在一次 drain 之前堆到很大。
+       *
+       * 原理：
+       *   parent.append(...args) 是 variadic WebIDL API。
+       *   一次调用里，绑定层要把 N 个 JS 参数逐个转成 DomRoot / Dom<T>，
+       *   每个参数一次 root/retain。实际大多走 DomRoot::from_ref → Dom::from_ref，
+       *   不是 Dom::clone；两者对 pool 的效果相同（borrowed）。
+       *   这些 clone 都在同一个 native call 内完成，调用返回时统一 drain。
+       *
+       * 本页只有 2 个节点（parent + child），args 把同一个 child 重复 N 次。
+       * 规范上 append 会依次移动同一个节点，最终 parent 只有 1 个子节点；
+       * 这里关心的是参数转换产生的 clone 次数和 pool 峰值，不是最终 DOM 结构。
+       *
+       * QuickJS 对一次 spread 的参数个数可能有上限，失败时 catch 并打印原因。
+       */
+
+      const N = 50000;
+
+      const parent = document.getElementById("parent");
+      const child = document.createElement("div");
+      const args = new Array(N).fill(child);
+
+      const t0 = performance.now();
+      let error = null;
+      try {
+        parent.append(...args);
+      } catch (e) {
+        error = e;
+      }
+      const t1 = performance.now();
+
+      console.log(
+        "[many-dom-clones-variadic] N =", N,
+        "error =", error,
+        "elapsed_ms =", (t1 - t0).toFixed(2),
+        "final_child_count =", parent.childNodes.length
+      );
+      console.log(
+        "[many-dom-clones-variadic] 看 QJS_POOL_STATS 的 max_len / pushes.borrowed"
+      );
+    </script>
+    <script>
+      // 留时间让统计写最后一行。
+      setTimeout(() => window.close(), 2000);
+    </script>
+  </body>
+</html>

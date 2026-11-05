@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <div id="root"></div>
+    <script>
+      /*
+       * 15-finalizer-fanout-deferred.html
+       *
+       * 极端场景 2：一个 finalizer 一次喂给 drain N 个 Deferred（fan-out）。
+       *
+       * 构造：
+       *   - 静态 NodeList 持有 N 个已下树节点（同 14）。
+       *   - 在 dispatchEvent 的 listener 里执行 list = null。
+       *   - NodeList 的 finalize 发生在 dispatchEvent 的 native call 内部；
+       *     N 个 Dom drop → Deferred 全落在该 native call 的 drain 窗口。
+       *
+       * 与 14 的区别：
+       *   14 的 push 在 native call 之外，走 task drain；
+       *   15 的 push 在 dispatchEvent 内部，走 native_call drain。
+       *   这里测的是“单个 finalizer 引发的 drain 峰值”。
+       *
+       * 注意：
+       *   DOM 的 parent/child、element/attr 互相持有 Dom，是计数环；
+       *   refcount 不会让它们级联释放（要 qjs_gc；收环期间 release_object
+       *   不推 Deferred）。所以这里可构造的“级联”只有一层 fan-out。
+       *   如果 drains 的 values 明显大于 N，才说明有更深层来源。
+       *
+       * 判据：
+       *   pushes.deferred 至少增加 N；
+       *   单次 native_call drain 的 values ≈ N，max_ns 明显抬升。
+       */
+
+      const N = 50000;
+      const root = document.getElementById("root");
+
+      for (let i = 0; i < N; i++) {
+        let ret = root.appendChild(document.createElement("div"));
+        ret = null;
+      }
+
+      let list = root.querySelectorAll("div");
+      console.log("[fanout] list.length =", list.length, "(expect", N + ")");
+
+      root.textContent = ""; // 下树；NodeList 仍持有节点
+
+      // listener 在 dispatchEvent 的 native call 内同步执行。
+      root.addEventListener("trigger", () => {
+        list = null; // NodeList finalize → N 个 Dom drop → Deferred
+      });
+
+      const ev = new Event("trigger");
+      const t0 = performance.now();
+      root.dispatchEvent(ev);
+      const t1 = performance.now();
+
+      console.log(
+        "[fanout] dispatchEvent_ms =", (t1 - t0).toFixed(2),
+        "（包含 NodeList finalize + 该 native call 返回前的 drain）"
+      );
+
+      setTimeout(() => {
+        runtime.drain_pool();
+        runtime.qjs_gc();
+        window.close();
+      }, 1000);
+    </script>
+  </body>
+</html>

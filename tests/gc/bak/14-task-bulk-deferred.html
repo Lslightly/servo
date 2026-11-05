@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <div id="root"></div>
+    <script>
+      /*
+       * 14-task-bulk-deferred.html
+       *
+       * 极端场景 1：task 级 Deferred 堆积。
+       *
+       * 机制：
+       *   - querySelectorAll 返回静态 NodeList；Rust 侧是
+       *     NodeListType::Simple(Vec<Dom<Node>>)，每个节点一份 Dom
+       *     （components/script/dom/node/nodelist.rs:25-31, 58-83）。
+       *   - 批量下树后，节点只由 NodeList 持有。
+       *   - 在 setTimeout 回调里 list = null：NodeList 的 JS 对象被 finalize，
+       *     一次 drop N 个 Dom<Node>；每个 release_object 读到 rc == 1
+       *     → push_pool(Deferred)。
+       *   - 这些 push 发生在 native call 之外，不会被某个 native call 的 mark
+       *     清掉，一直留到 task 结束的 drain_current_pool（DrainContext::Task）。
+       *
+       * 判据（QJS_POOL_STATS）：
+       *   pushes.deferred 至少增加 N；
+       *   drains[ctx=task] 的 values 出现一次 N 量级的峰值。
+       */
+
+      const N = 50000; // 可调
+      const root = document.getElementById("root");
+
+      // 1) 创建 + 上树，不保留任何 JS 引用。
+      for (let i = 0; i < N; i++) {
+        let ret = root.appendChild(document.createElement("div"));
+        ret = null;
+      }
+
+      // 2) 静态 NodeList：Rust 侧对每个节点持有一份 Dom<Node>。
+      let list = root.querySelectorAll("div");
+      console.log("[task-bulk] list.length =", list.length, "(expect", N + ")");
+
+      // 3) 批量下树。NodeList 仍持有每个节点，所以节点不会在此时释放。
+      root.textContent = "";
+
+      // 4) 在 task 里丢掉 NodeList 的 JS 引用。
+      //    NodeList finalize → drop N 个 Dom → Deferred 全部留在池里，
+      //    直到这个 task 结束时统一 drain。
+      setTimeout(() => {
+        const t0 = performance.now();
+        list = null;
+        const t1 = performance.now();
+        console.log(
+          "[task-bulk] NodeList finalize_ms =", (t1 - t0).toFixed(2),
+          "（实际 drain 在这个 task 返回之后）"
+        );
+        setTimeout(() => window.close(), 1000);
+      }, 0);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <div id="parent"></div>
+    <script>
+      /*
+       * 目的：让大量节点在同一段 native call 里变成 Pooled::Deferred，
+       * 使紧随其后的 drain_pool 一次释放大量值，测 drain 的极端时间占比。
+       *
+       * 触发条件（代码事实）：
+       *   Dom<T>::drop → quickjs_refs::release → release_object
+       *   只有 JS_GetRefCount(v) == 1 且不在收环时才 push_pool(Deferred)
+       *   （servo-quickjs/mozjs/src/engine/mod.rs:422-457）。
+       *   “== 1” 是减之前的读数：表示这次 Rust 侧 drop 是最后一份。
+       *
+       * 因此顺序必须是：
+       *   1. 先把 JS 侧引用全部丢掉（节点变量、appendChild 的返回值）。
+       *   2. 再在同一个 native call 里批量下树。
+       *      如果下树时 JS 还持有节点，树边 Dom::drop 读到的是 >1，
+       *      只会走 JS_FreeValueRT，不会进 Deferred。
+       *
+       * 为什么不用 N 次 removeChild：
+       *   每次 removeChild 是一次独立 native call，结束时各自 drain，
+       *   drain 时间被摊薄。用一次 parent.textContent = "" 批量下树，
+       *   N 个 Deferred 才会落在同一个 drain 窗口里。
+       *
+       * 关于 reflow：
+       *   动态创建的节点如果没被布局看过，就没有布局侧 Dom 句柄，
+       *   此时不需要 reflow，树边就是最后一份。
+       *   若先用 reflow 建立布局句柄，则树边先减到 1，布局句柄要等
+       *   下一次 reflow 才成为最后一份——那次 reflow 的 native call
+       *   才是承载 Deferred 的 drain。
+       */
+
+      const N = 200000; // 极端占比：调大 N；debug 构建下 20 万节点约数秒
+      const ESTABLISH_LAYOUT = true; // true：上树后先 reflow，让布局持有节点
+
+      const parent = document.getElementById("parent");
+      const nodes = new Array(N);
+
+      const t0 = performance.now();
+
+      // 阶段 1：创建 + 上树。返回值立即丢弃。
+      for (let i = 0; i < N; i++) {
+        const n = document.createElement("div");
+        nodes[i] = n;
+        let ret = parent.appendChild(n);
+        ret = null; // appendChild 的返回值
+      }
+
+      if (ESTABLISH_LAYOUT) {
+        void parent.offsetHeight; // 让布局侧建立 Dom 句柄
+      }
+
+      // 阶段 2：丢掉所有 JS 引用。此后每个节点只由 DOM 树持有（计数 1）。
+      for (let i = 0; i < N; i++) {
+        nodes[i] = null;
+      }
+
+      const t1 = performance.now();
+
+      // 阶段 3：一次 native call 批量下树。
+      // 每个子节点的树边 Dom::drop 读到 rc == 1 → Deferred；
+      // 该 native call 返回前的 drain_pool 一次释放 N 个值。
+      parent.textContent = "";
+
+      const t2 = performance.now();
+
+      // 打开 ESTABLISH_LAYOUT 时，Deferred 会落在这次 reflow 的 native call 里。
+      void parent.offsetHeight;
+
+      const t3 = performance.now();
+
+      runtime.drain_pool();
+      runtime.qjs_gc();
+
+      const t4 = performance.now();
+
+      console.log(
+        "[extreme-deferred] N =", N,
+        "create_attach_ms =", (t1 - t0).toFixed(2),
+        "bulk_detach_ms =", (t2 - t1).toFixed(2),
+        "reflow_ms =", (t3 - t2).toFixed(2),
+        "drain_gc_ms =", (t4 - t3).toFixed(2)
+      );
+      console.log(
+        "[extreme-deferred] 看 QJS_POOL_STATS 的 pushes.deferred 与单次 drain 的 max_ns"
+      );
+    </script>
+    <script>
+      // 留时间让 QJS_POOL_STATS 写出最后一行。
+      setTimeout(() => window.close(), 2000);
+    </script>
+  </body>
+</html>
