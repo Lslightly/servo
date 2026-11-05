@@ -65,13 +65,13 @@ python etc/ci/performance/merge_drain_stats.py out --wall
 
 ### `drain-summary.csv`
 
-每个 `(thread, pid, runtime)` 7 行 context，加 1 行 `ALL` 合计。脚本在 Python 中完成
+每个 `(thread, pid, runtime)` 8 行 context，加 1 行 `ALL` 合计。脚本在 Python 中完成
 计数、求和、最大值和直方图分桶；Rust 只写原始行。
 
 | 列 | 含义 |
 |---|---|
 | `testcase_name` | 测例名（文件名中 `<testcase>`） |
-| `context` | `scope_drop` / `native_call` / `runtime_destroy` / `proxy_trap` / `job_callback` / `job_run` / `task` / `ALL` |
+| `context` | `scope_drop` / `native_call` / `runtime_destroy` / `proxy_trap` / `job_callback` / `job_run` / `task` / `drain_pool_gc` / `ALL` |
 | `thread`, `pid`, `runtime` | 线程与 runtime 标识 |
 | `calls` | drain 调用次数 |
 | `empty` | 空 drain 次数（不计时） |

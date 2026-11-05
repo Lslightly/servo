@@ -46,6 +46,7 @@ CONTEXTS = [
     "job_callback",
     "job_run",
     "task",
+    "drain_pool_gc",
 ]
 
 SUMMARY_COLUMNS = [
@@ -167,7 +168,7 @@ def aggregate(records: list[dict]) -> dict[tuple, dict]:
 
 
 def summary_rows(testcase: str, groups: dict[tuple, dict], wall_seconds: float | None) -> list[dict]:
-    """Build the seven context rows plus the ALL row for each runtime."""
+    """Build the context rows plus the ALL row for each runtime."""
     # Wall time in milliseconds; the denominator of drain_pool(%).
     wall_ms = wall_seconds * 1000 if wall_seconds is not None else None
 
@@ -224,7 +225,7 @@ def summary_rows(testcase: str, groups: dict[tuple, dict], wall_seconds: float |
                 }
             )
 
-        # Pseudo-context ALL: the sum of the seven contexts for this runtime.
+        # Pseudo-context ALL: the sum of the contexts for this runtime.
         rows.append(
             {
                 **base,

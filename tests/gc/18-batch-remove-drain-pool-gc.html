@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style>
+      html, body { margin: 0; padding: 0; }
+      .item { height: 30px; line-height: 30px; border-bottom: 1px solid #eee; }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <script>
+      /*
+       * 目的：在 17-batch-remove-drain 的基础上，把显式的 drain_pool 换成
+       * drain_pool_gc（drain pool + 一次完整 GC，记成一条合计耗时），
+       * 看「批量删节点 + GC」的总成本随节点数怎么增长。
+       *
+       * 流程和 17 一样，每个尺寸：
+       *   1. 建树：N 个空元素挂到容器上，循环里不留任何 JS 引用；
+       *   2. 批量下树：一次 `box.textContent = "..."` 移除全部子节点；
+       *   3. reflow：读一次 offsetHeight 强制布局；
+       *   4. drain_pool_gc：drain pool，再跑一次 GC。
+       *
+       * 重要：drain_pool_gc 里的 drain 部分通常是空的。
+       *   `box.textContent = "..."` 这个 native call 返回时，引擎已经用
+       *   ctx=native_call 把 Deferred 排空了（见 17 的注释）。从 JS 调用的
+       *   drain_pool_gc 本身也是一个 native call，它内部 drain 时 pool 已经空，
+       *   所以 ctx=drain_pool_gc 那条的 elapsed_ns 基本就是 GC 的耗时。
+       *   想分开看：同一次运行里，ctx=native_call、values ≈ N 的那条是 drain，
+       *   ctx=drain_pool_gc 那条是 GC。
+       *
+       * 计时口径：
+       *   页面里不做任何计时。DRAIN_STATS=1 时，drain_pool_gc 写一条
+       *   ctx=drain_pool_gc 的记录，elapsed_ns 是 drain + GC 的合计；
+       *   empty 字段为 0 表示这条记录计了时（drain_pool_gc 总会跑 GC，所以总是计时）。
+       *
+       * 运行示例：
+       *   DRAIN_STATS=1 QJS_DRAIN_STATS_OUT=drains.jsonl \
+       *     ./servoshell tests/gc/18-batch-remove-drain-pool-gc.html
+       */
+
+      const SIZES = [10, 20, 50, 100, 200, 500, 1000, 2000];
+      const AUTO_CLOSE = true;
+
+      const stage = document.getElementById("stage");
+
+      function forceReflow() {
+        // 读一次布局属性，强制走完一次 reflow。
+        void document.body.offsetHeight;
+      }
+
+      function makeRows(n) {
+        const box = document.createElement("div");
+        stage.appendChild(box);
+        for (let i = 0; i < n; i++) {
+          const row = document.createElement("div");
+          row.className = "item";         // 不设 textContent：避免多一个 Text 子节点
+          box.appendChild(row);
+        }
+        return box;
+      }
+
+      function runSize(size) {
+        const box = makeRows(size);
+
+        // 建树本身也会往 pool 里塞值，先清掉，避免混进下树那次。
+        // 这里用 drain_pool_gc 而不是 drain_pool：同样清空 pool，并顺带
+        // 跑一次 GC，建树留下的不可达对象不会留到下一次测量。
+        forceReflow();
+        runtime.drain_pool_gc();
+
+        // 1. 批量下树：一次 native call 摘掉 N 个子节点。
+        //    每条树边读到 rc == 1 → 全部进 Deferred，在这个 native call
+        //    返回时以 ctx=native_call 排空。
+        box.textContent = "removed";
+
+        // 2. reflow：布局侧若有 Dom 句柄，最后一份引用会在这里释放。
+        forceReflow();
+
+        // 3. drain_pool_gc：此时 pool 通常已空，这条记录测到的主要是 GC。
+        runtime.drain_pool_gc();
+
+        box.remove();
+
+        console.log("[batch-remove-gc] size =", size, "values_expected =", size);
+      }
+
+      let next = 0;
+      function step() {
+        if (next >= SIZES.length) {
+          console.log(
+            "[batch-remove-gc] 看 DRAIN_STATS：ctx=drain_pool_gc 的 elapsed_ns 是" +
+            "本次 drain + GC 的合计；ctx=native_call、values ≈ size 的那条是纯 drain"
+          );
+          if (AUTO_CLOSE) {
+            setTimeout(() => window.close(), 2000);
+          }
+          return;
+        }
+        runSize(SIZES[next++]);
+        // 每个尺寸单独占一个 task，让上一个尺寸的残留 drain 先结束。
+        setTimeout(step, 0);
+      }
+
+      step();
+    </script>
+  </body>
+</html>
