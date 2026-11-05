@@ -54,7 +54,7 @@ DRAIN_STATS=1 CARGO_TARGET_DIR=target/drain-stats cargo build -p servoshell \
 ```sh
 mkdir -p out
 /usr/bin/time -q -f '%e' -o out/wall-demo.txt \
-  env QJS_DRAIN_STATS_OUT=out/stats-demo.jsonl \
+  env QJS_DRAIN_STATS_OUT=out/qjs-drain-stats-demo.jsonl \
   ./target/drain-stats/debug/servoshell --headless tests/gc/2-remove-subtree.html
 python etc/ci/performance/merge_drain_stats.py out
 ```
@@ -82,7 +82,7 @@ DRAIN_STATS=1 CARGO_TARGET_DIR=target/drain-stats cargo build -p servoshell \
 ```sh
 mkdir -p out flames; rm -rf flames/*
 /usr/bin/time -q -f '%e' -o out/wall-demo.txt \
-  env QJS_DRAIN_STATS_OUT=out/stats-demo.jsonl \
+  env QJS_DRAIN_STATS_OUT=out/qjs-drain-stats-demo.jsonl \
       SERVO_EVENT_FLAME_DIR=./flames \
       SERVO_EVENT_FLAME_CLASS=HTMLDivElement \
       SERVO_TRACING=mozjs_gc=trace \
