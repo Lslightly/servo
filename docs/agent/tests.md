@@ -17,6 +17,7 @@
 |---|---|
 | `runtime.qjs_refcount(node)` | 读节点当前引用计数；已减去传参时 VM 栈上的那份临时 +1 |
 | `runtime.drain_pool()` | 立刻 drain autorelease pool |
+| `runtime.drain_pool_gc()` | 先 drain pool，再跑一次 GC；`DRAIN_STATS` 里记为 `ctx=drain_pool_gc`，`elapsed_ns` 是两步合计 |
 | `runtime.qjs_gc()` | 触发一次 QuickJS GC（`JS_GC`，`GCReason::API`） |
 
 实现见 `components/script_bindings/quickjs_runtime_helper.rs`。

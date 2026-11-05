@@ -9,6 +9,7 @@
 //! runtime.qjs_gc();            // force a full QuickJS GC
 //! runtime.qjs_refcount(div);   // the QuickJS reference count of `div`
 //! runtime.drain_pool();        // release the autorelease pool now
+//! runtime.drain_pool_gc();     // release the pool, then run a full GC
 //! ```
 //!
 //! This is a debug hook, not a web API: it is installed on every `Window` and
@@ -86,6 +87,15 @@ unsafe extern "C" fn drain_pool(_cx: *mut RawJSContext, _argc: u32, _vp: *mut JS
     true
 }
 
+/// Drains the autorelease pool and then runs a full GC, as one operation, so a page can measure
+/// the combined cost of both. With `DRAIN_STATS=1` the total time is recorded as one
+/// `drain_pool_gc` line.
+#[expect(unsafe_code)]
+unsafe extern "C" fn drain_pool_gc(_cx: *mut RawJSContext, _argc: u32, _vp: *mut JSVal) -> bool {
+    js::quickjs::drain_pool_and_gc();
+    true
+}
+
 /// Defines `name` on `obj` as a native function calling `call`.
 #[expect(unsafe_code)]
 unsafe fn define_method(
@@ -123,6 +133,7 @@ pub fn init_runtime_helper(cx: &mut JSContext, global: HandleObject) {
         define_method(cx, runtime, c"qjs_gc", qjs_gc);
         define_method(cx, runtime, c"qjs_refcount", qjs_refcount);
         define_method(cx, runtime, c"drain_pool", drain_pool);
+        define_method(cx, runtime, c"drain_pool_gc", drain_pool_gc);
         let defined = JS_DefineProperty3(
             cx,
             global,
