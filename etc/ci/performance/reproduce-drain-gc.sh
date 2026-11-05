@@ -64,7 +64,7 @@ for case_path in $CASES; do
   page=$(basename "$case_path")
   html=$REPO_ROOT/$case_path.html
   [ -f "$html" ] || { echo "missing $html" >&2; exit 1; }
-  stats=$OUT/stats-$page.jsonl
+  stats=$OUT/qjs-drain-stats-$page.jsonl
   rm -f "$stats"
 
   echo "running $page for ${RUN_SECONDS}s"

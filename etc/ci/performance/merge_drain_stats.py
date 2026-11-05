@@ -3,8 +3,8 @@
 
 Input: a directory containing
 
-    stats-<testcase>.jsonl   one JSON line per drain_pool call (QJS_DRAIN_STATS_OUT)
-    wall-<testcase>.txt      whole-process wall time in seconds (/usr/bin/time -f '%e')
+    qjs-drain-stats-<testcase>.jsonl   one JSON line per drain_pool call (QJS_DRAIN_STATS_OUT)
+    wall-<testcase>.txt                whole-process wall time in seconds (/usr/bin/time -f '%e')
 
 Each JSON line looks like
 
@@ -280,7 +280,7 @@ def main() -> None:
         nargs="?",
         default=".",
         type=Path,
-        help="directory with stats-*.jsonl and wall-*.txt (default: .)",
+        help="directory with qjs-drain-stats-*.jsonl and wall-*.txt (default: .)",
     )
     parser.add_argument(
         "--out-dir",
@@ -302,8 +302,8 @@ def main() -> None:
     # Discover testcases from the stats files. Only with --wall are wall files
     # scanned too, so one without stats is reported as skipped.
     testcases = set()
-    for path in stats_dir.glob("stats-*.jsonl"):
-        testcases.add(path.name[len("stats-"): -len(".jsonl")])
+    for path in stats_dir.glob("qjs-drain-stats-*.jsonl"):
+        testcases.add(path.name[len("qjs-drain-stats-"): -len(".jsonl")])
     if args.wall:
         for path in stats_dir.glob("wall-*.txt"):
             testcases.add(path.name[len("wall-"): -len(".txt")])
@@ -313,7 +313,7 @@ def main() -> None:
     skipped = []
 
     for testcase in sorted(testcases):
-        stats_path = stats_dir / f"stats-{testcase}.jsonl"
+        stats_path = stats_dir / f"qjs-drain-stats-{testcase}.jsonl"
         wall_seconds = (
             read_wall_seconds(stats_dir / f"wall-{testcase}.txt") if args.wall else None
         )

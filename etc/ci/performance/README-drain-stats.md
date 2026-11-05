@@ -15,13 +15,13 @@ DRAIN_STATS=1 SERVO_TARGET_DIR=$PWD/target/drain-stats \
 
 约定文件放在同一目录：
 
-- `stats-<testcase>.jsonl`：**每次 drain 写一行**；
+- `qjs-drain-stats-<testcase>.jsonl`：**每次 drain 写一行**；
 - `wall-<testcase>.txt`：`time` 记录的整个进程墙钟秒数。
 
 ```sh
 mkdir -p out
 /usr/bin/time -q -f '%e' -o out/wall-demo.txt \
-  env QJS_DRAIN_STATS_OUT=out/stats-demo.jsonl \
+  env QJS_DRAIN_STATS_OUT=out/qjs-drain-stats-demo.jsonl \
   target/drain-stats/debug/servoshell out/demo.html --headless
 ```
 
@@ -59,7 +59,7 @@ python etc/ci/performance/merge_drain_stats.py out --wall
 - `--wall`：读取 `wall-*.txt`。**默认关闭**；关闭时不读 wall 文件，`drain_pool(%)` 留空，
   也不会因缺 wall time 而跳过测例。
 
-输入目录里所有 `stats-*.jsonl` 都会按文件名中的 `<testcase>` 合并。
+输入目录里所有 `qjs-drain-stats-*.jsonl` 都会按文件名中的 `<testcase>` 合并。
 
 ## 4. 输出
 
