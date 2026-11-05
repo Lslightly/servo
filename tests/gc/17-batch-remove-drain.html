@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style>
+      html, body { margin: 0; padding: 0; }
+      .item { height: 30px; line-height: 30px; border-bottom: 1px solid #eee; }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <script>
+      /*
+       * 目的：测「批量删节点」时 drain_pool 的开销，看它随节点数怎么增长。
+       *
+       * 每个尺寸都走同一套顺序：
+       *   1. 建树：N 个空元素挂到容器上，循环里不留任何 JS 引用；
+       *   2. 批量下树：一次 `box.textContent = "..."` 移除全部子节点；
+       *   3. reflow：读一次 offsetHeight 强制布局；
+       *   4. drain_pool：显式排空 pool。
+       *
+       * 为什么用一次 textContent 而不是 N 次 removeChild：
+       *   Dom<T>::drop → release_object 只有在 JS_GetRefCount(v) == 1 时才
+       *   push_pool(Pooled::Deferred)（servo-quickjs/mozjs/src/engine/mod.rs）。
+       *   建树后 JS 侧不留引用，节点只剩树边这一份计数，
+       *   批量下树时每条树边都读到 1，N 个 Deferred 落在同一个 native call 里。
+       *   而 removeChild 是逐个 native call，每个返回时各 drain 一次，
+       *   drain 时间被摊薄，测不到批量成本。详见 bak/13-extreme-drain-deferred.html。
+       *
+       * 关于 reflow：
+       *   没被布局看过的新节点没有布局侧 Dom 句柄，树边就是最后一份；
+       *   若提前 reflow 过，布局句柄会晚一步释放，承载 Deferred 的 drain
+       *   会挪到下一次 reflow 的那个 native call 里。
+       *
+       * 节点构成：每行只有一个空元素，不设 textContent。
+       *   设 textContent 会额外生成 Text 子节点，多一份引用计数，
+       *   干扰对「元素本身」这唯一一条释放路径的观察。
+       * 期望：单次 drain 释放的值约为 N（可用 DRAIN_STATS 的 values 核对）。
+       *
+       * 计时口径：
+       *   页面里不做任何计时。批量下树那次 native call 返回时 pool 就已经排空了，
+       *   显式 drain_pool 之前的时间戳只会读到空 pool，测不出真实成本。
+       *   drain 成本一律从 DRAIN_STATS 读：找 ctx=native_call、values ≈ N 的那条，
+       *   它的 elapsed_ns 就是本次批量 drain 的耗时。
+       *   参考值（debug 构建）：约 4.2 µs/value，2000 个节点单次 drain ≈ 8.5ms。
+       *
+       * 每个尺寸单独占一个 task（setTimeout 0 串起来），互不叠加；
+       * 建树产生的 pool 条目会在下树前先 drain 掉。
+       *
+       * 运行示例：
+       *   DRAIN_STATS=1 QJS_DRAIN_STATS_OUT=drains.jsonl \
+       *     ./servoshell tests/gc/17-batch-remove-drain.html
+       */
+
+      const SIZES = [10, 20, 50, 100, 200, 500, 1000, 2000];
+      const AUTO_CLOSE = true;
+      const PROBE_SIZE = 100;        // 额外跑一轮带 qjs_refcount 的诊断
+
+      const stage = document.getElementById("stage");
+
+      function forceReflow() {
+        // 读一次布局属性，强制走完一次 reflow。
+        void document.body.offsetHeight;
+      }
+
+      function refcountIfPossible(value) {
+        try {
+          return runtime.qjs_refcount(value);
+        } catch (e) {
+          return null;
+        }
+      }
+
+      function makeRows(n) {
+        const box = document.createElement("div");
+        stage.appendChild(box);
+        for (let i = 0; i < n; i++) {
+          const row = document.createElement("div");
+          row.className = "item";         // 不设 textContent：避免多一个 Text 子节点
+          box.appendChild(row);
+        }
+        return box;
+      }
+
+      function runSize(size) {
+        const box = makeRows(size);
+
+        // 建树本身也会往 pool 里塞值，先排空，避免混进下树那次 drain。
+        forceReflow();
+        runtime.drain_pool();
+
+        // 1. 批量下树：一次 native call 摘掉 N 个子节点。
+        //    每条树边读到 rc == 1 → 全部进 Deferred。
+        box.textContent = "removed";
+
+        // 2. reflow：布局侧若有 Dom 句柄，最后一份引用会在这里释放。
+        forceReflow();
+
+        // 3. drain_pool：释放上一批 Deferred。
+        runtime.drain_pool();
+
+        box.remove();
+
+        console.log("[batch-remove] size =", size, "values_expected =", size);
+      }
+
+      // 诊断轮：用 qjs_refcount 观察探针节点在三个阶段里的计数变化。
+      // 探针自己多持一份引用，所以它的树边永远读不到 rc == 1、不会进 Deferred；
+      // 批量是否真的进了 pool，以 DRAIN_STATS 的 values 为准。
+      function probeRound(size) {
+        const box = makeRows(size);
+        const probe = box.firstElementChild;   // 多持一份引用，作为观察对象
+        forceReflow();
+        runtime.drain_pool();
+        const beforeDetach = refcountIfPossible(probe);
+
+        box.textContent = "removed";
+        const afterDetach = refcountIfPossible(probe);
+
+        forceReflow();
+        const afterReflow = refcountIfPossible(probe);
+
+        runtime.drain_pool();
+        const afterDrain = refcountIfPossible(probe);
+
+        console.log(
+          "[batch-remove] probe size =", size,
+          "refcount before =", beforeDetach,
+          "detach =", afterDetach,
+          "reflow =", afterReflow,
+          "drain =", afterDrain,
+          "（探针自身多持一份引用）"
+        );
+
+        box.remove();
+      }
+
+      let next = 0;
+      function step() {
+        if (next >= SIZES.length) {
+          probeRound(PROBE_SIZE);
+          console.log(
+            "[batch-remove] 看 DRAIN_STATS：找 ctx=native_call、values ≈ size 的那条，" +
+            "它的 elapsed_ns 才是本次批量 drain 的成本"
+          );
+          if (AUTO_CLOSE) {
+            setTimeout(() => window.close(), 2000);
+          }
+          return;
+        }
+        runSize(SIZES[next++]);
+        // 每个尺寸单独占一个 task，让上一个尺寸的残留 drain 先结束。
+        setTimeout(step, 0);
+      }
+
+      step();
+    </script>
+  </body>
+</html>
