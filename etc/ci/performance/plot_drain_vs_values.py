@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -26,7 +27,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-from matplotlib import font_manager  # noqa: E402
+from matplotlib import font_manager, ticker  # noqa: E402
 
 # Categorical slots 1-4 of the reference palette, in fixed order.
 COLORS = {
@@ -39,6 +40,8 @@ SERIES = ["mean", "p50", "p99", "max"]
 # Vertical offsets (points) for the right-hand direct labels, which would otherwise
 # pile up where the lines converge on a single-sample bin.
 LABEL_OFFSET = {"mean": 22, "p50": -14, "p99": 44, "max": -36}
+# Bins with at most this many samples get their exact values printed on the plot.
+SPARSE_LABEL_MAX = 10
 TEXT_PRIMARY = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
 GRID = "#d9d8d4"
@@ -177,6 +180,10 @@ def bin_label(lo: int, hi: int) -> str:
     return f"{lo}" if lo == hi else f"{lo}–{hi}"
 
 
+def fmt_us(value: float) -> str:
+    return f"{value:.2f}" if value < 10 else f"{value:.0f}"
+
+
 def plot(bins, stats, out: Path, title: str, cjk: bool) -> None:
     labels = [bin_label(lo, hi) for lo, hi, _ in bins]
     x = np.arange(len(bins))
@@ -214,9 +221,40 @@ def plot(bins, stats, out: Path, title: str, cjk: bool) -> None:
             va="center",
         )
 
+    # Sparse bins hold only a handful of samples; print each point's value so the
+    # tail can be read without estimating positions on a log axis. The last bin is
+    # skipped: its values already appear in the right-hand labels.
+    for i in range(len(bins) - 1):
+        if stats["count"][i] > SPARSE_LABEL_MAX:
+            continue
+        # Label only values that are visually distinct on the log axis; otherwise
+        # two labels land on nearly the same spot and overprint each other.
+        labelled = []
+        for key in SERIES:
+            value = stats[key][i]
+            if any(abs(math.log(max(value, 1e-9) / other)) < math.log(1.15) for other in labelled):
+                continue
+            labelled.append(max(value, 1e-9))
+            ax.annotate(
+                fmt_us(value),
+                (x[i], max(value, 0.001)),
+                xytext=(7, 0),
+                textcoords="offset points",
+                ha="left",
+                va="center",
+                fontsize=7,
+                color=COLORS[key],
+                zorder=4,
+            )
+
     ax.set_yscale("log")
+    # Leave room on the right so the end labels stay inside the axes.
+    ax.set_xlim(-0.4, len(bins) + 2.6)
+    # Headroom for the stacked end labels, which sit above the highest line.
+    bottom, top = ax.get_ylim()
+    ax.set_ylim(bottom, top * 3)
     ax.set_xticks(x)
-    ax.set_xticklabels([f"{lab}\n(n={n:,})" for lab, n in zip(labels, stats["count"])], fontsize=9)
+    ax.set_xticklabels([f"{lab}\n(n={n:,})" for lab, n in zip(labels, stats["count"])], fontsize=8)
 
     xlabel = (
         "移除的 value 数量（2 的幂分箱，括号内为 drain 次数）"
@@ -235,10 +273,8 @@ def plot(bins, stats, out: Path, title: str, cjk: bool) -> None:
     for side in ("left", "bottom"):
         ax.spines[side].set_color(GRID)
     ax.tick_params(colors=TEXT_SECONDARY, length=0)
-    ax.yaxis.set_major_formatter(
-        matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}")
-    )
-    ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{v:g}"))
+    ax.yaxis.set_minor_formatter(ticker.NullFormatter())
 
     ax.legend(frameon=False, loc="upper left", labelcolor=TEXT_PRIMARY, fontsize=10)
     fig.tight_layout()
