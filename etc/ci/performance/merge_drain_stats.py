@@ -16,7 +16,8 @@ timed). The Rust side does no aggregation: this script computes the counts,
 totals, maxima and histograms.
 
 The wall-*.txt files are optional. Without --wall, the script never reads them,
-drain_pool(%) stays empty, and no testcase is skipped for a missing wall time.
+the drain_pool(%) column is omitted, and no testcase is skipped for a missing
+wall time.
 
 Output: three CSV files in --out-dir (default: the input directory)
 
@@ -345,6 +346,13 @@ def main() -> None:
         all_hist.extend(hist_rows(testcase, groups))
 
     summary_df = pd.DataFrame(all_summary, columns=SUMMARY_COLUMNS)
+    # Put the unit in the header, like `drain_pool(%)` already does.
+    summary_df = summary_df.rename(
+        columns={"total_time": "total_time(ms)", "max_time": "max_time(ms)"}
+    )
+    if not args.wall:
+        # No wall time, no percentage: drop the all-empty column.
+        summary_df = summary_df.drop(columns=["drain_pool(%)"])
     hist_df = pd.DataFrame(all_hist, columns=HIST_COLUMNS)
     skipped_df = pd.DataFrame(skipped, columns=SKIPPED_COLUMNS)
 
