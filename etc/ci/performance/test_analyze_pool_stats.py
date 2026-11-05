@@ -25,13 +25,13 @@ def rows_of(*records):
 
 
 class ConclusionsTest(unittest.TestCase):
-    def test_conclusion_with_elapsed(self):
-        text = a.conclusions([record(elapsed_ms=200)], rows_of(record(elapsed_ms=200)), [])
-        self.assertIn("占运行时间 75.0%", text)
+    def test_conclusion_with_wall(self):
+        text = a.conclusions([record()], rows_of(record()), [], wall_ms=200)
+        self.assertIn("占程序执行时间 75.0%", text)
 
-    def test_conclusion_without_elapsed(self):
+    def test_conclusion_without_wall(self):
         text = a.conclusions([record()], rows_of(record()), [])
-        self.assertIn("缺 `elapsed_ms`", text)
+        self.assertIn("未提供外部墙钟", text)
 
     def test_conclusion_slow_tail(self):
         text = a.conclusions([record()], rows_of(record()), [])
@@ -56,6 +56,11 @@ class SourceSectionTest(unittest.TestCase):
         self.assertIn("```sh", text)
         self.assertIn("QJS_POOL_STATS_SAMPLE=0 ./servoshell page.html", text)
         self.assertIn("analyze_pool_stats.py", text)
+
+    def test_source_includes_wall(self):
+        text = a.source_section(["stats.jsonl"], [], [record()], wall_ms=1234.5)
+        self.assertIn("--wall-ms 1234.5", text)
+        self.assertIn("本报告使用 1234.5 ms", text)
 
     def test_source_quotes_paths_and_report(self):
         text = a.source_section(["dir/a b.jsonl"], [], [record()],
