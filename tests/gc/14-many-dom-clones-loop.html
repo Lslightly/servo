@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <div id="parent"></div>
+    <script>
+      /*
+       * 目的：节点很少，但产生大量 Dom::clone（→ retain → pool 的 borrowed）。
+       *
+       * 原理：
+       *   每次 DOM getter 把节点返回给 JS，绑定层都会创建一个 DomRoot / Dom<T>。
+       *   实际路径是 DomRoot::from_ref → Dom::from_ref → quickjs_refs::retain，
+       *   不是 Dom::clone；两者对 pool 的效果相同（borrowed）。
+       *   所以 retain 次数由“JS → native 调用次数”决定，与节点数量无关。
+       *
+       * 本页只有 2 个节点（parent + child），循环 3 个 getter：
+       *   parent.firstChild、child.parentNode、parent.childNodes[0]
+       * 每个 getter 一次 native call，每次返回一个节点 → 一次 clone。
+       *
+       * 注意：每次 native call 返回都会 drain，所以 pool 不会跨迭代累积；
+       * 这里测的是 Dom::clone / retain 的总次数。
+       */
+
+      const N = 10000;
+
+      const parent = document.getElementById("parent");
+      const child = document.createElement("div");
+      parent.appendChild(child);
+
+      const t0 = performance.now();
+
+      let v;
+      for (let i = 0; i < N; i++) {
+        v = parent.firstChild; // child
+        v = child.parentNode; // parent
+        v = parent.childNodes[0]; // child
+      }
+
+      const t1 = performance.now();
+
+      console.log(
+        "[many-dom-clones-loop] N =", N,
+        "getter_calls =", N * 3,
+        "elapsed_ms =", (t1 - t0).toFixed(2)
+      );
+      console.log(
+        "[many-dom-clones-loop] 看 QJS_POOL_STATS 的 pushes.borrowed 与 apis 中 retain 的 total"
+      );
+    </script>
+    <script>
+      // 留时间让统计写最后一行。
+      setTimeout(() => window.close(), 2000);
+    </script>
+  </body>
+</html>

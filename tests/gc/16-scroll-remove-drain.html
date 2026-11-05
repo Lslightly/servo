@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style>
+      html, body { margin: 0; padding: 0; }
+      /* 每行带一个 Text 子节点，保证下树时 Text 也参与计数 */
+      .item { height: 30px; line-height: 30px; border-bottom: 1px solid #eee; }
+    </style>
+  </head>
+  <body>
+    <div id="list"></div>
+    <script>
+      /*
+       * 目的：在「页面下滑」期间持续下树，让 drain_pool 在整个滚动过程里
+       * 被反复触发，用来观察 drain 的次数、单次最大耗时和总量。
+       *
+       * 和 13-extreme-drain-deferred 的区别：
+       *   13 是一次 native call 塞进 N 个 Deferred，测极端峰值。
+       *   本测例是滚动驱动的连续小批量下树，测「滚动中 drain 是否拖慢每帧」。
+       *
+       * 为什么删完会进池（计数口径）：
+       *   每个 .item 有两条被释放的边：
+       *     - Text 子节点：只被父元素的树边持有（计数 1）。
+       *       removeChild 里树边 −1 → 0 之前的读数是 1
+       *       → release_object 走 push_pool(Deferred)
+       *       → 这次 native 调用返回时的 drain（ctx = native_call）释放它。
+       *     - 元素本身：树边 + 本次 lastElementChild/firstElementChild
+       *       产生的 JS 临时包装（计数 2）。
+       *       removeChild 里树边 −1 读到 2，不进池；
+       *       包装被 JS 释放时读到 1 → Deferred
+       *       → 留到本 task 结束的 drain（ctx = task）统一释放。
+       *
+       * 关键约束：不能长期保存被删节点（数组、全局变量、闭包捕获）。
+       *   只要还留一份 JS 引用，包装释放那次就不会发生，节点不进池，
+       *   直到变量置 null / finalize。13 号样例的注释也写了这一点。
+       *
+       * 触发方向：只有「往下滑」（手指往上拽，scrollY 变大）才删；
+       * 往上滑不触发，只更新记录的滚动位置。
+       *
+       * 判据（用 DRAIN_STATS=1 构建，看 JSONL 最后一个快照）：
+       *   - drains[ctx=native_call] 与 drains[ctx=task] 的 calls 随滚动增长；
+       *   - ctx=task 的 values 出现 REMOVE_PER_EVENT 量级的重复峰值；
+       *   - 若拖动/滚动时掉帧，看 ctx=task 的 max_ns 是否接近帧预算（16ms）。
+       *
+       * 运行示例：
+       *   QJS_DRAIN_STATS_OUT=drains.jsonl ./servoshell tests/gc/16-scroll-remove-drain.html
+       */
+
+      const N = 3000;                 // 初始文字元素行数
+      const REMOVE_PER_EVENT = 16;    // 每个 scroll 事件删几行
+      const AUTO_SCROLL = true;       // true：脚本自动下滑，无需人工滚动
+      const SCROLL_STEP = 200;        // 自动下滑每 tick 的像素
+      const SCROLL_TICK_MS = 16;      // 自动下滑周期
+      const FALLBACK_DIRECT_DRIVE = true; // 1.5s 内没收到 scroll 事件就改为定时直删
+      const AUTO_CLOSE = true;
+      const LOG_EVERY_EVENTS = 25;
+
+      const list = document.getElementById("list");
+
+      // 阶段 1：建树。
+      // 循环里不保留任何 JS 引用：row 随每轮块作用域结束而释放，
+      // textContent 产生的 Text 子节点也没有 JS 包装。
+      for (let i = 0; i < N; i++) {
+        const row = document.createElement("div");
+        row.className = "item";
+        row.textContent = "row " + i;
+        list.appendChild(row);
+      }
+      console.log(
+        "[scroll-remove] rows =", N,
+        "scrollHeight =", document.documentElement.scrollHeight,
+        "removePerEvent =", REMOVE_PER_EVENT
+      );
+
+      let scrollEvents = 0;
+      let downEvents = 0;              // 其中「往下滑」的事件数（scrollY 变大）
+      let lastScrollY = window.scrollY; // 用来判断这次是往下还是往上
+      let removedTotal = 0;
+      let handlerTotalMs = 0;
+      let handlerMaxMs = 0;
+      let handling = false;
+      let directMode = false;
+      let finished = false;
+      let autoTimer = null;
+      let fallbackTimer = null;
+
+      // 阶段 2：下树。从顶部删（已滑过的内容），保住下方待滚动的内容。
+      // 不给被删节点起变量名，避免 JS 侧多留一份计数。
+      function removeSome() {
+        const t0 = performance.now();
+        let n = 0;
+        while (n < REMOVE_PER_EVENT) {
+          if (list.firstElementChild === null) break;
+          let tmp = list.removeChild(list.firstElementChild);
+          tmp = null;
+          n++;
+        }
+        removedTotal += n;
+        const dt = performance.now() - t0;
+        handlerTotalMs += dt;
+        if (dt > handlerMaxMs) handlerMaxMs = dt;
+        return n;
+      }
+
+      function onScroll() {
+        // 删掉上方节点可能引起滚动位置回调，避免重入。
+        if (handling || finished) return;
+        handling = true;
+        scrollEvents++;
+
+        // 只在下滑（手指往上拽、scrollY 变大）时删；上滑只更新位置，不动 DOM。
+        const y = window.scrollY;
+        const dy = y - lastScrollY;
+        lastScrollY = y;
+        if (dy > 0) {
+          downEvents++;
+          removeSome();
+        }
+        handling = false;
+
+        if (scrollEvents % LOG_EVERY_EVENTS === 0) {
+          console.log(
+            "[scroll-remove] events =", scrollEvents,
+            "downEvents =", downEvents,
+            "removed =", removedTotal,
+            "avg_handler_ms =", downEvents
+              ? (handlerTotalMs / downEvents).toFixed(3)
+              : "-",
+            "max_handler_ms =", handlerMaxMs.toFixed(3)
+          );
+        }
+      }
+      window.addEventListener("scroll", onScroll, { passive: true });
+
+      // 阶段 3：收尾。强制再 drain 一次，作为终点可对比。
+      function report(reason) {
+        if (finished) return;
+        finished = true;
+        if (autoTimer !== null) { clearInterval(autoTimer); autoTimer = null; }
+        if (fallbackTimer !== null) { clearInterval(fallbackTimer); fallbackTimer = null; }
+
+        const t0 = performance.now();
+        window.runtime.drain_pool();
+        window.runtime.qjs_gc();
+        const finalMs = performance.now() - t0;
+
+        console.log(
+          "[scroll-remove] done:", reason,
+          "mode =", directMode ? "direct" : "scroll",
+          "scrollEvents =", scrollEvents,
+          "downEvents =", downEvents,
+          "removed =", removedTotal + "/" + N,
+          "remaining =", list.children.length,
+          "handler_total_ms =", handlerTotalMs.toFixed(2),
+          "handler_max_ms =", handlerMaxMs.toFixed(2),
+          "final_drain_gc_ms =", finalMs.toFixed(2)
+        );
+        console.log(
+          "[scroll-remove] 看 DRAIN_STATS：ctx=native_call / ctx=task 的 calls、" +
+          "max_ns、values；以及 QJS_POOL_STATS 的 pushes.deferred"
+        );
+
+        if (AUTO_CLOSE) {
+          setTimeout(() => window.close(), 2000);
+        }
+      }
+
+      if (AUTO_SCROLL) {
+        let ticks = 0;
+        let lastSeenY = window.scrollY;
+        let stuckTicks = 0;
+
+        autoTimer = setInterval(() => {
+          if (finished) return;
+          ticks++;
+          window.scrollBy(0, SCROLL_STEP);
+
+          const y = window.scrollY;
+          if (y === lastSeenY) {
+            stuckTicks++;
+            // 连续 8 个 tick 都不动：到底了，或 scrollY 不更新。
+            if (stuckTicks >= 8) {
+              report(scrollEvents === 0 ? "no-scroll-support" : "bottom");
+            }
+          } else {
+            stuckTicks = 0;
+            lastSeenY = y;
+          }
+          if (ticks > 3000) report("tick-timeout");
+        }, SCROLL_TICK_MS);
+      }
+
+      // 兜底：环境不派发 scroll 事件时，用定时器直接下树，
+      // 保证 remove + drain 的负载仍然跑起来（日志里 mode 会写成 direct）。
+      if (FALLBACK_DIRECT_DRIVE) {
+        setTimeout(() => {
+          if (finished || scrollEvents > 0) return;
+          directMode = true;
+          console.log("[scroll-remove] no scroll events; direct removal fallback");
+          fallbackTimer = setInterval(() => {
+            if (finished) return;
+            if (list.firstElementChild === null) { report("direct-done"); return; }
+            removeSome();
+            if (removedTotal % (REMOVE_PER_EVENT * LOG_EVERY_EVENTS) === 0) {
+              console.log(
+                "[scroll-remove] direct removed =", removedTotal,
+                "avg_handler_ms =", (handlerTotalMs / (removedTotal / REMOVE_PER_EVENT)).toFixed(3)
+              );
+            }
+          }, SCROLL_TICK_MS);
+        }, 1500);
+      }
+    </script>
+  </body>
+</html>
