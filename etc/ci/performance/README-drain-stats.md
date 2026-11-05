@@ -15,7 +15,7 @@ DRAIN_STATS=1 SERVO_TARGET_DIR=$PWD/target/drain-stats \
 
 约定文件放在同一目录：
 
-- `stats-<testcase>.jsonl`：每个线程的 runtime 销毁时写一行；
+- `stats-<testcase>.jsonl`：**每次 drain 写一行**；
 - `wall-<testcase>.txt`：`time` 记录的整个进程墙钟秒数。
 
 ```sh
@@ -25,14 +25,21 @@ mkdir -p out
   target/drain-stats/debug/servoshell out/demo.html --headless
 ```
 
+一行格式：
+
+```json
+{"thread":"Script(1,1)","pid":123,"runtime":1,"ctx":"native_call","elapsed_ns":1234,"values":5}
+```
+
 注意：
 
-1. **进程必须自然退出。** 被 `timeout -s KILL` 杀死的进程不会写 JSON，因为数据只在 runtime
-   销毁时落盘。
-2. 一个测例可以有多个线程，每个线程一行，`pid + runtime` 区分。
-3. 文件在进程第一次写入时**截断**，之后同进程的 runtime 追加：旧文件会被覆盖，
+1. 每次 drain 立即写一行并 flush，**进程被 `timeout -s KILL` 杀死也能保留已写入的数据**；
+   被杀之后的 drain 不存在，不会被当作空 drain。
+2. 一个测例可以有多个线程，用 `pid + runtime` 区分。
+3. 空 drain 的 `elapsed_ns` 为 `null`，不计时。
+4. 文件在进程第一次写入时**截断**，之后同进程的 runtime 追加：旧文件会被覆盖，
    不会混入上一次运行的数据。
-4. 旧版带 `final` 字段、周期快照的 JSONL 不再兼容，请重新采集。
+5. 旧版聚合 JSON（`drains` 数组、`final` 字段）不再兼容，请重新采集。
 
 ## 3. 合并多个测例
 
@@ -40,9 +47,17 @@ mkdir -p out
 python etc/ci/performance/merge_drain_stats.py out
 ```
 
+如果同时采集了 `wall-<testcase>.txt`，加 `--wall` 才会读取它们并计算 `drain_pool(%)`：
+
+```sh
+python etc/ci/performance/merge_drain_stats.py out --wall
+```
+
 可选参数：
 
 - `--out-dir DIR`：CSV 输出目录，默认与输入目录相同。
+- `--wall`：读取 `wall-*.txt`。**默认关闭**；关闭时不读 wall 文件，`drain_pool(%)` 留空，
+  也不会因缺 wall time 而跳过测例。
 
 输入目录里所有 `stats-*.jsonl` 都会按文件名中的 `<testcase>` 合并。
 
@@ -50,7 +65,8 @@ python etc/ci/performance/merge_drain_stats.py out
 
 ### `drain-summary.csv`
 
-每个线程 7 行 context，加 1 行 `ALL` 合计。
+每个 `(thread, pid, runtime)` 7 行 context，加 1 行 `ALL` 合计。脚本在 Python 中完成
+计数、求和、最大值和直方图分桶；Rust 只写原始行。
 
 | 列 | 含义 |
 |---|---|
@@ -62,7 +78,7 @@ python etc/ci/performance/merge_drain_stats.py out
 | `total_time` | 非空 drain 的总耗时，毫秒 |
 | `max_time` | 单次最大耗时，毫秒 |
 | `value_count` | drain 掉的 value 数量 |
-| `drain_pool(%)` | 该行 `total_time / wall time × 100` |
+| `drain_pool(%)` | 该行 `total_time / wall time × 100`；仅 `--wall` 时有值 |
 
 `ALL` 行：`calls`、`empty`、`value_count`、`total_time` 求和，`max_time` 取最大。
 
@@ -82,7 +98,7 @@ python etc/ci/performance/merge_drain_stats.py out
 |---|---|
 | `testcase_name` | 被跳过的测例 |
 | `wall_seconds` | 墙钟秒数（有则记录） |
-| `reason` | `timeout/no-data`：没有 JSON，通常是被杀；`no-wall`：有 JSON 但缺 wall time，主表仍输出，百分比留空 |
+| `reason` | `no-data`：完全没有 drain 记录；`no-wall`：有记录但缺 wall time，主表仍输出，百分比留空 |
 
 ## 5. 相关文档
 
