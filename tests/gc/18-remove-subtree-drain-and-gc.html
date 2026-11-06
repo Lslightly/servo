@@ -15,14 +15,18 @@
        * drain_pool_gc（drain pool + 一次完整 GC，记成一条合计耗时），
        * 看「批量删节点 + GC」的总成本随节点数怎么增长。
        *
-       * 流程和 17 一样，每个尺寸：
-       *   1. 建树：N 个空元素挂到容器上，循环里不留任何 JS 引用；
-       *   2. 批量下树：一次 `box.textContent = "..."` 移除全部子节点；
-       *   3. reflow：读一次 offsetHeight 强制布局；
-       *   4. drain_pool_gc：drain pool，再跑一次 GC。
+       * 流程，每个尺寸：
+       *   1. 建树：创建一棵 n 个节点的子树（1 个根 + n-1 个子节点），
+       *      挂到父节点上，然后把 JS 侧的引用置空；
+       *   2. reflow + drain_pool_gc：清掉建树留下的 pool 记录；
+       *   3. 下树：一次 `stage.textContent = "removed"` 摘掉整棵子树；
+       *   4. reflow：读一次 offsetHeight 强制布局；
+       *   5. drain_pool_gc：drain pool，再跑一次 GC，把靠树边相互引用的
+       *      子树节点一起回收。
+       * 每个尺寸重复 REPEATS（30）次，每次单独占一个 task。
        *
        * 重要：drain_pool_gc 里的 drain 部分通常是空的。
-       *   `box.textContent = "..."` 这个 native call 返回时，引擎已经用
+       *   `stage.textContent = "..."` 这个 native call 返回时，引擎已经用
        *   ctx=native_call 把 Deferred 排空了（见 17 的注释）。从 JS 调用的
        *   drain_pool_gc 本身也是一个 native call，它内部 drain 时 pool 已经空，
        *   所以 ctx=drain_pool_gc 那条的 elapsed_ns 基本就是 GC 的耗时。
@@ -36,10 +40,11 @@
        *
        * 运行示例：
        *   DRAIN_STATS=1 QJS_DRAIN_STATS_OUT=drains.jsonl \
-       *     ./servoshell tests/gc/18-batch-remove-drain-pool-gc.html
+       *     ./servoshell tests/gc/18-remove-subtree-drain-and-gc.html
        */
 
       const SIZES = [10, 20, 50, 100, 200, 500, 1000, 2000];
+      const REPEATS = 30;             // 每个尺寸跑 30 次，每次单独占一个 task
       const AUTO_CLOSE = true;
 
       const stage = document.getElementById("stage");
@@ -49,19 +54,25 @@
         void document.body.offsetHeight;
       }
 
-      function makeRows(n) {
-        const box = document.createElement("div");
-        stage.appendChild(box);
-        for (let i = 0; i < n; i++) {
-          const row = document.createElement("div");
-          row.className = "item";         // 不设 textContent：避免多一个 Text 子节点
-          box.appendChild(row);
+      function makeSubTrees(n) {
+        // 一棵 n 个节点的子树：1 个根节点 + (n-1) 个子节点。
+        // 子节点都挂在根下面，整棵子树靠 DOM 树边相互引用。
+        const root = document.createElement("div");
+        for (let i = 1; i < n; i++) {
+          const child = document.createElement("div");
+          child.className = "item";       // 不设 textContent：避免多一个 Text 子节点
+          root.appendChild(child);
         }
-        return box;
+        return root;
       }
 
-      function runSize(size) {
-        const box = makeRows(size);
+      function runSize(size, repeat) {
+        // 建树：创建一棵 n 个节点的子树，然后挂到父节点（stage）上。
+        let subtree = makeSubTrees(size);
+        let tmp = stage.appendChild(subtree);
+        // 挂好之后丢掉 JS 侧的引用，子树只剩 DOM 树边这一份。
+        subtree = null;
+        tmp = null;
 
         // 建树本身也会往 pool 里塞值，先清掉，避免混进下树那次。
         // 这里用 drain_pool_gc 而不是 drain_pool：同样清空 pool，并顺带
@@ -69,23 +80,25 @@
         forceReflow();
         runtime.drain_pool_gc();
 
-        // 1. 批量下树：一次 native call 摘掉 N 个子节点。
+        // 1. 下树：一次 native call 从父节点摘掉整棵子树。
         //    每条树边读到 rc == 1 → 全部进 Deferred，在这个 native call
         //    返回时以 ctx=native_call 排空。
-        box.textContent = "removed";
+        stage.textContent = "removed";
 
         // 2. reflow：布局侧若有 Dom 句柄，最后一份引用会在这里释放。
         forceReflow();
 
-        // 3. drain_pool_gc：此时 pool 通常已空，这条记录测到的主要是 GC。
+        // 3. drain_pool_gc：子树内部节点相互引用、又没有外部根了，
+        //    这次 GC 把它们一起回收。
         runtime.drain_pool_gc();
 
-        box.remove();
-
-        console.log("[batch-remove-gc] size =", size, "values_expected =", size);
+        console.log("[batch-remove-gc] size =", size, "repeat =", repeat,
+                    "values_expected =", size);
       }
 
-      let next = 0;
+      let next = 0;     // 当前尺寸在 SIZES 中的下标
+      let repeat = 0;   // 当前尺寸已经跑过的次数
+
       function step() {
         if (next >= SIZES.length) {
           console.log(
@@ -97,8 +110,12 @@
           }
           return;
         }
-        runSize(SIZES[next++]);
-        // 每个尺寸单独占一个 task，让上一个尺寸的残留 drain 先结束。
+        runSize(SIZES[next], repeat);
+        // 每个尺寸跑 REPEATS 次，每次单独占一个 task，让上一次的残留 drain 先结束。
+        if (++repeat >= REPEATS) {
+          repeat = 0;
+          next++;
+        }
         setTimeout(step, 0);
       }
 
