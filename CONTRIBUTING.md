@@ -6,15 +6,15 @@ Patches that comply with upstream rules and are stable, should preferably be sub
 Patches that are blocked upstream, and improve the experience on ohos can be merged here, to ease sharing between ohos contributors.
 
 The `main` branch follows `upstream/main` and carries no patches. 
-The `ohos-main` contains `main` + our patches and will be rebased regularly (via force-push).
+The `ohos-main` contains the latest Servo release + our patches and will be rebased onto each new release (via force-push).
 Previous states will be preserved by tagging commits before / after syncing.
 After a sync, update local branches with `git pull --rebase` / `git rebase ohos-main`
 (set `pull.rebase = true`), or deterministically with
 `git rebase --onto sync/<date> pre-sync/<date> <branch>` — see
 [docs/ohos-sync.md](docs/ohos-sync.md), "After a sync: updating your branches".
-`base/<date>` tags mark the base state of `main` on a given date of a sync.
-`pre-sync/<date>` tags mark the last commit on `ohos-main` before a rebase onto main.
-`sync/<date>` marks the last commit on `ohos-main` after a rebase onto main.
+`base/<date>` tags mark the upstream commit, normally a release tag's, that a sync rebased `ohos-main` onto.
+`pre-sync/<date>` tags mark the last commit on `ohos-main` before a sync.
+`sync/<date>` marks the last commit on `ohos-main` after a sync.
 
 
 The rules in this fork are roughly:

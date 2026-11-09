@@ -11,8 +11,9 @@ Usage: uv run docs/ohos-sync/check_integrity.py [head-ref]
 The base is derived as `<head-ref>~<number of STACK.md entries>`; a shallow
 clone is deepened to reach it. Then `check_stack.py` runs against it, including
 the `--check` runs of the vendoring scripts under third_party/, and the base
-must be an ancestor of servo/servo `main` (checked via the GitHub API,
-authenticated with $GITHUB_TOKEN if set). This is the `integrity` CI job.
+must be an ancestor of servo/servo `main` or a servo/servo release tag (checked
+via the GitHub API, authenticated with $GITHUB_TOKEN if set). This is the
+`integrity` CI job.
 """
 
 import json
@@ -20,23 +21,36 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from typing import Any
 
 from check_stack import check_manifest, check_patches, check_vendored
 from stacklib import git, read_manifest
 
 
-def upstream_status(base: str) -> str:
+def servo_api(path: str) -> Any:
     request = urllib.request.Request(
-        f"https://api.github.com/repos/servo/servo/compare/{base}...main",
+        f"https://api.github.com/repos/servo/servo/{path}",
         headers={"Accept": "application/vnd.github+json"},
     )
     if token := os.environ.get("GITHUB_TOKEN"):
         request.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(request) as response:
+        return json.load(response)
+
+
+def upstream_status(base: str) -> str:
     try:
-        with urllib.request.urlopen(request) as response:
-            return json.load(response)["status"]
+        return servo_api(f"compare/{base}...main")["status"]
     except urllib.error.HTTPError as e:
         return f"HTTP {e.code}"
+
+
+def release_tag(base: str) -> str | None:
+    try:
+        tags = servo_api("tags?per_page=100")
+    except urllib.error.HTTPError:
+        return None
+    return next((tag["name"] for tag in tags if tag["commit"]["sha"] == base), None)
 
 
 def main() -> int:
@@ -56,8 +70,10 @@ def main() -> int:
     status = upstream_status(base)
     if status in ("ahead", "identical"):
         print("base ok: ancestor of servo/servo main")
+    elif tag := release_tag(base):
+        print(f"base ok: servo/servo release {tag}")
     else:
-        print(f"base is not an ancestor of servo/servo main (compare status: {status})")
+        print(f"base is neither an ancestor of servo/servo main (compare status: {status}) nor a release tag")
         ok = False
     return 0 if ok else 1
 

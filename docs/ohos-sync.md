@@ -1,7 +1,7 @@
 # Syncing `ohos-main` with upstream
 
-`ohos-main` is `main` (a mirror of `upstream/main`) plus an ordered patch
-stack. It is rebased regularly and force-pushed. This is the runbook; it is
+`ohos-main` is the latest Servo release (an upstream `v<version>` tag) plus an
+ordered patch stack. It is rebased regularly and force-pushed. This is the runbook; it is
 written so an agent session can run a sync end to end with only
 "run the sync runbook in docs/ohos-sync.md" as instruction.
 
@@ -25,7 +25,7 @@ disagree, `CONTRIBUTING.md` wins and this file must be fixed.
 - `integrity` CI job: runs `docs/ohos-sync/check_integrity.py` on every PR,
   i.e. `check_stack.py` against the PR head with the base derived from the
   manifest length (CI has no `base/<date>` tags), and checks that this base
-  is an upstream commit.
+  is an upstream commit on `main` or an upstream release tag.
 
 ## What a sync review consists of
 
@@ -43,8 +43,15 @@ A rebase can go wrong in three ways, and each needs its own evidence:
 
 ## Decisions (fixed, do not re-ask)
 
-1. Base = the tip of `upstream/main` at the time of the sync, unless the
-   sync request names a commit.
+1. Base = the newest upstream release tag (`v<version>`) at the time of the
+   sync, unless the sync request names a commit. A release tag sits on a
+   release branch: its branch point on `upstream/main` plus release commits
+   (for 0.8.0, Stylo from crates.io and a publishing option; earlier releases
+   also carried backports). `third_party/patches/stylo/update.sh` vendors
+   Stylo from either source, but the `[patch]` table in `Cargo.toml` has to
+   match it: `[patch.crates-io]` for a release, `[patch."<git url>"]` for a
+   commit on `upstream/main`. `check_stack.py` fails on the
+   `[[patch.unused]]` entry that a mismatch leaves in `Cargo.lock`.
 2. `Cargo.lock` is never merged by hand. Resolve to upstream's version, then
    regenerate the fork's additions with `cargo update -p <crate>` /
    `cargo metadata --locked` until it is consistent.
@@ -76,19 +83,25 @@ A rebase can go wrong in three ways, and each needs its own evidence:
 ### 0. Prepare
 
 ```sh
-git fetch upstream main
-gh api "repos/servo/servo/actions/runs?head_sha=$(git rev-parse upstream/main)&event=merge_group" \
+git fetch upstream main tag v<version>
+point=$(git merge-base v<version> upstream/main)
+git log --oneline $point..v<version>
+gh api "repos/servo/servo/actions/runs?head_sha=$point&event=merge_group" \
   --jq '.workflow_runs[] | select(.name == "Main") | .conclusion'
 git tag pre-sync/<date> ohos-main
-git tag base/<date> upstream/main
+git tag base/<date> 'v<version>^{commit}'
 git worktree add -b ohos-sync-<date> <worktree-dir> ohos-main
 ```
 
 The base needs a complete WPT run in servo/servo's merge queue, whose results
 [servo-ohos-wpt](https://github.com/openharmony-rs/servo-ohos-wpt) shows as the
-upstream base line: the `gh api` command must print `success`, which means that
-all WPT chunks ran. Otherwise, tag the newest earlier upstream commit for which
-it does as `base/<date>` instead of `upstream/main`.
+upstream base line. A release has no run of its own, so this is the run of its
+branch point, which servo-ohos-wpt also takes as the base of `ohos-main`'s runs:
+the `gh api` command must print `success`, which means that all WPT chunks ran,
+and the release commits that `git log` lists must change no code beyond the
+source of dependencies and publishing options. Otherwise, ask a human. For a
+named commit on `upstream/main`, check its own run instead, and tag the newest
+earlier upstream commit whose run succeeded if it didn't.
 
 Use a private cargo target dir for the worktree.
 
@@ -97,7 +110,7 @@ touch files the stack touches — this is the briefing for conflict
 resolution:
 
 ```sh
-git merge-tree --write-tree upstream/main ohos-main | grep ^CONFLICT
+git merge-tree --write-tree base/<date> ohos-main | grep ^CONFLICT
 git diff --name-only base/<prev>..pre-sync/<date> | grep -v '^ports/arkweb/' \
   | xargs git log --oneline base/<prev>..base/<date> --
 ```
@@ -126,8 +139,15 @@ and the stack's differences get expectations.
 
 ```sh
 git -c rerere.enabled=false rebase --signoff --empty=ask \
+  --exec 'cargo metadata --locked --format-version 1 > /dev/null' \
   --onto base/<date> base/<prev> ohos-sync-<date>
 ```
+
+`--exec` stops after every commit whose `Cargo.lock` no longer matches,
+including one that merged without a conflict: a new upstream version keeps
+the old version of a workspace crate that a patch adds to the lock (on
+2026-11-09, arkweb and servo-media-cache). Fix it with `cargo metadata`
+without `--locked`, amend, and continue.
 
 `--empty=ask` (`stop` from git 2.45) stops at a patch that applies empty,
 so it becomes a decision-3 placeholder instead of silently disappearing.
@@ -147,12 +167,15 @@ For each stop:
   `cargo metadata --locked` and fix by `cargo update -p` on the fork's own
   dependencies only.
 - Vendored third-party code (`third_party/<name>`): when upstream moves the
-  pin its `third_party/patches/<name>/update.sh` reads (Stylo's `rev` in
-  `Cargo.toml`), rebase those patches onto the new pin in a checkout of the
+  pin its `third_party/patches/<name>/update.sh` reads (Stylo's version, or
+  its `rev` on upstream's main branch, in `Cargo.toml`), rebase those patches onto the new pin in a checkout of the
   project, re-export them with `update.sh --export-patches <checkout> <rev>`,
   re-run `update.sh` and regenerate `Cargo.lock`; `update.sh --check` must
-  pass. A stale copy still builds, because `[patch]` resolves to whatever is
-  vendored, so check this whenever the pin moved, conflict or not.
+  pass. A stale copy still builds: for a git pin, `[patch]` resolves to
+  whatever is vendored, and for a crates.io version, Cargo builds the
+  unpatched crate when the vendored copy has another version (a
+  `[[patch.unused]]` entry in `Cargo.lock`). So check this whenever the pin
+  moved, conflict or not.
 - QuickJS expectations (the `if js_engine == "quickjs"` conditions in
   `tests/wpt/meta`, `tests/wpt/mozilla/meta` and `tests/wpt/webgl/meta`):
   take upstream's side of the conflicting hunks; step 3

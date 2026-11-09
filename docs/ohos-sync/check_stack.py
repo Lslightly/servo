@@ -97,6 +97,11 @@ def check_vendored() -> bool:
         r = subprocess.run([script, "--check"], capture_output=True, text=True)
         print(f"{script.relative_to(REPO)}: {r.stdout.strip() or r.stderr.strip()}")
         ok = r.returncode == 0 and ok
+    # A `[patch]` table whose vendored crates don't match the dependency (a crates.io table on a git pin, or
+    # another version) makes Cargo build the unpatched crate, and only Cargo.lock records it.
+    if "[[patch.unused]]" in (REPO / "Cargo.lock").read_text():
+        print("Cargo.lock: `[[patch.unused]]`: a [patch] table in Cargo.toml doesn't apply")
+        ok = False
     return ok
 
 
