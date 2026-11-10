@@ -149,6 +149,8 @@ those scripts (they need network access). `check_stack.py` runs each with
 123. `quickjs: Bump servo-quickjs for mozjs 0.26.14` — B · CI · watch: Cargo.toml
 124. `docs: Base ohos-main on Servo releases` — B · tooling · watch: -
 125. `backport: wpt: Wait for web fonts before measuring in Ahem-based testharness tests (#49502)` — B · CI · watch: -
+126. `fixup! ci: Run the device WPT in one chunk per DAYU200 board` — A · manual · watch: -
+127. `docs: record patches 126 to 127 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 10 Nov 2026 16:08:28 +0000
+Subject: [PATCH] docs: record patches 126 to 127 in the stack manifest
+
+Validation: `uv run docs/ohos-sync/check_stack.py base/2026-11-09` passes.
+AI-assisted: Yes (agent session; written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index f454b200eeb..d1fe292cfd1 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -149,6 +149,8 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 123. `quickjs: Bump servo-quickjs for mozjs 0.26.14` — B · CI · watch: Cargo.toml
+ 124. `docs: Base ohos-main on Servo releases` — B · tooling · watch: -
+ 125. `backport: wpt: Wait for web fonts before measuring in Ahem-based testharness tests (#49502)` — B · CI · watch: -
++126. `fixup! ci: Run the device WPT in one chunk per DAYU200 board` — A · manual · watch: -
++127. `docs: record patches 126 to 127 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 

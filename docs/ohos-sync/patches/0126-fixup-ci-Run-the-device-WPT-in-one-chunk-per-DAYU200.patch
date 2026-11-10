@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Tue, 10 Nov 2026 16:08:19 +0000
+Subject: [PATCH] fixup! ci: Run the device WPT in one chunk per DAYU200 board
+
+The merge job deleted the chunk artifacts it merged. When a failed chunk
+was re-run, the re-run's merge found only that chunk, and nothing was
+stored: in the nightly run of 2026-11-10 (42752587516), chunk 2 lost its
+board and its re-run passed, but chunk 1's artifact was gone. The merge
+now keeps the chunk artifacts, which expire after 30 days, as long as
+GitHub allows a re-run, and the re-run's merge takes the other chunk's
+artifact from the first attempt, as `upload-artifact/merge` takes the
+latest artifact of each name. servo-ohos-wpt's store.yml also looked for
+that run's merged artifact in the wrong directory; that is fixed there.
+
+The merge also ran when the setup found nothing to test, and failed with
+"No artifacts found", as in the nightly run of 2026-11-09 (42545185337).
+It now runs only when the setup decided to test.
+
+Validation: actionlint reports only the known warnings (two local actions without a description, the custom runner labels). Not run on CI yet. An independent agent review checked both changes against the sources of `upload-artifact/merge@v7` (`listArtifacts({latest: true})`) and `download-artifact@v8`, and against the artifacts and logs of both attempts of 42752587516.
+AI-assisted: Yes (agent session; found from the 2026-11-10 nightly's re-run and written by the agent, reviewed by an independent agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/ohos-device-wpt.yml | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/.github/workflows/ohos-device-wpt.yml b/.github/workflows/ohos-device-wpt.yml
+index 812b808ca2a..8fd5a3ef149 100644
+--- a/.github/workflows/ohos-device-wpt.yml
++++ b/.github/workflows/ohos-device-wpt.yml
+@@ -226,11 +226,14 @@ jobs:
+           name: wpt-full-logs-ohos-dayu200-${{ matrix.chunk }}
+           path: wpt-full-logs
+           if-no-files-found: error
++          # The merge keeps the chunks, so that a re-run of a failed chunk merges with the others, for
++          # as long as GitHub allows re-runs.
++          retention-days: 30
+ 
+   merge:
+     name: Merge the WPT results
+-    needs: wpt
+-    if: ${{ !cancelled() }}
++    needs: [setup, wpt]
++    if: ${{ !cancelled() && needs.setup.outputs.run == 'true' }}
+     runs-on: ubuntu-24.04
+     permissions: {}
+     steps:
+@@ -238,7 +241,6 @@ jobs:
+         with:
+           name: wpt-full-logs-ohos-dayu200
+           pattern: wpt-full-logs-ohos-dayu200-*
+-          delete-merged: true
+ 
+   # The called workflow takes its token from the `servo-ohos-wpt` environment, which only ohos-main
+   # can use.
