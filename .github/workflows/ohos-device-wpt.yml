@@ -226,11 +226,14 @@ jobs:
           name: wpt-full-logs-ohos-dayu200-${{ matrix.chunk }}
           path: wpt-full-logs
           if-no-files-found: error
+          # The merge keeps the chunks, so that a re-run of a failed chunk merges with the others, for
+          # as long as GitHub allows re-runs.
+          retention-days: 30
 
   merge:
     name: Merge the WPT results
-    needs: wpt
-    if: ${{ !cancelled() }}
+    needs: [setup, wpt]
+    if: ${{ !cancelled() && needs.setup.outputs.run == 'true' }}
     runs-on: ubuntu-24.04
     permissions: {}
     steps:
@@ -238,7 +241,6 @@ jobs:
         with:
           name: wpt-full-logs-ohos-dayu200
           pattern: wpt-full-logs-ohos-dayu200-*
-          delete-merged: true
 
   # The called workflow takes its token from the `servo-ohos-wpt` environment, which only ohos-main
   # can use.
