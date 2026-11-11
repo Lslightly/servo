@@ -151,6 +151,9 @@ those scripts (they need network access). `check_stack.py` runs each with
 125. `backport: wpt: Wait for web fonts before measuring in Ahem-based testharness tests (#49502)` — B · CI · watch: -
 126. `fixup! ci: Run the device WPT in one chunk per DAYU200 board` — A · manual · watch: -
 127. `docs: record patches 126 to 127 in the stack manifest` — B · none · watch: -
+128. `script: Run debugger.js on QuickJS` — B · CI · watch: components/default-resources/resources/debugger.js support/quickjs/cargo-config.toml
+129. `ci: Run the devtools tests on QuickJS` — A · CI · watch: python/servo/devtools_tests
+130. `docs: record patches 128 to 130 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

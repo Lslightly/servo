@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 4 Nov 2026 11:26:32 +0000
+Subject: [PATCH] ci: Run the devtools tests on QuickJS
+
+The QuickJS build passes them as the SpiderMonkey build does, with
+servo-quickjs's emulation of the Debugger API. They run after the
+artifact for WPT is uploaded, so that a failure doesn't skip WPT. They
+have no QuickJS-specific expectations, so a new devtools test that
+fails only on QuickJS fails this job.
+
+Validation: `./mach test-devtools` on local QuickJS builds against servo-quickjs 48bd1fc (the same tree as 6ac4a17): 102 passed, 7 xfailed, in release and checked-release. The workflow didn't run (local branch).
+AI-assisted: Yes (agent session; written and tested by the agent, reviewed by another agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ .github/workflows/quickjs.yml | 15 ++++++++++-----
+ python/servo/pr_jobs.py       |  3 ++-
+ 2 files changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/.github/workflows/quickjs.yml b/.github/workflows/quickjs.yml
+index a4fc8eb474a..e4b3c31e3de 100644
+--- a/.github/workflows/quickjs.yml
++++ b/.github/workflows/quickjs.yml
+@@ -1,8 +1,8 @@
+-# Builds servoshell on the QuickJS mozjs shim (openharmony-rs/servo-quickjs) and runs WPT with it,
+-# against the expectations with their `js_engine == "quickjs"` conditions. Pull requests run WPT
+-# on the directories of the Linux WPT job, and the whole suite when they change the shim pin
+-# (python/servo/pr_jobs.py); the merge queue runs the build and smoketest only, and ohos-main-wpt.yml
+-# the whole suite on every ohos-main push.
++# Builds servoshell on the QuickJS mozjs shim (openharmony-rs/servo-quickjs), and runs the devtools
++# tests and WPT with it, against the expectations with their `js_engine == "quickjs"` conditions.
++# Pull requests run WPT on the directories of the Linux WPT job, and the whole suite when they change
++# the shim pin (python/servo/pr_jobs.py); the merge queue runs the build, smoketest and devtools
++# tests only, and ohos-main-wpt.yml the whole suite on every ohos-main push.
+ name: QuickJS
+ on:
+   workflow_call:
+@@ -133,6 +133,11 @@ jobs:
+           name: ${{ env.PROFILE }}-binary-quickjs
+           path: target/${{ env.PROFILE }}/servo-tech-demo.tar.gz
+           if-no-files-found: error
++      # The devtools' debugger runs on the shim's emulation of SpiderMonkey's Debugger API. After
++      # the WPT artifact, so that a failure here doesn't skip WPT.
++      - name: Devtools tests
++        timeout-minutes: 15
++        run: ./mach test-devtools --profile "$PROFILE"
+ 
+   # Takes the token of the caller, like the Linux WPT job: its report creates a check run and
+   # comments on the pull request.
+diff --git a/python/servo/pr_jobs.py b/python/servo/pr_jobs.py
+index da52ef4f6d6..8bbee72b50a 100644
+--- a/python/servo/pr_jobs.py
++++ b/python/servo/pr_jobs.py
+@@ -12,7 +12,8 @@
+ Every pull request runs the Linux unit tests and lint. On top of that:
+ 
+ - OHOS code: the OHOS build. The Linux WPT run never executes that code.
+-- The QuickJS workflow or the servo-quickjs pin: the QuickJS build and the whole QuickJS WPT suite.
++- The QuickJS workflow or the servo-quickjs pin: the QuickJS build, its devtools tests and the whole
++  QuickJS WPT suite.
+ - WPT tests or expectations: a Linux WPT run of the directories of those tests, with SpiderMonkey
+   and QuickJS, or of the whole suites for more than `MAX_DIRECTORIES` directories.
+ - Files that no build or test reads, such as documentation: nothing.
