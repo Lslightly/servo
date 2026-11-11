@@ -126,8 +126,8 @@ fn test_valid_dom_struct_generation() {
                 cx: &mut js::context::JSContext,
                 rval: js::rust::MutableHandleValue,
             ) {
-                let object = crate::DomObject::reflector(self).get_jsobject();
-                object.to_jsval(cx, rval);
+                let reflector = crate::DomObject::reflector(self);
+                ::js::conversions::ToJSValConvertible::to_jsval(reflector, cx, rval);
             }
         }
         impl crate::DomObject for DomElement {

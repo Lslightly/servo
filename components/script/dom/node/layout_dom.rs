@@ -349,9 +349,18 @@ impl<'dom> LayoutDom<'dom, Node> {
             .and_then(|iframe_element| iframe_element.pipeline_id())
     }
 
+    /// The identity of the node is the address of its DOM object, not of its JS object: the
+    /// latter changes when the `JSDomStub` is materialized into a real `JSObject`, while layout
+    /// and style cache this identity for as long as the node lives.
+    #[cfg(not(feature = "js-quickjs"))]
     #[expect(unsafe_code)]
     pub(crate) fn opaque(self) -> OpaqueNode {
         unsafe { OpaqueNode(self.get_jsobject() as usize) }
+    }
+
+    #[cfg(feature = "js-quickjs")]
+    pub(crate) fn opaque(self) -> OpaqueNode {
+        OpaqueNode(self.get_dom_obj_ptr() as usize)
     }
 
     #[expect(unsafe_code)]

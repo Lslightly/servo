@@ -175,6 +175,13 @@ impl FromJSValConvertible for ByteString {
 
 impl<T> ToJSValConvertible for Reflector<T> {
     fn to_jsval(&self, cx: &mut JSContext, mut rval: MutableHandleValue) {
+        // QuickJS: the DOM object is still a `JSDomStub` until it is first handed to JS.
+        // Materialize it before the value leaves the embedder, as QuickJS treats it as a regular
+        // object (e.g. `ResolvePromise` reads its `then` property).
+        #[cfg(feature = "js-quickjs")]
+        unsafe {
+            crate::wrap::materialize_if_needed(cx, self);
+        }
         let obj = self.get_jsobject().get();
         assert!(!obj.is_null());
         rval.set(ObjectValue(obj));
