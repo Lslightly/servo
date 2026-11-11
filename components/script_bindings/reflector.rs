@@ -5,10 +5,12 @@
 #![cfg_attr(crown, allow(crown::jscontext_first_arg))]
 
 use std::cell::Cell;
+#[cfg(feature = "js-quickjs")]
+use std::ffi::c_void;
 use std::rc::Rc;
 
 use js::context::JSContext;
-use js::jsapi::{AddAssociatedMemory, Heap, JSObject, MemoryUse, RemoveAssociatedMemory};
+use js::jsapi::{AddAssociatedMemory, Heap, JSClass, JSObject, MemoryUse, RemoveAssociatedMemory};
 use js::rust::HandleObject;
 use malloc_size_of_derive::MallocSizeOf;
 
@@ -38,6 +40,39 @@ impl AssociatedMemorySize for AssociatedMemory {
     }
 }
 
+#[cfg(feature = "js-quickjs")]
+struct LazyCache {
+    proto: Cell<*mut JSObject>,
+    canonical_proto: Cell<*mut JSObject>,
+    /// The class the reflector was created with: the object's actual interface class, which may
+    /// be more derived than the static type the object is currently handled as (e.g. an
+    /// `HTMLDivElement` returned as `Element`). `None` for proxies, which have no class of their
+    /// own.
+    class: Option<*const JSClass>,
+    /// Whether the object is wrapped as a proxy: such an object is backed by a real `JSObject`
+    /// from the start and must never be materialized.
+    is_proxy: bool,
+    /// Whether that class has `[LegacyUnforgeable]` members to copy into the object.
+    has_legacy_unforgeable_members: bool,
+}
+
+#[cfg(feature = "js-quickjs")]
+impl LazyCache {
+    fn new(
+        class: Option<*const JSClass>,
+        is_proxy: bool,
+        has_legacy_unforgeable_members: bool,
+    ) -> Self {
+        LazyCache {
+            proto: Cell::new(std::ptr::null_mut()),
+            canonical_proto: Cell::new(std::ptr::null_mut()),
+            class,
+            is_proxy,
+            has_legacy_unforgeable_members,
+        }
+    }
+}
+
 /// A struct to store a reference to the reflector of a DOM object.
 #[derive(MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
@@ -54,6 +89,12 @@ pub struct Reflector<T = ()> {
     /// QuickJS: whether `object` holds a count, see `hold_object`.
     #[cfg(feature = "js-quickjs")]
     counted: Cell<bool>,
+    /// QuickJS: the lazy-wrap cache. `Some` while `object` is a `JSDomStub` that has not been
+    /// materialized into a real `JSObject` yet; cleared once the object is bound to a real
+    /// `JSObject` (see `wrap::materialize_if_needed`).
+    #[cfg(feature = "js-quickjs")]
+    #[ignore_malloc_size_of = "raw JS object pointers, owned by the JS engine"]
+    proto_cache: Cell<Option<LazyCache>>,
 }
 
 unsafe impl<T> js::gc::Traceable for Reflector<T> {
@@ -94,6 +135,20 @@ impl<T> Reflector<T> {
     pub fn get_jsobject(&self) -> HandleObject<'_> {
         // We're rooted, so it's safe to hand out a handle to object in Heap
         unsafe { HandleObject::from_raw(self.object.handle()) }
+    }
+
+    /// Return a raw pointer to the DOM object that owns this `Reflector`.
+    ///
+    /// By Servo convention, every DOM struct has its `Reflector` as its first field, so the
+    /// address of the `Reflector` is also the address of the surrounding DOM struct. This is the
+    /// pointer stored in `DOM_OBJECT_SLOT` of the corresponding JS object.
+    ///
+    /// Unlike [`Self::get_jsobject`], this does not change when a `JSDomStub` is materialized into
+    /// a real `JSObject`, so it can be used as a stable node identity (e.g. for `OpaqueNode`).
+    #[cfg(feature = "js-quickjs")]
+    #[inline]
+    pub fn get_dom_obj_ptr(&self) -> *mut c_void {
+        self as *const Reflector<T> as *mut c_void
     }
 
     /// Get the cached prototype ID.
@@ -145,11 +200,136 @@ impl<T> Reflector<T> {
         unsafe { *self.object.get_unsafe() = std::ptr::null_mut() };
     }
 
+    /// QuickJS: replaces the object the reflector points at, e.g. when a `JSDomStub` is
+    /// materialized into a real `JSObject`. The old object must already have been freed or
+    /// otherwise made unreachable.
+    ///
+    /// # Safety
+    ///
+    /// The provided [`JSObject`] pointer must point to a valid [`JSObject`].
+    #[cfg(feature = "js-quickjs")]
+    pub(crate) unsafe fn rebind_jsobject(&self, object: *mut JSObject) {
+        assert!(!self.object.get().is_null(), "Reflector not initialized");
+        assert!(!object.is_null());
+        assert!(!self.counted.get(), "Cannot rebind a counted reflector");
+        unsafe {
+            *self.object.get_unsafe() = object;
+            crate::root::quickjs_refs::register(self as *const Self as *const Reflector, object);
+        }
+    }
+
     /// Return a pointer to the memory location at which the JS reflector
     /// object is stored. Used to root the reflector, as
     /// required by the JSAPI rooting APIs.
     pub fn rootable(&self) -> &Heap<*mut JSObject> {
         &self.object
+    }
+
+    /// Whether the object is backed by a real `JSObject`.
+    ///
+    /// QuickJS: this is true once the lazy cache has been cleared, i.e. after materializing a
+    /// `JSDomStub`. Proxies cache their wrap info as well, so callers that care about proxies
+    /// must check `is_proxy` too (see `wrap::materialize_if_needed`).
+    pub fn is_js_binded(&self) -> bool {
+        #[cfg(feature = "js-quickjs")]
+        {
+            unsafe { (*self.proto_cache.as_ptr()).is_none() }
+        }
+        #[cfg(not(feature = "js-quickjs"))]
+        {
+            true
+        }
+    }
+
+    /// Cache the prototype, canonical prototype and wrap info of this DOM object, for lazily
+    /// creating its real `JSObject` later.
+    pub fn cache_proto(
+        &self,
+        proto: HandleObject<'_>,
+        canonical_proto: HandleObject<'_>,
+        class: Option<&'static JSClass>,
+        is_proxy: bool,
+        has_legacy_unforgeable_members: bool,
+    ) {
+        #[cfg(feature = "js-quickjs")]
+        {
+            let cache = LazyCache::new(
+                class.map(|class| class as *const JSClass),
+                is_proxy,
+                has_legacy_unforgeable_members,
+            );
+            cache.proto.set(proto.get());
+            cache.canonical_proto.set(canonical_proto.get());
+            self.proto_cache.set(Some(cache));
+        }
+        #[cfg(not(feature = "js-quickjs"))]
+        {
+            let _ = (proto, canonical_proto, class, is_proxy, has_legacy_unforgeable_members);
+        }
+    }
+
+    /// QuickJS: drops the cached prototypes once `object` is a real `JSObject`.
+    #[cfg(feature = "js-quickjs")]
+    pub(crate) fn clear_proto_cache(&self) {
+        self.proto_cache.set(None);
+    }
+
+    /// Return a handle to the cached prototype. The handle points into the reflector, so it stays
+    /// valid as long as the reflector does.
+    pub fn get_proto(&self) -> HandleObject<'_> {
+        #[cfg(feature = "js-quickjs")]
+        {
+            let cache = unsafe { (*self.proto_cache.as_ptr()).as_ref() }
+                .expect("Lazy cache not set");
+            let cell = &cache.proto;
+            assert!(!unsafe { *cell.as_ptr() }.is_null(), "Lazy cache not set");
+            unsafe { HandleObject::from_marked_location(cell.as_ptr()) }
+        }
+        #[cfg(not(feature = "js-quickjs"))]
+        {
+            unimplemented!()
+        }
+    }
+
+    /// Return a handle to the cached canonical prototype.
+    pub fn get_canonical_proto(&self) -> HandleObject<'_> {
+        #[cfg(feature = "js-quickjs")]
+        {
+            let cache = unsafe { (*self.proto_cache.as_ptr()).as_ref() }
+                .expect("Lazy cache not set");
+            let cell = &cache.canonical_proto;
+            assert!(!unsafe { *cell.as_ptr() }.is_null(), "Lazy cache not set");
+            unsafe { HandleObject::from_marked_location(cell.as_ptr()) }
+        }
+        #[cfg(not(feature = "js-quickjs"))]
+        {
+            unimplemented!()
+        }
+    }
+
+    /// QuickJS: the class the reflector was created with. Panics for proxies, which have none.
+    #[cfg(feature = "js-quickjs")]
+    pub(crate) fn get_class(&self) -> *const JSClass {
+        unsafe { (*self.proto_cache.as_ptr()).as_ref() }
+            .expect("Lazy cache not set")
+            .class
+            .expect("Proxy has no class")
+    }
+
+    /// QuickJS: whether the reflector wraps its object as a proxy.
+    #[cfg(feature = "js-quickjs")]
+    pub(crate) fn is_proxy(&self) -> bool {
+        unsafe { (*self.proto_cache.as_ptr()).as_ref() }
+            .expect("Lazy cache not set")
+            .is_proxy
+    }
+
+    /// QuickJS: whether the reflector's class has `[LegacyUnforgeable]` members.
+    #[cfg(feature = "js-quickjs")]
+    pub(crate) fn has_legacy_unforgeable_members(&self) -> bool {
+        unsafe { (*self.proto_cache.as_ptr()).as_ref() }
+            .expect("Lazy cache not set")
+            .has_legacy_unforgeable_members
     }
 }
 
@@ -164,6 +344,8 @@ impl<T: AssociatedMemorySize> Reflector<T> {
             size: T::default(),
             #[cfg(feature = "js-quickjs")]
             counted: Cell::new(false),
+            #[cfg(feature = "js-quickjs")]
+            proto_cache: Cell::new(None),
         }
     }
 
