@@ -32,8 +32,10 @@ pub(crate) fn expand_dom_object(input: syn::ItemStruct) -> proc_macro2::TokenStr
     let items = quote! {
         impl #impl_generics ::js::conversions::ToJSValConvertible for #name #ty_generics #where_clause {
             fn to_jsval(&self, cx: &mut js::context::JSContext, rval: js::rust::MutableHandleValue) {
-                let object = crate::DomObject::reflector(self).get_jsobject();
-                object.to_jsval(cx, rval);
+                // Go through the reflector's conversion, which materializes the DOM object on
+                // first conversion in QuickJS, instead of handing out the `JSDomStub`.
+                let reflector = crate::DomObject::reflector(self);
+                ::js::conversions::ToJSValConvertible::to_jsval(reflector, cx, rval);
             }
         }
 
