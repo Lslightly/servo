@@ -79,30 +79,30 @@ unsafe fn wrap_object<T: MutDomObject>(
         (config.proto_object_fn)(cx, *scope, canonical_proto.handle_mut());
         assert!(!canonical_proto.is_null());
 
-        rooted!(&in(cx) let mut proto = ptr::null_mut::<JSObject>());
-        match given_proto {
-            Some(given) if !config.is_proxy => {
-                proto.set(*given);
-                if get_context_realm(cx.raw_cx()) != get_object_realm(*given) {
-                    assert!(JS_WrapObject(cx, proto.handle_mut()));
-                }
-            },
-            _ => proto.set(*canonical_proto),
-        }
-
-        // Cache the proto, canonical proto and wrap info in the reflector, for materializing the
-        // object later. Proxies are cached too, so that `new_and_bindto_jsobject` can tell them
-        // apart from an object that still needs materializing.
-        (*raw.as_ptr()).reflector().cache_proto(
-            proto.handle(),
-            canonical_proto.handle(),
-            config.class,
-            config.is_proxy,
-            config.has_legacy_unforgeable_members,
-        );
-
         // not proxy object, use JS_NewDomStub to create a JSDomStub object.
         if !config.is_proxy {
+            rooted!(&in(cx) let mut proto = ptr::null_mut::<JSObject>());
+            match given_proto {
+                Some(given) if !config.is_proxy => {
+                    proto.set(*given);
+                    if get_context_realm(cx.raw_cx()) != get_object_realm(*given) {
+                        assert!(JS_WrapObject(cx, proto.handle_mut()));
+                    }
+                },
+                _ => proto.set(*canonical_proto),
+            }
+
+            // Cache the proto, canonical proto and wrap info in the reflector, for materializing the
+            // object later. Proxies are cached too, so that `new_and_bindto_jsobject` can tell them
+            // apart from an object that still needs materializing.
+            (*raw.as_ptr()).reflector().cache_proto(
+                proto.handle(),
+                canonical_proto.handle(),
+                config.class,
+                config.is_proxy,
+                config.has_legacy_unforgeable_members,
+            );
+
             // The stub owns `ObjectData` (allocated by `JS_NewDomStub`) and, through it, the DOM
             // node until it is replaced by a real `JSObject`. Like a materialized object, the
             // stub keeps the node in `DOM_OBJECT_SLOT`.
