@@ -11,16 +11,14 @@ use js::glue::SetProxyReservedSlot;
 use js::jsapi::{JS_SetReservedSlot, JSAutoRealm, JSClass, JSObject};
 use js::jsval::{PrivateValue, UndefinedValue};
 use js::rust::wrappers2::{
-    JS_GetDomStubRefCount, JS_InitializePropertiesFromCompatibleNativeObject, JS_NewDomStub,
-    JS_NewObjectWithGivenProto, JS_UnbindDomStub, JS_WrapObject, NewProxyObject,
+    JS_InitializePropertiesFromCompatibleNativeObject, JS_NewDomStub, JS_WrapObject, NewProxyObject,
 };
 use js::rust::{Handle, get_context_realm, get_object_class, get_object_realm};
 
 use crate::codegen::PrototypeList;
-use crate::conversions::{DOM_OBJECT_SLOT, private_from_object};
+use crate::conversions::DOM_OBJECT_SLOT;
 use crate::import::module::JS_GetReservedSlot;
 use crate::proxyhandler::ensure_expando_object;
-use crate::reflector::Reflector;
 use crate::root::{DomRoot, MaybeUnreflectedDom, Root};
 use crate::utils::DOM_PROTO_UNFORGEABLE_HOLDER_SLOT;
 use crate::{DomObject, DomTypes, MutDomObject};
@@ -49,7 +47,7 @@ pub(crate) unsafe fn wrap<T: MutDomObject, D: DomTypes>(
 ) -> DomRoot<T> {
     unsafe {
         rooted!(&in(cx) let mut obj = ptr::null_mut::<JSObject>());
-        wrap_object::<T, D>(
+        wrap_object::<T>(
             cx,
             &scope.reflector().get_jsobject(),
             given_proto,
@@ -64,7 +62,7 @@ pub(crate) unsafe fn wrap<T: MutDomObject, D: DomTypes>(
 }
 
 // `wrap` is instantiated many times, so we move most of the code into this non-generic helper.
-unsafe fn wrap_object<T: MutDomObject, D: DomTypes>(
+unsafe fn wrap_object<T: MutDomObject>(
     cx: &mut JSContext,
     scope: &HandleObject,
     given_proto: Option<js::rust::Handle<*mut JSObject>>,
@@ -168,80 +166,5 @@ unsafe fn wrap_object<T: MutDomObject, D: DomTypes>(
                 assert!(copy_fn(cx, rval.handle(), unforgeable_holder.handle()));
             }
         }
-    }
-}
-
-/// Materialize the object the reflector points at, if it is still a `JSDomStub`.
-///
-/// The reflector's old `JSDomStub` is unbound from the DOM node: it stays allocated until the
-/// pool drops the references it holds, but no longer finalizes the node. The stub's reference
-/// count is carried over to the new `JSObject`. Only the object's initial reference is owned by
-/// the pool; the rest are duplicated without corresponding pool entries and leak for now.
-/// Afterwards the reflector points at the new `JSObject` and the cached prototypes are dropped.
-///
-/// The new object is created with the class, prototype and wrap info cached when the reflector
-/// was created (the object's actual interface), not with those of the static type it is currently
-/// handled as. E.g. `document.getElementById` returns `Element`, but the object may be an
-/// `HTMLDivElement`: using `Element` would fail `this` checks for members declared on
-/// subinterfaces and would finalize the object through the wrong Rust type. For the same reason
-/// the DOM node is read from the stub's reserved slot rather than taken from a typed reference.
-///
-/// This must run before the object is handed to JS: QuickJS inspects the value as a regular
-/// object in some conversions (e.g. `ResolvePromise` reads its `then` property), which a
-/// `JSDomStub` cannot support.
-pub(crate) unsafe fn materialize_if_needed<T>(cx: &mut JSContext, reflector: &Reflector<T>) {
-    // Proxies are backed by a real `JSObject` from the start and must not be materialized. An
-    // object that has already been materialized has had its cache cleared.
-    if reflector.is_js_binded() {
-        return;
-    }
-    if reflector.is_proxy() {
-        return;
-    }
-
-    unsafe {
-        rooted!(&in(cx) let mut rval = ptr::null_mut::<JSObject>());
-
-        let proto = reflector.get_proto();
-        let canonical_proto = reflector.get_canonical_proto();
-        let class = reflector.get_class();
-        let has_legacy_unforgeable_members = reflector.has_legacy_unforgeable_members();
-
-        // Detach the DOM node from the old JSDomStub: the stub may still be referenced from the
-        // pool, so it is freed when the pool drains; by then it must not finalize the node.
-        let stub = reflector.get_jsobject().get();
-        let dom_ptr = private_from_object(stub);
-        assert!(!dom_ptr.is_null(), "JSDomStub without a DOM object");
-        let ref_count = JS_GetDomStubRefCount(stub);
-        JS_UnbindDomStub(cx, stub);
-
-        // Bind to a real JSObject, carrying over the stub's reference count. `JS_NewObjectWithGivenProto`
-        // creates the object with a count of 1, and the pool holds a reference for it, so duplicate it
-        // `ref_count - 1` times to match the stub's count. These extra references are not backed by
-        // pool entries, so they leak for now.
-        rval.set(JS_NewObjectWithGivenProto(cx, class, proto));
-        assert!(!rval.is_null());
-        for _ in 0..ref_count {
-            js::quickjs::retain_object(rval.get());
-        }
-        JS_SetReservedSlot(rval.get(), DOM_OBJECT_SLOT, &PrivateValue(dom_ptr));
-
-        // From here on we copy the legacy unforgeable properties to instance which was originally in a different function.
-        if has_legacy_unforgeable_members {
-            let copy_fn = JS_InitializePropertiesFromCompatibleNativeObject;
-
-            let mut slot = UndefinedValue();
-            JS_GetReservedSlot(
-                canonical_proto.get(),
-                DOM_PROTO_UNFORGEABLE_HOLDER_SLOT,
-                &mut slot,
-            );
-            rooted!(&in(cx) let mut unforgeable_holder = ptr::null_mut::<JSObject>());
-            unforgeable_holder.handle_mut().set(slot.to_object());
-            assert!(copy_fn(cx, rval.handle(), unforgeable_holder.handle()));
-        }
-
-        reflector.rebind_jsobject(rval.get());
-        reflector.clear_proto_cache();
     }
 }
