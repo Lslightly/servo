@@ -179,7 +179,7 @@ impl<T> ToJSValConvertible for Reflector<T> {
         // object (e.g. `ResolvePromise` reads its `then` property).
         #[cfg(feature = "js-quickjs")]
         unsafe {
-            crate::wrap::materialize_if_needed(cx, self);
+            self.materialize_if_needed();
         }
         let obj = self.get_jsobject().get();
         assert!(!obj.is_null());
