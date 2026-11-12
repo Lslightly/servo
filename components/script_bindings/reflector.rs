@@ -18,8 +18,8 @@ use js::jsval::{PrivateValue, UndefinedValue};
 use js::rust::HandleObject;
 #[cfg(feature = "js-quickjs")]
 use js::rust::wrappers2::{
-    JS_GetDomStubRefCount, JS_InitializePropertiesFromCompatibleNativeObject,
-    JS_NewObjectWithGivenProto, JS_UnbindDomStub,
+    EnterRealm, JS_GetDomStubRefCount, JS_InitializePropertiesFromCompatibleNativeObject,
+    JS_NewObjectWithGivenProto, JS_UnbindDomStub, LeaveRealm,
 };
 use malloc_size_of_derive::MallocSizeOf;
 
@@ -404,6 +404,14 @@ impl<T> Reflector<T> {
             let ref_count = JS_GetDomStubRefCount(stub);
             JS_UnbindDomStub(cx, stub);
 
+            // Materialization can be triggered from any realm (e.g. the top window touching a node
+            // of an iframe). The shim records `cx.current_realm()` in the new object's
+            // `ObjectData`, and `GlobalScope::from_object` reads it back through
+            // `GetNonCCWObjectGlobal`, so the object must be created in the realm it belongs to
+            // rather than in the caller's realm. The cached canonical prototype is in that realm:
+            // it was created when the DOM object was wrapped, inside the `JSAutoRealm` of its
+            // global.
+            let old_realm = EnterRealm(cx, canonical_proto.get());
             // Bind to a real JSObject, carrying over the stub's reference count. `JS_NewObjectWithGivenProto`
             // creates the object with a count of 1, and the pool holds a reference for it, so duplicate it
             // `ref_count - 1` times to match the stub's count. These extra references are not backed by
@@ -430,6 +438,7 @@ impl<T> Reflector<T> {
                 assert!(copy_fn(cx, rval.handle(), unforgeable_holder.handle()));
             }
 
+            LeaveRealm(cx, old_realm);
             self.rebind_jsobject(rval.get());
             self.clear_proto_cache();
         }
