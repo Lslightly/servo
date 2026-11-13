@@ -64,9 +64,6 @@ struct LazyCache {
     /// `HTMLDivElement` returned as `Element`). `None` for proxies, which have no class of their
     /// own.
     class: Option<*const JSClass>,
-    /// Whether the object is wrapped as a proxy: such an object is backed by a real `JSObject`
-    /// from the start and must never be materialized.
-    is_proxy: bool,
     /// Whether that class has `[LegacyUnforgeable]` members to copy into the object.
     has_legacy_unforgeable_members: bool,
 }
@@ -75,14 +72,12 @@ struct LazyCache {
 impl LazyCache {
     fn new(
         class: Option<*const JSClass>,
-        is_proxy: bool,
         has_legacy_unforgeable_members: bool,
     ) -> Self {
         LazyCache {
             proto: Cell::new(std::ptr::null_mut()),
             canonical_proto: Cell::new(std::ptr::null_mut()),
             class,
-            is_proxy,
             has_legacy_unforgeable_members,
         }
     }
@@ -271,14 +266,12 @@ impl<T> Reflector<T> {
         proto: HandleObject<'_>,
         canonical_proto: HandleObject<'_>,
         class: Option<&'static JSClass>,
-        is_proxy: bool,
         has_legacy_unforgeable_members: bool,
     ) {
         #[cfg(feature = "js-quickjs")]
         {
             let cache = LazyCache::new(
                 class.map(|class| class as *const JSClass),
-                is_proxy,
                 has_legacy_unforgeable_members,
             );
             cache.proto.set(proto.get());
@@ -287,7 +280,7 @@ impl<T> Reflector<T> {
         }
         #[cfg(not(feature = "js-quickjs"))]
         {
-            let _ = (proto, canonical_proto, class, is_proxy, has_legacy_unforgeable_members);
+            let _ = (proto, canonical_proto, class, has_legacy_unforgeable_members);
         }
     }
 
@@ -339,14 +332,6 @@ impl<T> Reflector<T> {
             .expect("Proxy has no class")
     }
 
-    /// QuickJS: whether the reflector wraps its object as a proxy.
-    #[cfg(feature = "js-quickjs")]
-    pub(crate) fn is_proxy(&self) -> bool {
-        unsafe { (*self.proto_cache.as_ptr()).as_ref() }
-            .expect("Lazy cache not set")
-            .is_proxy
-    }
-
     /// QuickJS: whether the reflector's class has `[LegacyUnforgeable]` members.
     #[cfg(feature = "js-quickjs")]
     pub(crate) fn has_legacy_unforgeable_members(&self) -> bool {
@@ -378,9 +363,6 @@ impl<T> Reflector<T> {
         // Proxies are backed by a real `JSObject` from the start and must not be materialized. An
         // object that has already been materialized has had its cache cleared.
         if self.is_js_binded() {
-            return;
-        }
-        if self.is_proxy() {
             return;
         }
 

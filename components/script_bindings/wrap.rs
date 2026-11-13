@@ -83,7 +83,7 @@ unsafe fn wrap_object<T: MutDomObject>(
         if !config.is_proxy {
             rooted!(&in(cx) let mut proto = ptr::null_mut::<JSObject>());
             match given_proto {
-                Some(given) if !config.is_proxy => {
+                Some(given) => {
                     proto.set(*given);
                     if get_context_realm(cx.raw_cx()) != get_object_realm(*given) {
                         assert!(JS_WrapObject(cx, proto.handle_mut()));
@@ -99,7 +99,6 @@ unsafe fn wrap_object<T: MutDomObject>(
                 proto.handle(),
                 canonical_proto.handle(),
                 config.class,
-                config.is_proxy,
                 config.has_legacy_unforgeable_members,
             );
 
