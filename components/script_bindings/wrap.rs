@@ -19,11 +19,10 @@ use crate::codegen::PrototypeList;
 use crate::conversions::DOM_OBJECT_SLOT;
 use crate::import::module::JS_GetReservedSlot;
 use crate::proxyhandler::ensure_expando_object;
+use crate::reflector::ProtoObjectFn;
 use crate::root::{DomRoot, MaybeUnreflectedDom, Root};
 use crate::utils::DOM_PROTO_UNFORGEABLE_HOLDER_SLOT;
 use crate::{DomObject, DomTypes, MutDomObject};
-
-type ProtoObjectFn = fn(&mut js::context::JSContext, HandleObject, MutableHandleObject);
 
 /// TODO: unforgeable is missing
 pub(crate) struct WrapConfig {
@@ -75,30 +74,25 @@ unsafe fn wrap_object<T: MutDomObject>(
         assert!(((*get_object_class(scope.get())).flags & JSCLASS_IS_GLOBAL) != 0);
         let _ac = JSAutoRealm::new(cx.raw_cx(), scope.get());
 
-        rooted!(&in(cx) let mut canonical_proto = ptr::null_mut::<JSObject>());
-        (config.proto_object_fn)(cx, *scope, canonical_proto.handle_mut());
-        assert!(!canonical_proto.is_null());
-
-        // not proxy object, use JS_NewDomStub to create a JSDomStub object.
+        // Not a proxy object: create a `JSDomStub` and record what materialization needs.
         if !config.is_proxy {
-            rooted!(&in(cx) let mut proto = ptr::null_mut::<JSObject>());
-            match given_proto {
+            // Only the caller's prototype is recorded now. The canonical prototype, and this
+            // interface's unforgeable holder with it, is created lazily the first time the object
+            // is handed to JS (see `Reflector::materialize_if_needed`): an object that is never
+            // exposed does not create its interface's prototype.
+            let given = match given_proto {
                 Some(given) => {
-                    proto.set(*given);
-                    if get_context_realm(cx.raw_cx()) != get_object_realm(*given) {
+                    rooted!(&in(cx) let mut proto = *given);
+                    if get_context_realm(cx.raw_cx()) != get_object_realm(proto.get()) {
                         assert!(JS_WrapObject(cx, proto.handle_mut()));
                     }
+                    proto.get()
                 },
-                _ => proto.set(*canonical_proto),
-            }
-
-            // Cache the proto, canonical proto and wrap info in the reflector, for materializing the
-            // object later. Proxies are cached too, so that `new_and_bindto_jsobject` can tell them
-            // apart from an object that still needs materializing.
-            (*raw.as_ptr()).reflector().cache_proto(
-                proto.handle(),
-                canonical_proto.handle(),
-                config.class,
+                None => ptr::null_mut(),
+            };
+            (*raw.as_ptr()).reflector().set_materialize_cache(
+                given,
+                config.proto_object_fn,
                 config.has_legacy_unforgeable_members,
             );
 
@@ -114,6 +108,11 @@ unsafe fn wrap_object<T: MutDomObject>(
             );
             return;
         }
+
+        // Proxies are real objects from the start and need the canonical prototype now.
+        rooted!(&in(cx) let mut canonical_proto = ptr::null_mut::<JSObject>());
+        (config.proto_object_fn)(cx, *scope, canonical_proto.handle_mut());
+        assert!(!canonical_proto.is_null());
 
         {
             let handler: *const libc::c_void = config.proxy_handler.unwrap();
