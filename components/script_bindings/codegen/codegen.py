@@ -9796,7 +9796,7 @@ class GlobalGenRoots():
         #[allow(dead_code)]
         pub(crate) fn type_id(&self) -> &'static {base}TypeId {{
             unsafe {{
-                &get_dom_class(self.reflector().get_jsobject().get())
+                &get_dom_class(self.reflector().rootable().get())
                     .unwrap()
                     .type_id
                     .{base.lower()}

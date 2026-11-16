@@ -125,11 +125,6 @@ impl<T> PartialEq for Reflector<T> {
 }
 
 impl<T> Reflector<T> {
-    /// Get the object the reflector points at, materializing it first if it is still a lazy
-    /// `JSDomStub`, so that it can be handed to the engine, which reads it as a regular
-    /// `JSObject`. Paths that must not allocate, or that must see the object as it currently is
-    /// (GC tracing, finalization, reference counting — a stub's count carries over to the
-    /// materialized object), read the pointer through [`Self::rootable`] instead.
     #[inline]
     pub fn get_jsobject(&self) -> HandleObject<'_> {
         // A `JSDomStub` is not a `JSObject`: handing it out as one makes QuickJS read the stub's
