@@ -581,7 +581,7 @@ pub(crate) mod quickjs_refs {
     /// # Safety
     /// `reflector` must be the reflector of a live DOM object.
     pub(crate) unsafe fn retain(reflector: *const Reflector) {
-        let object = unsafe { (*reflector).get_jsobject().get() };
+        let object = unsafe { (*reflector).rootable().get() };
         if object.is_null() {
             PENDING.with(|p| *p.borrow_mut().entry(reflector as usize).or_insert(0) += 1);
             return;
