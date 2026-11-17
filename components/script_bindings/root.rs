@@ -606,7 +606,7 @@ pub(crate) mod quickjs_refs {
                 },
             }
         } else {
-            unsafe { (*reflector).get_jsobject().get() }
+            unsafe { (*reflector).rootable().get() }
         };
         if object.is_null() {
             assert!(

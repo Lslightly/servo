@@ -752,6 +752,8 @@ impl EventTarget {
             if let Some(form_owner) = form_owner {
                 scopechain.append(form_owner.reflector().get_jsobject().get());
             }
+            #[cfg(feature = "js-quickjs")]
+            unsafe { element.reflector().materialize_if_needed(); }
             scopechain.append(element.reflector().get_jsobject().get());
         }
 
