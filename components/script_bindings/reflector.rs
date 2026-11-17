@@ -19,8 +19,8 @@ use js::rust::{HandleObject, MutableHandleObject};
 #[cfg(feature = "js-quickjs")]
 use js::rust::wrappers2::{
     EnterRealm, JS_GetDomStubInfo, JS_GetDomStubRefCount,
-    JS_InitializePropertiesFromCompatibleNativeObject, JS_NewObjectWithGivenProto, JS_UnbindDomStub,
-    LeaveRealm,
+    JS_InitializePropertiesFromCompatibleNativeObject, JS_IsDomStub, JS_NewObjectWithGivenProto,
+    JS_UnbindDomStub, LeaveRealm,
 };
 use malloc_size_of_derive::MallocSizeOf;
 
@@ -134,7 +134,14 @@ impl<T> PartialEq for Reflector<T> {
 impl<T> Reflector<T> {
     #[inline]
     pub fn get_jsobject(&self) -> HandleObject<'_> {
-        debug_assert!(!unsafe { js::quickjs::JS_IsDomStub(*self) }, "JSDomStub leaked into a JS value");
+        // A `JSDomStub` is not a `JSObject`: handing it out as one makes QuickJS read the stub's
+        // fields as `JSObject` fields. Materialize before calling this.
+        #[cfg(feature = "js-quickjs")]
+        unsafe {
+            if JS_IsDomStub(self.object.get()) {
+                panic!("get_jsobject() called on a reflector whose object is a JSDomStub");
+            }
+        }
         // We're rooted, so it's safe to hand out a handle to object in Heap
         unsafe { HandleObject::from_raw(self.object.handle()) }
     }
@@ -293,7 +300,7 @@ impl<T> Reflector<T> {
     /// object in some conversions (e.g. `ResolvePromise` reads its `then` property), which a
     /// `JSDomStub` cannot support.
     #[cfg(feature = "js-quickjs")]
-    pub(crate) unsafe fn materialize_if_needed(&self) {
+    pub unsafe fn materialize_if_needed(&self) {
         let (given_proto, proto_object_fn, has_legacy_unforgeable_members) = {
             let Some(cache) = (unsafe { (*self.materialize_cache.as_ptr()).as_ref() }) else {
                 // Already materialized, or a proxy: proxies never populate the cache.

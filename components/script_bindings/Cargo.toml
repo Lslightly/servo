@@ -21,6 +21,7 @@ path = "lib.rs"
 
 [dependencies]
 atomic_refcell = { workspace = true }
+backtrace = { workspace = true }
 bitflags = { workspace = true }
 crossbeam-channel = { workspace = true }
 deny_public_fields = { workspace = true }
@@ -42,6 +43,7 @@ profile_traits = { workspace = true }
 regex = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 servo-base = { workspace = true }
 servo-config = { workspace = true }
 servo-constellation-traits = { workspace = true }
