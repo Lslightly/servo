@@ -183,7 +183,7 @@ impl LiveDOMReferences {
                 // QuickJS: a table entry holds a count on the object until it is swept.
                 #[cfg(feature = "js-quickjs")]
                 unsafe {
-                    js::quickjs::retain_object((*(ptr as *const Reflector)).get_jsobject().get())
+                    js::quickjs::retain_object((*(ptr as *const Reflector)).rootable().get())
                 };
                 let refcount = Arc::new(unsafe { TrustedReference::new(ptr) });
                 entry.insert(Arc::downgrade(&refcount));
@@ -216,7 +216,7 @@ pub fn sweep_live_references() {
                 return true;
             }
             unsafe {
-                js::quickjs::release_object((*(*ptr as *const Reflector)).get_jsobject().get())
+                js::quickjs::release_object((*(*ptr as *const Reflector)).rootable().get())
             };
             false
         });

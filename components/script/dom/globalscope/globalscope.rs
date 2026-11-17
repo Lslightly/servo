@@ -2008,7 +2008,7 @@ impl GlobalScope {
     /// was created in.
     #[expect(unsafe_code)]
     pub(crate) fn from_reflector<T: DomObject>(reflector: &T) -> DomRoot<Self> {
-        unsafe { GlobalScope::from_object(*reflector.reflector().get_jsobject()) }
+        unsafe { GlobalScope::from_object(reflector.reflector().rootable().get()) }
     }
 
     /// Returns the global scope of the realm that the given JS object was created in.

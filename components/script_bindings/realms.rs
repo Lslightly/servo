@@ -16,6 +16,6 @@ pub fn enter_auto_realm<'cx, D: DomTypes>(
 ) -> AutoRealm<'cx> {
     AutoRealm::new(
         cx,
-        NonNull::new(object.reflector().get_jsobject().get()).unwrap(),
+        NonNull::new(object.reflector().rootable().get()).unwrap(),
     )
 }
