@@ -2686,6 +2686,9 @@ def DOMClass(descriptor: Descriptor) -> str:
         globals_ = camel_to_upper_snake(descriptor.name)
     else:
         globals_ = 'EMPTY'
+    # Per-interface data that materializing a `JSDomStub` needs, shared by every object of the
+    # interface instead of being copied onto each reflector.
+    hasLegacyUnforgeableMembers = 'true' if descriptor.hasLegacyUnforgeableMembers else 'false'
     return f"""
 DOMClass {{
     interface_chain: [ {prototypeChainString} ],
@@ -2693,6 +2696,8 @@ DOMClass {{
     type_id: {DOMClassTypeId(descriptor)},
     malloc_size_of: {mallocSizeOf} as unsafe fn(&mut _, _) -> _,
     global: Globals::{globals_},
+    proto_object_fn: GetProtoObject::<D>,
+    has_legacy_unforgeable_members: {hasLegacyUnforgeableMembers},
 }}"""
 
 
@@ -7296,6 +7301,17 @@ def finalizeHook(descriptor: Descriptor, hookName: str, context: str) -> str:
                 getReservedSlot=getReservedSlotFunc(descriptor),
                 slotIndex=memberReservedSlot(m, descriptor),
             ))
+
+    # QuickJS: a never-materialized `JSDomStub` has no reserved slots, so the observable-array
+    # cleanup must not touch it (it cannot own observable proxies either). The release below must
+    # still run: it is what finalizes the DOM node for a stub.
+    if cleanup:
+        cleanup = ["\n".join([
+            "// QuickJS: `JSDomStub`s have no reserved slots and no observable proxies.",
+            "if !crate::conversions::is_dom_stub(obj) {",
+            *cleanup,
+            "}",
+        ])]
 
     if descriptor.isGlobal():
         release = "finalize_global(obj, this);"
