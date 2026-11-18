@@ -301,6 +301,7 @@ impl<T> Reflector<T> {
     /// `JSDomStub` cannot support.
     #[cfg(feature = "js-quickjs")]
     pub unsafe fn materialize_if_needed(&self) {
+        crate::lazy_binding_stats::record_call();
         let (given_proto, proto_object_fn, has_legacy_unforgeable_members) = {
             let Some(cache) = (unsafe { (*self.materialize_cache.as_ptr()).as_ref() }) else {
                 // Already materialized, or a proxy: proxies never populate the cache.
@@ -312,6 +313,7 @@ impl<T> Reflector<T> {
                 cache.has_legacy_unforgeable_members,
             )
         };
+        crate::lazy_binding_stats::record_materialized();
 
         unsafe {
             let stub = self.object.get();

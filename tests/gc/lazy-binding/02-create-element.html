@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script src="lb.js"></script>
+<script>
+  // Warm-up: `document` materializes itself the first time it is handed to JS.
+  // Reset afterwards so the first measured delta only covers createElement.
+  var doc = document;
+  window.runtime.reset_materialize_stats();
+
+  var div1 = doc.createElement("div");
+  LB.expect(
+    "createElement materializes its result",
+    1,
+    window.runtime.materialize_count()
+  );
+
+  var div2 = doc.createElement("div");
+  LB.expect(
+    "each createElement result materializes separately",
+    1,
+    window.runtime.materialize_count() - 1
+  );
+
+  // Reading properties of an already materialized element does not rematerialize.
+  void div1.id;
+  LB.expect(
+    "reading properties of a materialized element does not rematerialize",
+    0,
+    window.runtime.materialize_count() - 2
+  );
+
+  void div1;
+  void div2;
+  LB.finish("02-create-element");
+</script>
+</body>
+</html>

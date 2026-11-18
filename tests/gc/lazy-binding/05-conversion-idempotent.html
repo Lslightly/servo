@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script src="lb.js"></script>
+<script>
+  // Warm-up: Document and body are lazy objects of their own.
+  //
+  // `window` is a Rust accessor returning a WindowProxy (Window.webidl:9), so
+  // every evaluation re-enters the generic to_jsval conversion and counts one
+  // `materialize_calls` entry; the proxy never populates the materialize cache,
+  // so `materialize_count` does not change. Cache `runtime` so that measuring
+  // the counters does not itself evaluate `window`.
+  var doc = document;
+  var runtime = window.runtime;
+  var body = doc.body;
+  runtime.reset_materialize_stats();
+
+  var el = doc.createElement("div");
+  LB.expect(
+    "createElement materializes its result",
+    1,
+    runtime.materialize_count()
+  );
+
+  // Returning a DOM object from a native API converts it to a JS value again.
+  // The conversion calls materialize_if_needed (so `calls` grows), but the
+  // element is already materialized (so `materialized` does not).
+  var materialized = runtime.materialize_count();
+  var calls = runtime.materialize_calls();
+  var returned = body.appendChild(el);
+  LB.expect(
+    "appendChild's return value does not rematerialize the element",
+    0,
+    runtime.materialize_count() - materialized
+  );
+  LB.expectTrue(
+    "appendChild's return value still goes through materialize_if_needed",
+    runtime.materialize_calls() > calls
+  );
+  LB.expectTrue("appendChild returns the same element", returned === el);
+
+  // Plain JS references are not conversions at all.
+  calls = runtime.materialize_calls();
+  var alias = el;
+  var holder = { el: el };
+  holder.el = el;
+  LB.expect(
+    "plain JS references do not call materialize_if_needed",
+    0,
+    runtime.materialize_calls() - calls
+  );
+
+  // Resolving a proxy DOM object (WindowProxy, Document, NodeList, ...) is a
+  // conversion too: it enters materialize_if_needed but never materializes.
+  calls = runtime.materialize_calls();
+  materialized = runtime.materialize_count();
+  void window;
+  LB.expect(
+    "resolving window enters materialize_if_needed",
+    1,
+    runtime.materialize_calls() - calls
+  );
+  LB.expect(
+    "resolving window does not materialize anything",
+    0,
+    runtime.materialize_count() - materialized
+  );
+
+  void alias;
+  void holder;
+  LB.finish("05-conversion-idempotent");
+</script>
+</body>
+</html>

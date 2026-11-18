@@ -10,7 +10,13 @@
 //! runtime.qjs_refcount(div);   // the QuickJS reference count of `div`
 //! runtime.drain_pool();        // release the autorelease pool now
 //! runtime.drain_pool_gc();     // release the pool, then run a full GC
+//! runtime.materialize_count(); // DOM objects materialized on this script thread
+//! runtime.materialize_calls(); // calls to `materialize_if_needed`, including no-ops
+//! runtime.reset_materialize_stats();
 //! ```
+//!
+//! The `materialize_*` functions only exist when the process environment variable
+//! `SERVO_LAZY_BINDING_STATS` is set; see `tests/gc/lazy-binding/`.
 //!
 //! This is a debug hook, not a web API: it is installed on every `Window` and
 //! should not be relied on by pages.
@@ -22,7 +28,7 @@ use js::context::JSContext;
 use js::jsapi::{
     CallArgs, GCReason, JS_GetFunctionObject, JSContext as RawJSContext, JSPROP_ENUMERATE,
 };
-use js::jsval::{Int32Value, JSVal};
+use js::jsval::{DoubleValue, Int32Value, JSVal, UndefinedValue};
 use js::realm::AutoRealm;
 use js::rust::wrappers2::{JS_DefineProperty3, JS_GC, JS_NewFunction, JS_NewPlainObject};
 use js::rust::HandleObject;
@@ -96,6 +102,52 @@ unsafe extern "C" fn drain_pool_gc(_cx: *mut RawJSContext, _argc: u32, _vp: *mut
     true
 }
 
+/// A JS number for a counter value: `Int32Value` while it fits, `DoubleValue` above that.
+///
+/// Both are JS Numbers (`typeof` is `"number"`); the int tag is just the compact
+/// representation. Values stay exact well past anything these counters reach.
+fn count_value(count: u64) -> JSVal {
+    if count <= i32::MAX as u64 {
+        Int32Value(count as i32)
+    } else {
+        DoubleValue(count as f64)
+    }
+}
+
+/// Number of DOM objects actually materialized on this script thread.
+#[expect(unsafe_code)]
+unsafe extern "C" fn materialize_count(_cx: *mut RawJSContext, argc: u32, vp: *mut JSVal) -> bool {
+    // SAFETY: We are in a JS hook, and `vp`/`argc` describe its arguments.
+    let args = unsafe { CallArgs::from_vp(vp, argc) };
+    let stats = crate::lazy_binding_stats::stats();
+    args.rval().set(count_value(stats.materialized));
+    true
+}
+
+/// Number of calls to `materialize_if_needed` on this script thread, including no-ops.
+#[expect(unsafe_code)]
+unsafe extern "C" fn materialize_calls(_cx: *mut RawJSContext, argc: u32, vp: *mut JSVal) -> bool {
+    // SAFETY: We are in a JS hook, and `vp`/`argc` describe its arguments.
+    let args = unsafe { CallArgs::from_vp(vp, argc) };
+    let stats = crate::lazy_binding_stats::stats();
+    args.rval().set(count_value(stats.calls));
+    true
+}
+
+/// Clears both materialization counters for this script thread.
+#[expect(unsafe_code)]
+unsafe extern "C" fn reset_materialize_stats(
+    _cx: *mut RawJSContext,
+    argc: u32,
+    vp: *mut JSVal,
+) -> bool {
+    crate::lazy_binding_stats::reset();
+    // SAFETY: We are in a JS hook, and `vp`/`argc` describe its arguments.
+    let args = unsafe { CallArgs::from_vp(vp, argc) };
+    args.rval().set(UndefinedValue());
+    true
+}
+
 /// Defines `name` on `obj` as a native function calling `call`.
 #[expect(unsafe_code)]
 unsafe fn define_method(
@@ -134,6 +186,18 @@ pub fn init_runtime_helper(cx: &mut JSContext, global: HandleObject) {
         define_method(cx, runtime, c"qjs_refcount", qjs_refcount);
         define_method(cx, runtime, c"drain_pool", drain_pool);
         define_method(cx, runtime, c"drain_pool_gc", drain_pool_gc);
+        // Off by default: the accessors are a test hook, not a web API, and exposing them
+        // changes the properties visible on `window.runtime`.
+        if crate::lazy_binding_stats::enabled() {
+            define_method(cx, runtime, c"materialize_count", materialize_count);
+            define_method(cx, runtime, c"materialize_calls", materialize_calls);
+            define_method(
+                cx,
+                runtime,
+                c"reset_materialize_stats",
+                reset_materialize_stats,
+            );
+        }
         let defined = JS_DefineProperty3(
             cx,
             global,

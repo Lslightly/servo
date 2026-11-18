@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<body>
+<div id="x"></div>
+<span id="y"></span>
+<script src="lb.js"></script>
+<script>
+  // Warm-up: Document itself is lazy too.
+  var doc = document;
+  window.runtime.reset_materialize_stats();
+
+  // Parser-created nodes stay stubs until JS first receives them.
+  var x1 = doc.getElementById("x");
+  LB.expect(
+    "getElementById materializes a parser-created node on first handoff",
+    1,
+    window.runtime.materialize_count()
+  );
+
+  var x2 = doc.getElementById("x");
+  LB.expect(
+    "getElementById of the same node does not rematerialize",
+    0,
+    window.runtime.materialize_count() - 1
+  );
+
+  var y = doc.getElementById("y");
+  LB.expect(
+    "getElementById materializes each distinct node once",
+    1,
+    window.runtime.materialize_count() - 1
+  );
+
+  var missing = doc.getElementById("does-not-exist");
+  LB.expect(
+    "getElementById of a missing node changes nothing",
+    0,
+    window.runtime.materialize_count() - 2
+  );
+  LB.expectTrue("missing lookup returns null", missing === null);
+
+  void x1;
+  void x2;
+  void y;
+  LB.finish("03-get-element-by-id");
+</script>
+</body>
+</html>

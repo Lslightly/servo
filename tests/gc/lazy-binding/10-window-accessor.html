@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script src="lb.js"></script>
+<script>
+  // `window` is a Rust accessor returning a WindowProxy (Window.webidl:9), and
+  // `document` is a Rust accessor on Window as well. Every evaluation re-enters
+  // the bindings' generic to_jsval conversion, which calls
+  // `materialize_if_needed`. Both return proxies, whose materialize cache is
+  // always None, so `materialize_calls` grows while `materialize_count` does
+  // not. This is why call-delta measurements cache `window.runtime` first.
+  var runtime = window.runtime;
+  runtime.reset_materialize_stats();
+
+  var calls = runtime.materialize_calls();
+  var materialized = runtime.materialize_count();
+  void window;
+  LB.expect(
+    "evaluating window adds one materialize call",
+    1,
+    runtime.materialize_calls() - calls
+  );
+  LB.expect(
+    "evaluating window materializes nothing",
+    0,
+    runtime.materialize_count() - materialized
+  );
+
+  // The accessor runs on every evaluation: two evaluations, two calls.
+  calls = runtime.materialize_calls();
+  void window;
+  void window;
+  LB.expect(
+    "each evaluation of window adds another call",
+    2,
+    runtime.materialize_calls() - calls
+  );
+
+  // `window.document` evaluates two accessors: `window`, then `document`.
+  // Both are proxies, so it adds two calls and still materializes nothing.
+  calls = runtime.materialize_calls();
+  materialized = runtime.materialize_count();
+  var doc1 = window.document;
+  LB.expect(
+    "window.document adds a call for each accessor",
+    2,
+    runtime.materialize_calls() - calls
+  );
+  LB.expect(
+    "window.document materializes nothing",
+    0,
+    runtime.materialize_count() - materialized
+  );
+
+  // The getters re-run, but the reflectors still point at the same JS objects,
+  // so the call count grows while object identity stays stable.
+  calls = runtime.materialize_calls();
+  var doc2 = window.document;
+  LB.expect(
+    "repeated window.document adds the same calls again",
+    2,
+    runtime.materialize_calls() - calls
+  );
+  LB.expectTrue("window.document returns the same object", doc1 === doc2);
+
+  void doc1;
+  void doc2;
+  LB.finish("10-window-accessor");
+</script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+<script src="lb.js"></script>
+<script>
+  // The parser creates and upgrades <my-el> below without ever handing it to
+  // JS, so the first handoff is the custom element upgrade itself: invoking
+  // the constructor requires the element's JS wrapper.
+  class MyElement extends HTMLElement {
+    constructor() {
+      super();
+      LB.expect(
+        "upgrading a parser-created custom element materializes it once",
+        1,
+        window.runtime.materialize_count()
+      );
+      LB.expectTrue("constructor's this is the custom element", this instanceof MyElement);
+    }
+  }
+  customElements.define("my-element", MyElement);
+  window.runtime.reset_materialize_stats();
+</script>
+</head>
+<body>
+<my-element></my-element>
+<script>
+  LB.finish("07-custom-element");
+</script>
+</body>
+</html>

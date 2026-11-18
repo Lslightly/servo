@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script src="lb.js"></script>
+<script>
+  // `Document` has a named getter (Document.webidl), so the bindings mark it as
+  // a proxy (`descriptor.proxy = true`). Like Window, NodeList and
+  // HTMLCollection it is a real object from the start and never goes through
+  // the JSDomStub/materialize path.
+  var runtime = window.runtime;
+  runtime.reset_materialize_stats();
+  var before = runtime.materialize_count();
+  void document;
+  LB.expect(
+    "document is a named-properties proxy and is not lazy",
+    0,
+    runtime.materialize_count() - before
+  );
+
+  // `documentElement` is an ordinary Element, so it is lazy.
+  runtime.reset_materialize_stats();
+  var html1 = document.documentElement;
+  LB.expect(
+    "documentElement materializes on its first access",
+    1,
+    runtime.materialize_count()
+  );
+
+  var html2 = document.documentElement;
+  LB.expect(
+    "documentElement does not rematerialize",
+    0,
+    runtime.materialize_count() - 1
+  );
+
+  void html1;
+  void html2;
+  LB.finish("01-document");
+</script>
+</body>
+</html>

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<body>
+<span id="s"></span>
+<script src="lb.js"></script>
+<script>
+  // Warm-up: Document itself is lazy too.
+  var doc = document;
+  window.runtime.reset_materialize_stats();
+
+  // The materialized object must be created with the class and realm recorded
+  // on the stub (the object's actual interface), and with that interface's
+  // canonical prototype -- not with a prototype of the static type it was
+  // handled as.
+  var div = doc.createElement("div");
+  LB.expect(
+    "createElement materializes its result",
+    1,
+    window.runtime.materialize_count()
+  );
+  LB.expectTrue(
+    "materialized div uses HTMLDivElement.prototype",
+    Object.getPrototypeOf(div) === HTMLDivElement.prototype
+  );
+  LB.expectTrue("materialized div is an HTMLDivElement", div instanceof HTMLDivElement);
+  LB.expectTrue("materialized div is an Element", div instanceof Element);
+
+  // getElementById is declared to return Element, but the stub records
+  // HTMLSpanElement; materialization must pick the latter.
+  var span = doc.getElementById("s");
+  LB.expect(
+    "getElementById materializes the parser-created span",
+    1,
+    window.runtime.materialize_count() - 1
+  );
+  LB.expectTrue(
+    "getElementById result uses its actual interface prototype",
+    Object.getPrototypeOf(span) === HTMLSpanElement.prototype
+  );
+  LB.expectTrue("materialized span is an HTMLSpanElement", span instanceof HTMLSpanElement);
+
+  void div;
+  void span;
+  LB.finish("08-prototype-identity");
+</script>
+</body>
+</html>
