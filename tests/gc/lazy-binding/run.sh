@@ -46,7 +46,7 @@ done
 if [[ ! -x "$BINARY" ]]; then
   echo "error: $BINARY is not executable" >&2
   echo "build it with:" >&2
-  echo "  ./mach build --features js-quickjs --config patch.crates-io.mozjs.path=\"servo-quickjs/mozjs\"" >&2
+  echo "  ./mach build --features js-quickjs --config 'patch.crates-io.mozjs.path=\"servo-quickjs/mozjs\"'" >&2
   exit 2
 fi
 if ! command -v timeout >/dev/null 2>&1; then
