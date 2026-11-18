@@ -154,6 +154,11 @@ those scripts (they need network access). `check_stack.py` runs each with
 128. `script: Run debugger.js on QuickJS` — B · CI · watch: components/default-resources/resources/debugger.js support/quickjs/cargo-config.toml
 129. `ci: Run the devtools tests on QuickJS` — A · CI · watch: python/servo/devtools_tests
 130. `docs: record patches 128 to 130 in the stack manifest` — B · none · watch: -
+131. `backport: deny: Rustsec for rusqlite advisory (#49746)` — B · CI · watch: -
+132. `backport: build: bump libz-sys from 1.1.31 to 1.1.32 (#49922)` — B · CI · watch: -
+133. `backport: deny: Allow chrono in cargo deny (#50002)` — B · CI · watch: -
+134. `wpt: Let fetch-cannot-overwhelm-system wait for its requests to a small file` — B · CI · watch: -
+135. `docs: record patches 131 to 135 in the stack manifest` — B · none · watch: -
 
 ## Sync log
 

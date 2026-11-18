@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 18 Nov 2026 18:54:45 +0000
+Subject: [PATCH] wpt: Let fetch-cannot-overwhelm-system wait for its requests
+ to a small file
+
+The test sent 5,000 asynchronous XMLHttpRequests for `/`, the directory
+listing of the WPT server, and finished 10 ms later without waiting for
+them. Servo opens a connection per request, so the shared WPT server
+then spent tens of seconds answering the listings while the other test
+runners waited for their test pages and testharness.js. Tests that
+started in that window timed out or were reported as CRASH ("Browser
+not responding"), e.g. three flaky results of the QuickJS WPT job of
+servo-ohos#55 (run 44176987934), which all started within 0.3 s after
+this test ended on another runner. A crash caused by the requests would
+also have been attributed to the next test.
+
+Request /common/blank.html, an empty file, and finish when every
+request has ended (`loadend`), with the long timeout. The test still
+checks what it was added for in servo/servo#22769 (#22768): that
+thousands of concurrent fetches don't crash the browser.
+
+Validation: host checked-release build of this stack, `./mach test-wpt --processes 4 tests/wpt/mozilla/tests/mozilla`: 316 tests as expected; this test takes 3.3 s and the tests started within 2 s after it on the other runners 0.1-0.6 s (except http-cache-xhr.html, an expected timeout). Alone, `--repeat 5` in one browser: OK each time, 1.9 s, then 9-14 s per run (the earlier runs' connections stay open), within the long timeout. Measured before the change, with a probe of testharness.js every 200 ms on the WPT server: the old test ends after 0.07 s, the next test then takes 6.1 s and the probe waits 5.7 s; this version takes 2.4 s with the probe waiting at most 0.5 s and the next test 0.05 s.
+AI-assisted: Yes (agent session; the agent found the cause of the flaky results, wrote and measured the change)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ tests/wpt/mozilla/meta/MANIFEST.json          |  9 ++++++--
+ .../fetch-cannot-overwhelm-system.window.js   | 22 +++++++++----------
+ 2 files changed, 18 insertions(+), 13 deletions(-)
+
+diff --git a/tests/wpt/mozilla/meta/MANIFEST.json b/tests/wpt/mozilla/meta/MANIFEST.json
+index 7701a74afb5..06e70bc5376 100644
+--- a/tests/wpt/mozilla/meta/MANIFEST.json
++++ b/tests/wpt/mozilla/meta/MANIFEST.json
+@@ -14531,7 +14531,7 @@
+      ]
+     ],
+     "fetch-cannot-overwhelm-system.window.js": [
+-     "989231e9caedd099f5212bd2f9d377c83f929a22",
++     "af27ef5f0ae66e3749278ab811b8f34e60bd5565",
+      [
+       "mozilla/fetch-cannot-overwhelm-system.window.html",
+       {
+@@ -14539,8 +14539,13 @@
+         [
+          "title",
+          "Ensure multiple fetch do not crash the browser."
++        ],
++        [
++         "timeout",
++         "long"
+         ]
+-       ]
++       ],
++       "timeout": "long"
+       }
+      ]
+     ],
+diff --git a/tests/wpt/mozilla/tests/mozilla/fetch-cannot-overwhelm-system.window.js b/tests/wpt/mozilla/tests/mozilla/fetch-cannot-overwhelm-system.window.js
+index 989231e9cae..af27ef5f0ae 100644
+--- a/tests/wpt/mozilla/tests/mozilla/fetch-cannot-overwhelm-system.window.js
++++ b/tests/wpt/mozilla/tests/mozilla/fetch-cannot-overwhelm-system.window.js
+@@ -1,15 +1,15 @@
+ // META: title=Ensure multiple fetch do not crash the browser.
++// META: timeout=long
+ 
+-async_test(function(t) {
+-  onload = t.step_func(function() {
+-    var step;
+-    var xhr
+-    var url = '/';
+-    t.step_timeout(t.step_func_done(), 10);
+-    for (step = 0; step < 5000; step++) {
+-      xhr = new XMLHttpRequest();
+-      xhr.open('GET', url, true);
++promise_test(async () => {
++  const requests = [];
++  for (let i = 0; i < 5000; i++) {
++    requests.push(new Promise(resolve => {
++      const xhr = new XMLHttpRequest();
++      xhr.open('GET', '/common/blank.html', true);
++      xhr.onloadend = resolve;
+       xhr.send();
+-    }
+-  });
++    }));
++  }
++  await Promise.all(requests);
+ });

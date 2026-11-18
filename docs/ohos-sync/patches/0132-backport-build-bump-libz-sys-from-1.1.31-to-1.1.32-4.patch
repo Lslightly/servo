@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "dependabot[bot]" <49699333+dependabot[bot]@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:42:44 +0000
+Subject: [PATCH] backport: build: bump libz-sys from 1.1.31 to 1.1.32 (#49922)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Bumps [libz-sys](https://github.com/rust-lang/libz-sys) from 1.1.31 to
+1.1.32.
+<details>
+<summary>Release notes</summary>
+<p><em>Sourced from <a
+href="https://github.com/rust-lang/libz-sys/releases">libz-sys's
+releases</a>.</em></p>
+<blockquote>
+<h2>1.1.32</h2>
+<h2>What's Changed</h2>
+<ul>
+<li>Update to zlib 1.4 to fix the following CVEs: by <a
+href="https://github.com/loganaden"><code>@​loganaden</code></a> in <a
+href="https://redirect.github.com/rust-lang/libz-sys/pull/281">rust-lang/libz-sys#281</a></li>
+</ul>
+<h2>New Contributors</h2>
+<ul>
+<li><a href="https://github.com/loganaden"><code>@​loganaden</code></a>
+made their first contribution in <a
+href="https://redirect.github.com/rust-lang/libz-sys/pull/281">rust-lang/libz-sys#281</a></li>
+</ul>
+<p><strong>Full Changelog</strong>: <a
+href="https://github.com/rust-lang/libz-sys/compare/1.1.31...1.1.32">https://github.com/rust-lang/libz-sys/compare/1.1.31...1.1.32</a></p>
+</blockquote>
+</details>
+<details>
+<summary>Commits</summary>
+<ul>
+<li><a
+href="https://github.com/rust-lang/libz-sys/commit/f0414fcb657593eea473f24a564acbf6653757ca"><code>f0414fc</code></a>
+bump patch to 1.1.32 to integrate security-relevant zlib fixes</li>
+<li><a
+href="https://github.com/rust-lang/libz-sys/commit/6c608d23dc6039afceefa56f8b219fcf85ddeded"><code>6c608d2</code></a>
+Merge pull request <a
+href="https://redirect.github.com/rust-lang/libz-sys/issues/281">#281</a>
+from cyberstormdotmu/main</li>
+<li><a
+href="https://github.com/rust-lang/libz-sys/commit/2401ceedb25a536d2865300a854bca10fc5c1835"><code>2401cee</code></a>
+Update zlib 1.4 to fix the following CVEs:</li>
+<li>See full diff in <a
+href="https://github.com/rust-lang/libz-sys/compare/1.1.31...1.1.32">compare
+view</a></li>
+</ul>
+</details>
+<br />
+
+[![Dependabot compatibility
+score](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=libz-sys&package-manager=cargo&previous-version=1.1.31&new-version=1.1.32)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)
+
+Dependabot will resolve any conflicts with this PR as long as you don't
+alter it yourself. You can also trigger a rebase manually by commenting
+`@dependabot rebase`.
+
+[//]: # (dependabot-automerge-start)
+[//]: # (dependabot-automerge-end)
+
+----
+
+<details>
+<summary>Dependabot commands and options</summary>
+<br />
+
+You can trigger Dependabot actions by commenting on this PR:
+- `@dependabot rebase` will rebase this PR
+- `@dependabot recreate` will recreate this PR, overwriting any edits
+that have been made to it
+- `@dependabot show <dependency name> ignore conditions` will show all
+of the ignore conditions of the specified dependency
+- `@dependabot ignore this major version` will close this PR and stop
+Dependabot creating any more for this major version (unless you reopen
+the PR or upgrade to it yourself)
+- `@dependabot ignore this minor version` will close this PR and stop
+Dependabot creating any more for this minor version (unless you reopen
+the PR or upgrade to it yourself)
+- `@dependabot ignore this dependency` will close this PR and stop
+Dependabot creating any more for this dependency (unless you reopen the
+PR or upgrade to it yourself)
+
+</details>
+
+Signed-off-by: dependabot[bot] <support@github.com>
+Co-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+
+Fork note: upstream 1ee46e02bee, which came after Servo 0.8.0, backported
+unchanged except for the separator line of Dependabot's text, written
+`----` instead of `---` so that `git am` of this patch file keeps the rest
+of the message. libz-sys 1.1.31 has the heap buffer overflow that the
+cargo-deny step of `./mach test-tidy` reports on 0.8.0. Drop this patch
+at the first sync onto a release that contains #49922, where it applies
+empty.
+
+Validation: `./mach test-tidy` on ohos-main 8ca6843c7f9 with this commit and the previous one: the cargo-deny step no longer reports the libz-sys advisory; the chrono one, which the next backport handles, remains. `cargo metadata --locked` resolves; the builds of the stack tip use libz-sys 1.1.33 (see the bookkeeping commit).
+AI-assisted: Yes (agent session; backported by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ Cargo.lock | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 1b9deb95c41..1512a80a4ef 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5127,9 +5127,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "libz-sys"
+-version = "1.1.31"
++version = "1.1.33"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
++checksum = "fee3f59f4321dab0c78d828942e7aa09d0bd8ad6e78a501977e6bf3d02938045"
+ dependencies = [
+  "cc",
+  "libc",

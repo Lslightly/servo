@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Narfinger <Narfinger@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 12:58:26 +0000
+Subject: [PATCH] backport: deny: Allow chrono in cargo deny (#50002)
+
+Chrono is unmaintained. We need to switch to time or jiff.
+This fixes the merge queue.
+
+Testing: No tests for deny.
+
+Signed-off-by: Narfinger <Narfinger@users.noreply.github.com>
+
+Fork note: upstream 60d9b3ecb68, which came after Servo 0.8.0, backported
+unchanged. On 0.8.0 the cargo-deny step of `./mach test-tidy` fails on
+this advisory too. Upstream replaced chrono with jiff afterwards (#50004),
+which this fork doesn't carry. Drop this patch at the first sync onto a
+release that contains #50002, where it applies empty, or is superseded
+by #50004.
+
+Validation: `./mach test-tidy` on ohos-main 8ca6843c7f9 with this commit and the previous two: no errors (before them, the cargo-deny step reported the libsqlite3-sys, libz-sys and chrono advisories).
+AI-assisted: Yes (agent session; backported unchanged by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ deny.toml | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/deny.toml b/deny.toml
+index 7e295b5fa46..1269bcdce3d 100644
+--- a/deny.toml
++++ b/deny.toml
+@@ -53,6 +53,8 @@ ignore = [
+     # rusqlite can not be independently updated as sea-query-rusqlite needs update.
+     "RUSTSEC-2026-0459",
+ 
++    # chrono is unmaintained and will be replaced by probably jiff.
++    "RUSTSEC-2026-0543",
+ ]
+ 
+ # This section is considered when running `cargo deny check licenses`

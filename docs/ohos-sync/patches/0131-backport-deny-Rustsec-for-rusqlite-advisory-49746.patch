@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Narfinger <Narfinger@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 11:38:49 +0000
+Subject: [PATCH] backport: deny: Rustsec for rusqlite advisory (#49746)
+
+This adds an exception to rustsec advisory for rusqlite. Currently the
+rusqlite version cannot be updated as sea-query-rusqlite is dependent on
+0.38. With >=0.39 being safe. This is a vulnerability in libsqlite which
+is bundled in.
+
+https://rustsec.org/advisories/RUSTSEC-2026-0459
+
+Testing: No tests for deny.toml.
+
+Signed-off-by: Narfinger <Narfinger@users.noreply.github.com>
+
+Fork note: upstream b8e2c9652a1, which came after Servo 0.8.0, backported
+unchanged. On 0.8.0 the cargo-deny step of `./mach test-tidy` fails on
+this advisory. Drop this patch at the first sync onto a release that
+contains #49746, where it applies empty.
+
+Validation: `./mach test-tidy` on ohos-main 8ca6843c7f9 with this commit: the cargo-deny step no longer reports the libsqlite3-sys advisory (RUSTSEC-2026-0459); the libz-sys and chrono advisories, which the next two backports handle, remain.
+AI-assisted: Yes (agent session; backported unchanged by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ deny.toml | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/deny.toml b/deny.toml
+index 210b14b8b7e..7e295b5fa46 100644
+--- a/deny.toml
++++ b/deny.toml
+@@ -49,6 +49,10 @@ ignore = [
+     # The crate `zvariant_derive` is unmaintained. Wait for `atspi-common` to start
+     # using `zbus`.
+     "RUSTSEC-2026-0372",
++
++    # rusqlite can not be independently updated as sea-query-rusqlite needs update.
++    "RUSTSEC-2026-0459",
++
+ ]
+ 
+ # This section is considered when running `cargo deny check licenses`

@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Wed, 18 Nov 2026 18:54:59 +0000
+Subject: [PATCH] docs: record patches 131 to 135 in the stack manifest
+
+Three backports that make the cargo-deny step of `./mach test-tidy` pass
+on Servo 0.8.0 again, as upstream did after the release: the rusqlite
+advisory exception (131), the libz-sys bump to 1.1.33 (132) and the
+chrono exception (133). Each is dropped at the first sync onto a
+release that contains it. Plus a fix of a Servo test that floods the
+shared WPT server and makes parallel tests time out (134). All four are
+tier B like the earlier backport; this bookkeeping entry is B, like the
+earlier ones.
+
+Validation: `uv run docs/ohos-sync/check_stack.py base/2026-11-09` passes. At this commit, on the host: `./mach test-tidy` reports no errors (before 131-133 its cargo-deny step reported the libsqlite3-sys, libz-sys and chrono advisories); `./mach clippy --locked -- -- --deny warnings`, `RUSTFLAGS="-D warnings" ./mach build --use-crown --locked --profile checked-release`, `RUSTFLAGS="-D warnings" ./mach build --locked --ohos --profile checked-release` with the default and the harmonyos flavor (each leaves a servoshell-default-signed.hap) and `./mach test-unit --profile checked-release` (1,258 tests) and `--doc` pass; all builds compile libz-sys 1.1.33. WPT: see 134.
+AI-assisted: Yes (agent session; written by the agent)
+Signed-off-by: Jonathan Schwender <schwenderjonathan@gmail.com>
+---
+ docs/ohos-sync/STACK.md | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/docs/ohos-sync/STACK.md b/docs/ohos-sync/STACK.md
+index b3bbe27bf41..753cf7695a5 100644
+--- a/docs/ohos-sync/STACK.md
++++ b/docs/ohos-sync/STACK.md
+@@ -154,6 +154,11 @@ those scripts (they need network access). `check_stack.py` runs each with
+ 128. `script: Run debugger.js on QuickJS` — B · CI · watch: components/default-resources/resources/debugger.js support/quickjs/cargo-config.toml
+ 129. `ci: Run the devtools tests on QuickJS` — A · CI · watch: python/servo/devtools_tests
+ 130. `docs: record patches 128 to 130 in the stack manifest` — B · none · watch: -
++131. `backport: deny: Rustsec for rusqlite advisory (#49746)` — B · CI · watch: -
++132. `backport: build: bump libz-sys from 1.1.31 to 1.1.32 (#49922)` — B · CI · watch: -
++133. `backport: deny: Allow chrono in cargo deny (#50002)` — B · CI · watch: -
++134. `wpt: Let fetch-cannot-overwhelm-system wait for its requests to a small file` — B · CI · watch: -
++135. `docs: record patches 131 to 135 in the stack manifest` — B · none · watch: -
+ 
+ ## Sync log
+ 
