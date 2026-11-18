@@ -363,9 +363,7 @@ impl<T> Reflector<T> {
 
             // Detach the DOM node from the old JSDomStub: the stub may still be referenced from
             // the pool, so it is freed when the pool drains; by then it must not finalize the
-            // node. The pointer is read through the `object` field directly, not `get_jsobject`:
-            // this function is what `get_jsobject` calls to materialize, so reading through it
-            // would recurse.
+            // node. The pointer is read through the `object` field directly, not `get_jsobject`.
             let ref_count = JS_GetDomStubRefCount(stub);
             JS_UnbindDomStub(cx, stub);
 
