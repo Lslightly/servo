@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+<body>
+<div id="a"></div>
+<div id="b"></div>
+<div id="c"></div>
+<script src="lb.js"></script>
+<script>
+  // Warm-up: Document itself is lazy too.
+  var doc = document;
+  window.runtime.reset_materialize_stats();
+
+  // NodeList/HTMLCollection are proxies: wrap() never creates a stub for them,
+  // so neither the collection nor its length is a materialization.
+  var list = doc.querySelectorAll("div");
+  LB.expect(
+    "querySelectorAll returns a proxy and materializes nothing",
+    0,
+    window.runtime.materialize_count()
+  );
+  void list.length;
+  LB.expect(
+    "reading NodeList.length materializes nothing",
+    0,
+    window.runtime.materialize_count()
+  );
+
+  // Only the elements pulled out of the collection are handed to JS.
+  var first = list[0];
+  LB.expect(
+    "indexing a NodeList materializes that element",
+    1,
+    window.runtime.materialize_count()
+  );
+
+  var firstAgain = list[0];
+  LB.expect(
+    "indexing the same element again does not rematerialize",
+    0,
+    window.runtime.materialize_count() - 1
+  );
+
+  var second = list[1];
+  LB.expect(
+    "indexing a different element materializes it",
+    1,
+    window.runtime.materialize_count() - 1
+  );
+
+  var collection = doc.getElementsByTagName("div");
+  LB.expect(
+    "getElementsByTagName returns a proxy and materializes nothing",
+    0,
+    window.runtime.materialize_count() - 2
+  );
+
+  var third = collection[2];
+  LB.expect(
+    "indexing an HTMLCollection materializes that element",
+    1,
+    window.runtime.materialize_count() - 2
+  );
+
+  // The global Window is a WindowProxy, not a lazy DOM stub.
+  var win = window;
+  LB.expect(
+    "window is a proxy and materializes nothing",
+    0,
+    window.runtime.materialize_count() - 3
+  );
+  LB.expectTrue("window is the global proxy", win === window);
+
+  void first;
+  void firstAgain;
+  void second;
+  void third;
+  LB.finish("04-nodelist-proxy");
+</script>
+</body>
+</html>
