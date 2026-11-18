@@ -253,11 +253,33 @@ pub unsafe fn is_dom_proxy(obj: *mut JSObject) -> bool {
 // globals and non-globals.
 pub const DOM_OBJECT_SLOT: u32 = 0;
 
+/// Whether `obj` is a `JSDomStub`, i.e. not yet materialized into a real `JSObject`.
+///
+/// Always false when not building with QuickJS.
+#[inline]
+pub fn is_dom_stub(obj: *mut JSObject) -> bool {
+    #[cfg(feature = "js-quickjs")]
+    {
+        unsafe { js::rust::wrappers2::JS_IsDomStub(obj) }
+    }
+    #[cfg(not(feature = "js-quickjs"))]
+    {
+        let _ = obj;
+        false
+    }
+}
+
 /// Get the private pointer of a DOM object from a given reflector.
 ///
 /// # Safety
 /// obj must point to a valid non-null JS object.
 pub unsafe fn private_from_object(obj: *mut JSObject) -> *const libc::c_void {
+    #[cfg(feature = "js-quickjs")]
+    if is_dom_stub(obj) {
+        // A `JSDomStub` is not a `JSObject`: it stores the DOM node directly.
+        return unsafe { js::rust::wrappers2::JS_GetDomStubDomPtr(obj) };
+    }
+
     let mut value = UndefinedValue();
     unsafe {
         if is_dom_object(obj) {
@@ -453,6 +475,13 @@ unsafe fn private_from_proto_check_static(
     obj: *mut JSObject,
     proto_check: fn(&'static DOMClass) -> bool,
 ) -> Result<*const libc::c_void, ()> {
+    // QuickJS: a `JSDomStub`'s class id already names its concrete interface, and it has no
+    // prototype or DOMClass to check against; generated code (finalize hooks, trace hooks,
+    // method prologues) reaches here with stubs and only needs the DOM pointer.
+    if is_dom_stub(obj) {
+        return Ok(unsafe { private_from_object(obj) });
+    }
+
     unsafe {
         let dom_class = get_dom_class(obj).map_err(|_| ())?;
         if proto_check(dom_class) {

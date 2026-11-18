@@ -8,7 +8,7 @@ use js::JSCLASS_IS_GLOBAL;
 use js::context::JSContext;
 use js::gc::{HandleObject, MutableHandleObject};
 use js::glue::SetProxyReservedSlot;
-use js::jsapi::{JS_SetReservedSlot, JSAutoRealm, JSClass, JSObject};
+use js::jsapi::{JSAutoRealm, JSClass, JSObject};
 use js::jsval::{PrivateValue, UndefinedValue};
 use js::rust::wrappers2::{
     JS_InitializePropertiesFromCompatibleNativeObject, JS_NewDomStub, JS_WrapObject, NewProxyObject,
@@ -16,7 +16,6 @@ use js::rust::wrappers2::{
 use js::rust::{Handle, get_context_realm, get_object_class, get_object_realm};
 
 use crate::codegen::PrototypeList;
-use crate::conversions::DOM_OBJECT_SLOT;
 use crate::import::module::JS_GetReservedSlot;
 use crate::proxyhandler::ensure_expando_object;
 use crate::reflector::ProtoObjectFn;
@@ -74,38 +73,26 @@ unsafe fn wrap_object<T: MutDomObject>(
         assert!(((*get_object_class(scope.get())).flags & JSCLASS_IS_GLOBAL) != 0);
         let _ac = JSAutoRealm::new(cx.raw_cx(), scope.get());
 
-        // Not a proxy object: create a `JSDomStub` and record what materialization needs.
+        // Not a proxy object: create a `JSDomStub`, which keeps the DOM node and the given
+        // prototype itself.
         if !config.is_proxy {
-            // Only the caller's prototype is recorded now. The canonical prototype, and this
+            // Only the caller's prototype is stored now. The canonical prototype, and this
             // interface's unforgeable holder with it, is created lazily the first time the object
             // is handed to JS (see `Reflector::materialize_if_needed`): an object that is never
             // exposed does not create its interface's prototype.
-            let given = match given_proto {
+            let class = config.class.unwrap();
+            let dom_ptr = raw.as_ptr() as *mut c_void;
+            match given_proto {
                 Some(given) => {
                     rooted!(&in(cx) let mut proto = *given);
                     if get_context_realm(cx.raw_cx()) != get_object_realm(proto.get()) {
                         assert!(JS_WrapObject(cx, proto.handle_mut()));
                     }
-                    proto.get()
+                    rval.set(JS_NewDomStub(cx, class, dom_ptr, proto.get()));
                 },
-                None => ptr::null_mut(),
-            };
-            (*raw.as_ptr()).reflector().set_materialize_cache(
-                given,
-                config.proto_object_fn,
-                config.has_legacy_unforgeable_members,
-            );
-
-            // The stub owns `ObjectData` (allocated by `JS_NewDomStub`) and, through it, the DOM
-            // node until it is replaced by a real `JSObject`. Like a materialized object, the
-            // stub keeps the node in `DOM_OBJECT_SLOT`.
-            rval.set(JS_NewDomStub(cx, config.class.unwrap()));
+                None => rval.set(JS_NewDomStub(cx, class, dom_ptr, ptr::null_mut())),
+            }
             assert!(!rval.is_null());
-            JS_SetReservedSlot(
-                rval.get(),
-                DOM_OBJECT_SLOT,
-                &PrivateValue(raw.as_ptr() as *const c_void),
-            );
             return;
         }
 

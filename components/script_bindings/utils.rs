@@ -70,6 +70,14 @@ pub struct DOMClass {
 
     /// The `Globals` flag for this global interface, if any.
     pub global: Globals,
+
+    /// Creates this interface's canonical prototype lazily, when a `JSDomStub` of this
+    /// interface is first materialized into a real `JSObject`.
+    pub proto_object_fn: crate::reflector::ProtoObjectFn,
+
+    /// Whether this interface has `[LegacyUnforgeable]` members to copy into materialized
+    /// objects.
+    pub has_legacy_unforgeable_members: bool,
 }
 unsafe impl Sync for DOMClass {}
 
