@@ -14531,7 +14531,7 @@
      ]
     ],
     "fetch-cannot-overwhelm-system.window.js": [
-     "989231e9caedd099f5212bd2f9d377c83f929a22",
+     "af27ef5f0ae66e3749278ab811b8f34e60bd5565",
      [
       "mozilla/fetch-cannot-overwhelm-system.window.html",
       {
@@ -14539,8 +14539,13 @@
         [
          "title",
          "Ensure multiple fetch do not crash the browser."
+        ],
+        [
+         "timeout",
+         "long"
         ]
-       ]
+       ],
+       "timeout": "long"
       }
      ]
     ],
