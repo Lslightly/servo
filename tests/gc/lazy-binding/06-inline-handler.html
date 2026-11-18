@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+<script src="lb.js"></script>
+<script>
+  // Reset before the body is parsed. Nothing below references <body>, so it is
+  // still a stub when the inline handler runs at the load event.
+  window.runtime.reset_materialize_stats();
+</script>
+</head>
+<!--
+  Dispatching an event with an inline handler hands the Event object to JS for
+  the first time, which materializes the Event. The handler's target element is
+  put into the compiled function's scope chain, but that does not hand it to
+  JS: <body> stays a stub until JS actually receives it.
+-->
+<body onload="onBodyLoad(event)">
+<script>
+  function onBodyLoad(event) {
+    var runtime = window.runtime;
+    var afterDispatch = runtime.materialize_count();
+    LB.expect(
+      "dispatching an event with an inline handler materializes the event",
+      1,
+      afterDispatch
+    );
+    LB.expectTrue("the dispatched event is trusted", event.isTrusted === true);
+    LB.expectTrue(
+      "LegacyUnforgeable event.isTrusted is readable on the materialized event",
+      "isTrusted" in event
+    );
+
+    // Compiling the handler did not hand the target element to JS.
+    var body = document.body;
+    LB.expect(
+      "the handler target stays a stub until JS receives it",
+      1,
+      runtime.materialize_count() - afterDispatch
+    );
+
+    void body;
+    void event;
+    LB.finish("06-inline-handler");
+  }
+</script>
+</body>
+</html>

@@ -34,6 +34,7 @@ pub mod interface;
 pub mod interfaces;
 pub mod iterable;
 pub mod js;
+pub mod lazy_binding_stats;
 pub mod like;
 mod lock;
 mod mem;
