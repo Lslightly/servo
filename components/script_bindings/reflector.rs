@@ -18,9 +18,9 @@ use js::jsval::{PrivateValue, UndefinedValue};
 use js::rust::{HandleObject, MutableHandleObject};
 #[cfg(feature = "js-quickjs")]
 use js::rust::wrappers2::{
-    EnterRealm, JS_GetDomStubDomPtr, JS_GetDomStubGivenProto, JS_GetDomStubInfo,
-    JS_GetDomStubRefCount, JS_InitializePropertiesFromCompatibleNativeObject, JS_IsDomStub,
-    JS_NewObjectWithGivenProto, JS_UnbindDomStub, LeaveRealm,
+    EnterRealm, JS_GetDomStubDomPtr, JS_GetDomStubInfo, JS_GetDomStubRefCount,
+    JS_InitializePropertiesFromCompatibleNativeObject, JS_IsDomStub, JS_NewObjectWithGivenProto,
+    JS_UnbindDomStub, LeaveRealm,
 };
 use malloc_size_of_derive::MallocSizeOf;
 
@@ -34,7 +34,7 @@ use crate::iterable::{Iterable, IterableIterator};
 use crate::realms::enter_auto_realm;
 use crate::root::{Dom, DomRoot, Root};
 #[cfg(feature = "js-quickjs")]
-use crate::utils::DOM_PROTO_UNFORGEABLE_HOLDER_SLOT;
+use crate::utils::{DOM_PROTO_UNFORGEABLE_HOLDER_SLOT, DOMJSClass};
 use crate::{DomTypes, JSTraceable};
 
 pub trait AssociatedMemorySize: Default {
@@ -68,6 +68,14 @@ pub type ProtoObjectFn =
 // QuickJS: `Dom<T>` reads `object` through a `*const Reflector<()>`, whatever `T` is.
 #[cfg_attr(feature = "js-quickjs", repr(C))]
 pub struct Reflector<T = ()> {
+    /// QuickJS: the interface's class (`WrapConfig::class`), recorded by `wrap`.
+    ///
+    /// A `JSDomStub` stores only its DOM node and realm; the shim reads this back from the node
+    /// pointer at offset 0 to find the interface's finalizer and trace hook. **It must stay the
+    /// first field**: mozjs's `engine::class::ReflectorHeader` mirrors that.
+    #[cfg(feature = "js-quickjs")]
+    #[ignore_malloc_size_of = "shared per interface, owned by codegen"]
+    dom_js_class: Cell<*const DOMJSClass>,
     #[ignore_malloc_size_of = "defined and measured in rust-mozjs"]
     object: Heap<*mut JSObject>,
     /// Associated memory size (of rust side). Used for memory reporting to SM.
@@ -78,6 +86,11 @@ pub struct Reflector<T = ()> {
     #[cfg(feature = "js-quickjs")]
     counted: Cell<bool>,
 }
+
+/// The QuickJS shim reads the interface class of a `JSDomStub` from the DOM node pointer at
+/// offset 0 (mozjs `engine::class::ReflectorHeader`), so `dom_js_class` must stay first.
+#[cfg(feature = "js-quickjs")]
+const _: () = assert!(std::mem::offset_of!(Reflector<()>, dom_js_class) == 0);
 
 unsafe impl<T> js::gc::Traceable for Reflector<T> {
     unsafe fn trace(&self, tracer: *mut js::jsapi::JSTracer) {
@@ -129,6 +142,21 @@ impl<T> Reflector<T> {
         }
         // We're rooted, so it's safe to hand out a handle to object in Heap
         unsafe { HandleObject::from_raw(self.object.handle()) }
+    }
+
+    /// QuickJS: the interface's class, recorded by `wrap`; null for objects that were never
+    /// wrapped (and for every reflector in non-QuickJS builds).
+    #[cfg(feature = "js-quickjs")]
+    #[inline]
+    pub fn dom_js_class(&self) -> *const DOMJSClass {
+        self.dom_js_class.get()
+    }
+
+    /// QuickJS: record the interface's class, before creating the object's `JSDomStub`.
+    #[cfg(feature = "js-quickjs")]
+    #[inline]
+    pub(crate) fn set_dom_js_class(&self, class: *const DOMJSClass) {
+        self.dom_js_class.set(class);
     }
 
     /// Return a raw pointer to the DOM object that owns this `Reflector`.
@@ -242,8 +270,10 @@ impl<T> Reflector<T> {
     /// the pool; the rest are duplicated without corresponding pool entries and leak for now.
     /// Afterwards the reflector points at the new `JSObject`.
     ///
-    /// Everything materialization needs is read from the stub (DOM node, realm, given prototype)
-    /// or from the per-interface `DOMClass` (canonical prototype function, unforgeable members).
+    /// Everything materialization needs is read from the stub (DOM node, realm) or from the
+    /// per-interface class recorded on the reflector (`DOMJSClass`: the `JSClass` itself, the
+    /// canonical prototype function, the unforgeable members). The interface's canonical
+    /// prototype is always used.
     /// The new object is created with the class and realm recorded on the stub (the object's
     /// actual interface), not with those of the static type it is currently handled as. E.g.
     /// `document.getElementById` returns `Element`, but the object may be an `HTMLDivElement`:
@@ -269,22 +299,22 @@ impl<T> Reflector<T> {
         unsafe {
             let dom_ptr = JS_GetDomStubDomPtr(stub);
             assert!(!dom_ptr.is_null(), "JSDomStub without a DOM object");
-            let given_proto = JS_GetDomStubGivenProto(stub);
 
-            // Read the stub's class, realm's global and shim context before unbinding it:
+            // Read the realm's global and shim context before unbinding the stub:
             // `JS_UnbindDomStub` clears the realm and releases the stub's reference to it.
-            let mut class: *const JSClass = std::ptr::null();
             let mut scope: *mut JSObject = std::ptr::null_mut();
             let mut raw_cx: *mut js::jsapi::JSContext = std::ptr::null_mut();
-            JS_GetDomStubInfo(stub, &mut class, &mut scope, &mut raw_cx);
-            assert!(!class.is_null());
+            JS_GetDomStubInfo(stub, &mut scope, &mut raw_cx);
             assert!(!scope.is_null());
             assert!(!raw_cx.is_null(), "JSDomStub without a live runtime");
 
-            // The per-interface data: unlike the old per-node `MaterializeCache`, these live in
-            // the `DOMClass` shared by every object of the interface.
-            let dom_class = crate::conversions::get_dom_class(stub)
-                .expect("JSDomStub is not a DOM class");
+            // The per-interface data, recorded on the reflector by `wrap`: the class and the
+            // `DOMClass` shared by every object of the interface.
+            let dom_js_class = self.dom_js_class();
+            assert!(!dom_js_class.is_null(), "JSDomStub without an interface class");
+            // `DOMJSClass::base` is its first field, so this pointer also names the `JSClass`.
+            let class = dom_js_class as *const JSClass;
+            let dom_class = &(*dom_js_class).dom_class;
 
             // Recover the shim context from the stub's realm, which the stub keeps alive, rather
             // than from the thread-local one.
@@ -308,11 +338,9 @@ impl<T> Reflector<T> {
             );
             assert!(!canonical_proto.is_null());
 
-            let proto = if given_proto.is_null() {
-                canonical_proto.get()
-            } else {
-                given_proto
-            };
+            // The interface's canonical prototype is always used: the stub no longer records a
+            // `given_proto`.
+            let proto = canonical_proto.get();
 
             // Bind to a real JSObject, carrying over the stub's reference count.
             // `JS_NewObjectWithGivenProto` creates the object with a count of 1, and the pool
@@ -364,6 +392,8 @@ impl<T: AssociatedMemorySize> Reflector<T> {
     #[expect(clippy::new_without_default)]
     pub fn new() -> Reflector<T> {
         Reflector {
+            #[cfg(feature = "js-quickjs")]
+            dom_js_class: Cell::new(std::ptr::null()),
             object: Heap::default(),
             proto_id: Cell::new(u16::MAX),
             size: T::default(),
