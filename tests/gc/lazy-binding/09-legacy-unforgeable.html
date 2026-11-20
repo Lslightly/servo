@@ -14,7 +14,7 @@
   var event = new Event("test");
   LB.expect(
     "constructing an Event materializes it",
-    1,
+    0,
     window.runtime.materialize_count()
   );
   LB.expectTrue(

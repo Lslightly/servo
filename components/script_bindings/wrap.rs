@@ -11,21 +11,22 @@ use js::glue::SetProxyReservedSlot;
 use js::jsapi::{JSAutoRealm, JSClass, JSObject};
 use js::jsval::{PrivateValue, UndefinedValue};
 use js::rust::wrappers2::{
-    JS_InitializePropertiesFromCompatibleNativeObject, JS_NewDomStub, JS_WrapObject, NewProxyObject,
+    JS_InitializePropertiesFromCompatibleNativeObject, JS_NewDomStub, JS_NewObjectWithGivenProto,
+    JS_WrapObject, NewProxyObject,
 };
 use js::rust::{Handle, get_context_realm, get_object_class, get_object_realm};
 #[cfg(feature = "js-quickjs")]
 use crate::utils::DOMJSClass;
 
 use crate::codegen::PrototypeList;
-use crate::import::module::JS_GetReservedSlot;
+use crate::conversions::DOM_OBJECT_SLOT;
+use crate::import::module::{JS_GetReservedSlot, JS_SetReservedSlot};
 use crate::proxyhandler::ensure_expando_object;
 use crate::reflector::ProtoObjectFn;
 use crate::root::{DomRoot, MaybeUnreflectedDom, Root};
 use crate::utils::DOM_PROTO_UNFORGEABLE_HOLDER_SLOT;
 use crate::{DomObject, DomTypes, MutDomObject};
 
-/// TODO: unforgeable is missing
 pub(crate) struct WrapConfig {
     pub(crate) is_maybe_cross_origin_object: bool,
     pub(crate) is_proxy: bool,
@@ -75,39 +76,58 @@ unsafe fn wrap_object<T: MutDomObject>(
         assert!(((*get_object_class(scope.get())).flags & JSCLASS_IS_GLOBAL) != 0);
         let _ac = JSAutoRealm::new(cx.raw_cx(), scope.get());
 
-        // Not a proxy object: create a `JSDomStub`, which keeps the DOM node, its realm and the
-        // prototype the caller asked for.
+        // Not a proxy object: either a lazily created `JSDomStub` (the common case), or — when
+        // the caller asked for a prototype of its own — a real object created eagerly.
         if !config.is_proxy {
             // Record the interface class on the reflector; the shim reads it back from the node
-            // pointer to find the interface's finalizer and trace hook. The canonical prototype,
-            // and this interface's unforgeable holder with it, is created lazily the first time
-            // the object is handed to JS (see `Reflector::materialize_if_needed`): an object that
-            // is never exposed does not create its interface's prototype. A canonical prototype
-            // is only used at materialization time when `given_proto` is absent.
+            // pointer to find the interface's finalizer and trace hook.
             let class = config.class.unwrap();
             let dom_ptr = raw.as_ptr();
             (*dom_ptr)
                 .reflector()
                 .set_dom_js_class(class as *const JSClass as *const DOMJSClass);
-            match given_proto {
-                Some(given) => {
-                    rooted!(&in(cx) let mut proto = *given);
-                    // The proto may come from another realm (e.g. a subclassed DOM constructor
-                    // called across realms); make it a wrapper in this one before the stub holds
-                    // it.
-                    if get_context_realm(cx.raw_cx()) != get_object_realm(proto.get()) {
-                        assert!(JS_WrapObject(cx, proto.handle_mut()));
-                    }
-                    rval.set(JS_NewDomStub(cx, class, dom_ptr as *mut c_void, proto.get()));
-                },
-                None => rval.set(JS_NewDomStub(
-                    cx,
-                    class,
-                    dom_ptr as *mut c_void,
-                    ptr::null_mut(),
-                )),
+            let dom_ptr = dom_ptr as *mut c_void;
+
+            // The common case: no caller-given prototype. Keep the object lazy. The canonical
+            // prototype, and this interface's unforgeable holder with it, is created the first
+            // time the object is handed to JS (see `Reflector::materialize_if_needed`): an object
+            // that is never exposed does not create its interface's prototype.
+            let Some(given) = given_proto else {
+                rval.set(JS_NewDomStub(cx, class, dom_ptr));
+                assert!(!rval.is_null());
+                return;
+            };
+
+            // A caller-given prototype (a subclassed DOM constructor, i.e.
+            // `new.target.prototype`) cannot be carried by a `JSDomStub`: a stub is always
+            // materialized with the interface's canonical prototype. Create the real object now,
+            // exactly as `Reflector::materialize_if_needed` would, and copy the unforgeable
+            // members here.
+            rooted!(&in(cx) let mut proto = *given);
+            // The proto may come from another realm (e.g. a subclassed DOM constructor called
+            // across realms); make it a wrapper in this one first.
+            if get_context_realm(cx.raw_cx()) != get_object_realm(proto.get()) {
+                assert!(JS_WrapObject(cx, proto.handle_mut()));
             }
+
+            // The canonical prototype still has to exist: it holds this interface's unforgeable
+            // members, even when the instance does not use it.
+            rooted!(&in(cx) let mut canonical_proto = ptr::null_mut::<JSObject>());
+            (config.proto_object_fn)(cx, *scope, canonical_proto.handle_mut());
+            assert!(!canonical_proto.is_null());
+
+            let proto_ptr = proto.get();
+            rval.set(JS_NewObjectWithGivenProto(
+                cx,
+                class,
+                HandleObject::from_marked_location(&proto_ptr),
+            ));
             assert!(!rval.is_null());
+            JS_SetReservedSlot(rval.get(), DOM_OBJECT_SLOT, &PrivateValue(dom_ptr));
+
+            if config.has_legacy_unforgeable_members {
+                copy_legacy_unforgeable_members(cx, rval, canonical_proto.get());
+            }
             return;
         }
 
@@ -143,28 +163,33 @@ unsafe fn wrap_object<T: MutDomObject>(
             SetProxyReservedSlot(rval.get(), 0, &PrivateValue(raw.as_ptr() as *const c_void));
         }
 
-        // From here on we copy the legacy unforgeable properties to instance which was originally in a different function.
+        // A proxy cannot hold the properties itself: they go on its expando object, which the
+        // proxy handler forwards to.
         if config.has_legacy_unforgeable_members {
             rooted!(&in(cx) let mut expando = ptr::null_mut::<JSObject>());
-            if config.is_proxy {
-                ensure_expando_object(cx, rval.handle(), expando.handle_mut());
-            }
-
-            let copy_fn = JS_InitializePropertiesFromCompatibleNativeObject;
-
-            let mut slot = UndefinedValue();
-            JS_GetReservedSlot(
-                canonical_proto.get(),
-                DOM_PROTO_UNFORGEABLE_HOLDER_SLOT,
-                &mut slot,
-            );
-            rooted!(&in(cx) let mut unforgeable_holder = ptr::null_mut::<JSObject>());
-            unforgeable_holder.handle_mut().set(slot.to_object());
-            if config.is_proxy {
-                assert!(copy_fn(cx, expando.handle(), unforgeable_holder.handle()));
-            } else {
-                assert!(copy_fn(cx, rval.handle(), unforgeable_holder.handle()));
-            }
+            ensure_expando_object(cx, rval.handle(), expando.handle_mut());
+            copy_legacy_unforgeable_members(cx, expando.handle_mut(), canonical_proto.get());
         }
+    }
+}
+
+/// Copies the interface's legacy unforgeable properties onto `target`, taking them from the
+/// unforgeable holder recorded on the interface's canonical prototype. They become
+/// non-configurable own properties of `target`.
+unsafe fn copy_legacy_unforgeable_members(
+    cx: &mut JSContext,
+    target: MutableHandleObject,
+    canonical_proto: *mut JSObject,
+) {
+    unsafe {
+        let mut slot = UndefinedValue();
+        JS_GetReservedSlot(canonical_proto, DOM_PROTO_UNFORGEABLE_HOLDER_SLOT, &mut slot);
+        rooted!(&in(cx) let mut unforgeable_holder = ptr::null_mut::<JSObject>());
+        unforgeable_holder.handle_mut().set(slot.to_object());
+        assert!(JS_InitializePropertiesFromCompatibleNativeObject(
+            cx,
+            target.handle(),
+            unforgeable_holder.handle(),
+        ));
     }
 }
