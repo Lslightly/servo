@@ -18,9 +18,9 @@ use js::jsval::{PrivateValue, UndefinedValue};
 use js::rust::{HandleObject, MutableHandleObject};
 #[cfg(feature = "js-quickjs")]
 use js::rust::wrappers2::{
-    EnterRealm, JS_GetDomStubDomPtr, JS_GetDomStubInfo, JS_GetDomStubRefCount,
-    JS_InitializePropertiesFromCompatibleNativeObject, JS_IsDomStub, JS_NewObjectWithGivenProto,
-    JS_UnbindDomStub, LeaveRealm,
+    EnterRealm, JS_GetDomStubDomPtr, JS_GetDomStubGivenProto, JS_GetDomStubInfo,
+    JS_GetDomStubRefCount, JS_InitializePropertiesFromCompatibleNativeObject, JS_IsDomStub,
+    JS_NewObjectWithGivenProto, JS_UnbindDomStub, LeaveRealm,
 };
 use malloc_size_of_derive::MallocSizeOf;
 
@@ -265,10 +265,11 @@ impl<T> Reflector<T> {
     /// the pool; the rest are duplicated without corresponding pool entries and leak for now.
     /// Afterwards the reflector points at the new `JSObject`.
     ///
-    /// Everything materialization needs is read from the stub (DOM node, realm) or from the
-    /// per-interface class recorded on the reflector (`DOMJSClass`: the `JSClass` itself, the
-    /// canonical prototype function, the unforgeable members). The interface's canonical
-    /// prototype is always used.
+    /// Everything materialization needs is read from the stub (DOM node, realm, given prototype)
+    /// or from the per-interface class recorded on the reflector (`DOMJSClass`: the `JSClass`
+    /// itself, the canonical prototype function, the unforgeable members). The given prototype is
+    /// preferred; the interface's canonical prototype is used when there is none (and is always
+    /// created, because it holds the interface's unforgeable members).
     /// The new object is created with the class and realm recorded on the stub (the object's
     /// actual interface), not with those of the static type it is currently handled as. E.g.
     /// `document.getElementById` returns `Element`, but the object may be an `HTMLDivElement`:
@@ -294,6 +295,7 @@ impl<T> Reflector<T> {
         unsafe {
             let dom_ptr = JS_GetDomStubDomPtr(stub);
             assert!(!dom_ptr.is_null(), "JSDomStub without a DOM object");
+            let given_proto = JS_GetDomStubGivenProto(stub);
 
             // Read the realm's global and shim context before unbinding the stub:
             // `JS_UnbindDomStub` clears the realm and releases the stub's reference to it.
@@ -333,9 +335,14 @@ impl<T> Reflector<T> {
             );
             assert!(!canonical_proto.is_null());
 
-            // The interface's canonical prototype is always used: the stub no longer records a
-            // `given_proto`.
-            let proto = canonical_proto.get();
+            // Use the prototype the object was created with, if any: a subclassed DOM constructor
+            // (`class Foo extends Event`) passes the subclass prototype through `new.target`;
+            // otherwise fall back to the interface's canonical prototype.
+            let proto = if given_proto.is_null() {
+                canonical_proto.get()
+            } else {
+                given_proto
+            };
 
             // Bind to a real JSObject, carrying over the stub's reference count.
             // `JS_NewObjectWithGivenProto` creates the object with a count of 1, and the pool

@@ -11,9 +11,9 @@ use js::glue::SetProxyReservedSlot;
 use js::jsapi::{JSAutoRealm, JSClass, JSObject};
 use js::jsval::{PrivateValue, UndefinedValue};
 use js::rust::wrappers2::{
-    JS_InitializePropertiesFromCompatibleNativeObject, JS_NewDomStub, NewProxyObject,
+    JS_InitializePropertiesFromCompatibleNativeObject, JS_NewDomStub, JS_WrapObject, NewProxyObject,
 };
-use js::rust::{Handle, get_object_class};
+use js::rust::{Handle, get_context_realm, get_object_class, get_object_realm};
 #[cfg(feature = "js-quickjs")]
 use crate::utils::DOMJSClass;
 
@@ -65,9 +65,7 @@ pub(crate) unsafe fn wrap<T: MutDomObject, D: DomTypes>(
 unsafe fn wrap_object<T: MutDomObject>(
     cx: &mut JSContext,
     scope: &HandleObject,
-    // QuickJS: `given_proto` is no longer recorded on the stub; materialization always uses the
-    // interface's canonical prototype. The parameter is kept for the generated callers.
-    _given_proto: Option<js::rust::Handle<*mut JSObject>>,
+    given_proto: Option<js::rust::Handle<*mut JSObject>>,
     raw: &Root<MaybeUnreflectedDom<T>>,
     config: &WrapConfig,
     mut rval: MutableHandleObject,
@@ -77,19 +75,38 @@ unsafe fn wrap_object<T: MutDomObject>(
         assert!(((*get_object_class(scope.get())).flags & JSCLASS_IS_GLOBAL) != 0);
         let _ac = JSAutoRealm::new(cx.raw_cx(), scope.get());
 
-        // Not a proxy object: create a `JSDomStub`, which keeps only the DOM node and its realm.
+        // Not a proxy object: create a `JSDomStub`, which keeps the DOM node, its realm and the
+        // prototype the caller asked for.
         if !config.is_proxy {
             // Record the interface class on the reflector; the shim reads it back from the node
             // pointer to find the interface's finalizer and trace hook. The canonical prototype,
             // and this interface's unforgeable holder with it, is created lazily the first time
             // the object is handed to JS (see `Reflector::materialize_if_needed`): an object that
-            // is never exposed does not create its interface's prototype.
+            // is never exposed does not create its interface's prototype. A canonical prototype
+            // is only used at materialization time when `given_proto` is absent.
             let class = config.class.unwrap();
             let dom_ptr = raw.as_ptr();
             (*dom_ptr)
                 .reflector()
                 .set_dom_js_class(class as *const JSClass as *const DOMJSClass);
-            rval.set(JS_NewDomStub(cx, class, dom_ptr as *mut c_void));
+            match given_proto {
+                Some(given) => {
+                    rooted!(&in(cx) let mut proto = *given);
+                    // The proto may come from another realm (e.g. a subclassed DOM constructor
+                    // called across realms); make it a wrapper in this one before the stub holds
+                    // it.
+                    if get_context_realm(cx.raw_cx()) != get_object_realm(proto.get()) {
+                        assert!(JS_WrapObject(cx, proto.handle_mut()));
+                    }
+                    rval.set(JS_NewDomStub(cx, class, dom_ptr as *mut c_void, proto.get()));
+                },
+                None => rval.set(JS_NewDomStub(
+                    cx,
+                    class,
+                    dom_ptr as *mut c_void,
+                    ptr::null_mut(),
+                )),
+            }
             assert!(!rval.is_null());
             return;
         }
