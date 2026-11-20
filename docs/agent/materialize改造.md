@@ -3,6 +3,12 @@
 > 目标分支：`lazy-binding-rebase-1112`
 > 设计依据：`docs/agent/draft-lazy-binding.md`（下文简称"草稿"）
 > 行号只是本文写作时的快照；实施时按符号名定位。
+>
+> **后续变更（已实施）**：`JSDomStub` 不再保存 `given_proto`。带 given proto 的构造
+> （子类构造器、`Reflect.construct` 的 `newTarget.prototype`）在 `wrap()` 时直接创建真
+> `JSObject`，从不进入 stub/materialize 路径。`JS_NewDomStub` 现在是
+> `(cx, clasp, dom_ptr)`，`JS_GetDomStubGivenProto` 已删除；下文涉及 given_proto 的描述
+> 是当时的设计快照。
 
 ---
 

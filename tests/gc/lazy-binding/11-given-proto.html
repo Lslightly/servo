@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script src="lb.js"></script>
+<script>
+  // Warm-up: Document itself is lazy too.
+  var doc = document;
+  window.runtime.reset_materialize_stats();
+
+  // A subclassed DOM constructor must get `new.target.prototype`, but a
+  // JSDomStub can only be materialized with the interface's canonical
+  // prototype. Such objects are therefore created eagerly as real JSObjects:
+  // they never materialize and do not count.
+  class MyEvent extends Event {}
+  var event = new MyEvent("subclass");
+
+  LB.expect(
+    "subclassed Event is created eagerly (no materialization)",
+    0,
+    window.runtime.materialize_count()
+  );
+  LB.expectTrue(
+    "subclassed Event uses the subclass prototype",
+    Object.getPrototypeOf(event) === MyEvent.prototype
+  );
+  LB.expectTrue("subclassed Event is a MyEvent", event instanceof MyEvent);
+  LB.expectTrue("subclassed Event is an Event", event instanceof Event);
+  LB.expectTrue("subclassed Event kept its type", event.type === "subclass");
+
+  // The eager path must still copy [LegacyUnforgeable] members from the
+  // interface's canonical prototype holder.
+  LB.expectTrue(
+    "LegacyUnforgeable isTrusted was copied onto the eager instance",
+    event.isTrusted === false
+  );
+  LB.expectTrue(
+    "isTrusted is an own property of the eager instance",
+    Object.prototype.hasOwnProperty.call(event, "isTrusted")
+  );
+
+  // An explicit newTarget (Reflect.construct) takes the same path.
+  function Target() {}
+  Target.prototype = Object.create(Event.prototype);
+  var reflected = Reflect.construct(Event, ["reflected"], Target);
+
+  LB.expect(
+    "Reflect.construct with a custom newTarget is created eagerly",
+    0,
+    window.runtime.materialize_count()
+  );
+  LB.expectTrue(
+    "Reflect.construct instance uses newTarget.prototype",
+    Object.getPrototypeOf(reflected) === Target.prototype
+  );
+  LB.expectTrue("Reflect.construct instance is an Event", reflected instanceof Event);
+  LB.expectTrue(
+    "LegacyUnforgeable isTrusted was copied onto the Reflect.construct instance",
+    reflected.isTrusted === false
+  );
+
+  void event;
+  void reflected;
+  LB.finish("11-given-proto");
+</script>
+</body>
+</html>
