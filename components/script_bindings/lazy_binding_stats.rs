@@ -6,6 +6,7 @@
 //!
 //! They are thread-local: each script thread (each pipeline) has its own counts, so a page
 //! never observes materializations performed for another pipeline's realm.
+#![cfg(feature = "js-quickjs")]
 
 use std::cell::Cell;
 use std::sync::OnceLock;

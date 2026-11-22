@@ -10,7 +10,9 @@ use std::ffi::c_void;
 use std::rc::Rc;
 
 use js::context::JSContext;
-use js::jsapi::{AddAssociatedMemory, Heap, JSClass, JSObject, MemoryUse, RemoveAssociatedMemory};
+use js::jsapi::{AddAssociatedMemory, Heap, JSObject, MemoryUse, RemoveAssociatedMemory};
+#[cfg(feature = "js-quickjs")]
+use js::jsapi::JSClass;
 #[cfg(feature = "js-quickjs")]
 use js::jsapi::JS_SetReservedSlot;
 #[cfg(feature = "js-quickjs")]

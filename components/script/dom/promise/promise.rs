@@ -384,6 +384,7 @@ impl Promise {
         handler: &PromiseNativeHandler,
     ) {
         let global = GlobalScope::from_current_realm(cx);
+        #[cfg(feature = "js-quickjs")]
         unsafe { handler.reflector().materialize_if_needed(); }
         run_a_script::<DomTypeHolder, _, _>(cx, &global, |cx| {
             rooted!(&in(cx) let resolve_func =
