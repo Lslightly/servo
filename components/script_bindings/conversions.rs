@@ -179,9 +179,7 @@ impl<T> ToJSValConvertible for Reflector<T> {
         // Materialize it before the value leaves the embedder, as QuickJS treats it as a regular
         // object (e.g. `ResolvePromise` reads its `then` property).
         #[cfg(feature = "js-quickjs")]
-        unsafe {
-            self.materialize_if_needed();
-        }
+        self.materialize_if_needed();
         let obj = self.get_jsobject().get();
         assert!(!obj.is_null());
         rval.set(ObjectValue(obj));

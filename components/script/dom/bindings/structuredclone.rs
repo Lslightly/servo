@@ -198,7 +198,7 @@ unsafe fn read_object<T: Serializable<crate::DomTypeHolder>>(
 
     if let Ok(obj) = T::deserialize(cx, owner, serialized) {
         #[cfg(feature = "js-quickjs")]
-        unsafe { obj.reflector().materialize_if_needed(); }
+        obj.reflector().materialize_if_needed();
         let reflector = obj.reflector().get_jsobject().get();
         sc_reader.roots.push(Heap::boxed(reflector));
         return reflector;

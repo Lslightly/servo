@@ -229,7 +229,7 @@ fn html_constructor(
     };
 
     #[cfg(feature = "js-quickjs")]
-    unsafe { result.reflector().materialize_if_needed(); }
+    result.reflector().materialize_if_needed();
     rooted!(&in(cx) let mut element = result.reflector().get_jsobject().get());
     unsafe {
         if !JS_WrapObject(cx, element.handle_mut()) {

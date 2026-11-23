@@ -235,18 +235,14 @@ impl RequestListener {
                         match cursor.downcast::<IDBCursorWithValue>() {
                             Some(cursor_with_value) => {
                                 #[cfg(feature = "js-quickjs")]
-                                unsafe {
-                                    cursor_with_value.reflector().materialize_if_needed();
-                                }
+                                cursor_with_value.reflector().materialize_if_needed();
                                 answer.handle_mut().set(ObjectValue(
                                     *cursor_with_value.reflector().get_jsobject(),
                                 ));
                             },
                             None => {
                                 #[cfg(feature = "js-quickjs")]
-                                unsafe {
-                                    cursor.reflector().materialize_if_needed();
-                                }
+                                cursor.reflector().materialize_if_needed();
                                 answer
                                     .handle_mut()
                                     .set(ObjectValue(*cursor.reflector().get_jsobject()));

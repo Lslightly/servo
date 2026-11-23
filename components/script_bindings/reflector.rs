@@ -284,7 +284,7 @@ impl<T> Reflector<T> {
     /// object in some conversions (e.g. `ResolvePromise` reads its `then` property), which a
     /// `JSDomStub` cannot support.
     #[cfg(feature = "js-quickjs")]
-    pub unsafe fn materialize_if_needed(&self) {
+    pub fn materialize_if_needed(&self) {
         crate::lazy_binding_stats::record_call();
         let stub = self.object.get();
         if !unsafe { JS_IsDomStub(stub) } {

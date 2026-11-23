@@ -346,9 +346,7 @@ impl ModuleTree {
 
         // Step 7. Set script's record to the result of CreateDefaultExportSyntheticModule(sheet).
         #[cfg(feature = "js-quickjs")]
-        unsafe {
-            sheet.reflector().materialize_if_needed();
-        }
+        sheet.reflector().materialize_if_needed();
         rooted!(&in(cx) let sheet = ObjectValue(sheet.reflector().get_jsobject().get()));
         rooted!(&in(cx) let module_script = unsafe { CreateDefaultExportSyntheticModule(cx, sheet.handle()) });
         script.set_record(module_script.handle());
