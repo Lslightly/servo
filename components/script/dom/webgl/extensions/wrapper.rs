@@ -64,6 +64,10 @@ where
         if !enabled {
             self.enable(ext);
         }
+        #[cfg(feature = "js-quickjs")]
+        unsafe {
+            extension.reflector().materialize_if_needed();
+        }
         rval.set(extension.reflector().get_jsobject().get());
     }
 

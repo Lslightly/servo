@@ -1776,6 +1776,10 @@ pub(crate) fn handle_get_property(
                 let mut realm = enter_auto_realm(cx, &*document);
                 let cx = &mut realm.current_realm();
 
+                #[cfg(feature = "js-quickjs")]
+                unsafe {
+                    element.reflector().materialize_if_needed();
+                }
                 rooted!(&in(cx) let mut property = UndefinedValue());
                 match get_property_jsval(
                     cx,

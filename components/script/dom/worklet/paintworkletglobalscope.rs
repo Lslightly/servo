@@ -319,11 +319,21 @@ impl PaintWorkletGlobalScope {
         rooted_vec!(let mut arguments_values);
         for argument in arguments {
             let style_value = CSSStyleValue::new(cx, self.upcast(), argument.clone());
+            #[cfg(feature = "js-quickjs")]
+            unsafe {
+                style_value.reflector().materialize_if_needed();
+            }
             arguments_values.push(ObjectValue(style_value.reflector().get_jsobject().get()));
         }
         let arguments_value_array = HandleValueArray::from(&arguments_values);
         rooted!(&in(cx) let argument_object = unsafe { NewArrayObject(cx, &arguments_value_array) });
 
+        #[cfg(feature = "js-quickjs")]
+        unsafe {
+            rendering_context.reflector().materialize_if_needed();
+            paint_size.reflector().materialize_if_needed();
+            properties.reflector().materialize_if_needed();
+        }
         rooted_vec!(let mut callback_args);
         callback_args.push(ObjectValue(
             rendering_context.reflector().get_jsobject().get(),
