@@ -10,4 +10,4 @@
 SERVO_QUICKJS_DEBUGGER = "1"
 
 [patch.crates-io]
-mozjs = { git = "https://github.com/openharmony-rs/servo-quickjs", rev = "6ac4a17b197264851600edb124c7ef2b508c8f90" }
+mozjs = { git = "https://github.com/Lslightly/servo-quickjs.git", rev = "fccc670031cb2cbb968a29f90d4ded84c5f67b1e" }
