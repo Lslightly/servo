@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script src="lb.js"></script>
+<script>
+  // Materialization transfers the stub's Rust/JS references to the new JSObject and releases the
+  // stub's own counts. If the new object is over-retained, a detached element stays alive forever.
+  var runtime = window.runtime;
+  var element = document.createElement("div");
+  var weak = new WeakRef(element);
+
+  runtime.drain_pool();
+  LB.expectTrue("materialized element is initially alive", weak.deref() === element);
+
+  element = null;
+  runtime.drain_pool_gc();
+
+  // A WeakRef keeps its target alive until the end of the job that read it. Collect in a later job.
+  window.setTimeout(function () {
+    runtime.drain_pool_gc();
+    LB.expectTrue("materialized element is collectable", weak.deref() === undefined);
+    LB.finish("12-materialize-gc");
+  }, 0);
+</script>
+</body>
+</html>

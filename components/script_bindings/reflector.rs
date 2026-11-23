@@ -10,20 +10,20 @@ use std::ffi::c_void;
 use std::rc::Rc;
 
 use js::context::JSContext;
-use js::jsapi::{AddAssociatedMemory, Heap, JSObject, MemoryUse, RemoveAssociatedMemory};
-#[cfg(feature = "js-quickjs")]
-use js::jsapi::JSClass;
 #[cfg(feature = "js-quickjs")]
 use js::jsapi::JS_SetReservedSlot;
 #[cfg(feature = "js-quickjs")]
+use js::jsapi::JSClass;
+use js::jsapi::{AddAssociatedMemory, Heap, JSObject, MemoryUse, RemoveAssociatedMemory};
+#[cfg(feature = "js-quickjs")]
 use js::jsval::{PrivateValue, UndefinedValue};
-use js::rust::{HandleObject, MutableHandleObject};
 #[cfg(feature = "js-quickjs")]
 use js::rust::wrappers2::{
-    EnterRealm, JS_GetDomStubDomPtr, JS_GetDomStubInfo, JS_GetDomStubRefCount,
-    JS_InitializePropertiesFromCompatibleNativeObject, JS_IsDomStub,
+    EnterRealm, JS_GetDomStubDomPtr, JS_GetDomStubInfo, JS_GetDomStubPoolRefCount,
+    JS_GetDomStubRefCount, JS_InitializePropertiesFromCompatibleNativeObject, JS_IsDomStub,
     JS_NewObjectWithGivenProto, JS_UnbindDomStub, LeaveRealm,
 };
+use js::rust::{HandleObject, MutableHandleObject};
 use malloc_size_of_derive::MallocSizeOf;
 
 #[cfg(feature = "js-quickjs")]
@@ -60,8 +60,7 @@ impl AssociatedMemorySize for AssociatedMemory {
 
 /// The generated `GetProtoObject` of an interface: returns its prototype in the realm of
 /// `global`, creating the prototype, its interface object and its unforgeable holder if needed.
-pub type ProtoObjectFn =
-    fn(&mut js::context::JSContext, HandleObject<'_>, MutableHandleObject<'_>);
+pub type ProtoObjectFn = fn(&mut js::context::JSContext, HandleObject<'_>, MutableHandleObject<'_>);
 
 /// A struct to store a reference to the reflector of a DOM object.
 #[derive(MallocSizeOf)]
@@ -262,10 +261,9 @@ impl<T> Reflector<T> {
     /// Materialize the object the reflector points at, if it is still a `JSDomStub`.
     ///
     /// The reflector's old `JSDomStub` is unbound from the DOM node: it stays allocated until the
-    /// pool drops the references it holds, but no longer finalizes the node. The stub's reference
-    /// count is carried over to the new `JSObject`. Only the object's initial reference is owned by
-    /// the pool; the rest are duplicated without corresponding pool entries and leak for now.
-    /// Afterwards the reflector points at the new `JSObject`.
+    /// pool drops the references it holds, but no longer finalizes the node. The stub's non-pool
+    /// references are carried over to the new `JSObject`; its pool references remain in the pool
+    /// until the next drain. Afterwards the reflector points at the new `JSObject`.
     ///
     /// Everything materialization needs is read from the stub (DOM node, realm) or from the
     /// per-interface class recorded on the reflector (`DOMJSClass`: the `JSClass` itself, the
@@ -310,7 +308,10 @@ impl<T> Reflector<T> {
             // The per-interface data, recorded on the reflector by `wrap`: the class and the
             // `DOMClass` shared by every object of the interface.
             let dom_js_class = self.dom_js_class();
-            assert!(!dom_js_class.is_null(), "JSDomStub without an interface class");
+            assert!(
+                !dom_js_class.is_null(),
+                "JSDomStub without an interface class"
+            );
             // `DOMJSClass::base` is its first field, so this pointer also names the `JSClass`.
             let class = dom_js_class as *const JSClass;
             let dom_class = &(*dom_js_class).dom_class;
@@ -337,11 +338,22 @@ impl<T> Reflector<T> {
             );
             assert!(!canonical_proto.is_null());
 
-            // Bind to a real JSObject, carrying over the stub's reference count.
-            // `JS_NewObjectWithGivenProto` creates the object with a count of 1, and the pool
-            // holds a reference for it, so duplicate it `ref_count - 1` times to match the stub's
-            // count. These extra references are not backed by pool entries, so they leak for now.
+            // Bind to a real JSObject, carrying over the stub's non-pool references. The pool
+            // entries that keep the stub alive are dropped by a later drain; only `k - m`
+            // references belong to Rust or JS. The new object's initial count is itself adopted
+            // into the pool and will be released by that drain, so retain all `k - m` transferred
+            // references without adding pool entries.
             let ref_count = JS_GetDomStubRefCount(stub);
+            let pool_ref_count = JS_GetDomStubPoolRefCount(stub);
+            assert!(
+                pool_ref_count <= ref_count as u32,
+                "JSDomStub pool has more references than the object"
+            );
+            let transferred_ref_count = ref_count - pool_ref_count as i32;
+            assert!(
+                transferred_ref_count >= 1,
+                "materializing a JSDomStub with no non-pool reference"
+            );
             let proto = canonical_proto.get();
             rval.set(JS_NewObjectWithGivenProto(
                 cx,
@@ -349,7 +361,7 @@ impl<T> Reflector<T> {
                 HandleObject::from_marked_location(&proto),
             ));
             assert!(!rval.is_null());
-            for _ in 0..ref_count {
+            for _ in 0..transferred_ref_count {
                 js::quickjs::retain_object(rval.get());
             }
             JS_SetReservedSlot(rval.get(), DOM_OBJECT_SLOT, &PrivateValue(dom_ptr));
@@ -375,8 +387,12 @@ impl<T> Reflector<T> {
             LeaveRealm(cx, old_realm);
 
             // The new object holds its own realm reference (`ObjectData::new`): only now is it
-            // safe to detach the stub's node and drop the stub's reference to the realm.
+            // safe to detach the stub's node and drop the stub's reference to the realm. The
+            // stub must no longer finalize the node before its non-pool references are released.
             JS_UnbindDomStub(cx, stub);
+            for _ in 0..transferred_ref_count {
+                js::quickjs::release_object(stub);
+            }
             self.rebind_jsobject(rval.get());
         }
     }

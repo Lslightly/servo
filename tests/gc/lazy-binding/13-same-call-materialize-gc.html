@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script src="lb.js"></script>
+<script>
+  // Probe objects that are materialized during the native call that creates them.
+  // createElement returns a JSDomStub that is converted to a JSObject before the native call
+  // returns, while the stub's creation-time counts are still in the autorelease pool.
+  var runtime = window.runtime;
+  var refs = [];
+  var total = 20000;
+  var sampleEvery = 100;
+
+  for (let i = 0; i < total; i++) {
+    let div = document.createElement("div");
+    if (i % sampleEvery === 0) {
+      refs.push(new WeakRef(div));
+    }
+  }
+
+  // Multiple later jobs let the pool drain and finalizers enqueue more work. WeakRef also keeps
+  // a target alive for the job that read it, so the final count must happen after another GC.
+  function collect(rounds) {
+    window.setTimeout(function () {
+      runtime.drain_pool_gc();
+      if (rounds > 0) {
+        collect(rounds - 1);
+        return;
+      }
+
+      var alive = 0;
+      for (var i = 0; i < refs.length; i++) {
+        if (refs[i].deref() !== undefined) {
+          alive++;
+        }
+      }
+
+      LB.expect("same-call materialized createElement results are collectable", 0, alive);
+      LB.expectTrue("all WeakRef probes were collected", alive === 0);
+      LB.finish("13-same-call-materialize-gc");
+    }, 0);
+  }
+
+  collect(3);
+</script>
+</body>
+</html>

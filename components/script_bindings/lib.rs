@@ -44,6 +44,8 @@ pub mod observablearray;
 pub mod permanent_root;
 pub mod principals;
 pub mod proxyhandler;
+#[cfg(feature = "js-quickjs")]
+pub mod quickjs_runtime_helper;
 pub mod realms;
 pub mod record;
 pub mod refcounted;
