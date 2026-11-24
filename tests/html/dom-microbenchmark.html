@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>DOM binding microbenchmark</title>
+</head>
+<body>
+  <div id="bench-host"><span id="bench-target">benchmark</span></div>
+  <script>
+    (function () {
+      var doc = document;
+      var host = doc.getElementById("bench-host");
+      var element = doc.createElement("div");
+      element.id = "bench-element";
+      host.appendChild(element);
+      var sink = 0;
+
+      function measure(name, iterations, operation) {
+        var warmup = Math.min(iterations, 10000);
+        for (var i = 0; i < warmup; i++) {
+          sink ^= operation() | 0;
+        }
+
+        var start = performance.now();
+        for (var i = 0; i < iterations; i++) {
+          sink ^= operation() | 0;
+        }
+        var elapsed = performance.now() - start;
+        console.log("[BENCH] " + name + " " + iterations + " " + elapsed.toFixed(3));
+      }
+
+      measure("el.id", 1000000, function () {
+        return element.id.length;
+      });
+      measure("document.body", 1000000, function () {
+        return doc.body ? doc.body.nodeType : 0;
+      });
+      measure("el.parentNode", 1000000, function () {
+        return element.parentNode ? element.parentNode.nodeType : 0;
+      });
+      measure("el.setAttribute", 500000, function () {
+        element.setAttribute("a", "b");
+        return 0;
+      });
+      measure("document.getElementById", 1000000, function () {
+        return doc.getElementById("bench-target") ? 1 : 0;
+      });
+
+      console.log("[BENCH-END] sink=" + sink);
+      window.close();
+    })();
+  </script>
+</body>
+</html>
+

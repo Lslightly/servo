@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script>
+  var checks = 0;
+  var failures = 0;
+  function expectTrue(name, value) {
+    checks++;
+    if (value !== true) failures++;
+    console.log((value === true ? "[PASS] " : "[FAIL] ") + name);
+  }
+
+  // run.sh passes prefs.json, which explicitly disables dom_testutils_enabled.
+  // SERVO_LAZY_BINDING_STATS is still set, so this checks that the environment
+  // variable alone cannot expose window.runtime.
+  expectTrue(
+    "window.runtime is undefined when dom_testutils_enabled is false",
+    typeof window.runtime === "undefined"
+  );
+  console.log(
+    (failures === 0 ? "[PASS] " : "[FAIL] ") +
+      "prefs-disabled (" + checks + " checks, " + failures + " failures)"
+  );
+  window.close();
+</script>
+</body>
+</html>
