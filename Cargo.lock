@@ -5021,7 +5021,7 @@ dependencies = [
 [[package]]
 name = "mozjs"
 version = "0.26.14"
-source = "git+https://github.com/Lslightly/servo-quickjs.git?rev=fccc670031cb2cbb968a29f90d4ded84c5f67b1e#fccc670031cb2cbb968a29f90d4ded84c5f67b1e"
+source = "git+https://github.com/Lslightly/servo-quickjs.git?rev=ed0b43ddccd8432e732a65527129015533a6ff8d#ed0b43ddccd8432e732a65527129015533a6ff8d"
 dependencies = [
  "cc",
  "encoding_rs",
@@ -8938,7 +8938,7 @@ dependencies = [
 [[package]]
 name = "servo-quickjs"
 version = "0.1.0"
-source = "git+https://github.com/Lslightly/servo-quickjs.git?rev=fccc670031cb2cbb968a29f90d4ded84c5f67b1e#fccc670031cb2cbb968a29f90d4ded84c5f67b1e"
+source = "git+https://github.com/Lslightly/servo-quickjs.git?rev=ed0b43ddccd8432e732a65527129015533a6ff8d#ed0b43ddccd8432e732a65527129015533a6ff8d"
 dependencies = [
  "cc",
 ]
