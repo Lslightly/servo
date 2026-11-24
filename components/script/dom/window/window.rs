@@ -4360,10 +4360,14 @@ impl Window {
 
         let window = WindowBinding::Wrap::<crate::DomTypeHolder>(cx, &origin, win);
         #[cfg(feature = "js-quickjs")]
-        script_bindings::quickjs_runtime_helper::init_runtime_helper(
-            cx,
-            window.reflector().get_jsobject(),
-        );
+        {
+            if pref!(dom_testutils_enabled) {
+                script_bindings::quickjs_runtime_helper::init_runtime_helper(
+                    cx,
+                    window.reflector().get_jsobject(),
+                );
+            }
+        }
         window
     }
 

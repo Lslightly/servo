@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script src="lb.js"></script>
+<script>
+  // run.sh launches this page with 14-prefs.json, which explicitly disables
+  // dom_testutils_enabled. The stats environment variable is still set, so this
+  // also checks that it alone cannot expose window.runtime.
+  LB.expectTrue(
+    "window.runtime is undefined when dom_testutils_enabled is false",
+    typeof window.runtime === "undefined"
+  );
+  LB.finish("14-runtime-pref-disabled");
+</script>
+</body>
+</html>

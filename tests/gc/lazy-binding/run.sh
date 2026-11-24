@@ -12,10 +12,13 @@
 # Each page sets its own expectations and prints a `[PASS]`/`[FAIL]` summary
 # before calling `window.close()`. The `materialize_*` counters only exist when
 # the process is started with SERVO_LAZY_BINDING_STATS=1, which this runner sets.
+# The shared WPT preferences file enables `dom_testutils_enabled`, which exposes
+# the QuickJS `window.runtime` helper used by every page.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
+PREF_FILE=$REPO_ROOT/resources/wpt-prefs.json
 
 BINARY=$REPO_ROOT/target/debug/servoshell
 FILTER=""
@@ -49,6 +52,10 @@ if [[ ! -x "$BINARY" ]]; then
   echo "  ./mach build --features js-quickjs --config 'patch.crates-io.mozjs.path=\"servo-quickjs/mozjs\"'" >&2
   exit 2
 fi
+if [[ ! -f "$PREF_FILE" ]]; then
+  echo "error: $PREF_FILE is missing" >&2
+  exit 2
+fi
 if ! command -v timeout >/dev/null 2>&1; then
   echo "error: 'timeout' (coreutils) is required" >&2
   exit 2
@@ -75,12 +82,18 @@ for page in "${pages[@]}"; do
   fi
   total=$((total + 1))
 
+  pref_args=(--prefs-file "$PREF_FILE")
+  if [[ "$name" == "14-runtime-pref-disabled.html" ]]; then
+    pref_args=(--prefs-file "$SCRIPT_DIR/14-prefs.json")
+  fi
+
   log=$tmpdir/${name%.html}.log
   status=0
   # The page exits by itself (`window.close()`); `--exit` and the timeout are
   # safety nets for a page that throws before it can close the window.
   timeout --kill-after=5 "${TIMEOUT_SECS}s" \
-    env SERVO_LAZY_BINDING_STATS=1 "$BINARY" -z --exit "file://$page" \
+    env SERVO_LAZY_BINDING_STATS=1 "$BINARY" -z --exit \
+    "${pref_args[@]}" "file://$page" \
     >"$log" 2>&1 || status=$?
 
   failures=$(grep -c '^\[FAIL\] ' "$log" 2>/dev/null || true)

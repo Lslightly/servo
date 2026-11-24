@@ -18,8 +18,9 @@
 //! The `materialize_*` functions only exist when the process environment variable
 //! `SERVO_LAZY_BINDING_STATS` is set; see `tests/gc/lazy-binding/`.
 //!
-//! This is a debug hook, not a web API: it is installed on every `Window` and
-//! should not be relied on by pages.
+//! This is a debug hook, not a web API: it is installed on a `Window` only when
+//! the `dom_testutils_enabled` preference is set and should not be relied on by
+//! ordinary pages.
 
 use std::ffi::CStr;
 use std::ptr::NonNull;
