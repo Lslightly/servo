@@ -361,9 +361,7 @@ impl<T> Reflector<T> {
                 HandleObject::from_marked_location(&proto),
             ));
             assert!(!rval.is_null());
-            for _ in 0..transferred_ref_count {
-                js::quickjs::retain_object(rval.get());
-            }
+            js::quickjs::retain_object_count(rval.get(), transferred_ref_count as u32);
             JS_SetReservedSlot(rval.get(), DOM_OBJECT_SLOT, &PrivateValue(dom_ptr));
 
             // Copy the legacy unforgeable properties, which the interface defines on its holder,
@@ -390,9 +388,7 @@ impl<T> Reflector<T> {
             // safe to detach the stub's node and drop the stub's reference to the realm. The
             // stub must no longer finalize the node before its non-pool references are released.
             JS_UnbindDomStub(cx, stub);
-            for _ in 0..transferred_ref_count {
-                js::quickjs::release_object(stub);
-            }
+            js::quickjs::release_dom_stub_count(stub, transferred_ref_count as u32);
             self.rebind_jsobject(rval.get());
         }
     }
