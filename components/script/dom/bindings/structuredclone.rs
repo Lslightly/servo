@@ -411,6 +411,8 @@ fn receive_object<T: Transferable>(
     let Ok(received) = T::transfer_receive(cx, owner, id, serialized) else {
         return Err(());
     };
+    #[cfg(feature = "js-quickjs")]
+    received.reflector().materialize_if_needed();
     return_object.set(received.reflector().rootable().get());
     sc_reader.roots.push(Heap::boxed(return_object.get()));
     Ok(())
