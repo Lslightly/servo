@@ -17,8 +17,6 @@ use js::rust::wrappers2::{
     NewProxyObject,
 };
 use js::rust::{Handle, get_context_realm, get_object_class, get_object_realm};
-#[cfg(feature = "js-quickjs")]
-use crate::utils::DOMJSClass;
 
 use crate::codegen::PrototypeList;
 use crate::conversions::DOM_OBJECT_SLOT;
@@ -27,6 +25,8 @@ use crate::proxyhandler::ensure_expando_object;
 use crate::reflector::ProtoObjectFn;
 use crate::root::{DomRoot, MaybeUnreflectedDom, Root};
 use crate::utils::DOM_PROTO_UNFORGEABLE_HOLDER_SLOT;
+#[cfg(feature = "js-quickjs")]
+use crate::utils::DOMJSClass;
 use crate::{DomObject, DomTypes, MutDomObject};
 
 pub(crate) struct WrapConfig {
@@ -50,11 +50,20 @@ pub(crate) unsafe fn wrap<T: MutDomObject, D: DomTypes>(
 ) -> DomRoot<T> {
     unsafe {
         rooted!(&in(cx) let mut obj = ptr::null_mut::<JSObject>());
-        wrap_object::<T>(
+        let dom_ptr = raw.as_ptr();
+        #[cfg(feature = "js-quickjs")]
+        if !config.is_proxy {
+            // Record the interface class on the reflector; the shim reads it back from the node
+            // pointer to find the interface's finalizer and trace hook.
+            (*dom_ptr)
+                .reflector()
+                .set_dom_js_class(config.class.unwrap() as *const JSClass as *const DOMJSClass);
+        }
+        wrap_object(
             cx,
             &scope.reflector().get_jsobject(),
             given_proto,
-            &raw,
+            dom_ptr as *const c_void,
             &config,
             obj.handle_mut(),
         );
@@ -65,11 +74,11 @@ pub(crate) unsafe fn wrap<T: MutDomObject, D: DomTypes>(
 }
 
 // `wrap` is instantiated many times, so we move most of the code into this non-generic helper.
-unsafe fn wrap_object<T: MutDomObject>(
+unsafe fn wrap_object(
     cx: &mut JSContext,
     scope: &HandleObject,
     given_proto: Option<js::rust::Handle<*mut JSObject>>,
-    raw: &Root<MaybeUnreflectedDom<T>>,
+    raw: *const c_void,
     config: &WrapConfig,
     mut rval: MutableHandleObject,
 ) {
@@ -81,15 +90,7 @@ unsafe fn wrap_object<T: MutDomObject>(
         // Not a proxy object: either a lazily created `JSDomStub` (the common case in QuickJS),
         // or a real object created eagerly.
         if !config.is_proxy {
-            // Record the interface class on the reflector; the shim reads it back from the node
-            // pointer to find the interface's finalizer and trace hook.
             let class = config.class.unwrap();
-            let dom_ptr = raw.as_ptr();
-            #[cfg(feature = "js-quickjs")]
-            (*dom_ptr)
-                .reflector()
-                .set_dom_js_class(class as *const JSClass as *const DOMJSClass);
-            let dom_ptr = dom_ptr as *mut c_void;
 
             // QuickJS, the common case: no caller-given prototype. Keep the object lazy. The
             // canonical prototype, and this interface's unforgeable holder with it, is created the
@@ -97,7 +98,7 @@ unsafe fn wrap_object<T: MutDomObject>(
             // object that is never exposed does not create its interface's prototype.
             #[cfg(feature = "js-quickjs")]
             if given_proto.is_none() {
-                rval.set(JS_NewDomStub(cx, class, dom_ptr));
+                rval.set(JS_NewDomStub(cx, class, raw as *mut c_void));
                 assert!(!rval.is_null());
                 return;
             }
@@ -129,7 +130,7 @@ unsafe fn wrap_object<T: MutDomObject>(
                 HandleObject::from_marked_location(&proto_ptr),
             ));
             assert!(!rval.is_null());
-            JS_SetReservedSlot(rval.get(), DOM_OBJECT_SLOT, &PrivateValue(dom_ptr));
+            JS_SetReservedSlot(rval.get(), DOM_OBJECT_SLOT, &PrivateValue(raw));
 
             if config.has_legacy_unforgeable_members {
                 copy_legacy_unforgeable_members(cx, rval, canonical_proto.get());
@@ -166,7 +167,7 @@ unsafe fn wrap_object<T: MutDomObject>(
             };
 
             assert!(!rval.is_null());
-            SetProxyReservedSlot(rval.get(), 0, &PrivateValue(raw.as_ptr() as *const c_void));
+            SetProxyReservedSlot(rval.get(), 0, &PrivateValue(raw));
         }
 
         // A proxy cannot hold the properties itself: they go on its expando object, which the
