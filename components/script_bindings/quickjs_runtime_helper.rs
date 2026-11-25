@@ -31,8 +31,8 @@ use js::jsapi::{
 };
 use js::jsval::{DoubleValue, Int32Value, JSVal, UndefinedValue};
 use js::realm::AutoRealm;
-use js::rust::wrappers2::{JS_DefineProperty3, JS_GC, JS_NewFunction, JS_NewPlainObject};
 use js::rust::HandleObject;
+use js::rust::wrappers2::{JS_DefineProperty3, JS_GC, JS_NewFunction, JS_NewPlainObject};
 
 /// The QuickJS reference count of the object behind `val`, or `0` for values
 /// that do not carry one (numbers, strings, booleans, null, undefined).

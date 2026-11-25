@@ -215,9 +215,7 @@ pub fn sweep_live_references() {
             if Weak::upgrade(value).is_some() {
                 return true;
             }
-            unsafe {
-                js::quickjs::release_object((*(*ptr as *const Reflector)).rootable().get())
-            };
+            unsafe { js::quickjs::release_object((*(*ptr as *const Reflector)).rootable().get()) };
             false
         });
     });

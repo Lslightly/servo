@@ -190,7 +190,11 @@ unsafe fn copy_legacy_unforgeable_members(
 ) {
     unsafe {
         let mut slot = UndefinedValue();
-        JS_GetReservedSlot(canonical_proto, DOM_PROTO_UNFORGEABLE_HOLDER_SLOT, &mut slot);
+        JS_GetReservedSlot(
+            canonical_proto,
+            DOM_PROTO_UNFORGEABLE_HOLDER_SLOT,
+            &mut slot,
+        );
         rooted!(&in(cx) let mut unforgeable_holder = ptr::null_mut::<JSObject>());
         unforgeable_holder.handle_mut().set(slot.to_object());
         assert!(JS_InitializePropertiesFromCompatibleNativeObject(
