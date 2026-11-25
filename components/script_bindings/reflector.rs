@@ -243,21 +243,6 @@ impl<T> Reflector<T> {
         &self.object
     }
 
-    /// Whether the object is backed by a real `JSObject`.
-    ///
-    /// QuickJS: false while `object` is a `JSDomStub`, i.e. until it is materialized; proxies
-    /// are real objects from the start.
-    pub fn is_js_binded(&self) -> bool {
-        #[cfg(feature = "js-quickjs")]
-        {
-            unsafe { !JS_IsDomStub(self.object.get()) }
-        }
-        #[cfg(not(feature = "js-quickjs"))]
-        {
-            true
-        }
-    }
-
     /// Materialize the object the reflector points at, if it is still a `JSDomStub`.
     ///
     /// The reflector's old `JSDomStub` is unbound from the DOM node: it stays allocated until the
