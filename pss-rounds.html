@@ -1,0 +1,34 @@
+<!doctype html>
+<title>lazy-binding PSS rounds</title>
+<body>
+<script>
+// Each round parses `n` spans, touches each from JS (materializing its JSDomStub), removes them
+// and runs three GCs 50 ms apart; the next round starts right after the last GC.
+// After the GCs of each round we log `ROUND <n>` and idle for `settle` ms, so pss-rounds.sh
+// can read /proc/<pid>/smaps_rollup while nothing is being allocated. `ROUND 0` is the
+// baseline sample taken before any round runs.
+// Needs --pref dom_testutils_enabled=true.
+const params = new URLSearchParams(location.search);
+const n = Number(params.get("n") || 50000);
+const rounds = Number(params.get("rounds") || 48);
+const settle = Number(params.get("settle") || 400);
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+(async () => {
+  console.log("ROUND 0");
+  await pause(settle);
+  for (let round = 1; round <= rounds; round++) {
+    document.body.insertAdjacentHTML("beforeend", "<div id=c>" + "<span></span>".repeat(n) + "</div>");
+    const c = document.getElementById("c");
+    for (const span of c.getElementsByTagName("span")) void span;
+    c.remove();
+    for (let i = 0; i < 3; i++) {
+      await pause(50);
+      await TestUtils.gc();
+    }
+    console.log("ROUND " + round);
+    await pause(settle);
+  }
+  console.log("DONE");
+})();
+</script>
+</body>
