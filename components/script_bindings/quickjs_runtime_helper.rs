@@ -13,6 +13,8 @@
 //! runtime.materialize_count(); // DOM objects materialized on this script thread
 //! runtime.materialize_calls(); // calls to `materialize_if_needed`, including no-ops
 //! runtime.reset_materialize_stats();
+//! runtime.dom_stub_count();    // live DOM stubs on this script thread
+//! runtime.dom_stub_size();     // bytes those stubs occupy, allocation headers included
 //! ```
 //!
 //! The `materialize_*` functions only exist when the process environment variable
@@ -103,6 +105,32 @@ unsafe extern "C" fn drain_pool_gc(_cx: *mut RawJSContext, _argc: u32, _vp: *mut
     true
 }
 
+/// Number of DOM stubs alive on this script thread.
+///
+/// A stub is a lazy-binding placeholder: it stands in for a DOM object that has not been
+/// materialized yet (or that materialized but is still referenced through its stub). The count
+/// walks the engine's GC object list, so it reflects every stub the runtime still owns,
+/// including those held by the autorelease pool.
+#[expect(unsafe_code)]
+unsafe extern "C" fn dom_stub_count(_cx: *mut RawJSContext, argc: u32, vp: *mut JSVal) -> bool {
+    // SAFETY: We are in a JS hook, and `vp`/`argc` describe its arguments.
+    let args = unsafe { CallArgs::from_vp(vp, argc) };
+    let (count, _) = js::quickjs::dom_stub_usage();
+    args.rval().set(count_value(count as u64));
+    true
+}
+
+/// Bytes occupied by the DOM stubs alive on this script thread, including the allocation header
+/// of each stub.
+#[expect(unsafe_code)]
+unsafe extern "C" fn dom_stub_size(_cx: *mut RawJSContext, argc: u32, vp: *mut JSVal) -> bool {
+    // SAFETY: We are in a JS hook, and `vp`/`argc` describe its arguments.
+    let args = unsafe { CallArgs::from_vp(vp, argc) };
+    let (_, size) = js::quickjs::dom_stub_usage();
+    args.rval().set(count_value(size as u64));
+    true
+}
+
 /// A JS number for a counter value: `Int32Value` while it fits, `DoubleValue` above that.
 ///
 /// Both are JS Numbers (`typeof` is `"number"`); the int tag is just the compact
@@ -187,6 +215,8 @@ pub fn init_runtime_helper(cx: &mut JSContext, global: HandleObject) {
         define_method(cx, runtime, c"qjs_refcount", qjs_refcount);
         define_method(cx, runtime, c"drain_pool", drain_pool);
         define_method(cx, runtime, c"drain_pool_gc", drain_pool_gc);
+        define_method(cx, runtime, c"dom_stub_count", dom_stub_count);
+        define_method(cx, runtime, c"dom_stub_size", dom_stub_size);
         // Off by default: the accessors are a test hook, not a web API, and exposing them
         // changes the properties visible on `window.runtime`.
         if crate::lazy_binding_stats::enabled() {

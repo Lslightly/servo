@@ -17,7 +17,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../../../.." && pwd)
 PREF_FILE="${SCRIPT_DIR}/prefs.json"
 
-BINARY="${REPO_ROOT}/target/debug/servoshell"
+BINARY="${REPO_ROOT}/target/release/servoshell"
 FILTER=""
 TIMEOUT_SECS=30
 VERBOSE=0

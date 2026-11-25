@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script src="lb.js"></script>
+<script>
+  // A subtree created by the HTML parser (here through innerHTML) gets one JSDomStub per element
+  // at construction, but none of those nodes is ever handed to JS, so none materializes. While
+  // the subtree is in the document, the layout keeps the nodes alive; once it is removed and the
+  // layout recomputed, QuickJS GC reclaims their stubs. `runtime.dom_stub_count()` counts stubs
+  // directly, so the test does not need a WeakRef per node.
+  var runtime = window.runtime;
+  var doc = document;
+  var body = doc.body;
+  var total = 200;
+
+  // Free the stub replaced when `doc.body` was materialized, so the deltas below only see the
+  // stubs this page creates.
+  runtime.drain_pool_gc();
+
+  var host = doc.createElement("div");
+  body.appendChild(host);
+
+  var html = "";
+  for (var i = 0; i < total; i++) {
+    html += "<div></div>";
+  }
+
+  var before = runtime.dom_stub_count();
+  host.innerHTML = html;
+  var attached = runtime.dom_stub_count();
+  LB.expectTrue(
+    "the parser creates at least one JSDomStub per element of the unaccessed subtree",
+    attached - before >= total
+  );
+
+  // Detach the subtree. Layout still holds the nodes until it recomputes; reading offsetWidth
+  // forces that reflow, after which the nodes are unreachable and GC can free their stubs.
+  host.innerHTML = "";
+  void body.offsetWidth;
+
+  runtime.drain_pool_gc();
+  var after = runtime.dom_stub_count();
+  LB.expect(
+    "QuickJS GC reclaims the stubs of the detached, never-accessed subtree",
+    total,
+    attached - after
+  );
+  LB.finish("15-detached-subtree-stub-gc");
+</script>
+</body>
+</html>

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script src="lb.js"></script>
+<script>
+  // A DOM node gets a JSDomStub when it is constructed. For nodes created by the HTML parser,
+  // that stub survives until the node is handed to JS: the first conversion to a JS value
+  // materializes it into a real JSObject and retires the stub. `runtime.dom_stub_count()` walks
+  // the runtime's GC object list, so it shows the nodes' stubs disappear once they have been
+  // materialized and GC has run.
+  var runtime = window.runtime;
+  var doc = document;
+  var body = doc.body;
+  var total = 200;
+
+  // Free any stub whose pool entries predate the measurement, so the deltas below only see the
+  // stubs this page creates.
+  runtime.drain_pool_gc();
+
+  var host = doc.createElement("div");
+  body.appendChild(host);
+
+  var html = "";
+  for (var i = 0; i < total; i++) {
+    html += "<div></div>";
+  }
+
+  var before = runtime.dom_stub_count();
+  // The parser creates one JSDomStub per element without handing any of them to JS.
+  host.innerHTML = html;
+  var stubs = runtime.dom_stub_count();
+  LB.expectTrue(
+    "the parser creates at least one JSDomStub per element",
+    stubs - before >= total
+  );
+
+  // Hand every child to JS, keeping the materialized JSObjects in a JS variable. Each access
+  // replaces that node's JSDomStub with a JSObject.
+  var nodes = [];
+  var children = host.children;
+  for (var j = 0; j < children.length; j++) {
+    nodes.push(children[j]);
+  }
+
+  runtime.drain_pool_gc();
+  var after = runtime.dom_stub_count();
+  LB.expect(
+    "after GC none of the n JSDomStubs replaced by accessed nodes remains",
+    total,
+    stubs - after
+  );
+
+  LB.finish("14-materialized-stub-gc");
+</script>
+</body>
+</html>
