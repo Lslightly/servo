@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<body>
+<div id="host"><div id="root"><div></div><div></div><div></div><div></div><div></div><div></div></div></div>
+<script src="lb.js"></script>
+<script>
+  // The subtree is written directly in the markup: `#root` with six children. The HTML parser
+  // creates one JSDomStub per element, and JS never looks at the six children, so they all stay
+  // stubs. Only the subtree root is fetched by JS (`getElementById`), which materializes `#root`
+  // and frees its stub. Once the subtree is detached and every JS handle is dropped, a reflow
+  // followed by GC must reclaim the six never-materialized child stubs.
+  var runtime = window.runtime;
+  var doc = document; // Document is a named-properties proxy: +0
+
+  // Fetch the host first. `getElementById` materializes the node it returns, so doing it before
+  // the measurement keeps the host's own stub out of the deltas below.
+  var host = doc.getElementById("host");
+
+  runtime.reset_materialize_stats();
+  var before = runtime.dom_stub_count();
+  // This is the only node of the subtree JS ever obtains. `#root` was a stub until this call;
+  // the six children remain stubs.
+  var root = doc.getElementById("root");
+  var attached = runtime.dom_stub_count();
+  LB.expect(
+    "getElementById materializes the subtree root",
+    1,
+    runtime.materialize_count()
+  );
+
+  // Detach the subtree from the document. `removeChild` returns the removed node, which is the
+  // very same subtree root, so the return value is yet another JS reference to `#root` and must
+  // be dropped together with the `root` handle. Leaving either one alive keeps the whole
+  // subtree reachable from JavaScript and no stub can be collected.
+  var removed = host.removeChild(root);
+  removed = null;
+  root = null;
+
+  // Layout still holds the detached nodes until it recomputes; reading offsetWidth forces that
+  // reflow, after which the subtree is unreachable from both JS and layout.
+  void host.offsetWidth;
+
+  runtime.drain_pool_gc();
+  var after = runtime.dom_stub_count();
+  console.log("rechaimed JSDomStub count:", attached - after);
+  LB.expectTrue(
+    "QuickJS GC reclaims at least the six never-accessed child stubs of the detached subtree",
+    attached - after == 7 // 6 child + 1 root JSDomStub
+  );
+  LB.finish("17-materialized-root-detached-subtree-stub-gc");
+</script>
+</body>
+</html>
