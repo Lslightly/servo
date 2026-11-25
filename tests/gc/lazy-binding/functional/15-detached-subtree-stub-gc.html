@@ -1,45 +1,59 @@
 <!DOCTYPE html>
 <html>
 <body>
+<div id="host"></div>
 <script src="lb.js"></script>
 <script>
-  // A subtree created by the HTML parser (here through innerHTML) gets one JSDomStub per element
-  // at construction, but none of those nodes is ever handed to JS, so none materializes. While
-  // the subtree is in the document, the layout keeps the nodes alive; once it is removed and the
-  // layout recomputed, QuickJS GC reclaims their stubs. `runtime.dom_stub_count()` counts stubs
-  // directly, so the test does not need a WeakRef per node.
+  // Minimal case: the parser creates a chain of `total` divs that JS never touches, the chain is
+  // detached without handing any node to JS, and a single drain + GC should reclaim the stubs.
   var runtime = window.runtime;
   var doc = document;
-  var body = doc.body;
-  var total = 200;
+  var total = 5;
 
-  // Free the stub replaced when `doc.body` was materialized, so the deltas below only see the
-  // stubs this page creates.
-  runtime.drain_pool_gc();
-
-  var host = doc.createElement("div");
-  body.appendChild(host);
+  // `getElementById` materializes the host's own stub before counting starts.
+  var host = doc.getElementById("host");
 
   var html = "";
   for (var i = 0; i < total; i++) {
-    html += "<div></div>";
+    html += "<div>";
+  }
+  for (var i = 0; i < total; i++) {
+    html += "</div>";
   }
 
   var before = runtime.dom_stub_count();
-  host.innerHTML = html;
+  // `insertAdjacentHTML` hands no node to JS, unlike `createElement`.
+  host.insertAdjacentHTML("beforeend", html);
   var attached = runtime.dom_stub_count();
+  console.log("JSDomStubs added by the parser:", attached - before);
   LB.expectTrue(
-    "the parser creates at least one JSDomStub per element of the unaccessed subtree",
+    "the parser creates at least one JSDomStub per never-accessed element",
     attached - before >= total
   );
 
-  // Detach the subtree. Layout still holds the nodes until it recomputes; reading offsetWidth
-  // forces that reflow, after which the nodes are unreachable and GC can free their stubs.
-  host.innerHTML = "";
-  void body.offsetWidth;
+  // Detach without handing a node to JS: `replaceChildren()` returns `undefined`.
+  host.replaceChildren();
+  LB.expect("replaceChildren() leaves the host empty", 0, host.childNodes.length);
+
+  // Layout still holds the detached nodes until it recomputes; reading offsetWidth forces that
+  // reflow, after which the subtree is unreachable from both JS and layout.
+  void host.offsetWidth;
 
   runtime.drain_pool_gc();
+  runtime.dump_freed_dom_stubs();
   var after = runtime.dom_stub_count();
+  console.log("stubs: insert=" + attached + " after=" + after);
+
+  // Diagnostic only, and deliberately after the measurement because it materializes the node if
+  // one is still reachable: a stale `last_child` (or any other child pointer) on the host would
+  // keep the detached chain reachable for the GC even though `childNodes.length` is 0.
+  console.log(
+    "host.firstChild=" + host.firstChild +
+    " host.lastChild=" + host.lastChild +
+    " host.firstElementChild=" + host.firstElementChild +
+    " host.lastElementChild=" + host.lastElementChild
+  );
+
   LB.expect(
     "QuickJS GC reclaims the stubs of the detached, never-accessed subtree",
     total,

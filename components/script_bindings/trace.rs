@@ -64,6 +64,20 @@ pub(crate) unsafe fn trace_object(
 ) {
     unsafe {
         trace!("tracing {}", description);
+        #[cfg(feature = "js-quickjs")]
+        {
+            // `obj.ptr` is the address of the `Heap` slot; the object is the pointer it holds.
+            let obj_ptr = obj.get();
+            if js::rust::wrappers2::JS_IsDomStub(obj_ptr) {
+                eprintln!(
+                    "  tracing JSDomStub {description} at {obj_ptr:p}: class={} \
+                     refcount={} pool_refcount={}",
+                    js::quickjs::class_name(obj_ptr).unwrap_or("<unknown>"),
+                    js::rust::wrappers2::JS_GetDomStubRefCount(obj_ptr),
+                    js::rust::wrappers2::JS_GetDomStubPoolRefCount(obj_ptr),
+                );
+            }
+        }
         CallObjectTracer(
             tracer,
             obj.ptr.get() as *mut _,

@@ -15,6 +15,7 @@
 //! runtime.reset_materialize_stats();
 //! runtime.dom_stub_count();    // live DOM stubs on this script thread
 //! runtime.dom_stub_size();     // bytes those stubs occupy, allocation headers included
+//! runtime.dump_freed_dom_stubs(); // class names of the stubs the last GC freed
 //! ```
 //!
 //! The `materialize_*` functions only exist when the process environment variable
@@ -131,6 +132,42 @@ unsafe extern "C" fn dom_stub_size(_cx: *mut RawJSContext, argc: u32, vp: *mut J
     true
 }
 
+/// Prints the `JSDomStub` interface class names freed since the last GC started, one line per
+/// distinct class with its count, prefixed with `[freed-dom-stub]`.
+///
+/// The engine empties the record when a GC starts, so call this after `drain_pool_gc()` or
+/// `qjs_gc()`, not before: it lists what that GC (and any stub freed after it, before the next
+/// GC) reclaimed.
+#[expect(unsafe_code)]
+unsafe extern "C" fn dump_freed_dom_stubs(
+    _cx: *mut RawJSContext,
+    argc: u32,
+    vp: *mut JSVal,
+) -> bool {
+    let names = js::quickjs::freed_dom_stub_class_names();
+    // Group in free order: a Vec rather than a map, so the output reads in the order the GC
+    // released the stubs. The lists here are small, and counting is quadratic only in the
+    // number of distinct classes.
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for name in &names {
+        match counts.iter_mut().find(|(known, _)| *known == name.as_str()) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((name, 1)),
+        }
+    }
+    println!(
+        "[freed-dom-stub] gc reclaimed {} JSDomStub(s)",
+        names.len()
+    );
+    for (name, count) in counts {
+        println!("[freed-dom-stub] {name} x{count}");
+    }
+    // SAFETY: We are in a JS hook, and `vp`/`argc` describe its arguments.
+    let args = unsafe { CallArgs::from_vp(vp, argc) };
+    args.rval().set(UndefinedValue());
+    true
+}
+
 /// A JS number for a counter value: `Int32Value` while it fits, `DoubleValue` above that.
 ///
 /// Both are JS Numbers (`typeof` is `"number"`); the int tag is just the compact
@@ -217,6 +254,7 @@ pub fn init_runtime_helper(cx: &mut JSContext, global: HandleObject) {
         define_method(cx, runtime, c"drain_pool_gc", drain_pool_gc);
         define_method(cx, runtime, c"dom_stub_count", dom_stub_count);
         define_method(cx, runtime, c"dom_stub_size", dom_stub_size);
+        define_method(cx, runtime, c"dump_freed_dom_stubs", dump_freed_dom_stubs);
         // Off by default: the accessors are a test hook, not a web API, and exposing them
         // changes the properties visible on `window.runtime`.
         if crate::lazy_binding_stats::enabled() {

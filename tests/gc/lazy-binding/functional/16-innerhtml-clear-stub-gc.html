@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<body>
+<div id="host"></div>
+<script src="lb.js"></script>
+<script>
+  // Smallest reproducer for the stub leak in 15-detached-subtree-stub-gc.html: a single
+  // never-accessed `<p>` is created by the HTML parser through `innerHTML` (no createElement,
+  // no nesting), the host is then emptied. After layout recomputes, QuickJS GC should free
+  // that one stub, so exactly one stub must disappear between the parse and the detach.
+  // (The fragment parser also leaves its own root/fragment stubs behind; those are unrelated
+  // to the subtree, so they are excluded by comparing against `attached`.)
+  // A paragraph (HTMLParagraphElement) is used instead of a div to make it easier to spot
+  // in the JSDomStub class logs.
+  var runtime = window.runtime;
+  // `getElementById` materializes the host's own stub before counting starts.
+  var host = document.getElementById("host");
+
+  var before = runtime.dom_stub_count();
+  host.innerHTML = "<div><div></div></div>";
+  var attached = runtime.dom_stub_count();
+  LB.expectTrue(
+    "the parser creates at least one JSDomStub for the unaccessed paragraph",
+    attached - before >= 1
+  );
+
+  // Detach the paragraph. Layout still holds the node until it recomputes; reading offsetWidth
+  // forces that reflow, after which the node is unreachable and GC can free its stub.
+  host.innerHTML = "";
+  void host.offsetWidth;
+
+  runtime.drain_pool_gc();
+  var after = runtime.dom_stub_count();
+  LB.expect(
+    "QuickJS GC reclaims the stub of the detached, never-accessed paragraph",
+    2,
+    attached - after
+  );
+  LB.finish("16-innerhtml-clear-stub-gc");
+</script>
+</body>
+</html>

@@ -146,9 +146,25 @@ fn assert_not_impl_traceable(ty: &syn::Type) -> proc_macro2::TokenStream {
 }
 
 fn js_traceable_derive(s: synstructure::Structure) -> proc_macro2::TokenStream {
+    let ast = s.ast();
+    let name = &ast.ident;
     let mut asserts = quote!();
     let match_body = s.each(|binding| {
-        for attr in binding.ast().attrs.iter() {
+        let field = binding.ast();
+        let field_ty = &field.ty;
+        // 元组结构体/元组变体的字段没有 ident；synstructure 给它们绑定的名字是
+        // `__binding_<index>`，取序号当字段名，其它情况直接用字段 ident。
+        let field_name = match field.ident.as_ref() {
+            Some(ident) => quote!(stringify!(#ident)),
+            None => {
+                let binding_name = binding.binding.to_string();
+                let index = binding_name
+                    .strip_prefix("__binding_")
+                    .unwrap_or(&binding_name);
+                quote!(#index)
+            }
+        };
+        for attr in field.attrs.iter() {
             if attr.path().is_ident("no_trace") {
                 // If no reason argument is provided to `no_trace` (ie `#[no_trace="This types does not need..."]`),
                 // assert that the type in this bound field does not implement traceable.
@@ -160,11 +176,17 @@ fn js_traceable_derive(s: synstructure::Structure) -> proc_macro2::TokenStream {
                 return Some(quote!(<dyn crate::CustomTraceable>::trace(#binding, tracer);));
             }
         }
-        Some(quote!(#binding.trace(tracer);))
+        Some(quote! {
+            // eprintln!(
+            //     "    DOM trace: {}::{}: {}",
+            //     stringify!(#name),
+            //     #field_name,
+            //     stringify!(#field_ty)
+            // );
+            #binding.trace(tracer);
+        })
     });
 
-    let ast = s.ast();
-    let name = &ast.ident;
     let (impl_generics, ty_generics, where_clause) = ast.generics.split_for_impl();
     let mut where_clause = where_clause.unwrap_or(&parse_quote!(where)).clone();
     for param in ast.generics.type_params() {

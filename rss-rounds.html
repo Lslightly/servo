@@ -1,0 +1,26 @@
+<!doctype html>
+<title>lazy-binding RSS rounds</title>
+<body>
+<script>
+// Each round parses `n` spans, touches each from JS (materializing its JSDomStub), removes them
+// and runs three GCs 50 ms apart; the next round starts right after the last GC.
+// Needs --pref dom_testutils_enabled=true.
+const params = new URLSearchParams(location.search);
+const n = Number(params.get("n") || 50000);
+const rounds = Number(params.get("rounds") || 48);
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+(async () => {
+  for (let round = 1; round <= rounds; round++) {
+    document.body.insertAdjacentHTML("beforeend", "<div id=c>" + "<span></span>".repeat(n) + "</div>");
+    const c = document.getElementById("c");
+    for (const span of c.getElementsByTagName("span")) void span;
+    c.remove();
+    for (let i = 0; i < 3; i++) {
+      await pause(50);
+      await TestUtils.gc();
+    }
+  }
+  console.log("DONE");
+})();
+</script>
+</body>
