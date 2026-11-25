@@ -473,13 +473,6 @@ unsafe fn private_from_proto_check_static(
     obj: *mut JSObject,
     proto_check: fn(&'static DOMClass) -> bool,
 ) -> Result<*const libc::c_void, ()> {
-    // QuickJS: a `JSDomStub`'s class id already names its concrete interface, and it has no
-    // prototype or DOMClass to check against; generated code (finalize hooks, trace hooks,
-    // method prologues) reaches here with stubs and only needs the DOM pointer.
-    if is_dom_stub(obj) {
-        return Ok(unsafe { private_from_object(obj) });
-    }
-
     unsafe {
         let dom_class = get_dom_class(obj).map_err(|_| ())?;
         if proto_check(dom_class) {
