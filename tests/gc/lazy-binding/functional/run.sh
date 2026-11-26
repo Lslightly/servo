@@ -69,7 +69,7 @@ for page in "${pages[@]}"; do
   log=${tmpdir}/${name%.html}.log
   status=0
   timeout --kill-after=5 "${TIMEOUT_SECS}s" \
-    env SERVO_LAZY_BINDING_STATS=1 "${BINARY}" -z --exit \
+    env SERVO_LAZY_BINDING_STATS=1 "${BINARY}" -z \
     --prefs-file "${PREF_FILE}" "file://${page}" \
     >"${log}" 2>&1 || status=$?
 
