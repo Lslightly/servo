@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<body>
+<div id="host"></div>
+<script src="lb.js"></script>
+<script>
+  // Same check as 15-detached-subtree-stub-gc.html, detaching with `innerHTML = ""` instead of
+  // `replaceChildren()`: the parser creates a chain of `total` nested divs that JS never touches,
+  // so no stub materializes and each div is only reachable through its parent. The chain can only
+  // be reclaimed as a whole, so reclamation of all `total` stubs proves none of them leaked.
+  // (The fragment parser also leaves its own root/fragment stubs behind; those are unrelated
+  // to the subtree, so they are excluded by comparing against `attached`.)
+  var runtime = window.runtime;
+  // `getElementById` materializes the host's own stub before counting starts.
+  var host = document.getElementById("host");
+
+  runtime.drain_pool_gc(); // reclaim the stub replaced when the host materialized
+  var before = runtime.dom_stub_count();
+  var total = 50;
+  var html = "";
+  for (var i = 0; i < total; i++) {
+    html += "<div>";
+  }
+  for (var i = 0; i < total; i++) {
+    html += "</div>";
+  }
+  host.innerHTML = html;
+  var attached = runtime.dom_stub_count();
+  console.log("before insert:", before, "after insert:", attached);
+  LB.expectTrue(
+    "the parser creates at least one JSDomStub per never-accessed element",
+    attached - before >= total && attached - before < total + 5
+  );
+
+  // Detach the chain. Layout still holds the nodes until it recomputes; reading offsetWidth
+  // forces that reflow, after which the nodes are unreachable and GC can free their stubs.
+  host.innerHTML = "";
+  void host.offsetWidth;
+
+  window.setTimeout(() => {
+    runtime.drain_pool_gc();
+    var after = runtime.dom_stub_count();
+    var collected = attached - after;
+    LB.expectTrue(
+      "QuickJS GC reclaims the stubs of the detached, never-accessed subtree. [" + total + ", " + total +" + 5) stubs are reclaimed",
+      collected >= total && collected < total + 5
+    );
+    LB.finish("16-innerhtml-clear-stub-gc");
+  }, 100);
+</script>
+</body>
+</html>
