@@ -13,15 +13,15 @@ use js::context::JSContext;
 #[cfg(feature = "js-quickjs")]
 use js::jsapi::JS_SetReservedSlot;
 #[cfg(feature = "js-quickjs")]
-use js::jsapi::JSClass;
+use js::jsapi::{JSAutoRealm, JSClass};
 use js::jsapi::{AddAssociatedMemory, Heap, JSObject, MemoryUse, RemoveAssociatedMemory};
 #[cfg(feature = "js-quickjs")]
 use js::jsval::{PrivateValue, UndefinedValue};
 #[cfg(feature = "js-quickjs")]
 use js::rust::wrappers2::{
-    EnterRealm, JS_GetDomStubDomPtr, JS_GetDomStubInfo, JS_GetDomStubPoolRefCount,
-    JS_GetDomStubRefCount, JS_InitializePropertiesFromCompatibleNativeObject, JS_IsDomStub,
-    JS_NewObjectWithGivenProto, JS_UnbindDomStub, LeaveRealm,
+    JS_GetDomStubDomPtr, JS_GetDomStubInfo, JS_GetDomStubPoolRefCount, JS_GetDomStubRefCount,
+    JS_InitializePropertiesFromCompatibleNativeObject, JS_IsDomStub, JS_NewObjectWithGivenProto,
+    JS_UnbindDomStub,
 };
 use js::rust::{HandleObject, MutableHandleObject};
 use malloc_size_of_derive::MallocSizeOf;
@@ -309,8 +309,9 @@ impl<T> Reflector<T> {
             rooted!(&in(cx) let mut rval = std::ptr::null_mut::<JSObject>());
 
             // The stub was created inside the realm of its global: create the canonical prototype
-            // and the real object there, not in whatever realm triggered materialization.
-            let old_realm = EnterRealm(cx, scope);
+            // and the real object there, not in whatever realm triggered materialization. The
+            // guard also restores the realm if an assert below panics.
+            let _ac = JSAutoRealm::new(cx.raw_cx(), scope);
 
             // Create the interface's canonical prototype (and its unforgeable holder), lazily.
             // The global is kept alive by its realm, so a handle into this stack slot is valid
@@ -366,8 +367,6 @@ impl<T> Reflector<T> {
                     unforgeable_holder.handle(),
                 ));
             }
-
-            LeaveRealm(cx, old_realm);
 
             // The new object holds its own realm reference (`ObjectData::new`): only now is it
             // safe to detach the stub's node and drop the stub's reference to the realm. The
