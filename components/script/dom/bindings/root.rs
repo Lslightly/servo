@@ -29,6 +29,8 @@ use std::default::Default;
 use std::hash::{Hash, Hasher};
 use std::mem;
 
+#[cfg(not(feature = "js-quickjs"))]
+use js::jsapi::JSObject;
 use js::jsapi::{Heap, JSTracer, Value};
 use js::rust::HandleValue;
 use layout_api::TrustedNodeAddress;
@@ -132,6 +134,13 @@ impl<T> LayoutDom<'_, T>
 where
     T: DomObject,
 {
+    /// Get the reflector.
+    #[cfg(not(feature = "js-quickjs"))]
+    pub(crate) unsafe fn get_jsobject(&self) -> *mut JSObject {
+        assert_in_layout();
+        self.value.reflector().get_jsobject().get()
+    }
+
     /// Get the address of the DOM object that owns this reflector. Unlike
     /// [`Self::get_jsobject`], it is stable when the reflector's `JSDomStub` is materialized into
     /// a real `JSObject`, so it can be used as the node identity from layout.
