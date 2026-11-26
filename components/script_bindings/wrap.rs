@@ -123,11 +123,7 @@ unsafe fn wrap_object(
                 }
             }
 
-            rval.set(JS_NewObjectWithGivenProto(
-                cx,
-                class,
-                proto.handle(),
-            ));
+            rval.set(JS_NewObjectWithGivenProto(cx, class, proto.handle()));
             assert!(!rval.is_null());
             JS_SetReservedSlot(rval.get(), DOM_OBJECT_SLOT, &PrivateValue(raw));
 
