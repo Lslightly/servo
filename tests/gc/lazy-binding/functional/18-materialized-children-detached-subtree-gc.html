@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<body>
+<div id="host"><div id="root"><div id="c1"><div id="c2"><div id="c3"><div id="c4"><div id="c5"><div id="c6"></div></div></div></div></div></div></div></div>
+<script src="lb.js"></script>
+<script>
+  // A nested subtree: `#root` -> `#c1` -> ... -> `#c6`. The parser gives every level a JSDomStub.
+  // JS fetches a few levels by id (`#c2`, `#c4`, `#c6`), which materializes only the returned
+  // nodes; their ancestors and siblings stay stubs. The subtree is then detached with
+  // `replaceChildren()`, which hands no node to JS. Once every JS handle is dropped, GC must
+  // reclaim all stubs of the subtree and collect the materialized JSObjects. Since each level is
+  // only reachable through its parent, a single leaked JSObject would keep the whole chain alive.
+  var runtime = window.runtime;
+  var doc = document; // Document is a named-properties proxy: +0
+
+  // Fetch the host first so its materialize is not part of `materialize_count()`. Its retired
+  // stub still shows up in `dom_stub_count()` until `drain_pool_gc()`; that is the extra 1 in the
+  // stub reclaim count below.
+  var host = doc.getElementById("host");
+
+  runtime.reset_materialize_stats();
+  var before = runtime.dom_stub_count();
+  // The nodes must be fetched while they are still in the document, because `getElementById`
+  // only searches the document tree. Each call materializes just the returned node, so `#root`,
+  // `#c1`, `#c3` and `#c5` remain stubs.
+  var c2 = doc.getElementById("c2");
+  var c4 = doc.getElementById("c4");
+  var c6 = doc.getElementById("c6");
+  var nodes = [c2, c4, c6];
+  var weak = [new WeakRef(c2), new WeakRef(c4), new WeakRef(c6)];
+  LB.expect(
+    "only the three fetched nodes materialize",
+    3,
+    runtime.materialize_count()
+  );
+
+  // Detach the whole subtree without handing a node to JS: `replaceChildren()` returns undefined.
+  host.replaceChildren();
+
+  // Drop every JS handle to the subtree.
+  c2 = null;
+  c4 = null;
+  c6 = null;
+  nodes = null;
+
+  // Layout keeps the detached nodes alive until it recomputes; reading offsetWidth forces that
+  // reflow, after which the subtree is unreachable from both JS and layout.
+  void host.offsetWidth;
+
+  runtime.drain_pool_gc();
+  var after = runtime.dom_stub_count();
+  console.log("stubs: before=" + before + " after=" + after);
+  // 7 stubs for the subtree nodes, plus the host's own stub: `getElementById("host")` already
+  // retired it before the measurement, but it is not released until `drain_pool_gc()`, so
+  // `before` still counts it.
+  var collected = before - after;
+  LB.expect(
+    "QuickJS GC reclaims the stubs of the detached nested subtree",
+    8,
+    collected
+  );
+
+  var alive = 0;
+  for (var i = 0; i < weak.length; i++) {
+    if (weak[i].deref() !== undefined) {
+      alive++;
+    }
+  }
+  LB.expect(
+    "the materialized nodes of the detached nested subtree are collected",
+    0,
+    alive
+  );
+  LB.finish("18-materialized-children-detached-subtree-gc");
+</script>
+</body>
+</html>

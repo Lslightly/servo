@@ -1,14 +1,16 @@
 <!DOCTYPE html>
 <html>
 <body>
-<div id="host"><div id="root"><div></div><div></div><div></div><div></div><div></div><div></div></div></div>
+<div id="host"><div id="root"><div><div><div><div><div><div></div></div></div></div></div></div></div></div>
 <script src="lb.js"></script>
 <script>
-  // The subtree is written directly in the markup: `#root` with six children. The HTML parser
-  // creates one JSDomStub per element, and JS never looks at the six children, so they all stay
-  // stubs. Only the subtree root is fetched by JS (`getElementById`), which materializes `#root`
-  // and frees its stub. Once the subtree is detached and every JS handle is dropped, a reflow
-  // followed by GC must reclaim the six never-materialized child stubs.
+  // The subtree is written directly in the markup: `#root` followed by a nested chain of six
+  // divs. The HTML parser creates one JSDomStub per element, and JS never looks at the six
+  // descendants, so they all stay stubs. Only the subtree root is fetched by JS
+  // (`getElementById`), which materializes `#root` and frees its stub. Once the subtree is
+  // detached and every JS handle is dropped, a reflow followed by GC must reclaim the six
+  // never-materialized descendant stubs. Since each level is only reachable through its parent,
+  // a leaked stub at any level would keep every ancestor alive too.
   var runtime = window.runtime;
   var doc = document; // Document is a named-properties proxy: +0
 
@@ -19,7 +21,7 @@
   runtime.reset_materialize_stats();
   var before = runtime.dom_stub_count();
   // This is the only node of the subtree JS ever obtains. `#root` was a stub until this call;
-  // the six children remain stubs.
+  // the six nested descendants remain stubs.
   var root = doc.getElementById("root");
   var attached = runtime.dom_stub_count();
   LB.expect(
@@ -28,6 +30,10 @@
     runtime.materialize_count()
   );
 
+  // Weak handle on the materialized node itself, so the page can check after GC that the subtree
+  // root was collected and not just that its stub is gone.
+  var weak = new WeakRef(root);
+
   // Detach the subtree from the document. `removeChild` returns the removed node, which is the
   // very same subtree root, so the return value is yet another JS reference to `#root` and must
   // be dropped together with the `root` handle. Leaving either one alive keeps the whole
@@ -35,6 +41,10 @@
   var removed = host.removeChild(root);
   removed = null;
   root = null;
+  LB.expectTrue(
+    "root JSObject is not collected yet",
+    weak.deref() !== undefined
+  );
 
   // Layout still holds the detached nodes until it recomputes; reading offsetWidth forces that
   // reflow, after which the subtree is unreachable from both JS and layout.
@@ -44,8 +54,13 @@
   var after = runtime.dom_stub_count();
   console.log("rechaimed JSDomStub count:", attached - after);
   LB.expectTrue(
-    "QuickJS GC reclaims at least the six never-accessed child stubs of the detached subtree",
-    attached - after == 7 // 6 child + 1 root JSDomStub
+    "QuickJS GC reclaims the six never-accessed descendant stubs of the detached nested subtree",
+    attached - after == 7 // 6 descendants + 1 root JSDomStub
+  );
+
+  LB.expectTrue(
+    "the detached subtree root DOM node JSObject is collected",
+    weak.deref() === undefined
   );
   LB.finish("17-materialized-root-detached-subtree-stub-gc");
 </script>
