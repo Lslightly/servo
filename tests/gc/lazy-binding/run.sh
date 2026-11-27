@@ -6,8 +6,9 @@
 
 # Compatibility entry point for all assertion-based lazy-binding suites.
 #
-# Prefer functional/run.sh for normal materialization regressions and
-# runtime/run.sh when testing the window.runtime helper itself.
+# Prefer functional/run.sh for normal materialization regressions,
+# runtime/run.sh when testing the window.runtime helper itself, and
+# memory/run.sh for JSObject/DOM-stub/autorelease-pool memory analysis.
 #
 # Usage:
 #   run.sh [--binary PATH] [--filter STR] [--timeout SECS] [--verbose]
@@ -30,4 +31,5 @@ fi
 status=0
 "${SCRIPT_DIR}/functional/run.sh" "$@" || status=$?
 "${SCRIPT_DIR}/runtime/run.sh" "$@" || status=$?
+"${SCRIPT_DIR}/memory/run.sh" "$@" || status=$?
 exit "${status}"

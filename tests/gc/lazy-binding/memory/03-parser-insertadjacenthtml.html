@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<body>
+<div id="host"></div>
+<script src="mb.js"></script>
+<script>
+  // 解析器创建节点：`insertAdjacentHTML` 让 HTML parser 建立元素，JS 只查询其中一个。
+  //
+  // 测量点（全部由 runtime.memory_stats() 写入 CSV，check_stats.py 分析）：
+  //   parser-baseline -> parser-inserted : dom_stub_count 增加 N（每个元素一个 stub），
+  //                                        obj_count 基本不变（没有任何节点被物化）
+  //   parser-inserted -> parser-queried  : 只查询一个节点，obj_count +1，dom_stub_count -1
+  //   parser-deleted  vs parser-baseline : 清空并 GC 后两者都应回到基线
+  var runtime = window.runtime;
+  var host = document.getElementById("host");
+
+  // 预热解析路径，避免把 fragment/接口初始化的一次性开销算进测量。
+  host.insertAdjacentHTML("beforeend", "<div></div>");
+  host.innerHTML = "";
+  void host.offsetWidth;
+  runtime.drain_pool_gc();
+
+  MB.sample("parser-baseline");
+
+  var N = 200;
+  var html = "";
+  for (var i = 0; i < N; i++) {
+    html += "<div></div>";
+  }
+
+  host.insertAdjacentHTML("beforeend", html);
+  MB.sample("parser-inserted");
+
+  // JS 只查询第一个子节点：恰好物化一个节点，它的 stub 被释放。
+  var first = host.firstElementChild;
+  MB.sample("parser-queried");
+
+  // 删除：清空 host 后，解析出的节点不可达；reflow 让布局释放引用，GC 回收全部 stub。
+  first = null;
+  host.innerHTML = "";
+  void host.offsetWidth;
+  runtime.drain_pool_gc();
+  MB.sample("parser-deleted");
+
+  MB.finish("03-parser-insertadjacenthtml");
+</script>
+</body>
+</html>

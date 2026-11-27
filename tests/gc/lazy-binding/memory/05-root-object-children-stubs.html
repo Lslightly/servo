@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<body>
+<div id="host"></div>
+<script src="mb.js"></script>
+<script>
+  // 根节点物化、子节点保持 stub：`insertAdjacentHTML` 解析出 `#root` 和它的 N 个子节点，
+  // 之后 JS 只查询根节点。根从 stub 物化为 JSObject，子节点从未被访问，仍是 stub。
+  //
+  // 测量点（全部由 runtime.memory_stats() 写入 CSV，check_stats.py 分析）：
+  //   baseline -> parsed  : dom_stub_count +N+1（根 + 子节点），obj_count 基本不变
+  //   parsed -> queried   : 只查询根，obj_count +1，dom_stub_count -1
+  //   deleted vs baseline : 删除并 GC 后两者都回到基线
+  var runtime = window.runtime;
+  var host = document.getElementById("host");
+
+  // 预热解析路径。
+  host.insertAdjacentHTML("beforeend", "<div></div>");
+  host.innerHTML = "";
+  void host.offsetWidth;
+  runtime.drain_pool_gc();
+
+  MB.sample("root-baseline");
+
+  var children = 64;
+  var html = '<div id="root">';
+  for (var i = 0; i < children; i++) {
+    html += "<div></div>";
+  }
+  html += "</div>";
+  host.insertAdjacentHTML("beforeend", html);
+  MB.sample("root-parsed");
+
+  // 只查询根节点：子节点保持 stub。
+  var root = document.getElementById("root");
+  MB.sample("root-queried");
+
+  // 删除整棵子树，GC 后 stub 全部回收、根的 JSObject 被回收。
+  // 根的回收也可以从 JS 侧确认（CSV 只能看到计数），所以保留这个 WeakRef 检查。
+  var weak = new WeakRef(root);
+  root = null;
+  host.innerHTML = "";
+  void host.offsetWidth;
+  runtime.drain_pool_gc();
+  MB.sample("root-deleted");
+  MB.expectTrue("根节点的 JSObject 被回收", weak.deref() === undefined);
+  MB.finish("05-root-object-children-stubs");
+</script>
+</body>
+</html>

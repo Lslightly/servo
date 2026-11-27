@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<body>
+<div id="host"></div>
+<script src="mb.js"></script>
+<script>
+  // 纯 JS 创建节点：`createElement` 直接返回一个可用的 JSObject，不经过 stub。
+  //
+  // 测量点（全部由 runtime.memory_stats() 写入 CSV，check_stats.py 分析）：
+  //   create-baseline -> create-created  : obj_count 应增加 N，dom_stub_count 不变
+  //   create-deleted  vs create-baseline : 删除并 GC 后两者都应回到基线
+  var runtime = window.runtime;
+  var doc = document; // 首次交给 JS：document 自身物化
+  var host = doc.getElementById("host"); // 物化 host
+
+  // 预热：让 HTMLDivElement 的包装路径/原型先建立，避免把一次性开销算进测量。
+  var warm = doc.createElement("div");
+  host.appendChild(warm);
+  host.removeChild(warm);
+  warm = null;
+  void host.offsetWidth;
+  runtime.drain_pool_gc();
+
+  var N = 100;
+  var nodes = []; // 在基线之前创建，避免把数组本身算进 delta
+  MB.sample("create-baseline");
+
+  for (var i = 0; i < N; i++) {
+    var node = doc.createElement("div");
+    nodes.push(node);
+    host.appendChild(node);
+  }
+  node = null;
+  MB.sample("create-created");
+
+  // 删除：DOM mutation + reflow 后，布局不再引用这些节点，GC 应回收全部 JSObject。
+  for (var i = 0; i < N; i++) {
+    host.removeChild(nodes[i]);
+  }
+  nodes = null;
+  void host.offsetWidth;
+  runtime.drain_pool_gc();
+  MB.sample("create-deleted");
+
+  MB.finish("02-create-element");
+</script>
+</body>
+</html>

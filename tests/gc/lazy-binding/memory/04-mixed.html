@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<body>
+<!-- 静态子树：解析器建立 stub，JS 永不访问（既不在基线增量里，也不参与删除）。 -->
+<div id="static-host"><div><div></div><div></div></div></div>
+<div id="js-host"></div>
+<div id="parser-host"></div>
+<script src="mb.js"></script>
+<script>
+  // 三种来源的节点同时存在：
+  //   - 静态标记里的子树（stub 保持未物化）
+  //   - JS `createElement` 创建的节点（JSObject）
+  //   - `insertAdjacentHTML` 解析出的节点（stub），其中查询一个使其物化
+  //
+  // 测量点（全部由 runtime.memory_stats() 写入 CSV，check_stats.py 分析）：
+  //   baseline -> after-js      : obj_count +N_JS，dom_stub_count 不变
+  //   after-js -> after-parser  : dom_stub_count +N_PARSER，obj_count 基本不变
+  //   after-parser -> after-query : 查询一个解析节点，obj_count +1，dom_stub_count -1
+  //   after-delete vs baseline  : 两者都回到基线（静态子树的 stub 从未变化）
+  var runtime = window.runtime;
+  document.getElementById("static-host");
+  var jsHost = document.getElementById("js-host");
+  var parserHost = document.getElementById("parser-host");
+
+  // 预热 createElement 与 parser 两条路径。
+  var warm = document.createElement("div");
+  jsHost.appendChild(warm);
+  jsHost.removeChild(warm);
+  parserHost.insertAdjacentHTML("beforeend", "<div></div>");
+  parserHost.innerHTML = "";
+  warm = null;
+  void jsHost.offsetWidth;
+  runtime.drain_pool_gc();
+
+  var N_JS = 50;
+  var N_PARSER = 70;
+  var nodes = []; // 基线前创建，避免把数组本身算进 delta
+  MB.sample("mixed-baseline");
+
+  // (1) 纯 JS：createElement 直接产生 JSObject。
+  for (var i = 0; i < N_JS; i++) {
+    var node = document.createElement("div");
+    nodes.push(node);
+    jsHost.appendChild(node);
+  }
+  node = null;
+  MB.sample("mixed-after-js");
+
+  // (2) 解析器：每个元素一个 stub，第一个带 id 供查询。
+  var html = '<div id="parsed-root"></div>';
+  for (var i = 1; i < N_PARSER; i++) {
+    html += "<div></div>";
+  }
+  parserHost.insertAdjacentHTML("beforeend", html);
+  MB.sample("mixed-after-parser");
+
+  // (3) 只查询一个解析节点：物化它，释放它的 stub。
+  var parsedRoot = document.getElementById("parsed-root");
+  MB.sample("mixed-after-query");
+
+  // 删除：JS 创建的节点逐个移除，解析节点整体清空；静态子树保持不动。
+  for (var i = 0; i < N_JS; i++) {
+    jsHost.removeChild(nodes[i]);
+  }
+  nodes = null;
+  parsedRoot = null;
+  parserHost.innerHTML = "";
+  void jsHost.offsetWidth;
+  void parserHost.offsetWidth;
+  runtime.drain_pool_gc();
+  MB.sample("mixed-after-delete");
+
+  MB.finish("04-mixed");
+</script>
+</body>
+</html>
