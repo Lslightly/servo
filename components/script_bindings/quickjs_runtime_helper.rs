@@ -14,11 +14,20 @@
 //! runtime.materialize_calls(); // calls to `materialize_if_needed`, including no-ops
 //! runtime.reset_materialize_stats();
 //! runtime.dom_stub_count();    // live DOM stubs on this script thread
-//! runtime.dom_stub_size();     // bytes those stubs occupy, allocation headers included
+//! runtime.dom_stub_size();     // bytes those stubs occupy (32B each, the stub itself)
+//! runtime.memory_stats();      // append JSObject/property/DOM-stub sizes + pool count/size to a CSV
 //! ```
 //!
 //! The `materialize_*` functions only exist when the process environment variable
 //! `SERVO_LAZY_BINDING_STATS` is set; see `tests/gc/lazy-binding/`.
+//!
+//! `memory_stats()` appends one row to `$SERVO_MEMORY_STATS_PATH` (default:
+//! `${TMPDIR}/servo-memory-stats-<pid>.csv`) through the engine's
+//! `js::quickjs::append_memory_stats`, which owns the CSV format and the `t_ms`
+//! column (milliseconds since process start, on the same `/proc/uptime` clock
+//! that `.vscode/pss-sampler.sh` uses). The engine also appends the last two
+//! rows of each runtime when it is destroyed, before and after the autorelease
+//! pool drain.
 //!
 //! This is a debug hook, not a web API: it is installed on a `Window` only when
 //! the `dom_testutils_enabled` preference is set and should not be relied on by
@@ -120,14 +129,32 @@ unsafe extern "C" fn dom_stub_count(_cx: *mut RawJSContext, argc: u32, vp: *mut 
     true
 }
 
-/// Bytes occupied by the DOM stubs alive on this script thread, including the allocation header
-/// of each stub.
+/// Bytes occupied by the DOM stubs alive on this script thread: 32 bytes each on 64-bit, i.e.
+/// `sizeof(JSDomStub)`. Allocator block headers are not included; use `memory_stats()`'s
+/// `malloc_size` column for the allocator's view.
 #[expect(unsafe_code)]
 unsafe extern "C" fn dom_stub_size(_cx: *mut RawJSContext, argc: u32, vp: *mut JSVal) -> bool {
     // SAFETY: We are in a JS hook, and `vp`/`argc` describe its arguments.
     let args = unsafe { CallArgs::from_vp(vp, argc) };
     let (_, size) = js::quickjs::dom_stub_usage();
     args.rval().set(count_value(size as u64));
+    true
+}
+
+/// Appends one row with the current runtime's JSObject, Property and DOM stub sizes/counts,
+/// `memory_used_size`, `malloc_size`, and the number/size of values in the Rust-side
+/// autorelease pool, to `$SERVO_MEMORY_STATS_PATH` (default: a per-pid file in the temp
+/// directory).
+///
+/// The CSV columns, the path and `t_ms` (milliseconds since process start on the same monotonic
+/// `/proc/uptime` clock as `pss-sampler.sh`) are defined by the engine's
+/// `append_memory_stats`, which `JS_DestroyContext` calls before and after it drains the pool.
+#[expect(unsafe_code)]
+unsafe extern "C" fn memory_stats(_cx: *mut RawJSContext, argc: u32, vp: *mut JSVal) -> bool {
+    // SAFETY: We are in a JS hook, and `vp`/`argc` describe its arguments.
+    let args = unsafe { CallArgs::from_vp(vp, argc) };
+    js::quickjs::append_memory_stats();
+    args.rval().set(UndefinedValue());
     true
 }
 
@@ -217,6 +244,7 @@ pub fn init_runtime_helper(cx: &mut JSContext, global: HandleObject) {
         define_method(cx, runtime, c"drain_pool_gc", drain_pool_gc);
         define_method(cx, runtime, c"dom_stub_count", dom_stub_count);
         define_method(cx, runtime, c"dom_stub_size", dom_stub_size);
+        define_method(cx, runtime, c"memory_stats", memory_stats);
         // Off by default: the accessors are a test hook, not a web API, and exposing them
         // changes the properties visible on `window.runtime`.
         if crate::lazy_binding_stats::enabled() {

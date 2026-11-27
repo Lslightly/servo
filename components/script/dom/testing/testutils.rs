@@ -31,6 +31,12 @@ impl TestUtilsMethods<crate::DomTypeHolder> for TestUtils {
         // We need to spin the event-loop in order get the GC to actually run.
         // We do this by queuing a task that calls the GC and then resolves the promise.
         let task = task!(testutils_gc: move |cx| {
+            // QuickJS: values the engine handed to Rust in earlier tasks are held by the
+            // autorelease pool, which is Servo-side bookkeeping and invisible to a GC. Release
+            // them first, otherwise this GC cannot collect what the pool still pins. Mirrors
+            // `runtime.drain_pool_gc()`, which the lazy-binding tests use for the same reason.
+            #[cfg(feature = "js-quickjs")]
+            js::quickjs::drain_autorelease_pool();
             unsafe {
                 JS_GC(cx.raw_cx(), GCReason::DOM_TESTUTILS);
             }
