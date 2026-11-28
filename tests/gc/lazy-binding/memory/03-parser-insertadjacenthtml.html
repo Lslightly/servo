@@ -6,11 +6,13 @@
 <script>
   // 解析器创建节点：`insertAdjacentHTML` 让 HTML parser 建立元素，JS 只查询其中一个。
   //
-  // 测量点（全部由 runtime.memory_stats() 写入 CSV，check_stats.py 分析）：
-  //   parser-baseline -> parser-inserted : dom_stub_count 增加 N（每个元素一个 stub），
-  //                                        obj_count 基本不变（没有任何节点被物化）
-  //   parser-inserted -> parser-queried  : 只查询一个节点，obj_count +1，dom_stub_count -1
-  //   parser-deleted  vs parser-baseline : 清空并 GC 后两者都应回到基线
+  // 断言（计数由 `runtime.memory_usage()` 一次堆遍历给出的
+  // [objects, objectBytes, stubs, stubBytes] 读取，比较在页面内完成）：
+  //   base -> inserted    : dom_stub_count 增加约 N（每个元素一个 stub），obj_count 基本不变
+  //   inserted -> queried : 只查询一个节点，obj_count 约 +1，dom_stub_count 约 -1
+  //   deleted vs base     : 每轮清空、换到下一个任务 GC 后都应回到基线附近；
+  //                         按轮次累计增长即失败
+  // 计数允许小常数浮动：GC 可能顺带回收/创建其它小对象。
   var runtime = window.runtime;
   var host = document.getElementById("host");
 
@@ -20,29 +22,83 @@
   void host.offsetWidth;
   runtime.drain_pool_gc();
 
-  MB.sample("parser-baseline");
-
   var N = 200;
+  var ROUNDS = 5;
+  // 循环里会用 expectRange 打印断言；console 首次使用会创建一组常驻对象，
+  // 先在这里触发，避免把它算进每轮的对象增量。
+  console.log("warm-up");
+  // 快照记录在基线之前分配（记录本身是 JSObject，见 mb.js 顶部说明）。
+  var base = MB.record();
+  var inserted = MB.record();
+  var queried = MB.record();
+  var deleted = MB.record();
+
   var html = "";
   for (var i = 0; i < N; i++) {
     html += "<div></div>";
   }
 
-  host.insertAdjacentHTML("beforeend", html);
-  MB.sample("parser-inserted");
+  var round = 0;
 
-  // JS 只查询第一个子节点：恰好物化一个节点，它的 stub 被释放。
-  var first = host.firstElementChild;
-  MB.sample("parser-queried");
+  // 在当前任务里插入并删除，然后在下一个任务里 GC、取快照、断言。轮与轮之间都换一个
+  // 任务：同一任务里 `drain_pool_gc()` 回收不到每次解析留下的 fragment 记账对象，
+  // 换任务后再 GC 才能看出它们是不是真的被释放。
+  function runRound() {
+    host.insertAdjacentHTML("beforeend", html);
+    if (round === 0) {
+      MB.counts(inserted);
+    }
 
-  // 删除：清空 host 后，解析出的节点不可达；reflow 让布局释放引用，GC 回收全部 stub。
-  first = null;
-  host.innerHTML = "";
-  void host.offsetWidth;
-  runtime.drain_pool_gc();
-  MB.sample("parser-deleted");
+    // JS 只查询第一个子节点：恰好物化一个节点，它的 stub 被释放。
+    var first = host.firstElementChild;
+    if (round === 0) {
+      MB.counts(queried);
+    }
 
-  MB.finish("03-parser-insertadjacenthtml");
+    // 删除：清空 host 后，解析出的节点不可达；reflow 让布局释放引用。
+    first = null;
+    host.innerHTML = "";
+    void host.offsetWidth;
+    window.setTimeout(collect, 100);
+  }
+
+  function collect() {
+    runtime.drain_pool_gc();
+    MB.counts(deleted);
+
+    // 按“没有泄漏”的情况断言：每轮删除 + GC 后计数都回到基线附近。上界是固定的
+    // 小常数，不随轮次放宽；如果计数按轮次累计增长，后面的轮次会直接失败。
+    MB.expectRange("删除后 obj_count 回到基线", -2, 4, MB.delta(deleted, base, "objects"));
+    MB.expectRange("删除后 objectBytes 回到基线", -128, 320, MB.delta(deleted, base, "objectBytes"));
+    MB.expectRange("删除后 dom_stub_count 回到基线", 0, 0, MB.delta(deleted, base, "stubs"));
+    MB.expectRange("删除后 dom_stub_size 回到基线", 0, 0, MB.delta(deleted, base, "stubBytes"));
+
+    round++;
+    if (round < ROUNDS) {
+      runRound();
+      return;
+    }
+
+    // 所有快照取完再断言：expect* 的 console.log 本身会留下存活对象。
+    MB.expectRange("解析器为每个元素建一个 stub", N, N + 5, MB.delta(inserted, base, "stubs")); // N+2
+    MB.expectRange("stub 字节数随 stub 数增长", N * 32, (N + 5) * 32, MB.delta(inserted, base, "stubBytes"));
+    MB.expectRange("解析不按节点创建 JSObject（只有 fragment 记账）", -1, 3, MB.delta(inserted, base, "objects"));
+    MB.expectRange("解析不增加对象字节", -128, 128, MB.delta(inserted, base, "objectBytes"));
+    MB.expectRange("查询一个解析节点物化一个 JSObject", 1, 1, MB.delta(queried, inserted, "objects"));
+    MB.expectRange("查询使对象字节增加一个 JSObject", 1, 64, MB.delta(queried, inserted, "objectBytes"));
+    MB.expectRange("查询一个解析节点释放它自己的 stub", -2, -1, MB.delta(queried, inserted, "stubs"));
+    MB.expectRange("查询使 stub 字节减少一个 stub", -64, -32, MB.delta(queried, inserted, "stubBytes"));
+
+    MB.finish("03-parser-insertadjacenthtml");
+  }
+
+  // 基线也在下一个任务里取：warm-up 解析留下的 fragment 记账对象要等换任务后的 GC
+  // 才释放，这样基线和每轮测量是同一口径。
+  window.setTimeout(function () {
+    runtime.drain_pool_gc();
+    MB.counts(base);
+    runRound();
+  }, 100);
 </script>
 </body>
 </html>

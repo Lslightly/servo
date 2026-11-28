@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script src="lb.js"></script>
+<script>
+  // `runtime.memory_usage()` returns [objects, objectBytes, stubs, stubBytes] from a single
+  // QuickJS heap walk. This page checks the two counts across the lazy-binding boundaries:
+  //
+  //   1. the parser stamps one JSDomStub on every inserted element, while the JSObject count
+  //      stays flat (the inserted nodes are never handed to JS);
+  //   2. `getElementById` turns exactly the fetched node's stub into a JSObject;
+  //   3. detaching the subtree and collecting it reclaims the never-accessed span stubs and frees
+  //      the materialized wrapper.
+  //
+  // Stub counts are exact deltas. JSObject counts are not: `memory_usage()` itself creates
+  // JSObjects (the array it returns, plus a few engine-side objects around DOM calls), so object
+  // growth is only bounded to a small constant. The HTML fragment parser also leaves a couple of
+  // stubs behind that are unrelated to the subtree, hence the [n, n + 5) reclamation range.
+  var runtime = window.runtime;
+  var doc = document; // Document is a named-properties proxy: +0
+  var n = 10000;
+
+  // Fetch the host first. `document.body` materializes the body wrapper, which then stays out of
+  // every delta below; the initial GC releases the body's retired stub.
+  var body = doc.body;
+  runtime.drain_pool_gc();
+
+  var usage = runtime.memory_usage();
+  var baseObjects = usage[0];
+  var baseStubs = usage[2];
+  usage = null;
+
+  body.insertAdjacentHTML(
+    "beforeend",
+    "<div id=c>" + "<span></span>".repeat(n) + "</div>"
+  );
+  usage = runtime.memory_usage();
+  var insertedObjects = usage[0];
+  var insertedStubs = usage[2];
+  usage = null;
+
+  // `#c` was a stub until this call handed it to JS. Drain the pool before measuring so any
+  // deferred release from the materialization has happened.
+  var c = doc.getElementById("c");
+  runtime.drain_pool();
+  usage = runtime.memory_usage();
+  var replacedObjects = usage[0];
+  var replacedStubs = usage[2];
+  usage = null;
+
+  // Weak handle so the page can check that the materialized wrapper itself is collected, not just
+  // its stub. Created after the measurement above so it does not skew the object counts.
+  var weak = new WeakRef(c);
+
+  // `Node.remove()` returns undefined, so detaching hands no node to JS. Drop the remaining JS
+  // handle as well; either one alive would keep the subtree reachable.
+  c.remove();
+  c = null;
+
+  // Layout still holds the detached nodes until it recomputes. Reading offsetWidth forces that
+  // reflow, and the timeout lets Servo's own tasks run before the final drain + GC.
+  void body.offsetWidth;
+  window.setTimeout(function () {
+    runtime.drain_pool_gc();
+    usage = runtime.memory_usage();
+    var afterStubs = usage[2];
+    usage = null;
+
+    var insertedStubDelta = insertedStubs - baseStubs;
+    var retiredStubs = insertedStubs - replacedStubs;
+    var collectedStubs = replacedStubs - afterStubs;
+
+    LB.expectTrue(
+      "the parser creates a JSDomStub for every inserted node (" + n + " spans + the div)",
+      insertedStubDelta >= n + 1
+    );
+    LB.expectTrue(
+      "the " + n + " inserted nodes stay stubs: the JSObject count grows by a small constant",
+      insertedObjects - baseObjects >= 0 && insertedObjects - baseObjects < 10
+    );
+    LB.expect(
+      "getElementById retires exactly the fetched node's JSDomStub",
+      1,
+      retiredStubs
+    );
+    LB.expectTrue(
+      "getElementById materializes the fetched node as a JSObject (small constant growth)",
+      replacedObjects - insertedObjects >= 1 && replacedObjects - insertedObjects < 10
+    );
+    console.log("reclaimed JSDomStubs:", collectedStubs);
+    LB.expectTrue(
+      "QuickJS GC reclaims the stub of every never-accessed span in the detached subtree",
+      collectedStubs >= n && collectedStubs < n + 5
+    );
+    LB.expectTrue(
+      "the detached subtree's materialized JSObject is collected",
+      weak.deref() === undefined
+    );
+    LB.finish("19-memory-usage");
+  }, 100);
+</script>
+</body>
+</html>

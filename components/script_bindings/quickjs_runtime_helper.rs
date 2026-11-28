@@ -15,19 +15,22 @@
 //! runtime.reset_materialize_stats();
 //! runtime.dom_stub_count();    // live DOM stubs on this script thread
 //! runtime.dom_stub_size();     // bytes those stubs occupy (32B each, the stub itself)
+//! runtime.obj_count();         // live JSObjects on this script thread
+//! runtime.obj_size();          // bytes those objects occupy (the JSObject itself, 64B each)
+//! runtime.memory_usage();      // [objCount, objSize, domStubCount, domStubSize] in one heap walk
 //! runtime.memory_stats();      // append JSObject/property/DOM-stub sizes + pool count/size to a CSV
 //! ```
 //!
 //! The `materialize_*` functions only exist when the process environment variable
 //! `SERVO_LAZY_BINDING_STATS` is set; see `tests/gc/lazy-binding/`.
 //!
-//! `memory_stats()` appends one row to `$SERVO_MEMORY_STATS_PATH` (default:
-//! `${TMPDIR}/servo-memory-stats-<pid>.csv`) through the engine's
-//! `js::quickjs::append_memory_stats`, which owns the CSV format and the `t_ms`
-//! column (milliseconds since process start, on the same `/proc/uptime` clock
-//! that `.vscode/pss-sampler.sh` uses). The engine also appends the last two
-//! rows of each runtime when it is destroyed, before and after the autorelease
-//! pool drain.
+//! `memory_stats()` appends one row to `$SERVO_MEMORY_STATS_PATH` through the
+//! engine's `js::quickjs::append_memory_stats`, which owns the CSV format and the
+//! `t_ms` column (milliseconds since process start, on the same `/proc/uptime`
+//! clock that `.vscode/pss-sampler.sh` uses). The CSV is opt-in: when the
+//! environment variable is not set, nothing is collected and no file is written.
+//! The engine also appends the last two rows of each runtime when it is
+//! destroyed, before and after the autorelease pool drain.
 //!
 //! This is a debug hook, not a web API: it is installed on a `Window` only when
 //! the `dom_testutils_enabled` preference is set and should not be relied on by
@@ -38,12 +41,15 @@ use std::ptr::NonNull;
 
 use js::context::JSContext;
 use js::jsapi::{
-    CallArgs, GCReason, JS_GetFunctionObject, JSContext as RawJSContext, JSPROP_ENUMERATE,
+    CallArgs, GCReason, HandleValueArray, JS_GetFunctionObject, JSContext as RawJSContext,
+    JSPROP_ENUMERATE,
 };
-use js::jsval::{DoubleValue, Int32Value, JSVal, UndefinedValue};
+use js::jsval::{DoubleValue, Int32Value, JSVal, ObjectValue, UndefinedValue};
 use js::realm::AutoRealm;
 use js::rust::HandleObject;
-use js::rust::wrappers2::{JS_DefineProperty3, JS_GC, JS_NewFunction, JS_NewPlainObject};
+use js::rust::wrappers2::{
+    JS_DefineProperty3, JS_GC, JS_NewFunction, JS_NewPlainObject, NewArrayObject,
+};
 
 /// The QuickJS reference count of the object behind `val`, or `0` for values
 /// that do not carry one (numbers, strings, booleans, null, undefined).
@@ -141,10 +147,76 @@ unsafe extern "C" fn dom_stub_size(_cx: *mut RawJSContext, argc: u32, vp: *mut J
     true
 }
 
+/// Number of JSObjects alive on this script thread.
+///
+/// Counts every object in the engine's GC object list: DOM wrappers, plain objects and
+/// functions. `JSDomStub`s are not `JSObject`s; use `dom_stub_count()` for those. Like the stub
+/// counters, the walk includes objects the autorelease pool still holds, so drain the pool
+/// before comparing counts taken at different points.
+#[expect(unsafe_code)]
+unsafe extern "C" fn obj_count(_cx: *mut RawJSContext, argc: u32, vp: *mut JSVal) -> bool {
+    // SAFETY: We are in a JS hook, and `vp`/`argc` describe its arguments.
+    let args = unsafe { CallArgs::from_vp(vp, argc) };
+    let (count, _) = js::quickjs::obj_usage();
+    args.rval().set(count_value(count as u64));
+    true
+}
+
+/// Bytes occupied by the JSObjects alive on this script thread: `sizeof(JSObject)` each
+/// (64 bytes on 64-bit). Property slots, shapes and strings are not included; `memory_stats()`
+/// records those separately.
+#[expect(unsafe_code)]
+unsafe extern "C" fn obj_size(_cx: *mut RawJSContext, argc: u32, vp: *mut JSVal) -> bool {
+    // SAFETY: We are in a JS hook, and `vp`/`argc` describe its arguments.
+    let args = unsafe { CallArgs::from_vp(vp, argc) };
+    let (_, size) = js::quickjs::obj_usage();
+    args.rval().set(count_value(size as u64));
+    true
+}
+
+/// The live memory counters of this script thread, in one full heap walk, as a four-element
+/// array: `[objCount, objSize, domStubCount, domStubSize]`.
+///
+/// ```js
+/// const [objCount, objSize, stubCount, stubSize] = runtime.memory_usage();
+/// ```
+///
+/// The values are the same ones `obj_count()`, `obj_size()`, `dom_stub_count()` and
+/// `dom_stub_size()` return, but those four each walk the engine's whole GC object list, while
+/// this function reads all of them from a single walk. `objSize` counts one `sizeof(JSObject)`
+/// per object and `stubSize` one `sizeof(JSDomStub)` per stub; property slots, shapes, strings
+/// and allocator overhead are excluded (`memory_stats()` records those).
+#[expect(unsafe_code)]
+unsafe extern "C" fn memory_usage(cx: *mut RawJSContext, argc: u32, vp: *mut JSVal) -> bool {
+    let mut cx = unsafe {
+        // SAFETY: We are in a JS hook, so `cx` is a valid `JSContext`.
+        JSContext::from_ptr(NonNull::new(cx).expect("JSContext is not null in a JS hook"))
+    };
+    // SAFETY: We are in a JS hook, and `vp`/`argc` describe its arguments.
+    let args = unsafe { CallArgs::from_vp(vp, argc) };
+    let (obj_count, obj_size, stub_count, stub_size) = js::quickjs::memory_usage();
+    // SAFETY: `cx` is the context of this hook; `array` is rooted while we set the result.
+    unsafe {
+        rooted!(&in(cx) let values = vec![
+            count_value(obj_count as u64),
+            count_value(obj_size as u64),
+            count_value(stub_count as u64),
+            count_value(stub_size as u64),
+        ]);
+        rooted!(&in(cx) let array = NewArrayObject(&mut cx, &HandleValueArray::from(&values)));
+        assert!(
+            !array.get().is_null(),
+            "Failed to allocate the memory_usage array"
+        );
+        args.rval().set(ObjectValue(array.get()));
+    }
+    true
+}
+
 /// Appends one row with the current runtime's JSObject, Property and DOM stub sizes/counts,
 /// `memory_used_size`, `malloc_size`, and the number/size of values in the Rust-side
-/// autorelease pool, to `$SERVO_MEMORY_STATS_PATH` (default: a per-pid file in the temp
-/// directory).
+/// autorelease pool, to `$SERVO_MEMORY_STATS_PATH`. Does nothing when the environment variable
+/// is not set (the CSV is opt-in) or when there is no live runtime.
 ///
 /// The CSV columns, the path and `t_ms` (milliseconds since process start on the same monotonic
 /// `/proc/uptime` clock as `pss-sampler.sh`) are defined by the engine's
@@ -244,6 +316,9 @@ pub fn init_runtime_helper(cx: &mut JSContext, global: HandleObject) {
         define_method(cx, runtime, c"drain_pool_gc", drain_pool_gc);
         define_method(cx, runtime, c"dom_stub_count", dom_stub_count);
         define_method(cx, runtime, c"dom_stub_size", dom_stub_size);
+        define_method(cx, runtime, c"obj_count", obj_count);
+        define_method(cx, runtime, c"obj_size", obj_size);
+        define_method(cx, runtime, c"memory_usage", memory_usage);
         define_method(cx, runtime, c"memory_stats", memory_stats);
         // Off by default: the accessors are a test hook, not a web API, and exposing them
         // changes the properties visible on `window.runtime`.

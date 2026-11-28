@@ -7,10 +7,12 @@
   // 根节点物化、子节点保持 stub：`insertAdjacentHTML` 解析出 `#root` 和它的 N 个子节点，
   // 之后 JS 只查询根节点。根从 stub 物化为 JSObject，子节点从未被访问，仍是 stub。
   //
-  // 测量点（全部由 runtime.memory_stats() 写入 CSV，check_stats.py 分析）：
-  //   baseline -> parsed  : dom_stub_count +N+1（根 + 子节点），obj_count 基本不变
-  //   parsed -> queried   : 只查询根，obj_count +1，dom_stub_count -1
-  //   deleted vs baseline : 删除并 GC 后两者都回到基线
+  // 断言（计数由 `runtime.memory_usage()` 一次堆遍历给出的
+  // [objects, objectBytes, stubs, stubBytes] 读取，比较在页面内完成）：
+  //   base -> parsed    : dom_stub_count 约 +N+1（根 + 子节点），obj_count 基本不变
+  //   parsed -> queried : 只查询根，obj_count 约 +1，dom_stub_count 约 -1
+  //   deleted vs base   : 删除后换到下一个任务 GC，两者都回到基线
+  // 计数允许 ±2（字节 ±128）的浮动：GC 可能顺带回收/创建其它小对象。
   var runtime = window.runtime;
   var host = document.getElementById("host");
 
@@ -20,31 +22,69 @@
   void host.offsetWidth;
   runtime.drain_pool_gc();
 
-  MB.sample("root-baseline");
-
   var children = 64;
+  // 快照记录在基线之前分配（记录本身是 JSObject，见 mb.js 顶部说明）。
+  var base = MB.record();
+  var parsed = MB.record();
+  var queried = MB.record();
+  var deleted = MB.record();
+
   var html = '<div id="root">';
   for (var i = 0; i < children; i++) {
     html += "<div></div>";
   }
   html += "</div>";
-  host.insertAdjacentHTML("beforeend", html);
-  MB.sample("root-parsed");
 
-  // 只查询根节点：子节点保持 stub。
-  var root = document.getElementById("root");
-  MB.sample("root-queried");
+  var weak;
 
-  // 删除整棵子树，GC 后 stub 全部回收、根的 JSObject 被回收。
-  // 根的回收也可以从 JS 侧确认（CSV 只能看到计数），所以保留这个 WeakRef 检查。
-  var weak = new WeakRef(root);
-  root = null;
-  host.innerHTML = "";
-  void host.offsetWidth;
-  runtime.drain_pool_gc();
-  MB.sample("root-deleted");
-  MB.expectTrue("根节点的 JSObject 被回收", weak.deref() === undefined);
-  MB.finish("05-root-object-children-stubs");
+  function collect() {
+    // 换到下一个任务再 GC：同一任务里 `drain_pool_gc()` 回收不到解析留下的 fragment
+    // 记账对象。
+    runtime.drain_pool_gc();
+    MB.counts(deleted);
+
+    // 所有快照取完再断言：expect* 的 console.log 本身会留下存活对象。
+    MB.expectRange("解析器创建根和全部子节点的 stub", children + 1, children + 6, MB.delta(parsed, base, "stubs"));
+    MB.expectRange("根和子节点各占 32 字节 stub", (children + 1) * 32, (children + 6) * 32, MB.delta(parsed, base, "stubBytes"));
+    MB.expectRange("解析子树不创建 JSObject", -2, 2, MB.delta(parsed, base, "objects"));
+    MB.expectRange("解析子树不增加对象字节", -128, 128, MB.delta(parsed, base, "objectBytes"));
+    MB.expectRange("查询根物化根自身", 0, 2, MB.delta(queried, parsed, "objects"));
+    MB.expectRange("查询根增加一个 JSObject 的字节", 0, 128, MB.delta(queried, parsed, "objectBytes"));
+    MB.expectRange("查询根释放根自身的 stub", -2, 0, MB.delta(queried, parsed, "stubs"));
+    MB.expectRange("查询根减少一个 stub 的字节", -64, 0, MB.delta(queried, parsed, "stubBytes"));
+    MB.expectRange("只查询根时子节点保持 stub", children, children + 5, MB.delta(queried, base, "stubs"));
+    MB.expectRange("删除后 obj_count 回到基线", -2, 2, MB.delta(deleted, base, "objects"));
+    MB.expectRange("删除后 objectBytes 回到基线", -128, 128, MB.delta(deleted, base, "objectBytes"));
+    MB.expectRange("删除后 dom_stub_count 回到基线", -1, 1, MB.delta(deleted, base, "stubs"));
+    MB.expectRange("删除后 dom_stub_size 回到基线", -32, 32, MB.delta(deleted, base, "stubBytes"));
+    // 计数只能说明数量，说明不了被回收的是不是同一个对象，所以再用 WeakRef 确认一次。
+    MB.expectTrue("根节点的 JSObject 被回收", weak.deref() === undefined);
+
+    MB.finish("05-root-object-children-stubs");
+  }
+
+  // 基线也在下一个任务里取：warm-up 解析留下的 fragment 记账对象要等换任务后的 GC
+  // 才释放，这样基线和删除后的测量是同一口径。
+  window.setTimeout(function () {
+    runtime.drain_pool_gc();
+    MB.counts(base);
+
+    host.insertAdjacentHTML("beforeend", html);
+    MB.counts(parsed);
+
+    // 只查询根节点：子节点保持 stub。
+    var root = document.getElementById("root");
+    MB.counts(queried);
+
+    // 删除整棵子树，GC 放到下一个任务里执行。
+    // WeakRef 自身是一个 JSObject，所以它出现在 deleted 快照里；删除后的容差
+    // （-2..2）覆盖它。
+    weak = new WeakRef(root);
+    root = null;
+    host.innerHTML = "";
+    void host.offsetWidth;
+    window.setTimeout(collect, 100);
+  }, 100);
 </script>
 </body>
 </html>

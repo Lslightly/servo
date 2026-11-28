@@ -4,13 +4,11 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-# Memory analysis for lazy binding: DOM stub / JSObject / property / pool counts
-# and sizes at named checkpoints, plus the deletion behavior of the same pages.
-#
-# Each page calls `window.runtime.memory_stats()`, which appends a row to a CSV
-# selected by `SERVO_MEMORY_STATS_PATH`. Pages then print `[STATS] <label>`
-# markers; check_stats.py pairs markers with rows and prints a table, and checks
-# the count relationships the pages document.
+# Memory analysis for lazy binding: each page reads the engine's JSObject and
+# JSDomStub counters through `window.runtime.memory_usage()` (one heap walk
+# returning [objects, objectBytes, stubs, stubBytes]), asserts the count
+# relationships it documents, and prints `[PASS]`/`[FAIL]` lines. This runner
+# only launches the pages and reports their summaries.
 #
 # Usage:
 #   run.sh [--binary PATH] [--filter STR] [--timeout SECS] [--verbose]
@@ -29,7 +27,7 @@ TIMEOUT_SECS=60
 VERBOSE=0
 
 usage() {
-  sed -n '7,11p' "$0" | sed -e 's/^# \{0,1\}//' | sed '/./!d'
+  sed -n '7,16p' "$0" | sed -e 's/^# \{0,1\}//' | sed '/./!d'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -74,10 +72,9 @@ for page in "${pages[@]}"; do
   total=$((total + 1))
 
   log=${tmpdir}/${base}.log
-  csv=${tmpdir}/${base}.csv
   status=0
   timeout --kill-after=5 "${TIMEOUT_SECS}s" \
-    env SERVO_LAZY_BINDING_STATS=1 SERVO_MEMORY_STATS_PATH="${csv}" \
+    env SERVO_LAZY_BINDING_STATS=1 \
     "${BINARY}" -z \
     --prefs-file "${PREF_FILE}" "file://${page}" \
     >"${log}" 2>&1 || status=$?
@@ -93,17 +90,6 @@ for page in "${pages[@]}"; do
     echo "[PASS] ${name}"
   else
     echo "[FAIL] ${name} (exit ${status}, ${failures} failed checks, ${summary} summaries)"
-    page_failed=1
-  fi
-
-  # The CSV is the part the page cannot assert itself: JSObject and pool
-  # counts. Pair its rows with the page's [STATS] markers and check them.
-  if [[ -f ${csv} ]]; then
-    if ! python3 -I "${SCRIPT_DIR}/check_stats.py" "${base}" "${csv}" "${log}"; then
-      page_failed=1
-    fi
-  else
-    echo "[FAIL] ${name} (no memory-stats CSV: was window.runtime.memory_stats() called?)"
     page_failed=1
   fi
 

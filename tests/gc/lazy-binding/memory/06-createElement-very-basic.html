@@ -1,0 +1,37 @@
+<html>
+    <body>
+        <div id="host"></div>
+    </body>
+    <script src="mb.js"></script>
+    <script>
+        var host = document.getElementById("host");
+        const N = 100;
+
+        // 所有快照记录都在基线之前分配：记录本身是 JSObject。
+        var nodes = [];
+        nodes.push(1) // array prototype creation will add one JSObject
+        var base = MB.record();
+        var recs = [];
+        for (var i = 0; i < N; i++) {
+            recs.push(MB.record());
+        }
+        MB.counts(base);
+
+        // 测量循环里不调用 MB.expect / console.log：console 首次使用会创建约 21 个
+        // 常驻对象，并且每条消息还会留下少量对象，混进后续快照的 obj_count。
+        for (var i = 0; i < N; i++) {
+            var node = document.createElement("div");
+            MB.counts(recs[i]);
+            nodes.push(node);
+            var tmp = host.appendChild(node);
+            tmp = null;
+        }
+        node = null;
+
+        // 所有快照取完再断言。
+        for (var i = 0; i < N; i++) {
+            MB.expect("create N elements", i + 1, MB.delta(recs[i], base, "objects"));
+        }
+        MB.finish("06-createElement-very-basic");
+    </script>
+</html>

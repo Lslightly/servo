@@ -17299,12 +17299,19 @@
     <div class="a"><div class="b"><div class="c"><div class="d"><div class="e"><div class="f"><div class="g"></div></div></div></div></div></div></div>
     <!-- 纯静态页面：perf-rainbow.html 的副本，只在末尾加入测量脚本。
          解析器为每个元素建立一个 JSDomStub，本页脚本从不访问任何 DOM 节点，
-         所以 12 万个 div 全部保持为 stub。各项统计由 runtime.memory_stats() 写入
-         CSV，由 run.sh / check_stats.py 分析。 -->
+         所以 12 万个 div 全部保持为 stub。 -->
     <script src="mb.js"></script>
     <script>
       // 唯一的测量点：此时页面刚解析完，JS 尚未访问任何 DOM 节点。
-      MB.sample("static-parsed");
+      // MB.counts 用一次 `runtime.memory_usage()` 取齐
+      // [objects, objectBytes, stubs, stubBytes]。
+      var snapshot = MB.record();
+      MB.counts(snapshot);
+      MB.expectRange("每个静态元素都有一个 stub，范围[120960, 140000]", 120960, 140000, snapshot.stubs);
+      console.info("JSObject数量:", snapshot.objects);
+      MB.expectTrue("obj_count * 50 < stub 数", snapshot.objects * 50 < snapshot.stubs);
+      MB.expect("stub 每个 32 字节", snapshot.stubs * 32, snapshot.stubBytes);
+      MB.expect("每个 JSObject 64 字节", snapshot.objects * 64, snapshot.objectBytes);
       MB.finish("01-static-rainbow");
     </script>
 </body>

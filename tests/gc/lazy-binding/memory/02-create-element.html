@@ -4,43 +4,77 @@
 <div id="host"></div>
 <script src="mb.js"></script>
 <script>
-  // 纯 JS 创建节点：`createElement` 直接返回一个可用的 JSObject，不经过 stub。
+  // 纯 JS 创建节点：`createElement` 返回前仍会先给节点建一个 JSDomStub，再立即
+  // materialize 成 JSObject；退役的 stub 由 pool drain / GC 释放，不会留在净计数里。
   //
-  // 测量点（全部由 runtime.memory_stats() 写入 CSV，check_stats.py 分析）：
-  //   create-baseline -> create-created  : obj_count 应增加 N，dom_stub_count 不变
-  //   create-deleted  vs create-baseline : 删除并 GC 后两者都应回到基线
+  // 断言（计数由 `runtime.memory_usage()` 一次堆遍历给出的
+  // [objects, objectBytes, stubs, stubBytes] 读取，比较在页面内完成）：
+  //   base -> created : obj_count 增加 N，dom_stub_count 不变（每节点的 stub 已物化并释放）
+  //   deleted vs base : 删除并 GC 后两者都回到基线
+  // 计数允许 ±2（字节 ±128）的浮动：GC 可能顺带回收/创建其它小对象。
   var runtime = window.runtime;
   var doc = document; // 首次交给 JS：document 自身物化
   var host = doc.getElementById("host"); // 物化 host
 
   // 预热：让 HTMLDivElement 的包装路径/原型先建立，避免把一次性开销算进测量。
+  // appendChild/removeChild 的返回值是被插入/移除节点的 wrapper，留在变量里会让
+  // 节点活到下一次快照，所以用完立刻置 null。
   var warm = doc.createElement("div");
-  host.appendChild(warm);
-  host.removeChild(warm);
-  warm = null;
+  var tmp = host.appendChild(warm);
+  tmp = null;
+  tmp = host.removeChild(warm);
+  tmp = null;
   void host.offsetWidth;
+
+  // 预热 push：页面里第一次往数组 push 会一次性创建一个对象（和节点无关），
+  // 而且 GC 也回收不掉。它若发生在测量区间里，会让 delta 多出 1；放到基线之前。
+  var warmNodes = [];
+  warmNodes.push(null);
+  warmNodes.pop();
+
   runtime.drain_pool_gc();
 
   var N = 100;
-  var nodes = []; // 在基线之前创建，避免把数组本身算进 delta
-  MB.sample("create-baseline");
+  // 全部在基线之前分配：nodes 数组和快照记录本身就是 JSObject，放在基线
+  // 之后会把它们自己算进 delta。
+  var nodes = [];
+  nodes.push(1); // warm up array push. don't include array prototype object creation into the count of JSObject
+  var base = MB.record();
+  var created = MB.record();
+  var deleted = MB.record();
+  MB.counts(base);
 
+  var node = null;
   for (var i = 0; i < N; i++) {
-    var node = doc.createElement("div");
+    node = doc.createElement("div");
     nodes.push(node);
-    host.appendChild(node);
+    tmp = host.appendChild(node);
+    tmp = null;
   }
   node = null;
-  MB.sample("create-created");
+  MB.counts(created);
 
   // 删除：DOM mutation + reflow 后，布局不再引用这些节点，GC 应回收全部 JSObject。
-  for (var i = 0; i < N; i++) {
-    host.removeChild(nodes[i]);
+  for (var i = 1; i <= N; i++) {
+    tmp = host.removeChild(nodes[i]);
+    tmp = null;
   }
   nodes = null;
   void host.offsetWidth;
   runtime.drain_pool_gc();
-  MB.sample("create-deleted");
+  MB.counts(deleted);
+
+  // 所有快照取完再断言：expect* 的 console.log 本身会留下存活对象。
+  MB.expectRange("createElement 每个节点创建一个 JSObject", N, N, MB.delta(created, base, "objects"));
+  MB.expectRange("createElement 每个节点增加 64 字节", N * 64, N * 64, MB.delta(created, base, "objectBytes"));
+  // 每个节点都会先建一个 stub，但它在本调用内就 materialize 成 JSObject，退役 stub 到快照时
+  // 已释放；最终 GC 后再用下面的基线断言确认没有残留。
+  MB.expectRange("createElement 不留下净 DOM stub", -1, 1, MB.delta(created, base, "stubs"));
+  MB.expectRange("createElement 不留下 stub 字节", -32, 32, MB.delta(created, base, "stubBytes"));
+  MB.expectRange("删除后 obj_count 回到基线", -2, 2, MB.delta(deleted, base, "objects"));
+  MB.expectRange("删除后 objectBytes 回到基线", -128, 128, MB.delta(deleted, base, "objectBytes"));
+  MB.expectRange("删除后 dom_stub_count 回到基线", 0, 0, MB.delta(deleted, base, "stubs"));
+  MB.expectRange("删除后 dom_stub_size 回到基线", 0, 0, MB.delta(deleted, base, "stubBytes"));
 
   MB.finish("02-create-element");
 </script>

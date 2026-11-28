@@ -1,0 +1,17 @@
+<html>
+    <body>
+        <script src="mb.js"></script>
+        <script>
+            var base1 = MB.record();
+            var base2 = MB.record();
+            var base3 = MB.record();
+            MB.counts(base1);
+            MB.counts(base2);
+            runtime.drain_pool_gc();
+            MB.counts(base3);
+            MB.expect("JSObject count by MB.counts(base1)", 0, MB.delta(base2, base1, "objects"))
+            MB.expect("JSObject count by MB.counts(base2)+runtime.drain_pool_gc", 0, MB.delta(base3, base2, "objects"))
+            MB.finish("00-MB.counts");
+        </script>
+    </body>
+</html>
